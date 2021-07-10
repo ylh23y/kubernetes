@@ -21,16 +21,17 @@ import (
 	"testing"
 	"time"
 
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/clock"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/client-go/tools/record"
 	featuregatetesting "k8s.io/component-base/featuregate/testing"
+	statsapi "k8s.io/kubelet/pkg/apis/stats/v1alpha1"
 	kubeapi "k8s.io/kubernetes/pkg/apis/core"
+	"k8s.io/kubernetes/pkg/apis/scheduling"
 	"k8s.io/kubernetes/pkg/features"
-	statsapi "k8s.io/kubernetes/pkg/kubelet/apis/stats/v1alpha1"
 	evictionapi "k8s.io/kubernetes/pkg/kubelet/eviction/api"
 	"k8s.io/kubernetes/pkg/kubelet/lifecycle"
 	kubelettypes "k8s.io/kubernetes/pkg/kubelet/types"
@@ -45,14 +46,16 @@ const (
 // mockPodKiller is used to testing which pod is killed
 type mockPodKiller struct {
 	pod                 *v1.Pod
-	status              v1.PodStatus
+	evict               bool
+	statusFn            func(*v1.PodStatus)
 	gracePeriodOverride *int64
 }
 
 // killPodNow records the pod that was killed
-func (m *mockPodKiller) killPodNow(pod *v1.Pod, status v1.PodStatus, gracePeriodOverride *int64) error {
+func (m *mockPodKiller) killPodNow(pod *v1.Pod, evict bool, gracePeriodOverride *int64, statusFn func(*v1.PodStatus)) error {
 	m.pod = pod
-	m.status = status
+	m.statusFn = statusFn
+	m.evict = evict
 	m.gracePeriodOverride = gracePeriodOverride
 	return nil
 }
@@ -384,6 +387,52 @@ func TestMemoryPressure(t *testing.T) {
 	// all pods should admit now
 	expected = []bool{true, true}
 	for i, pod := range []*v1.Pod{bestEffortPodToAdmit, burstablePodToAdmit} {
+		if result := manager.Admit(&lifecycle.PodAdmitAttributes{Pod: pod}); expected[i] != result.Admit {
+			t.Errorf("Admit pod: %v, expected: %v, actual: %v", pod, expected[i], result.Admit)
+		}
+	}
+}
+
+func makeContainersByQOS(class v1.PodQOSClass) []v1.Container {
+	resource := newResourceList("100m", "1Gi", "")
+	switch class {
+	case v1.PodQOSGuaranteed:
+		return []v1.Container{newContainer("guaranteed-container", resource, resource)}
+	case v1.PodQOSBurstable:
+		return []v1.Container{newContainer("burtable-container", resource, nil)}
+	case v1.PodQOSBestEffort:
+		fallthrough
+	default:
+		return []v1.Container{newContainer("best-effort-container", nil, nil)}
+	}
+}
+
+func TestAdmitUnderNodeConditions(t *testing.T) {
+	manager := &managerImpl{}
+	pods := []*v1.Pod{
+		newPod("guaranteed-pod", scheduling.DefaultPriorityWhenNoDefaultClassExists, makeContainersByQOS(v1.PodQOSGuaranteed), nil),
+		newPod("burstable-pod", scheduling.DefaultPriorityWhenNoDefaultClassExists, makeContainersByQOS(v1.PodQOSBurstable), nil),
+		newPod("best-effort-pod", scheduling.DefaultPriorityWhenNoDefaultClassExists, makeContainersByQOS(v1.PodQOSBestEffort), nil),
+	}
+
+	expected := []bool{true, true, true}
+	for i, pod := range pods {
+		if result := manager.Admit(&lifecycle.PodAdmitAttributes{Pod: pod}); expected[i] != result.Admit {
+			t.Errorf("Admit pod: %v, expected: %v, actual: %v", pod, expected[i], result.Admit)
+		}
+	}
+
+	manager.nodeConditions = []v1.NodeConditionType{v1.NodeMemoryPressure}
+	expected = []bool{true, true, false}
+	for i, pod := range pods {
+		if result := manager.Admit(&lifecycle.PodAdmitAttributes{Pod: pod}); expected[i] != result.Admit {
+			t.Errorf("Admit pod: %v, expected: %v, actual: %v", pod, expected[i], result.Admit)
+		}
+	}
+
+	manager.nodeConditions = []v1.NodeConditionType{v1.NodeMemoryPressure, v1.NodeDiskPressure}
+	expected = []bool{false, false, false}
+	for i, pod := range pods {
 		if result := manager.Admit(&lifecycle.PodAdmitAttributes{Pod: pod}); expected[i] != result.Admit {
 			t.Errorf("Admit pod: %v, expected: %v, actual: %v", pod, expected[i], result.Admit)
 		}
@@ -839,10 +888,55 @@ func TestNodeReclaimFuncs(t *testing.T) {
 		t.Errorf("Manager should not report disk pressure")
 	}
 
+	// synchronize
+	manager.synchronize(diskInfoProvider, activePodsFunc)
+
+	// we should not have disk pressure
+	if manager.IsUnderDiskPressure() {
+		t.Errorf("Manager should not report disk pressure")
+	}
+
+	// induce hard threshold
+	fakeClock.Step(1 * time.Minute)
+	summaryProvider.result = summaryStatsMaker(".9Gi", "200Gi", podStats)
+	// make GC return disk usage bellow the threshold, but not satisfying minReclaim
+	diskGC.summaryAfterGC = summaryStatsMaker("1.1Gi", "200Gi", podStats)
+	manager.synchronize(diskInfoProvider, activePodsFunc)
+
+	// we should have disk pressure
+	if !manager.IsUnderDiskPressure() {
+		t.Errorf("Manager should report disk pressure since soft threshold was met")
+	}
+
+	// verify image gc was invoked
+	if !diskGC.imageGCInvoked || !diskGC.containerGCInvoked {
+		t.Errorf("Manager should have invoked image gc")
+	}
+
+	// verify a pod was killed because image gc was not enough to satisfy minReclaim
+	if podKiller.pod == nil {
+		t.Errorf("Manager should have killed a pod, but didn't")
+	}
+
+	// reset state
+	diskGC.imageGCInvoked = false
+	diskGC.containerGCInvoked = false
+	podKiller.pod = nil
+
+	// remove disk pressure
+	fakeClock.Step(20 * time.Minute)
+	summaryProvider.result = summaryStatsMaker("16Gi", "200Gi", podStats)
+	manager.synchronize(diskInfoProvider, activePodsFunc)
+
+	// we should not have disk pressure
+	if manager.IsUnderDiskPressure() {
+		t.Errorf("Manager should not report disk pressure")
+	}
+
 	// induce disk pressure!
 	fakeClock.Step(1 * time.Minute)
 	summaryProvider.result = summaryStatsMaker("400Mi", "200Gi", podStats)
-	// Dont reclaim any disk
+	// Don't reclaim any disk
 	diskGC.summaryAfterGC = summaryStatsMaker("400Mi", "200Gi", podStats)
 	manager.synchronize(diskInfoProvider, activePodsFunc)
 
@@ -880,7 +974,7 @@ func TestNodeReclaimFuncs(t *testing.T) {
 
 	// no image gc should have occurred
 	if diskGC.imageGCInvoked || diskGC.containerGCInvoked {
-		t.Errorf("Manager chose to perform image gc when it was not neeed")
+		t.Errorf("Manager chose to perform image gc when it was not needed")
 	}
 
 	// no pod should have been killed
@@ -903,7 +997,7 @@ func TestNodeReclaimFuncs(t *testing.T) {
 
 	// no image gc should have occurred
 	if diskGC.imageGCInvoked || diskGC.containerGCInvoked {
-		t.Errorf("Manager chose to perform image gc when it was not neeed")
+		t.Errorf("Manager chose to perform image gc when it was not needed")
 	}
 
 	// no pod should have been killed
@@ -1132,12 +1226,12 @@ func TestInodePressureNodeFsInodes(t *testing.T) {
 	}
 }
 
-// TestCriticalPodsAreNotEvicted
-func TestCriticalPodsAreNotEvicted(t *testing.T) {
+// TestStaticCriticalPodsAreNotEvicted
+func TestStaticCriticalPodsAreNotEvicted(t *testing.T) {
 	podMaker := makePodWithMemoryStats
 	summaryStatsMaker := makeMemoryStats
 	podsToMake := []podToMake{
-		{name: "critical", priority: defaultPriority, requests: newResourceList("100m", "1Gi", ""), limits: newResourceList("100m", "1Gi", ""), memoryWorkingSet: "800Mi"},
+		{name: "critical", priority: scheduling.SystemCriticalPriority, requests: newResourceList("100m", "1Gi", ""), limits: newResourceList("100m", "1Gi", ""), memoryWorkingSet: "800Mi"},
 	}
 	pods := []*v1.Pod{}
 	podStats := map[*v1.Pod]statsapi.PodStats{}
@@ -1147,11 +1241,12 @@ func TestCriticalPodsAreNotEvicted(t *testing.T) {
 		podStats[pod] = podStat
 	}
 
-	// Mark the pod as critical
 	pods[0].Annotations = map[string]string{
-		kubelettypes.CriticalPodAnnotationKey:  "",
 		kubelettypes.ConfigSourceAnnotationKey: kubelettypes.FileSource,
 	}
+	// Mark the pod as critical
+	podPriority := scheduling.SystemCriticalPriority
+	pods[0].Spec.Priority = &podPriority
 	pods[0].Namespace = kubeapi.NamespaceSystem
 
 	podToEvict := pods[0]
@@ -1208,9 +1303,6 @@ func TestCriticalPodsAreNotEvicted(t *testing.T) {
 		thresholdsFirstObservedAt:    thresholdsObservedAt{},
 	}
 
-	// Enable critical pod annotation feature gate
-	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ExperimentalCriticalPodAnnotation, true)()
-	// induce soft threshold
 	fakeClock.Step(1 * time.Minute)
 	summaryProvider.result = summaryStatsMaker("1500Mi", podStats)
 	manager.synchronize(diskInfoProvider, activePodsFunc)
@@ -1253,8 +1345,11 @@ func TestCriticalPodsAreNotEvicted(t *testing.T) {
 		t.Errorf("Manager should not report memory pressure")
 	}
 
-	// Disable critical pod annotation feature gate
-	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ExperimentalCriticalPodAnnotation, false)()
+	pods[0].Annotations = map[string]string{
+		kubelettypes.ConfigSourceAnnotationKey: kubelettypes.FileSource,
+	}
+	pods[0].Spec.Priority = nil
+	pods[0].Namespace = kubeapi.NamespaceSystem
 
 	// induce memory pressure!
 	fakeClock.Step(1 * time.Minute)
@@ -1264,11 +1359,6 @@ func TestCriticalPodsAreNotEvicted(t *testing.T) {
 	// we should have memory pressure
 	if !manager.IsUnderMemoryPressure() {
 		t.Errorf("Manager should report memory pressure")
-	}
-
-	// check the right pod was killed
-	if podKiller.pod != podToEvict {
-		t.Errorf("Manager chose to kill pod: %v, but should have chosen %v", podKiller.pod.Name, podToEvict.Name)
 	}
 }
 

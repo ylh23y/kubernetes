@@ -22,7 +22,7 @@ import (
 
 	v1 "k8s.io/api/core/v1"
 	storage "k8s.io/api/storage/v1"
-	apierrs "k8s.io/apimachinery/pkg/api/errors"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	corelisters "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/tools/cache"
@@ -127,6 +127,20 @@ var storageClasses = []*storage.StorageClass{
 		MountOptions:      []string{"foo"},
 		VolumeBindingMode: &modeImmediate,
 	},
+	{
+		TypeMeta: metav1.TypeMeta{
+			Kind: "StorageClass",
+		},
+
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "csi",
+		},
+
+		Provisioner:       "mydriver.csi.k8s.io",
+		Parameters:        class1Parameters,
+		ReclaimPolicy:     &deleteReclaimPolicy,
+		VolumeBindingMode: &modeImmediate,
+	},
 }
 
 // call to storageClass 1, returning an error
@@ -145,10 +159,6 @@ var provision1Success = provisionCall{
 var provision2Success = provisionCall{
 	ret:                nil,
 	expectedParameters: class2Parameters,
-}
-
-var provisionAlphaSuccess = provisionCall{
-	ret: nil,
 }
 
 // Test single call to syncVolume, expecting provisioning to happen.
@@ -427,7 +437,7 @@ func TestProvisionSync(t *testing.T) {
 				// Inject errors to simulate crashed API server during
 				// kubeclient.PersistentVolumes.Create()
 				{Verb: "create", Resource: "persistentvolumes", Error: errors.New("Mock creation error1")},
-				{Verb: "create", Resource: "persistentvolumes", Error: apierrs.NewAlreadyExists(api.Resource("persistentvolumes"), "")},
+				{Verb: "create", Resource: "persistentvolumes", Error: apierrors.NewAlreadyExists(api.Resource("persistentvolumes"), "")},
 			},
 			wrapTestWithPluginCalls(
 				nil, // recycle calls
@@ -453,8 +463,14 @@ func TestProvisionSync(t *testing.T) {
 			novolumes,
 			novolumes,
 			newClaimArray("claim11-21", "uid11-21", "1Gi", "", v1.ClaimPending, &classGold),
-			claimWithAnnotation(pvutil.AnnStorageProvisioner, "vendor.com/MockCSIPlugin",
-				newClaimArray("claim11-21", "uid11-21", "1Gi", "", v1.ClaimPending, &classGold)),
+			[]*v1.PersistentVolumeClaim{
+				annotateClaim(
+					newClaim("claim11-21", "uid11-21", "1Gi", "", v1.ClaimPending, &classGold),
+					map[string]string{
+						pvutil.AnnStorageProvisioner: "vendor.com/MockCSIDriver",
+						pvutil.AnnMigratedTo:         "vendor.com/MockCSIDriver",
+					}),
+			},
 			[]string{"Normal ExternalProvisioning"},
 			noerrors, wrapTestWithCSIMigrationProvisionCalls(testSyncClaim),
 		},
@@ -503,6 +519,30 @@ func TestProvisionSync(t *testing.T) {
 					newClaimArray("claim11-24", "uid11-24", "1Gi", "", v1.ClaimPending, &classExternalWait))),
 			[]string{"Normal ExternalProvisioning"},
 			noerrors, testSyncClaim,
+		},
+		{
+			// Provision a volume with a data source will fail
+			// for in-tree plugins
+			"11-25 - failed in-tree provision with data source",
+			novolumes,
+			novolumes,
+			claimWithDataSource("test-snap", "VolumeSnapshot", "snapshot.storage.k8s.io", newClaimArray("claim11-25", "uid11-25", "1Gi", "", v1.ClaimPending, &classGold)),
+			claimWithDataSource("test-snap", "VolumeSnapshot", "snapshot.storage.k8s.io", newClaimArray("claim11-25", "uid11-25", "1Gi", "", v1.ClaimPending, &classGold)),
+			[]string{"Warning ProvisioningFailed"}, noerrors,
+			testSyncClaim,
+		},
+		{
+			// Provision a volume with a data source will proceed
+			// for CSI plugins
+			"11-26 - csi with data source",
+			novolumes,
+			novolumes,
+			claimWithAnnotation(pvutil.AnnStorageProvisioner, "mydriver.csi.k8s.io",
+				claimWithDataSource("test-snap", "VolumeSnapshot", "snapshot.storage.k8s.io", newClaimArray("claim11-26", "uid11-26", "1Gi", "", v1.ClaimPending, &classCSI))),
+			claimWithAnnotation(pvutil.AnnStorageProvisioner, "mydriver.csi.k8s.io",
+				claimWithDataSource("test-snap", "VolumeSnapshot", "snapshot.storage.k8s.io", newClaimArray("claim11-26", "uid11-26", "1Gi", "", v1.ClaimPending, &classCSI))),
+			[]string{"Normal ExternalProvisioning"},
+			noerrors, wrapTestWithProvisionCalls([]provisionCall{}, testSyncClaim),
 		},
 	}
 	runSyncTests(t, tests, storageClasses, []*v1.Pod{})

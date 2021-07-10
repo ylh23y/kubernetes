@@ -25,8 +25,9 @@ import (
 	"testing"
 
 	"github.com/davecgh/go-spew/spew"
+	//lint:ignore SA1019 Keep using deprecated module; it still seems to be maintained and the api of the recommended replacement differs
 	"github.com/golang/protobuf/proto"
-	"github.com/google/gofuzz"
+	fuzz "github.com/google/gofuzz"
 	flag "github.com/spf13/pflag"
 
 	apitesting "k8s.io/apimachinery/pkg/api/apitesting"
@@ -85,7 +86,7 @@ func RoundTripProtobufTestForScheme(t *testing.T, scheme *runtime.Scheme, fuzzin
 	RoundTripTypes(t, scheme, codecFactory, fuzzer, nil)
 }
 
-var FuzzIters = flag.Int("fuzz-iters", 20, "How many fuzzing iterations to do.")
+var FuzzIters = flag.Int("fuzz-iters", defaultFuzzIters, "How many fuzzing iterations to do.")
 
 // globalNonRoundTrippableTypes are kinds that are effectively reserved across all GroupVersions
 // They don't roundtrip
@@ -102,6 +103,23 @@ var globalNonRoundTrippableTypes = sets.NewString(
 	// Delete options is only read in metav1
 	"DeleteOptions",
 )
+
+// GlobalNonRoundTrippableTypes returns the kinds that are effectively reserved across all GroupVersions.
+// They don't roundtrip and thus can be excluded in any custom/downstream roundtrip tests
+//
+//  kinds := scheme.AllKnownTypes()
+//  for gvk := range kinds {
+//      if roundtrip.GlobalNonRoundTrippableTypes().Has(gvk.Kind) {
+//          continue
+//      }
+//      t.Run(gvk.Group+"."+gvk.Version+"."+gvk.Kind, func(t *testing.T) {
+//          // roundtrip test
+//      })
+//  }
+//
+func GlobalNonRoundTrippableTypes() sets.String {
+	return sets.NewString(globalNonRoundTrippableTypes.List()...)
+}
 
 // RoundTripTypesWithoutProtobuf applies the round-trip test to all round-trippable Kinds
 // in the scheme.  It will skip all the GroupVersionKinds in the skip list.
@@ -142,6 +160,20 @@ func RoundTripExternalTypes(t *testing.T, scheme *runtime.Scheme, codecFactory r
 		}
 		t.Run(gvk.Group+"."+gvk.Version+"."+gvk.Kind, func(t *testing.T) {
 			roundTripSpecificKind(t, gvk, scheme, codecFactory, fuzzer, nonRoundTrippableTypes, false)
+		})
+	}
+}
+
+// RoundTripExternalTypesWithoutProtobuf applies the round-trip test to all external round-trippable Kinds
+// in the scheme.  It will skip all the GroupVersionKinds in the nonRoundTripExternalTypes list.
+func RoundTripExternalTypesWithoutProtobuf(t *testing.T, scheme *runtime.Scheme, codecFactory runtimeserializer.CodecFactory, fuzzer *fuzz.Fuzzer, nonRoundTrippableTypes map[schema.GroupVersionKind]bool) {
+	kinds := scheme.AllKnownTypes()
+	for gvk := range kinds {
+		if gvk.Version == runtime.APIVersionInternal || globalNonRoundTrippableTypes.Has(gvk.Kind) {
+			continue
+		}
+		t.Run(gvk.Group+"."+gvk.Version+"."+gvk.Kind, func(t *testing.T) {
+			roundTripSpecificKind(t, gvk, scheme, codecFactory, fuzzer, nonRoundTrippableTypes, true)
 		})
 	}
 }

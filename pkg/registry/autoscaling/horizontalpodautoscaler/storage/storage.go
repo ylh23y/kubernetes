@@ -29,6 +29,7 @@ import (
 	printersinternal "k8s.io/kubernetes/pkg/printers/internalversion"
 	printerstorage "k8s.io/kubernetes/pkg/printers/storage"
 	"k8s.io/kubernetes/pkg/registry/autoscaling/horizontalpodautoscaler"
+	"sigs.k8s.io/structured-merge-diff/v4/fieldpath"
 )
 
 // REST implements a RESTStorage for pod disruption budgets against etcd
@@ -37,26 +38,28 @@ type REST struct {
 }
 
 // NewREST returns a RESTStorage object that will work against horizontal pod autoscalers.
-func NewREST(optsGetter generic.RESTOptionsGetter) (*REST, *StatusREST) {
+func NewREST(optsGetter generic.RESTOptionsGetter) (*REST, *StatusREST, error) {
 	store := &genericregistry.Store{
 		NewFunc:                  func() runtime.Object { return &autoscaling.HorizontalPodAutoscaler{} },
 		NewListFunc:              func() runtime.Object { return &autoscaling.HorizontalPodAutoscalerList{} },
 		DefaultQualifiedResource: autoscaling.Resource("horizontalpodautoscalers"),
 
-		CreateStrategy: horizontalpodautoscaler.Strategy,
-		UpdateStrategy: horizontalpodautoscaler.Strategy,
-		DeleteStrategy: horizontalpodautoscaler.Strategy,
+		CreateStrategy:      horizontalpodautoscaler.Strategy,
+		UpdateStrategy:      horizontalpodautoscaler.Strategy,
+		DeleteStrategy:      horizontalpodautoscaler.Strategy,
+		ResetFieldsStrategy: horizontalpodautoscaler.Strategy,
 
 		TableConvertor: printerstorage.TableConvertor{TableGenerator: printers.NewTableGenerator().With(printersinternal.AddHandlers)},
 	}
 	options := &generic.StoreOptions{RESTOptions: optsGetter}
 	if err := store.CompleteWithOptions(options); err != nil {
-		panic(err) // TODO: Propagate error up
+		return nil, nil, err
 	}
 
 	statusStore := *store
 	statusStore.UpdateStrategy = horizontalpodautoscaler.StatusStrategy
-	return &REST{store}, &StatusREST{store: &statusStore}
+	statusStore.ResetFieldsStrategy = horizontalpodautoscaler.StatusStrategy
+	return &REST{store}, &StatusREST{store: &statusStore}, nil
 }
 
 // Implement ShortNamesProvider
@@ -95,4 +98,9 @@ func (r *StatusREST) Update(ctx context.Context, name string, objInfo rest.Updat
 	// We are explicitly setting forceAllowCreate to false in the call to the underlying storage because
 	// subresources should never allow create on update.
 	return r.store.Update(ctx, name, objInfo, createValidation, updateValidation, false, options)
+}
+
+// GetResetFields implements rest.ResetFieldsStrategy
+func (r *StatusREST) GetResetFields() map[fieldpath.APIVersion]*fieldpath.Set {
+	return r.store.GetResetFields()
 }

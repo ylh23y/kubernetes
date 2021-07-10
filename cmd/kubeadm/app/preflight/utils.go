@@ -20,10 +20,10 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/pkg/errors"
-
 	"k8s.io/apimachinery/pkg/util/version"
 	utilsexec "k8s.io/utils/exec"
+
+	"github.com/pkg/errors"
 )
 
 // GetKubeletVersion is helper function that returns version of kubelet available in $PATH
@@ -31,7 +31,7 @@ func GetKubeletVersion(execer utilsexec.Interface) (*version.Version, error) {
 	kubeletVersionRegex := regexp.MustCompile(`^\s*Kubernetes v((0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)([-0-9a-zA-Z_\.+]*)?)\s*$`)
 
 	command := execer.Command("kubelet", "--version")
-	out, err := command.CombinedOutput()
+	out, err := command.Output()
 	if err != nil {
 		return nil, errors.Wrap(err, "cannot execute 'kubelet --version'")
 	}

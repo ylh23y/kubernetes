@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package e2e_node
+package e2enode
 
 import (
 	"fmt"
@@ -26,10 +26,11 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/kubernetes/pkg/features"
 	kubeletconfig "k8s.io/kubernetes/pkg/kubelet/apis/config"
-	"k8s.io/kubernetes/pkg/util/mount"
 	"k8s.io/kubernetes/pkg/volume/util/fsquota"
 	"k8s.io/kubernetes/test/e2e/framework"
+	e2eskipper "k8s.io/kubernetes/test/e2e/framework/skipper"
 	imageutils "k8s.io/kubernetes/test/utils/image"
+	"k8s.io/mount-utils"
 
 	"github.com/onsi/ginkgo"
 )
@@ -61,7 +62,7 @@ func runOneQuotaTest(f *framework.Framework, quotasRequested bool) {
 			if quotasRequested && !supportsQuotas("/var/lib/kubelet") {
 				// No point in running this as a positive test if quotas are not
 				// enabled on the underlying filesystem.
-				framework.Skipf("Cannot run LocalStorageCapacityIsolationQuotaMonitoring on filesystem without project quota enabled")
+				e2eskipper.Skipf("Cannot run LocalStorageCapacityIsolationQuotaMonitoring on filesystem without project quota enabled")
 			}
 			// setting a threshold to 0% disables; non-empty map overrides default value (necessary due to omitempty)
 			initialConfig.EvictionHard = map[string]string{"memory.available": "0%"}
@@ -89,7 +90,7 @@ func runOneQuotaTest(f *framework.Framework, quotasRequested bool) {
 // pod that creates a file, deletes it, and writes data to it.  If
 // quotas are used to monitor, it will detect this deleted-but-in-use
 // file; if du is used to monitor, it will not detect this.
-var _ = framework.KubeDescribe("LocalStorageCapacityIsolationQuotaMonitoring [Slow] [Serial] [Disruptive] [Feature:LocalStorageCapacityIsolationQuota][NodeFeature:LSCIQuotaMonitoring]", func() {
+var _ = SIGDescribe("LocalStorageCapacityIsolationQuotaMonitoring [Slow] [Serial] [Disruptive] [Feature:LocalStorageCapacityIsolationQuota][NodeFeature:LSCIQuotaMonitoring]", func() {
 	f := framework.NewDefaultFramework("localstorage-quota-monitoring-test")
 	runOneQuotaTest(f, true)
 	runOneQuotaTest(f, false)

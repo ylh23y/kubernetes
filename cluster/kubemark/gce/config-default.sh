@@ -24,16 +24,18 @@
 source "${KUBE_ROOT}/cluster/gce/config-common.sh"
 
 CLEANUP_KUBEMARK_IMAGE=${CLEANUP_KUBEMARK_IMAGE:-true}
+TEST_CLUSTER_LOG_LEVEL="${TEST_CLUSTER_LOG_LEVEL:-"--v=4"}"
+
+# If you want to set up multiple kubemark clusters with different "names",
+# you should change this env per each start-kubemark.sh invocation.
+KUBE_GCE_INSTANCE_PREFIX="${KUBE_GCE_INSTANCE_PREFIX:-"default"}"
 
 # NUM_NODES is used by start-kubemark.sh to determine a correct number of replicas.
-NUM_NODES=${KUBEMARK_NUM_NODES:-10}	
+NUM_NODES=${KUBEMARK_NUM_NODES:-10}
 NUM_WINDOWS_NODES=${KUBEMARK_NUM_WINDOWS_NODES:-0}
 
 HOLLOW_KUBELET_TEST_LOG_LEVEL="${HOLLOW_KUBELET_TEST_LOG_LEVEL:-$TEST_CLUSTER_LOG_LEVEL}"
 HOLLOW_PROXY_TEST_LOG_LEVEL="${HOLLOW_PROXY_TEST_LOG_LEVEL:-$TEST_CLUSTER_LOG_LEVEL}"
-
-# ContentType used by all components to communicate with apiserver.
-TEST_CLUSTER_API_CONTENT_TYPE="${TEST_CLUSTER_API_CONTENT_TYPE:-}"
 
 # Hollow-node components' test arguments.
 HOLLOW_KUBELET_TEST_ARGS="${HOLLOW_KUBELET_TEST_ARGS:-} ${HOLLOW_KUBELET_TEST_LOG_LEVEL}"

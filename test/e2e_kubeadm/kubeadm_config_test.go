@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package e2e_kubeadm
+package kubeadm
 
 import (
 	yaml "gopkg.in/yaml.v2"
@@ -22,7 +22,6 @@ import (
 	rbacv1 "k8s.io/api/rbac/v1"
 	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/kubernetes/test/e2e/framework"
-	e2elog "k8s.io/kubernetes/test/e2e/framework/log"
 
 	"github.com/onsi/ginkgo"
 	"github.com/onsi/gomega"
@@ -33,7 +32,6 @@ const (
 	kubeadmConfigRoleName                         = "kubeadm:nodes-kubeadm-config"
 	kubeadmConfigRoleBindingName                  = kubeadmConfigRoleName
 	kubeadmConfigClusterConfigurationConfigMapKey = "ClusterConfiguration"
-	kubeadmConfigClusterStatusConfigMapKey        = "ClusterStatus"
 )
 
 var (
@@ -48,7 +46,7 @@ var (
 // Define container for all the test specification aimed at verifying
 // that kubeadm creates the cluster-info ConfigMap, that it is properly configured
 // and that all the related RBAC rules are in place
-var _ = KubeadmDescribe("kubeadm-config ConfigMap", func() {
+var _ = Describe("kubeadm-config ConfigMap", func() {
 
 	// Get an instance of the k8s test framework
 	f := framework.NewDefaultFramework("kubeadm-config")
@@ -61,23 +59,6 @@ var _ = KubeadmDescribe("kubeadm-config ConfigMap", func() {
 		cm := GetConfigMap(f.ClientSet, kubeSystemNamespace, kubeadmConfigName)
 
 		gomega.Expect(cm.Data).To(gomega.HaveKey(kubeadmConfigClusterConfigurationConfigMapKey))
-		gomega.Expect(cm.Data).To(gomega.HaveKey(kubeadmConfigClusterStatusConfigMapKey))
-
-		m := unmarshalYaml(cm.Data[kubeadmConfigClusterStatusConfigMapKey])
-		if _, ok := m["apiEndpoints"]; ok {
-			d := m["apiEndpoints"].(map[interface{}]interface{})
-			// get all control-plane nodes
-			controlPlanes := getControlPlaneNodes(f.ClientSet)
-
-			// checks that all the control-plane nodes are in the apiEndpoints list
-			for _, cp := range controlPlanes.Items {
-				if _, ok := d[cp.Name]; !ok {
-					e2elog.Failf("failed to get apiEndpoints for control-plane %s in %s", cp.Name, kubeadmConfigClusterStatusConfigMapKey)
-				}
-			}
-		} else {
-			e2elog.Failf("failed to get apiEndpoints from %s", kubeadmConfigClusterStatusConfigMapKey)
-		}
 	})
 
 	ginkgo.It("should have related Role and RoleBinding", func() {
@@ -92,7 +73,7 @@ var _ = KubeadmDescribe("kubeadm-config ConfigMap", func() {
 		)
 	})
 
-	ginkgo.It("should be accessible for for nodes", func() {
+	ginkgo.It("should be accessible for nodes", func() {
 		ExpectSubjectHasAccessToResource(f.ClientSet,
 			rbacv1.GroupKind, nodesGroup,
 			kubeadmConfigConfigMapResource,
@@ -112,7 +93,7 @@ func unmarshalYaml(data string) map[interface{}]interface{} {
 	m := make(map[interface{}]interface{})
 	err := yaml.Unmarshal([]byte(data), &m)
 	if err != nil {
-		e2elog.Failf("error parsing %s ConfigMap: %v", kubeadmConfigName, err)
+		framework.Failf("error parsing %s ConfigMap: %v", kubeadmConfigName, err)
 	}
 	return m
 }

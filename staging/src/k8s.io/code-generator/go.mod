@@ -2,27 +2,28 @@
 
 module k8s.io/code-generator
 
-go 1.12
+go 1.16
 
 require (
 	github.com/emicklei/go-restful v2.9.5+incompatible // indirect
-	github.com/go-openapi/spec v0.19.2 // indirect
-	github.com/gogo/protobuf v1.2.2-0.20190723190241-65acae22fc9d
-	github.com/json-iterator/go v1.1.6 // indirect
-	github.com/modern-go/reflect2 v1.0.1 // indirect
-	github.com/spf13/pflag v1.0.3
-	gonum.org/v1/gonum v0.0.0-20190331200053-3d26580ed485
-	gonum.org/v1/netlib v0.0.0-20190331212654-76723241ea4e // indirect
-	k8s.io/gengo v0.0.0-20190128074634-0689ccc1d7d6
-	k8s.io/klog v0.3.1
-	k8s.io/kube-openapi v0.0.0-20190709113604-33be087ad058
+	github.com/go-openapi/jsonpointer v0.19.5 // indirect
+	github.com/go-openapi/jsonreference v0.19.5 // indirect
+	github.com/go-openapi/swag v0.19.14 // indirect
+	github.com/gogo/protobuf v1.3.2
+	github.com/googleapis/gnostic v0.5.5
+	github.com/json-iterator/go v1.1.11 // indirect
+	github.com/onsi/ginkgo v1.14.0 // indirect
+	github.com/spf13/pflag v1.0.5
+	github.com/stretchr/testify v1.7.0 // indirect
+	golang.org/x/net v0.0.0-20210520170846-37e1c6afe023 // indirect
+	golang.org/x/sys v0.0.0-20210616094352-59db8d763f22 // indirect
+	golang.org/x/tools v0.1.2 // indirect
+	gopkg.in/yaml.v2 v2.4.0
+	gopkg.in/yaml.v3 v3.0.0-20210107192922-496545a6307b // indirect
+	k8s.io/gengo v0.0.0-20201214224949-b6c5ce23f027
+	k8s.io/klog/v2 v2.9.0
+	k8s.io/kube-openapi v0.0.0-20210421082810-95288971da7e
+	sigs.k8s.io/structured-merge-diff/v4 v4.1.2 // indirect
 )
 
-replace (
-	golang.org/x/crypto => golang.org/x/crypto v0.0.0-20181025213731-e84da0312774
-	golang.org/x/net => golang.org/x/net v0.0.0-20190206173232-65e2d4e15006
-	golang.org/x/sys => golang.org/x/sys v0.0.0-20190209173611-3b5209105503
-	golang.org/x/text => golang.org/x/text v0.3.1-0.20181227161524-e6919f6577db
-	golang.org/x/tools => golang.org/x/tools v0.0.0-20190313210603-aa82965741a9
-	k8s.io/code-generator => ../code-generator
-)
+replace k8s.io/code-generator => ../code-generator

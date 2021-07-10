@@ -24,7 +24,6 @@ import (
 	"k8s.io/cli-runtime/pkg/genericclioptions"
 	"k8s.io/client-go/tools/clientcmd"
 	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
-	cmdutil "k8s.io/kubectl/pkg/cmd/util"
 )
 
 type viewClusterTest struct {
@@ -48,8 +47,8 @@ func TestViewCluster(t *testing.T) {
 		},
 		CurrentContext: "minikube",
 		AuthInfos: map[string]*clientcmdapi.AuthInfo{
-			"minikube":   {Token: "minikube-token"},
-			"mu-cluster": {Token: "minikube-token"},
+			"minikube":   {Token: "REDACTED"},
+			"mu-cluster": {Token: "REDACTED"},
 		},
 	}
 
@@ -79,10 +78,10 @@ preferences: {}
 users:
 - name: minikube
   user:
-    token: minikube-token
+    token: REDACTED
 - name: mu-cluster
   user:
-    token: minikube-token` + "\n",
+    token: REDACTED` + "\n",
 	}
 
 	test.run(t)
@@ -103,8 +102,8 @@ func TestViewClusterMinify(t *testing.T) {
 		},
 		CurrentContext: "minikube",
 		AuthInfos: map[string]*clientcmdapi.AuthInfo{
-			"minikube":   {Token: "minikube-token"},
-			"mu-cluster": {Token: "minikube-token"},
+			"minikube":   {Token: "REDACTED"},
+			"mu-cluster": {Token: "REDACTED"},
 		},
 	}
 
@@ -134,7 +133,7 @@ preferences: {}
 users:
 - name: minikube
   user:
-    token: minikube-token` + "\n",
+    token: REDACTED` + "\n",
 		},
 		{
 			description: "Testing for kubectl config view --minify=true --context=my-cluster",
@@ -156,7 +155,7 @@ preferences: {}
 users:
 - name: mu-cluster
   user:
-    token: minikube-token` + "\n",
+    token: REDACTED` + "\n",
 		},
 	}
 
@@ -185,7 +184,7 @@ func (test viewClusterTest) run(t *testing.T) {
 	pathOptions.GlobalFile = fakeKubeFile.Name()
 	pathOptions.EnvVar = ""
 	streams, _, buf, _ := genericclioptions.NewTestIOStreams()
-	cmd := NewCmdConfigView(cmdutil.NewFactory(genericclioptions.NewTestConfigFlags()), streams, pathOptions)
+	cmd := NewCmdConfigView(streams, pathOptions)
 	// "context" is a global flag, inherited from base kubectl command in the real world
 	cmd.Flags().String("context", "", "The name of the kubeconfig context to use")
 	cmd.Flags().Parse(test.flags)

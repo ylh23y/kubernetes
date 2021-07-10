@@ -19,6 +19,7 @@ package secrets
 // This file tests use of the secrets API resource.
 
 import (
+	"context"
 	"testing"
 
 	"k8s.io/api/core/v1"
@@ -31,14 +32,14 @@ import (
 )
 
 func deleteSecretOrErrorf(t *testing.T, c clientset.Interface, ns, name string) {
-	if err := c.CoreV1().Secrets(ns).Delete(name, nil); err != nil {
+	if err := c.CoreV1().Secrets(ns).Delete(context.TODO(), name, metav1.DeleteOptions{}); err != nil {
 		t.Errorf("unable to delete secret %v: %v", name, err)
 	}
 }
 
 // TestSecrets tests apiserver-side behavior of creation of secret objects and their use by pods.
 func TestSecrets(t *testing.T) {
-	_, s, closeFn := framework.RunAMaster(nil)
+	_, s, closeFn := framework.RunAnAPIServer(nil)
 	defer closeFn()
 
 	client := clientset.NewForConfigOrDie(&restclient.Config{Host: s.URL, ContentConfig: restclient.ContentConfig{GroupVersion: &schema.GroupVersion{Group: "", Version: "v1"}}})
@@ -62,7 +63,7 @@ func DoTestSecrets(t *testing.T, client clientset.Interface, ns *v1.Namespace) {
 		},
 	}
 
-	if _, err := client.CoreV1().Secrets(s.Namespace).Create(&s); err != nil {
+	if _, err := client.CoreV1().Secrets(s.Namespace).Create(context.TODO(), &s, metav1.CreateOptions{}); err != nil {
 		t.Errorf("unable to create test secret: %v", err)
 	}
 	defer deleteSecretOrErrorf(t, client, s.Namespace, s.Name)
@@ -102,14 +103,14 @@ func DoTestSecrets(t *testing.T, client clientset.Interface, ns *v1.Namespace) {
 
 	// Create a pod to consume secret.
 	pod.ObjectMeta.Name = "uses-secret"
-	if _, err := client.CoreV1().Pods(ns.Name).Create(pod); err != nil {
+	if _, err := client.CoreV1().Pods(ns.Name).Create(context.TODO(), pod, metav1.CreateOptions{}); err != nil {
 		t.Errorf("Failed to create pod: %v", err)
 	}
 	defer integration.DeletePodOrErrorf(t, client, ns.Name, pod.Name)
 
 	// Create a pod that consumes non-existent secret.
 	pod.ObjectMeta.Name = "uses-non-existent-secret"
-	if _, err := client.CoreV1().Pods(ns.Name).Create(pod); err != nil {
+	if _, err := client.CoreV1().Pods(ns.Name).Create(context.TODO(), pod, metav1.CreateOptions{}); err != nil {
 		t.Errorf("Failed to create pod: %v", err)
 	}
 	defer integration.DeletePodOrErrorf(t, client, ns.Name, pod.Name)

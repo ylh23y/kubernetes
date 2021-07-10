@@ -14,17 +14,21 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package e2e_node
+package e2enode
 
 import (
-	"github.com/onsi/ginkgo"
-	"k8s.io/api/core/v1"
+	"context"
+
+	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/uuid"
 	"k8s.io/kubernetes/pkg/kubelet"
 	kubecontainer "k8s.io/kubernetes/pkg/kubelet/container"
 	"k8s.io/kubernetes/test/e2e/framework"
 	e2epod "k8s.io/kubernetes/test/e2e/framework/pod"
+	e2eskipper "k8s.io/kubernetes/test/e2e/framework/skipper"
+
+	"github.com/onsi/ginkgo"
 )
 
 const (
@@ -32,7 +36,7 @@ const (
 	logContainerName = "logger"
 )
 
-var _ = framework.KubeDescribe("ContainerLogPath [NodeConformance]", func() {
+var _ = SIGDescribe("ContainerLogPath [NodeConformance]", func() {
 	f := framework.NewDefaultFramework("kubelet-container-log-path")
 	var podClient *framework.PodClient
 
@@ -71,7 +75,12 @@ var _ = framework.KubeDescribe("ContainerLogPath [NodeConformance]", func() {
 						Containers: []v1.Container{
 							{
 								Image: busyboxImage,
-								Name:  podName,
+								SecurityContext: &v1.SecurityContext{
+									SELinuxOptions: &v1.SELinuxOptions{
+										Type: "container_logreader_t",
+									},
+								},
+								Name: podName,
 								// If we find expected log file and contains right content, exit 0
 								// else, keep checking until test timeout
 								Command: []string{"sh", "-c", "while true; do if [ -e " + expectedLogPath + " ] && grep -q " + log + " " + expectedLogPath + "; then exit 0; fi; sleep 1; done"},
@@ -113,7 +122,7 @@ var _ = framework.KubeDescribe("ContainerLogPath [NodeConformance]", func() {
 					d, err := getDockerLoggingDriver()
 					framework.ExpectNoError(err)
 					if d != "json-file" {
-						framework.Skipf("Skipping because Docker daemon is using a logging driver other than \"json-file\": %s", d)
+						e2eskipper.Skipf("Skipping because Docker daemon is using a logging driver other than \"json-file\": %s", d)
 					}
 					// Even if JSON logging is in use, this test fails if SELinux support
 					// is enabled, since the isolation provided by the SELinux policy
@@ -126,7 +135,7 @@ var _ = framework.KubeDescribe("ContainerLogPath [NodeConformance]", func() {
 					e, err := isDockerSELinuxSupportEnabled()
 					framework.ExpectNoError(err)
 					if e {
-						framework.Skipf("Skipping because Docker daemon is running with SELinux support enabled")
+						e2eskipper.Skipf("Skipping because Docker daemon is running with SELinux support enabled")
 					}
 				}
 
@@ -140,7 +149,7 @@ var _ = framework.KubeDescribe("ContainerLogPath [NodeConformance]", func() {
 				logDir := kubelet.ContainerLogsDir
 
 				// get containerID from created Pod
-				createdLogPod, err := podClient.Get(logPodName, metav1.GetOptions{})
+				createdLogPod, err := podClient.Get(context.TODO(), logPodName, metav1.GetOptions{})
 				logContainerID := kubecontainer.ParseContainerID(createdLogPod.Status.ContainerStatuses[0].ContainerID)
 				framework.ExpectNoError(err, "Failed to get pod: %s", logPodName)
 
@@ -157,7 +166,8 @@ var _ = framework.KubeDescribe("ContainerLogPath [NodeConformance]", func() {
 				logCRIDir := "/var/log/pods"
 
 				// get podID from created Pod
-				createdLogPod, err := podClient.Get(logPodName, metav1.GetOptions{})
+				createdLogPod, err := podClient.Get(context.TODO(), logPodName, metav1.GetOptions{})
+				framework.ExpectNoError(err, "Failed to get pod: %s", logPodName)
 				podNs := createdLogPod.Namespace
 				podName := createdLogPod.Name
 				podID := string(createdLogPod.UID)

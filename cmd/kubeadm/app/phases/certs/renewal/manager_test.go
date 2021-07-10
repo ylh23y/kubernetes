@@ -26,26 +26,31 @@ import (
 	"testing"
 	"time"
 
-	certutil "k8s.io/client-go/util/cert"
 	kubeadmapi "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm"
 	certtestutil "k8s.io/kubernetes/cmd/kubeadm/app/util/certs"
 	"k8s.io/kubernetes/cmd/kubeadm/app/util/pkiutil"
 	testutil "k8s.io/kubernetes/cmd/kubeadm/test"
+
+	certutil "k8s.io/client-go/util/cert"
 )
 
 var (
-	testCACertCfg = &certutil.Config{CommonName: "kubernetes"}
+	testCACertCfg = &pkiutil.CertConfig{
+		Config: certutil.Config{CommonName: "kubernetes"},
+	}
 
 	testCACert, testCAKey, _ = pkiutil.NewCertificateAuthority(testCACertCfg)
 
-	testCertCfg = &certutil.Config{
-		CommonName:   "test-common-name",
-		Organization: []string{"sig-cluster-lifecycle"},
-		AltNames: certutil.AltNames{
-			IPs:      []net.IP{net.ParseIP("10.100.0.1")},
-			DNSNames: []string{"test-domain.space"},
+	testCertCfg = &pkiutil.CertConfig{
+		Config: certutil.Config{
+			CommonName:   "test-common-name",
+			Organization: []string{"sig-cluster-lifecycle"},
+			AltNames: certutil.AltNames{
+				IPs:      []net.IP{net.ParseIP("10.100.0.1")},
+				DNSNames: []string{"test-domain.space"},
+			},
+			Usages: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
 		},
-		Usages: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
 	}
 )
 

@@ -1,114 +1,117 @@
 apiVersion: v1
 ephemeralContainers:
 - args:
-  - "21"
+  - "23"
   command:
-  - "20"
+  - "22"
   env:
-  - name: "28"
-    value: "29"
+  - name: "30"
+    value: "31"
     valueFrom:
       configMapKeyRef:
-        key: "35"
-        name: "34"
-        optional: false
-      fieldRef:
-        apiVersion: "30"
-        fieldPath: "31"
-      resourceFieldRef:
-        containerName: "32"
-        divisor: "12"
-        resource: "33"
-      secretKeyRef:
         key: "37"
         name: "36"
         optional: false
+      fieldRef:
+        apiVersion: "32"
+        fieldPath: "33"
+      resourceFieldRef:
+        containerName: "34"
+        divisor: "12"
+        resource: "35"
+      secretKeyRef:
+        key: "39"
+        name: "38"
+        optional: false
   envFrom:
   - configMapRef:
-      name: "26"
+      name: "28"
       optional: false
-    prefix: "25"
+    prefix: "27"
     secretRef:
-      name: "27"
+      name: "29"
       optional: false
-  image: "19"
-  imagePullPolicy: /
+  image: "21"
+  imagePullPolicy: /C龷ȪÆl殛瓷雼浢Ü礽绅
   lifecycle:
     postStart:
       exec:
         command:
-        - "58"
+        - "66"
       httpGet:
-        host: "60"
+        host: "68"
         httpHeaders:
-        - name: "61"
-          value: "62"
-        path: "59"
-        port: 1114837452
+        - name: "69"
+          value: "70"
+        path: "67"
+        port: -503563033
+        scheme: '趕ã/鈱$-议}ȧ外ĺ稥氹Ç|¶鎚¡ '
       tcpSocket:
-        host: "63"
-        port: 672648281
+        host: "72"
+        port: "71"
     preStop:
       exec:
         command:
-        - "64"
+        - "73"
       httpGet:
-        host: "67"
+        host: "75"
         httpHeaders:
-        - name: "68"
-          value: "69"
-        path: "65"
-        port: "66"
-        scheme: 魋Ď儇击3ƆìQ喞艋涽
+        - name: "76"
+          value: "77"
+        path: "74"
+        port: 991085362
+        scheme: 磩窮秳ķ蟒苾h^樅燴壩卄
       tcpSocket:
-        host: "71"
-        port: "70"
+        host: "78"
+        port: -479087071
   livenessProbe:
     exec:
       command:
-      - "44"
+      - "46"
     failureThreshold: -54954325
     httpGet:
-      host: "47"
+      host: "49"
       httpHeaders:
-      - name: "48"
-        value: "49"
-      path: "45"
-      port: "46"
+      - name: "50"
+        value: "51"
+      path: "47"
+      port: "48"
       scheme: 亞螩B峅x4%a鯿rŎǀ朲^苣fƼ@h
     initialDelaySeconds: 1392988974
     periodSeconds: -1771047449
     successThreshold: -1280107919
     tcpSocket:
-      host: "50"
+      host: "52"
       port: 1366345526
+    terminationGracePeriodSeconds: 8559948711650432497
     timeoutSeconds: 1563658126
-  name: "18"
+  name: "20"
   ports:
   - containerPort: -1300313567
-    hostIP: "24"
+    hostIP: "26"
     hostPort: 1305381319
-    name: "23"
+    name: "25"
   readinessProbe:
     exec:
       command:
-      - "51"
-    failureThreshold: -833209928
+      - "53"
+    failureThreshold: 1305372099
     httpGet:
-      host: "54"
+      host: "55"
       httpHeaders:
-      - name: "55"
-        value: "56"
-      path: "52"
-      port: "53"
-      scheme: OŖ樅尷
-    initialDelaySeconds: 819364842
-    periodSeconds: -983896210
-    successThreshold: 552512122
+      - name: "56"
+        value: "57"
+      path: "54"
+      port: -1395989138
+      scheme: 斎AO6ĴC浔Ű壝ž
+    initialDelaySeconds: -2014231015
+    periodSeconds: -1679907303
+    successThreshold: -1051545416
     tcpSocket:
-      host: "57"
-      port: 2136826132
-    timeoutSeconds: 933484239
+      host: "58"
+      port: 180803110
+    terminationGracePeriodSeconds: -1220632347188845753
+    timeoutSeconds: 1488277679
   resources:
     limits:
       V夸eɑeʤ: "420"
@@ -118,38 +121,79 @@ ephemeralContainers:
     allowPrivilegeEscalation: true
     capabilities:
       add:
-      - -议}ȧ外ĺ稥氹Ç|¶
+      - '"ŵw^Ü郀叚Fi皬择,Q'
       drop:
-      - ¡ Ɠ(嘒ėf倐ȓ圬剴扲ȿQZ
-    privileged: true
-    procMount: 1ZƜ/C龷
+      - ȸ{+
+    privileged: false
+    procMount: Ƙq/
     readOnlyRootFilesystem: true
-    runAsGroup: -3031446704001093654
+    runAsGroup: 8360795821384820753
+    runAsNonRoot: false
+    runAsUser: -1466062763730980131
+    procMount: Ðl恕ɍȇ廄裭4懙鏮嵒ƫS
+    readOnlyRootFilesystem: true
+    runAsGroup: 7608666948531988994
     runAsNonRoot: true
-    runAsUser: -2195720433245498980
+    runAsUser: -3031446704001093654
     seLinuxOptions:
-      level: "76"
-      role: "74"
-      type: "75"
-      user: "73"
+      level: "83"
+      role: "81"
+      type: "82"
+      user: "80"
+    seccompProfile:
+      localhostProfile: "87"
+      type: ' u衲<¿燥'
     windowsOptions:
-      gmsaCredentialSpec: "78"
-      gmsaCredentialSpecName: "77"
-      runAsUserName: "79"
+      gmsaCredentialSpec: "85"
+      gmsaCredentialSpecName: "84"
+      runAsUserName: "86"
+      localhostProfile: "89"
+      type: ɷD¡轫n(鲼ƳÐƣKʘń
+    windowsOptions:
+      gmsaCredentialSpec: "87"
+      gmsaCredentialSpecName: "86"
+      hostProcess: false
+      runAsUserName: "88"
+  startupProbe:
+    exec:
+      command:
+      - "59"
+    failureThreshold: -1009864962
+    httpGet:
+      host: "61"
+      httpHeaders:
+      - name: "62"
+        value: "63"
+      path: "60"
+      port: 1229400382
+      scheme: 3ƆìQ喞艋涽託仭
+    initialDelaySeconds: 2076966617
+    periodSeconds: -560446848
+    successThreshold: -1098992377
+    tcpSocket:
+      host: "65"
+      port: "64"
+    terminationGracePeriodSeconds: 2618170937706035036
+    timeoutSeconds: 202362764
+  targetContainerName: "88"
+  terminationMessagePath: "79"
+  terminationMessagePolicy: ?讦ĭÐ
+  tty: true
+    timeoutSeconds: 1229400382
   stdinOnce: true
-  targetContainerName: "80"
-  terminationMessagePath: "72"
-  terminationMessagePolicy: w-檮Ǣ冖ž琔n宂¬轚9Ȏ瀮
+  targetContainerName: "90"
+  terminationMessagePath: "81"
+  terminationMessagePolicy: Ņ£
   volumeDevices:
-  - devicePath: "43"
-    name: "42"
+  - devicePath: "45"
+    name: "44"
   volumeMounts:
-  - mountPath: "39"
+  - mountPath: "41"
     mountPropagation: 憍峕?狱³-Ǐ忄*
-    name: "38"
-    subPath: "40"
-    subPathExpr: "41"
-  workingDir: "22"
+    name: "40"
+    subPath: "42"
+    subPathExpr: "43"
+  workingDir: "24"
 kind: EphemeralContainers
 metadata:
   annotations:
@@ -165,8 +209,10 @@ metadata:
     "7": "8"
   managedFields:
   - apiVersion: "17"
+    fieldsType: "18"
     manager: "16"
     operation: 鐊唊飙Ş-U圴÷a/ɔ}摁(湗Ć]
+    subresource: "19"
   name: "2"
   namespace: "4"
   ownerReferences:

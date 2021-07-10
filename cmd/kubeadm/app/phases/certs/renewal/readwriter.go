@@ -19,20 +19,26 @@ package renewal
 import (
 	"crypto"
 	"crypto/x509"
+	"os"
 	"path/filepath"
 
-	"github.com/pkg/errors"
+	certsphase "k8s.io/kubernetes/cmd/kubeadm/app/phases/certs"
+	pkiutil "k8s.io/kubernetes/cmd/kubeadm/app/util/pkiutil"
 
 	"k8s.io/client-go/tools/clientcmd"
 	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 	certutil "k8s.io/client-go/util/cert"
 	"k8s.io/client-go/util/keyutil"
-	pkiutil "k8s.io/kubernetes/cmd/kubeadm/app/util/pkiutil"
+
+	"github.com/pkg/errors"
 )
 
 // certificateReadWriter defines the behavior of a component that
 // read or write a certificate stored/embedded in a file
 type certificateReadWriter interface {
+	//Exists return true if the certificate exists
+	Exists() bool
+
 	// Read a certificate stored/embedded in a file
 	Read() (*x509.Certificate, error)
 
@@ -53,6 +59,20 @@ func newPKICertificateReadWriter(certificateDir string, baseName string) *pkiCer
 		baseName:       baseName,
 		certificateDir: certificateDir,
 	}
+}
+
+// Exists checks if a certificate exist
+func (rw *pkiCertificateReadWriter) Exists() bool {
+	certificatePath, _ := pkiutil.PathsForCertAndKey(rw.certificateDir, rw.baseName)
+	return fileExists(certificatePath)
+}
+
+func fileExists(filename string) bool {
+	info, err := os.Stat(filename)
+	if os.IsNotExist(err) {
+		return false
+	}
+	return !info.IsDir()
 }
 
 // Read a certificate from a file the K8s pki managed by kubeadm
@@ -86,15 +106,25 @@ type kubeConfigReadWriter struct {
 	kubeConfigFileName string
 	kubeConfigFilePath string
 	kubeConfig         *clientcmdapi.Config
+	baseName           string
+	certificateDir     string
+	caCert             *x509.Certificate
 }
 
 // newKubeconfigReadWriter return a new kubeConfigReadWriter
-func newKubeconfigReadWriter(kubernetesDir string, kubeConfigFileName string) *kubeConfigReadWriter {
+func newKubeconfigReadWriter(kubernetesDir string, kubeConfigFileName string, certificateDir, baseName string) *kubeConfigReadWriter {
 	return &kubeConfigReadWriter{
 		kubernetesDir:      kubernetesDir,
 		kubeConfigFileName: kubeConfigFileName,
 		kubeConfigFilePath: filepath.Join(kubernetesDir, kubeConfigFileName),
+		certificateDir:     certificateDir,
+		baseName:           baseName,
 	}
+}
+
+// Exists checks if a certificate embedded in kubeConfig file exists
+func (rw *kubeConfigReadWriter) Exists() bool {
+	return fileExists(rw.kubeConfigFilePath)
 }
 
 // Read a certificate embedded in kubeConfig file managed by kubeadm.
@@ -106,6 +136,16 @@ func (rw *kubeConfigReadWriter) Read() (*x509.Certificate, error) {
 	if err != nil {
 		return nil, errors.Wrapf(err, "failed to load kubeConfig file %s", rw.kubeConfigFilePath)
 	}
+
+	// The CA cert is required for updating kubeconfig files.
+	// For local CA renewal, the local CA on disk could have changed, thus a reload is needed.
+	// For CSR renewal we assume the same CA on disk is mounted for usage with KCM's
+	// '--cluster-signing-cert-file' flag.
+	caCert, _, err := certsphase.LoadCertificateAuthority(rw.certificateDir, rw.baseName)
+	if err != nil {
+		return nil, err
+	}
+	rw.caCert = caCert
 
 	// get current context
 	if _, ok := kubeConfig.Contexts[kubeConfig.CurrentContext]; !ok {
@@ -120,7 +160,7 @@ func (rw *kubeConfigReadWriter) Read() (*x509.Certificate, error) {
 
 	cluster := kubeConfig.Clusters[clusterName]
 	if len(cluster.CertificateAuthorityData) == 0 {
-		return nil, errors.Errorf("kubeConfig file %s does not have and embedded server certificate", rw.kubeConfigFilePath)
+		return nil, errors.Errorf("kubeConfig file %s does not have an embedded server certificate", rw.kubeConfigFilePath)
 	}
 
 	// get auth info for current context and ensure a client certificate is embedded in it
@@ -131,7 +171,7 @@ func (rw *kubeConfigReadWriter) Read() (*x509.Certificate, error) {
 
 	authInfo := kubeConfig.AuthInfos[authInfoName]
 	if len(authInfo.ClientCertificateData) == 0 {
-		return nil, errors.Errorf("kubeConfig file %s does not have and embedded client certificate", rw.kubeConfigFilePath)
+		return nil, errors.Errorf("kubeConfig file %s does not have an embedded client certificate", rw.kubeConfigFilePath)
 	}
 
 	// parse the client certificate, retrive the cert config and then renew it
@@ -151,7 +191,7 @@ func (rw *kubeConfigReadWriter) Read() (*x509.Certificate, error) {
 func (rw *kubeConfigReadWriter) Write(newCert *x509.Certificate, newKey crypto.Signer) error {
 	// check if Read was called before Write
 	if rw.kubeConfig == nil {
-		return errors.Errorf("failed to Write kubeConfig file with renewd certs. It is necessary to call Read before Write")
+		return errors.Errorf("failed to Write kubeConfig file with renewed certs. It is necessary to call Read before Write")
 	}
 
 	// encodes the new key
@@ -159,6 +199,12 @@ func (rw *kubeConfigReadWriter) Write(newCert *x509.Certificate, newKey crypto.S
 	if err != nil {
 		return errors.Wrapf(err, "failed to marshal private key to PEM")
 	}
+
+	// Update the embedded CA in the kubeconfig file.
+	// This assumes that the user has kept the current context to the desired one.
+	clusterName := rw.kubeConfig.Contexts[rw.kubeConfig.CurrentContext].Cluster
+	cluster := rw.kubeConfig.Clusters[clusterName]
+	cluster.CertificateAuthorityData = pkiutil.EncodeCertPEM(rw.caCert)
 
 	// get auth info for current context and ensure a client certificate is embedded in it
 	authInfoName := rw.kubeConfig.Contexts[rw.kubeConfig.CurrentContext].AuthInfo

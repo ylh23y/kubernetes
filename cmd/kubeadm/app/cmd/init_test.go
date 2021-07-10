@@ -23,14 +23,14 @@ import (
 	"path/filepath"
 	"testing"
 
-	"k8s.io/apimachinery/pkg/util/sets"
+	kubeadmapiv1 "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm/v1beta3"
 	"k8s.io/kubernetes/cmd/kubeadm/app/cmd/options"
-	"k8s.io/kubernetes/cmd/kubeadm/app/features"
+
+	"k8s.io/apimachinery/pkg/util/sets"
 )
 
-const (
-	testInitConfig = `---
-apiVersion: kubeadm.k8s.io/v1beta2
+var testInitConfig = fmt.Sprintf(`---
+apiVersion: %s
 kind: InitConfiguration
 localAPIEndpoint:
   advertiseAddress: "1.2.3.4"
@@ -43,11 +43,10 @@ nodeRegistration:
     - c
     - d
 ---
-apiVersion: kubeadm.k8s.io/v1beta2
+apiVersion: %[1]s
 kind: ClusterConfiguration
 controlPlaneEndpoint: "3.4.5.6"
-`
-)
+`, kubeadmapiv1.SchemeGroupVersion.String())
 
 func TestNewInitData(t *testing.T) {
 	// create temp directory
@@ -87,13 +86,6 @@ func TestNewInitData(t *testing.T) {
 			expectError: true,
 		},
 		{
-			name: "fail if deprecated feature gates are set",
-			flags: map[string]string{
-				options.FeatureGatesString: fmt.Sprintf("%s=true", features.CoreDNS),
-			},
-			expectError: true,
-		},
-		{
 			name: "fails if invalid preflight checks are provided",
 			flags: map[string]string{
 				options.IgnorePreflightErrors: "all,something-else",
@@ -111,15 +103,11 @@ func TestNewInitData(t *testing.T) {
 		{
 			name: "--cri-socket and --node-name flags override config from file",
 			flags: map[string]string{
-				options.CfgPath:       configFilePath,
-				options.NodeCRISocket: "/var/run/crio/crio.sock",
-				options.NodeName:      "anotherName",
+				options.CfgPath:  configFilePath,
+				options.NodeName: "anotherName",
 			},
 			validate: func(t *testing.T, data *initData) {
-				// validate that cri-socket and node-name are overwritten
-				if data.cfg.NodeRegistration.CRISocket != "/var/run/crio/crio.sock" {
-					t.Errorf("Invalid NodeRegistration.CRISocket")
-				}
+				// validate that node-name is overwritten
 				if data.cfg.NodeRegistration.Name != "anotherName" {
 					t.Errorf("Invalid NodeRegistration.Name")
 				}
@@ -162,7 +150,7 @@ func TestNewInitData(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			// initialize an external init option and inject it to the init cmd
 			initOptions := newInitOptions()
-			cmd := NewCmdInit(nil, initOptions)
+			cmd := newCmdInit(nil, initOptions)
 
 			// sets cmd flags (that will be reflected on the init options)
 			for f, v := range tc.flags {

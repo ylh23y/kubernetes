@@ -17,6 +17,7 @@ limitations under the License.
 package copycerts
 
 import (
+	"context"
 	"encoding/hex"
 	"io/ioutil"
 	"os"
@@ -24,17 +25,18 @@ import (
 	"regexp"
 	"testing"
 
-	"github.com/lithammer/dedent"
-	v1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	fakeclient "k8s.io/client-go/kubernetes/fake"
-	certutil "k8s.io/client-go/util/cert"
-	keyutil "k8s.io/client-go/util/keyutil"
 	kubeadmapi "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm"
 	kubeadmconstants "k8s.io/kubernetes/cmd/kubeadm/app/constants"
 	"k8s.io/kubernetes/cmd/kubeadm/app/phases/certs"
 	cryptoutil "k8s.io/kubernetes/cmd/kubeadm/app/util/crypto"
 	testutil "k8s.io/kubernetes/cmd/kubeadm/test"
+
+	v1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	fakeclient "k8s.io/client-go/kubernetes/fake"
+	keyutil "k8s.io/client-go/util/keyutil"
+
+	"github.com/lithammer/dedent"
 )
 
 func TestGetDataFromInitConfig(t *testing.T) {
@@ -180,7 +182,7 @@ func TestUploadCerts(t *testing.T) {
 	if err != nil {
 		t.Fatalf("error decoding key: %v", err)
 	}
-	secretMap, err := cs.CoreV1().Secrets(metav1.NamespaceSystem).Get(kubeadmconstants.KubeadmCertsSecret, metav1.GetOptions{})
+	secretMap, err := cs.CoreV1().Secrets(metav1.NamespaceSystem).Get(context.TODO(), kubeadmconstants.KubeadmCertsSecret, metav1.GetOptions{})
 	if err != nil {
 		t.Fatalf("could not fetch secret: %v", err)
 	}
@@ -239,7 +241,7 @@ func TestDownloadCerts(t *testing.T) {
 		}
 		// Check that the written files are either certificates or keys, and that they have
 		// the expected permissions
-		if _, err := keyutil.ParsePublicKeysPEM(diskCertData); err == nil {
+		if _, err := keyutil.ParsePrivateKeyPEM(diskCertData); err == nil {
 			if stat, err := os.Stat(certPath); err == nil {
 				if stat.Mode() != keyFileMode {
 					t.Errorf("key %q should have mode %#o, has %#o", certName, keyFileMode, stat.Mode())
@@ -247,7 +249,7 @@ func TestDownloadCerts(t *testing.T) {
 			} else {
 				t.Errorf("could not stat key %q: %v", certName, err)
 			}
-		} else if _, err := certutil.ParseCertsPEM(diskCertData); err == nil {
+		} else if _, err := keyutil.ParsePublicKeysPEM(diskCertData); err == nil {
 			if stat, err := os.Stat(certPath); err == nil {
 				if stat.Mode() != certFileMode {
 					t.Errorf("cert %q should have mode %#o, has %#o", certName, certFileMode, stat.Mode())

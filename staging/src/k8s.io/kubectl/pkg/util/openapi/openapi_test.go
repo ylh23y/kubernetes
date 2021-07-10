@@ -28,9 +28,9 @@ import (
 	"k8s.io/kubectl/pkg/util/openapi"
 )
 
-var fakeSchema = testing.Fake{Path: filepath.Join("..", "..", "..", "test", "data", "openapi", "swagger.json")}
+var fakeSchema = testing.Fake{Path: filepath.Join("..", "..", "..", "testdata", "openapi", "swagger.json")}
 
-var _ = Describe("Reading apps/v1beta1/Deployment from openAPIData", func() {
+var _ = Describe("Reading apps/v1/Deployment from openAPIData", func() {
 	var resources openapi.Resources
 	BeforeEach(func() {
 		s, err := fakeSchema.OpenAPISchema()
@@ -41,7 +41,7 @@ var _ = Describe("Reading apps/v1beta1/Deployment from openAPIData", func() {
 
 	gvk := schema.GroupVersionKind{
 		Kind:    "Deployment",
-		Version: "v1beta1",
+		Version: "v1",
 		Group:   "apps",
 	}
 

@@ -26,13 +26,14 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	kubeletconfig "k8s.io/kubernetes/pkg/kubelet/apis/config"
 	"k8s.io/kubernetes/pkg/kubelet/cm/cpumanager"
+	imageutils "k8s.io/kubernetes/test/utils/image"
 )
 
 // tfWideDeepWorkload defines a workload to run
-// https://github.com/tensorflow/models/tree/master/official/wide_deep.
+// https://github.com/tensorflow/models/tree/master/official/r1/wide_deep.
 type tfWideDeepWorkload struct{}
 
-// Ensure tfWideDeepWorkload implemets NodePerfWorkload interface.
+// Ensure tfWideDeepWorkload implements NodePerfWorkload interface.
 var _ NodePerfWorkload = &tfWideDeepWorkload{}
 
 func (w tfWideDeepWorkload) Name() string {
@@ -43,7 +44,7 @@ func (w tfWideDeepWorkload) PodSpec() v1.PodSpec {
 	var containers []v1.Container
 	ctn := v1.Container{
 		Name:  fmt.Sprintf("%s-ctn", w.Name()),
-		Image: "gcr.io/kubernetes-e2e-test-images/node-perf/tf-wide-deep-amd64:1.0",
+		Image: imageutils.GetE2EImage(imageutils.NodePerfTfWideDeep),
 		Resources: v1.ResourceRequirements{
 			Requests: v1.ResourceList{
 				v1.ResourceName(v1.ResourceCPU):    resource.MustParse("15000m"),

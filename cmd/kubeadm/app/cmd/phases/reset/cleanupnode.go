@@ -20,16 +20,18 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 
-	"k8s.io/klog"
-	kubeadmapiv1beta2 "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm/v1beta2"
+	kubeadmapiv1 "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm/v1beta3"
 	"k8s.io/kubernetes/cmd/kubeadm/app/cmd/options"
 	"k8s.io/kubernetes/cmd/kubeadm/app/cmd/phases/workflow"
 	kubeadmconstants "k8s.io/kubernetes/cmd/kubeadm/app/constants"
+	"k8s.io/kubernetes/cmd/kubeadm/app/features"
 	"k8s.io/kubernetes/cmd/kubeadm/app/util/initsystem"
 	utilruntime "k8s.io/kubernetes/cmd/kubeadm/app/util/runtime"
+	"k8s.io/kubernetes/cmd/kubeadm/app/util/users"
+
+	"k8s.io/klog/v2"
 	utilsexec "k8s.io/utils/exec"
 )
 
@@ -82,14 +84,21 @@ func runCleanupNode(c workflow.RunData) error {
 		klog.Warningf("[reset] Failed to remove containers: %v\n", err)
 	}
 
-	r.AddDirsToClean("/etc/cni/net.d", "/var/lib/dockershim", "/var/run/kubernetes", "/var/lib/cni")
+	r.AddDirsToClean("/var/lib/dockershim", "/var/run/kubernetes", "/var/lib/cni")
 
 	// Remove contents from the config and pki directories
 	klog.V(1).Infoln("[reset] Removing contents from the config and pki directories")
-	if certsDir != kubeadmapiv1beta2.DefaultCertificatesDir {
+	if certsDir != kubeadmapiv1.DefaultCertificatesDir {
 		klog.Warningf("[reset] WARNING: Cleaning a non-default certificates directory: %q\n", certsDir)
 	}
 	resetConfigDir(kubeadmconstants.KubernetesDir, certsDir)
+
+	if r.Cfg() != nil && features.Enabled(r.Cfg().FeatureGates, features.RootlessControlPlane) {
+		klog.V(1).Infoln("[reset] Removing users and groups created for rootless control-plane")
+		if err := users.RemoveUsersAndGroups(); err != nil {
+			klog.Warningf("[reset] Failed to remove users and groups: %v\n", err)
+		}
+	}
 
 	return nil
 }
@@ -100,13 +109,10 @@ func absoluteKubeletRunDirectory() (string, error) {
 		klog.Warningf("[reset] Failed to evaluate the %q directory. Skipping its unmount and cleanup: %v\n", kubeadmconstants.KubeletRunDirectory, err)
 		return "", err
 	}
-
-	// Only unmount mount points which start with "/var/lib/kubelet" or absolute path of symbolic link, and avoid using empty absoluteKubeletRunDirectory
-	umountDirsCmd := fmt.Sprintf("awk '$2 ~ path {print $2}' path=%s/ /proc/mounts | xargs -r umount", absoluteKubeletRunDirectory)
-	klog.V(1).Infof("[reset] Executing command %q", umountDirsCmd)
-	umountOutputBytes, err := exec.Command("sh", "-c", umountDirsCmd).Output()
+	err = unmountKubeletDirectory(absoluteKubeletRunDirectory)
 	if err != nil {
-		klog.Warningf("[reset] Failed to unmount mounted directories in %s: %s\n", kubeadmconstants.KubeletRunDirectory, string(umountOutputBytes))
+		klog.Warningf("[reset] Failed to unmount mounted directories in %s \n", kubeadmconstants.KubeletRunDirectory)
+		return "", err
 	}
 	return absoluteKubeletRunDirectory, nil
 }
@@ -132,7 +138,7 @@ func resetConfigDir(configPathDir, pkiPathDir string) {
 	fmt.Printf("[reset] Deleting contents of config directories: %v\n", dirsToClean)
 	for _, dir := range dirsToClean {
 		if err := CleanDir(dir); err != nil {
-			klog.Warningf("[reset] Failed to remove directory: %q [%v]\n", dir, err)
+			klog.Warningf("[reset] Failed to delete contents of %q directory: %v", dir, err)
 		}
 	}
 

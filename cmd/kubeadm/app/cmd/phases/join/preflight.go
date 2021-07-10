@@ -21,22 +21,24 @@ import (
 	"fmt"
 	"text/template"
 
-	"github.com/lithammer/dedent"
-	"github.com/pkg/errors"
-	"k8s.io/klog"
 	kubeadmapi "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm"
 	"k8s.io/kubernetes/cmd/kubeadm/app/cmd/options"
 	"k8s.io/kubernetes/cmd/kubeadm/app/cmd/phases/workflow"
 	cmdutil "k8s.io/kubernetes/cmd/kubeadm/app/cmd/util"
 	"k8s.io/kubernetes/cmd/kubeadm/app/phases/certs"
 	"k8s.io/kubernetes/cmd/kubeadm/app/preflight"
+
+	"k8s.io/klog/v2"
 	utilsexec "k8s.io/utils/exec"
+
+	"github.com/lithammer/dedent"
+	"github.com/pkg/errors"
 )
 
 var (
 	preflightExample = cmdutil.Examples(`
 		# Run join pre-flight checks using a config file.
-		kubeadm join phase preflight --config kubeadm-config.yml
+		kubeadm join phase preflight --config kubeadm-config.yaml
 		`)
 
 	notReadyToJoinControlPlaneTemp = template.Must(template.New("join").Parse(dedent.Dedent(`
@@ -99,10 +101,6 @@ func runPreflight(c workflow.RunData) error {
 
 	// Continue with more specific checks based on the init configuration
 	klog.V(1).Infoln("[preflight] Running configuration dependant checks")
-	if err := preflight.RunOptionalJoinNodeChecks(utilsexec.New(), &initCfg.ClusterConfiguration, j.IgnorePreflightErrors()); err != nil {
-		return err
-	}
-
 	if j.Cfg().ControlPlane != nil {
 		// Checks if the cluster configuration supports
 		// joining a new control plane instance and if all the necessary certificates are provided

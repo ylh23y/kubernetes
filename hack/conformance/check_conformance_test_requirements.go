@@ -21,20 +21,20 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"errors"
 	"fmt"
 	"io/ioutil"
 	"os"
 	"regexp"
 
-	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
 )
 
 const (
 	//e.g. framework.ConformanceIt("should provide secure master service ", func() {
-	patternStartConformance = "framework.ConformanceIt\\(.*, func\\(\\) {$"
-	patternEndConformance   = "}\\)$"
-	patternSkip             = "framework.Skip.*\\("
+	patternStartConformance = `framework.ConformanceIt\(.*, func\(\) {$`
+	patternEndConformance   = `}\)$`
+	patternSkip             = `e2eskipper.Skip.*\(`
 )
 
 // This function checks the requirement: it works for all providers (e.g., no SkipIfProviderIs/SkipUnlessProviderIs calls)
@@ -48,7 +48,7 @@ func checkAllProviders(e2eFile string) error {
 
 	fileInput, err := ioutil.ReadFile(e2eFile)
 	if err != nil {
-		return errors.Wrapf(err, "Failed to read file %s", e2eFile)
+		return fmt.Errorf("Failed to read file %s: %w", e2eFile, err)
 	}
 	scanner := bufio.NewScanner(bytes.NewReader(fileInput))
 	scanner.Split(bufio.ScanLines)
@@ -57,14 +57,14 @@ func checkAllProviders(e2eFile string) error {
 		line := scanner.Text()
 		if regStartConformance.MatchString(line) {
 			if inConformanceCode {
-				return errors.Errorf("Missed the end of previous conformance test. There might be a bug in this script.")
+				return errors.New("Missed the end of previous conformance test. There might be a bug in this script.")
 			}
 			inConformanceCode = true
 		}
 		if inConformanceCode {
 			if regSkip.MatchString(line) {
 				// To list all invalid places in a single operation of this tool, here doesn't return error and continues checking.
-				fmt.Fprintf(os.Stderr, "%v: Conformance test should not call any framework.Skip*()\n", e2eFile)
+				fmt.Fprintf(os.Stderr, "%v: Conformance test should not call any e2eskipper.Skip*()\n", e2eFile)
 				checkFailed = true
 			}
 			if regEndConformance.MatchString(line) {
@@ -73,20 +73,20 @@ func checkAllProviders(e2eFile string) error {
 		}
 	}
 	if inConformanceCode {
-		return errors.Errorf("Missed the end of previous conformance test. There might be a bug in this script.")
+		return errors.New("Missed the end of previous conformance test. There might be a bug in this script.")
 	}
 	if checkFailed {
-		return errors.Errorf("We need to fix the above errors.")
+		return errors.New("We need to fix the above errors.")
 	}
 	return nil
 }
 
 func processFile(e2ePath string) error {
-	regGoFile := regexp.MustCompile(".*.go")
+	regGoFile := regexp.MustCompile(`.*\.go`)
 
 	files, err := ioutil.ReadDir(e2ePath)
 	if err != nil {
-		return errors.Wrapf(err, "Failed to read dir %s", e2ePath)
+		return fmt.Errorf("Failed to read dir %s: %w", e2ePath, err)
 	}
 	for _, file := range files {
 		if file.IsDir() {
@@ -113,7 +113,7 @@ func processDir(e2ePath string) error {
 	// Search sub directories if exist
 	files, err := ioutil.ReadDir(e2ePath)
 	if err != nil {
-		return errors.Wrapf(err, "Failed to read dir %s", e2ePath)
+		return fmt.Errorf("Failed to read dir %s: %w", e2ePath, err)
 	}
 	for _, file := range files {
 		if !file.IsDir() {

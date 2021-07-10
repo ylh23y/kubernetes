@@ -9,7 +9,7 @@
     "uid": "7",
     "resourceVersion": "11042405498087606203",
     "generation": 8071137005907523419,
-    "creationTimestamp": null,
+    "creationTimestamp": "2061-09-19T18:13:36Z",
     "deletionGracePeriodSeconds": -4955867275792137171,
     "labels": {
       "7": "8"
@@ -35,33 +35,35 @@
       {
         "manager": "16",
         "operation": "鐊唊飙Ş-U圴÷a/ɔ}摁(湗Ć]",
-        "apiVersion": "17"
+        "apiVersion": "17",
+        "fieldsType": "18",
+        "subresource": "19"
       }
     ]
   },
   "spec": {
-    "podCIDR": "18",
+    "podCIDR": "20",
     "podCIDRs": [
-      "19"
+      "21"
     ],
-    "providerID": "20",
+    "providerID": "22",
     "taints": [
       {
-        "key": "21",
-        "value": "22",
+        "key": "23",
+        "value": "24",
         "effect": "Hr鯹)晿\u003co,c鮽ort昍řČ扷5Ɨ"
       }
     ],
     "configSource": {
       "configMap": {
-        "namespace": "23",
-        "name": "24",
+        "namespace": "25",
+        "name": "26",
         "uid": "Ă凗蓏Ŋ蛊ĉy",
-        "resourceVersion": "25",
-        "kubeletConfigKey": "26"
+        "resourceVersion": "27",
+        "kubeletConfigKey": "28"
       }
     },
-    "externalID": "27"
+    "externalID": "29"
   },
   "status": {
     "capacity": {
@@ -77,14 +79,14 @@
         "status": "P$Iņɖ橙9ȫŚʒ",
         "lastHeartbeatTime": "2339-08-25T14:46:58Z",
         "lastTransitionTime": "2681-06-13T05:43:15Z",
-        "reason": "28",
-        "message": "29"
+        "reason": "30",
+        "message": "31"
       }
     ],
     "addresses": [
       {
         "type": "OŖ樅尷",
-        "address": "30"
+        "address": "32"
       }
     ],
     "daemonEndpoints": {
@@ -93,21 +95,21 @@
       }
     },
     "nodeInfo": {
-      "machineID": "31",
-      "systemUUID": "32",
-      "bootID": "33",
-      "kernelVersion": "34",
-      "osImage": "35",
-      "containerRuntimeVersion": "36",
-      "kubeletVersion": "37",
-      "kubeProxyVersion": "38",
-      "operatingSystem": "39",
-      "architecture": "40"
+      "machineID": "33",
+      "systemUUID": "34",
+      "bootID": "35",
+      "kernelVersion": "36",
+      "osImage": "37",
+      "containerRuntimeVersion": "38",
+      "kubeletVersion": "39",
+      "kubeProxyVersion": "40",
+      "operatingSystem": "41",
+      "architecture": "42"
     },
     "images": [
       {
         "names": [
-          "41"
+          "43"
         ],
         "sizeBytes": 9177598355370950419
       }
@@ -118,38 +120,38 @@
     "volumesAttached": [
       {
         "name": "ȭ%ƎÜ掸8½£.vǴʌ鴜Ł%ŨȈ",
-        "devicePath": "42"
+        "devicePath": "44"
       }
     ],
     "config": {
       "assigned": {
         "configMap": {
-          "namespace": "43",
-          "name": "44",
+          "namespace": "45",
+          "name": "46",
           "uid": "£趕ã/鈱$-议}ȧ外ĺ",
-          "resourceVersion": "45",
-          "kubeletConfigKey": "46"
+          "resourceVersion": "47",
+          "kubeletConfigKey": "48"
         }
       },
       "active": {
         "configMap": {
-          "namespace": "47",
-          "name": "48",
+          "namespace": "49",
+          "name": "50",
           "uid": "譋娲瘹ɭȊɚɎ(",
-          "resourceVersion": "49",
-          "kubeletConfigKey": "50"
+          "resourceVersion": "51",
+          "kubeletConfigKey": "52"
         }
       },
       "lastKnownGood": {
         "configMap": {
-          "namespace": "51",
-          "name": "52",
+          "namespace": "53",
+          "name": "54",
           "uid": "ėf倐ȓ圬剴扲ȿQZ{ʁgɸ",
-          "resourceVersion": "53",
-          "kubeletConfigKey": "54"
+          "resourceVersion": "55",
+          "kubeletConfigKey": "56"
         }
       },
-      "error": "55"
+      "error": "57"
     }
   }
 }

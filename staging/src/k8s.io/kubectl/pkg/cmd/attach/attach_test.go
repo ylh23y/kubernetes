@@ -17,6 +17,7 @@ limitations under the License.
 package attach
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"net/http"
@@ -35,6 +36,7 @@ import (
 	"k8s.io/client-go/tools/remotecommand"
 	"k8s.io/kubectl/pkg/cmd/exec"
 	cmdtesting "k8s.io/kubectl/pkg/cmd/testing"
+	"k8s.io/kubectl/pkg/cmd/util/podcmd"
 	"k8s.io/kubectl/pkg/polymorphichelpers"
 	"k8s.io/kubectl/pkg/scheme"
 )
@@ -65,6 +67,7 @@ func TestPodAndContainerAttach(t *testing.T) {
 		expectError           string
 		expectedPodName       string
 		expectedContainerName string
+		expectOut             string
 		obj                   *corev1.Pod
 	}{
 		{
@@ -85,6 +88,25 @@ func TestPodAndContainerAttach(t *testing.T) {
 			expectedPodName:       "foo",
 			expectedContainerName: "bar",
 			obj:                   attachPod(),
+			expectOut:             `Defaulted container "bar" out of: bar, debugger (ephem), initfoo (init)`,
+		},
+		{
+			name:                  "no container, no flags, sets default expected container as annotation",
+			options:               &AttachOptions{GetPodTimeout: defaultPodLogsTimeout},
+			args:                  []string{"foo"},
+			expectedPodName:       "foo",
+			expectedContainerName: "bar",
+			obj:                   setDefaultContainer(attachPod(), "initfoo"),
+			expectOut:             ``,
+		},
+		{
+			name:                  "no container, no flags, sets default missing container as annotation",
+			options:               &AttachOptions{GetPodTimeout: defaultPodLogsTimeout},
+			args:                  []string{"foo"},
+			expectedPodName:       "foo",
+			expectedContainerName: "bar",
+			obj:                   setDefaultContainer(attachPod(), "does-not-exist"),
+			expectOut:             `Defaulted container "bar" out of: bar, debugger (ephem), initfoo (init)`,
 		},
 		{
 			name:                  "container in flag",
@@ -103,11 +125,19 @@ func TestPodAndContainerAttach(t *testing.T) {
 			obj:                   attachPod(),
 		},
 		{
+			name:                  "ephemeral container in flag",
+			options:               &AttachOptions{StreamOptions: exec.StreamOptions{ContainerName: "debugger"}, GetPodTimeout: 30},
+			args:                  []string{"foo"},
+			expectedPodName:       "foo",
+			expectedContainerName: "debugger",
+			obj:                   attachPod(),
+		},
+		{
 			name:            "non-existing container",
 			options:         &AttachOptions{StreamOptions: exec.StreamOptions{ContainerName: "wrong"}, GetPodTimeout: 10},
 			args:            []string{"foo"},
 			expectedPodName: "foo",
-			expectError:     "container not found",
+			expectError:     "container wrong not found in pod foo",
 			obj:             attachPod(),
 		},
 		{
@@ -136,7 +166,7 @@ func TestPodAndContainerAttach(t *testing.T) {
 			test.options.Resources = test.args
 
 			if err := test.options.Validate(); err != nil {
-				if !strings.Contains(err.Error(), test.expectError) {
+				if test.expectError == "" || !strings.Contains(err.Error(), test.expectError) {
 					t.Errorf("unexpected error: expected %q, got %q", test.expectError, err)
 				}
 				return
@@ -145,15 +175,27 @@ func TestPodAndContainerAttach(t *testing.T) {
 			pod, err := test.options.findAttachablePod(&corev1.Pod{
 				ObjectMeta: metav1.ObjectMeta{Name: "test-pod", Namespace: "test"},
 				Spec: corev1.PodSpec{
+					InitContainers: []corev1.Container{
+						{
+							Name: "initfoo",
+						},
+					},
 					Containers: []corev1.Container{
 						{
 							Name: "foobar",
 						},
 					},
+					EphemeralContainers: []corev1.EphemeralContainer{
+						{
+							EphemeralContainerCommon: corev1.EphemeralContainerCommon{
+								Name: "ephemfoo",
+							},
+						},
+					},
 				},
 			})
 			if err != nil {
-				if !strings.Contains(err.Error(), test.expectError) {
+				if test.expectError == "" || !strings.Contains(err.Error(), test.expectError) {
 					t.Errorf("unexpected error: expected %q, got %q", err, test.expectError)
 				}
 				return
@@ -163,10 +205,17 @@ func TestPodAndContainerAttach(t *testing.T) {
 				t.Errorf("unexpected pod name: expected %q, got %q", test.expectedContainerName, pod.Name)
 			}
 
+			var buf bytes.Buffer
+			test.options.ErrOut = &buf
 			container, err := test.options.containerToAttachTo(attachPod())
+
+			if len(test.expectOut) > 0 && !strings.Contains(buf.String(), test.expectOut) {
+				t.Errorf("unexpected output: output did not contain %q\n---\n%s", test.expectOut, buf.String())
+			}
+
 			if err != nil {
-				if !strings.Contains(err.Error(), test.expectError) {
-					t.Errorf("unexpected error: expected %q, got %q", err, test.expectError)
+				if test.expectError == "" || !strings.Contains(err.Error(), test.expectError) {
+					t.Errorf("unexpected error: expected %q, got %q", test.expectError, err)
 				}
 				return
 			}
@@ -192,7 +241,7 @@ func TestAttach(t *testing.T) {
 		name, version, podPath, fetchPodPath, attachPath, container string
 		pod                                                         *corev1.Pod
 		remoteAttachErr                                             bool
-		exepctedErr                                                 string
+		expectedErr                                                 string
 	}{
 		{
 			name:         "pod attach",
@@ -212,7 +261,7 @@ func TestAttach(t *testing.T) {
 			pod:             attachPod(),
 			remoteAttachErr: true,
 			container:       "bar",
-			exepctedErr:     "attach error",
+			expectedErr:     "attach error",
 		},
 		{
 			name:         "container not found error",
@@ -222,7 +271,7 @@ func TestAttach(t *testing.T) {
 			attachPath:   "/api/" + version + "/namespaces/test/pods/foo/attach",
 			pod:          attachPod(),
 			container:    "foo",
-			exepctedErr:  "cannot attach to the container: container not found (foo)",
+			expectedErr:  "cannot attach to the container: container foo not found in pod foo",
 		},
 	}
 	for _, test := range tests {
@@ -231,7 +280,7 @@ func TestAttach(t *testing.T) {
 			defer tf.Cleanup()
 
 			codec := scheme.Codecs.LegacyCodec(scheme.Scheme.PrioritizedVersionsAllGroups()...)
-			ns := scheme.Codecs
+			ns := scheme.Codecs.WithoutConversion()
 
 			tf.Client = &fake.RESTClient{
 				GroupVersion:         schema.GroupVersion{Group: "", Version: "v1"},
@@ -240,10 +289,10 @@ func TestAttach(t *testing.T) {
 					switch p, m := req.URL.Path, req.Method; {
 					case p == test.podPath && m == "GET":
 						body := cmdtesting.ObjBody(codec, test.pod)
-						return &http.Response{StatusCode: 200, Header: cmdtesting.DefaultHeader(), Body: body}, nil
+						return &http.Response{StatusCode: http.StatusOK, Header: cmdtesting.DefaultHeader(), Body: body}, nil
 					case p == test.fetchPodPath && m == "GET":
 						body := cmdtesting.ObjBody(codec, test.pod)
-						return &http.Response{StatusCode: 200, Header: cmdtesting.DefaultHeader(), Body: body}, nil
+						return &http.Response{StatusCode: http.StatusOK, Header: cmdtesting.DefaultHeader(), Body: body}, nil
 					default:
 						t.Errorf("%s: unexpected request: %s %#v\n%#v", p, req.Method, req.URL, req)
 						return nil, fmt.Errorf("unexpected request")
@@ -282,15 +331,15 @@ func TestAttach(t *testing.T) {
 			}
 
 			err := options.Run()
-			if test.exepctedErr != "" && err.Error() != test.exepctedErr {
+			if test.expectedErr != "" && err.Error() != test.expectedErr {
 				t.Errorf("%s: Unexpected exec error: %v", test.name, err)
 				return
 			}
-			if test.exepctedErr == "" && err != nil {
+			if test.expectedErr == "" && err != nil {
 				t.Errorf("%s: Unexpected error: %v", test.name, err)
 				return
 			}
-			if test.exepctedErr != "" {
+			if test.expectedErr != "" {
 				return
 			}
 			if remoteAttach.url.Path != test.attachPath {
@@ -333,7 +382,7 @@ func TestAttachWarnings(t *testing.T) {
 			streams, _, _, bufErr := genericclioptions.NewTestIOStreams()
 
 			codec := scheme.Codecs.LegacyCodec(scheme.Scheme.PrioritizedVersionsAllGroups()...)
-			ns := scheme.Codecs
+			ns := scheme.Codecs.WithoutConversion()
 
 			tf.Client = &fake.RESTClient{
 				GroupVersion:         schema.GroupVersion{Group: "", Version: "v1"},
@@ -342,10 +391,10 @@ func TestAttachWarnings(t *testing.T) {
 					switch p, m := req.URL.Path, req.Method; {
 					case p == test.podPath && m == "GET":
 						body := cmdtesting.ObjBody(codec, test.pod)
-						return &http.Response{StatusCode: 200, Header: cmdtesting.DefaultHeader(), Body: body}, nil
+						return &http.Response{StatusCode: http.StatusOK, Header: cmdtesting.DefaultHeader(), Body: body}, nil
 					case p == test.fetchPodPath && m == "GET":
 						body := cmdtesting.ObjBody(codec, test.pod)
-						return &http.Response{StatusCode: 200, Header: cmdtesting.DefaultHeader(), Body: body}, nil
+						return &http.Response{StatusCode: http.StatusOK, Header: cmdtesting.DefaultHeader(), Body: body}, nil
 					default:
 						t.Errorf("%s: unexpected request: %s %#v\n%#v", p, req.Method, req.URL, req)
 						return nil, fmt.Errorf("unexpected request")
@@ -414,9 +463,24 @@ func attachPod() *corev1.Pod {
 					Name: "initfoo",
 				},
 			},
+			EphemeralContainers: []corev1.EphemeralContainer{
+				{
+					EphemeralContainerCommon: corev1.EphemeralContainerCommon{
+						Name: "debugger",
+					},
+				},
+			},
 		},
 		Status: corev1.PodStatus{
 			Phase: corev1.PodRunning,
 		},
 	}
+}
+
+func setDefaultContainer(pod *corev1.Pod, name string) *corev1.Pod {
+	if pod.Annotations == nil {
+		pod.Annotations = make(map[string]string)
+	}
+	pod.Annotations[podcmd.DefaultContainerAnnotationName] = name
+	return pod
 }

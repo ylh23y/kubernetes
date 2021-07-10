@@ -27,10 +27,6 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/lithammer/dedent"
-
-	"k8s.io/client-go/tools/clientcmd"
-	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 	kubeadmapi "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm"
 	kubeadmconstants "k8s.io/kubernetes/cmd/kubeadm/app/constants"
 	kubeadmutil "k8s.io/kubernetes/cmd/kubeadm/app/util"
@@ -38,6 +34,11 @@ import (
 	pkiutil "k8s.io/kubernetes/cmd/kubeadm/app/util/pkiutil"
 	testutil "k8s.io/kubernetes/cmd/kubeadm/test"
 	kubeconfigtestutil "k8s.io/kubernetes/cmd/kubeadm/test/kubeconfig"
+
+	"k8s.io/client-go/tools/clientcmd"
+	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
+
+	"github.com/lithammer/dedent"
 )
 
 func TestGetKubeConfigSpecsFailsIfCADoesntExists(t *testing.T) {
@@ -64,7 +65,7 @@ func TestGetKubeConfigSpecs(t *testing.T) {
 	defer os.RemoveAll(tmpdir)
 
 	// Adds a pki folder with a ca certs to the temp folder
-	pkidir := testutil.SetupPkiDirWithCertificateAuthorithy(t, tmpdir)
+	pkidir := testutil.SetupPkiDirWithCertificateAuthority(t, tmpdir)
 
 	// Creates InitConfigurations pointing to the pkidir folder
 	cfgs := []*kubeadmapi.InitConfiguration{
@@ -167,8 +168,22 @@ func TestGetKubeConfigSpecs(t *testing.T) {
 				if err != nil {
 					t.Error(err)
 				}
-				if spec.APIServer != controlPlaneEndpoint {
-					t.Errorf("getKubeConfigSpecs didn't injected cfg.APIServer endpoint into spec for %s", assertion.kubeConfigFile)
+				localAPIEndpoint, err := kubeadmutil.GetLocalAPIEndpoint(&cfg.LocalAPIEndpoint)
+				if err != nil {
+					t.Error(err)
+				}
+
+				switch assertion.kubeConfigFile {
+				case kubeadmconstants.AdminKubeConfigFileName, kubeadmconstants.KubeletKubeConfigFileName:
+					if spec.APIServer != controlPlaneEndpoint {
+						t.Errorf("expected getKubeConfigSpecs for %s to set cfg.APIServer to %s, got %s",
+							assertion.kubeConfigFile, controlPlaneEndpoint, spec.APIServer)
+					}
+				case kubeadmconstants.ControllerManagerKubeConfigFileName, kubeadmconstants.SchedulerKubeConfigFileName:
+					if spec.APIServer != localAPIEndpoint {
+						t.Errorf("expected getKubeConfigSpecs for %s to set cfg.APIServer to %s, got %s",
+							assertion.kubeConfigFile, localAPIEndpoint, spec.APIServer)
+					}
 				}
 
 				// Asserts CA certs and CA keys loaded into specs
@@ -185,7 +200,7 @@ func TestGetKubeConfigSpecs(t *testing.T) {
 
 func TestBuildKubeConfigFromSpecWithClientAuth(t *testing.T) {
 	// Creates a CA
-	caCert, caKey := certstestutil.SetupCertificateAuthorithy(t)
+	caCert, caKey := certstestutil.SetupCertificateAuthority(t)
 
 	// Executes buildKubeConfigFromSpec passing a KubeConfigSpec with a ClientAuth
 	config := setupdKubeConfigWithClientAuth(t, caCert, caKey, "https://1.2.3.4:1234", "myClientName", "test-cluster", "myOrg1", "myOrg2")
@@ -197,7 +212,7 @@ func TestBuildKubeConfigFromSpecWithClientAuth(t *testing.T) {
 
 func TestBuildKubeConfigFromSpecWithTokenAuth(t *testing.T) {
 	// Creates a CA
-	caCert, _ := certstestutil.SetupCertificateAuthorithy(t)
+	caCert, _ := certstestutil.SetupCertificateAuthority(t)
 
 	// Executes buildKubeConfigFromSpec passing a KubeConfigSpec with a Token
 	config := setupdKubeConfigWithTokenAuth(t, caCert, "https://1.2.3.4:1234", "myClientName", "123456", "test-cluster")
@@ -210,13 +225,15 @@ func TestBuildKubeConfigFromSpecWithTokenAuth(t *testing.T) {
 func TestCreateKubeConfigFileIfNotExists(t *testing.T) {
 
 	// Creates a CAs
-	caCert, caKey := certstestutil.SetupCertificateAuthorithy(t)
-	anotherCaCert, anotherCaKey := certstestutil.SetupCertificateAuthorithy(t)
+	caCert, caKey := certstestutil.SetupCertificateAuthority(t)
+	anotherCaCert, anotherCaKey := certstestutil.SetupCertificateAuthority(t)
 
 	// build kubeconfigs (to be used to test kubeconfigs equality/not equality)
 	config := setupdKubeConfigWithClientAuth(t, caCert, caKey, "https://1.2.3.4:1234", "test-cluster", "myOrg1", "myOrg2")
 	configWithAnotherClusterCa := setupdKubeConfigWithClientAuth(t, anotherCaCert, anotherCaKey, "https://1.2.3.4:1234", "test-cluster", "myOrg1", "myOrg2")
 	configWithAnotherClusterAddress := setupdKubeConfigWithClientAuth(t, caCert, caKey, "https://3.4.5.6:3456", "myOrg1", "test-cluster", "myOrg2")
+	invalidConfig := setupdKubeConfigWithClientAuth(t, caCert, caKey, "https://1.2.3.4:1234", "test-cluster", "myOrg1", "myOrg2")
+	invalidConfig.CurrentContext = "invalid context"
 
 	var tests = []struct {
 		name               string
@@ -227,6 +244,12 @@ func TestCreateKubeConfigFileIfNotExists(t *testing.T) {
 		{ // if there is no existing KubeConfig, creates the kubeconfig
 			name:       "KubeConfig doesn't exist",
 			kubeConfig: config,
+		},
+		{ // if KubeConfig is invalid raise error
+			name:               "KubeConfig is invalid",
+			existingKubeConfig: invalidConfig,
+			kubeConfig:         invalidConfig,
+			expectedError:      true,
 		},
 		{ // if KubeConfig is equal to the existingKubeConfig - refers to the same cluster -, use the existing (Test idempotency)
 			name:               "KubeConfig refers to the same cluster",
@@ -239,11 +262,10 @@ func TestCreateKubeConfigFileIfNotExists(t *testing.T) {
 			kubeConfig:         configWithAnotherClusterCa,
 			expectedError:      true,
 		},
-		{ // if KubeConfig is not equal to the existingKubeConfig - refers to the another cluster (a cluster with another address) -, raise error
+		{ // if KubeConfig is not equal to the existingKubeConfig - tollerate custom server addresses
 			name:               "KubeConfig referst to the cluster with another address",
 			existingKubeConfig: config,
 			kubeConfig:         configWithAnotherClusterAddress,
-			expectedError:      true,
 		},
 	}
 
@@ -307,7 +329,7 @@ func TestCreateKubeconfigFilesAndWrappers(t *testing.T) {
 			defer os.RemoveAll(tmpdir)
 
 			// Adds a pki folder with a ca certs to the temp folder
-			pkidir := testutil.SetupPkiDirWithCertificateAuthorithy(t, tmpdir)
+			pkidir := testutil.SetupPkiDirWithCertificateAuthority(t, tmpdir)
 
 			// Creates an InitConfiguration pointing to the pkidir folder
 			cfg := &kubeadmapi.InitConfiguration{
@@ -353,13 +375,13 @@ func TestWriteKubeConfigFailsIfCADoesntExists(t *testing.T) {
 		{
 			name: "WriteKubeConfigWithClientCert",
 			writeKubeConfigFunction: func(out io.Writer) error {
-				return WriteKubeConfigWithClientCert(out, cfg, "myUser", []string{"myOrg"})
+				return WriteKubeConfigWithClientCert(out, cfg, "myUser", []string{"myOrg"}, nil)
 			},
 		},
 		{
 			name: "WriteKubeConfigWithToken",
 			writeKubeConfigFunction: func(out io.Writer) error {
-				return WriteKubeConfigWithToken(out, cfg, "myUser", "12345")
+				return WriteKubeConfigWithToken(out, cfg, "myUser", "12345", nil)
 			},
 		},
 	}
@@ -382,7 +404,7 @@ func TestWriteKubeConfig(t *testing.T) {
 	defer os.RemoveAll(tmpdir)
 
 	// Adds a pki folder with a ca cert to the temp folder
-	pkidir := testutil.SetupPkiDirWithCertificateAuthorithy(t, tmpdir)
+	pkidir := testutil.SetupPkiDirWithCertificateAuthority(t, tmpdir)
 
 	// Retrieves ca cert for assertions
 	caCert, _, err := pkiutil.TryLoadCertAndKeyFromDisk(pkidir, kubeadmconstants.CACertAndKeyBaseName)
@@ -407,14 +429,14 @@ func TestWriteKubeConfig(t *testing.T) {
 		{
 			name: "WriteKubeConfigWithClientCert",
 			writeKubeConfigFunction: func(out io.Writer) error {
-				return WriteKubeConfigWithClientCert(out, cfg, "myUser", []string{"myOrg"})
+				return WriteKubeConfigWithClientCert(out, cfg, "myUser", []string{"myOrg"}, nil)
 			},
 			withClientCert: true,
 		},
 		{
 			name: "WriteKubeConfigWithToken",
 			writeKubeConfigFunction: func(out io.Writer) error {
-				return WriteKubeConfigWithToken(out, cfg, "myUser", "12345")
+				return WriteKubeConfigWithToken(out, cfg, "myUser", "12345", nil)
 			},
 			withToken: true,
 		},
@@ -454,12 +476,20 @@ func TestWriteKubeConfig(t *testing.T) {
 }
 
 func TestValidateKubeConfig(t *testing.T) {
-	caCert, caKey := certstestutil.SetupCertificateAuthorithy(t)
-	anotherCaCert, anotherCaKey := certstestutil.SetupCertificateAuthorithy(t)
+	caCert, caKey := certstestutil.SetupCertificateAuthority(t)
+	anotherCaCert, anotherCaKey := certstestutil.SetupCertificateAuthority(t)
 
 	config := setupdKubeConfigWithClientAuth(t, caCert, caKey, "https://1.2.3.4:1234", "test-cluster", "myOrg1")
 	configWithAnotherClusterCa := setupdKubeConfigWithClientAuth(t, anotherCaCert, anotherCaKey, "https://1.2.3.4:1234", "test-cluster", "myOrg1")
 	configWithAnotherServerURL := setupdKubeConfigWithClientAuth(t, caCert, caKey, "https://4.3.2.1:4321", "test-cluster", "myOrg1")
+
+	// create a valid config but with whitespace around the CA PEM.
+	// validateKubeConfig() should tollerate that.
+	configWhitespace := config.DeepCopy()
+	configWhitespaceCtx := configWhitespace.Contexts[configWhitespace.CurrentContext]
+	configWhitespaceCA := string(configWhitespace.Clusters[configWhitespaceCtx.Cluster].CertificateAuthorityData)
+	configWhitespaceCA = "\n" + configWhitespaceCA + "\n"
+	configWhitespace.Clusters[configWhitespaceCtx.Cluster].CertificateAuthorityData = []byte(configWhitespaceCA)
 
 	tests := map[string]struct {
 		existingKubeConfig *clientcmdapi.Config
@@ -475,13 +505,17 @@ func TestValidateKubeConfig(t *testing.T) {
 			kubeConfig:         config,
 			expectedError:      true,
 		},
-		"kubeconfig exist and has invalid server url": {
+		"kubeconfig exist and has a different server url": {
 			existingKubeConfig: configWithAnotherServerURL,
 			kubeConfig:         config,
-			expectedError:      true,
 		},
 		"kubeconfig exist and is valid": {
 			existingKubeConfig: config,
+			kubeConfig:         config,
+			expectedError:      false,
+		},
+		"kubeconfig exist and is valid even if its CA contains whitespace": {
+			existingKubeConfig: configWhitespace,
 			kubeConfig:         config,
 			expectedError:      false,
 		},
@@ -528,7 +562,7 @@ func TestValidateKubeconfigsForExternalCA(t *testing.T) {
 	}
 
 	// creates CA, write to pkiDir and remove ca.key to get into external CA condition
-	caCert, caKey := certstestutil.SetupCertificateAuthorithy(t)
+	caCert, caKey := certstestutil.SetupCertificateAuthority(t)
 	if err := pkiutil.WriteCertAndKey(pkiDir, kubeadmconstants.CACertAndKeyBaseName, caCert, caKey); err != nil {
 		t.Fatalf("failure while saving CA certificate and key: %v", err)
 	}
@@ -540,7 +574,7 @@ func TestValidateKubeconfigsForExternalCA(t *testing.T) {
 	config := setupdKubeConfigWithClientAuth(t, caCert, caKey, "https://1.2.3.4:1234", "test-cluster", "myOrg1")
 
 	// create a config with another CA
-	anotherCaCert, anotherCaKey := certstestutil.SetupCertificateAuthorithy(t)
+	anotherCaCert, anotherCaKey := certstestutil.SetupCertificateAuthority(t)
 	configWithAnotherClusterCa := setupdKubeConfigWithClientAuth(t, anotherCaCert, anotherCaKey, "https://1.2.3.4:1234", "test-cluster", "myOrg1")
 
 	// create a config with another server URL
@@ -573,15 +607,14 @@ func TestValidateKubeconfigsForExternalCA(t *testing.T) {
 			initConfig:    initConfig,
 			expectedError: true,
 		},
-		"some files have invalid Server Url": {
+		"some files have a different Server URL": {
 			filesToWrite: map[string]*clientcmdapi.Config{
 				kubeadmconstants.AdminKubeConfigFileName:             config,
 				kubeadmconstants.KubeletKubeConfigFileName:           config,
 				kubeadmconstants.ControllerManagerKubeConfigFileName: config,
 				kubeadmconstants.SchedulerKubeConfigFileName:         configWithAnotherServerURL,
 			},
-			initConfig:    initConfig,
-			expectedError: true,
+			initConfig: initConfig,
 		},
 		"all files are valid": {
 			filesToWrite: map[string]*clientcmdapi.Config{
@@ -632,7 +665,7 @@ func setupdKubeConfigWithClientAuth(t *testing.T, caCert *x509.Certificate, caKe
 		},
 	}
 
-	config, err := buildKubeConfigFromSpec(spec, clustername)
+	config, err := buildKubeConfigFromSpec(spec, clustername, nil)
 	if err != nil {
 		t.Fatal("buildKubeConfigFromSpec failed!")
 	}
@@ -651,7 +684,7 @@ func setupdKubeConfigWithTokenAuth(t *testing.T, caCert *x509.Certificate, APISe
 		},
 	}
 
-	config, err := buildKubeConfigFromSpec(spec, clustername)
+	config, err := buildKubeConfigFromSpec(spec, clustername, nil)
 	if err != nil {
 		t.Fatal("buildKubeConfigFromSpec failed!")
 	}

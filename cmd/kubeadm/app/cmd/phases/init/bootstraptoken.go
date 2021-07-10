@@ -19,13 +19,13 @@ package phases
 import (
 	"fmt"
 
-	"github.com/pkg/errors"
-
 	"k8s.io/kubernetes/cmd/kubeadm/app/cmd/options"
 	"k8s.io/kubernetes/cmd/kubeadm/app/cmd/phases/workflow"
 	cmdutil "k8s.io/kubernetes/cmd/kubeadm/app/cmd/util"
 	clusterinfophase "k8s.io/kubernetes/cmd/kubeadm/app/phases/bootstraptoken/clusterinfo"
 	nodebootstraptokenphase "k8s.io/kubernetes/cmd/kubeadm/app/phases/bootstraptoken/node"
+
+	"github.com/pkg/errors"
 )
 
 var (
@@ -85,6 +85,10 @@ func runBootstrapToken(c workflow.RunData) error {
 	// Create the default node bootstrap token
 	if err := nodebootstraptokenphase.UpdateOrCreateTokens(client, false, data.Cfg().BootstrapTokens); err != nil {
 		return errors.Wrap(err, "error updating or creating token")
+	}
+	// Create RBAC rules that makes the bootstrap tokens able to get nodes
+	if err := nodebootstraptokenphase.AllowBoostrapTokensToGetNodes(client); err != nil {
+		return errors.Wrap(err, "error allowing bootstrap tokens to get Nodes")
 	}
 	// Create RBAC rules that makes the bootstrap tokens able to post CSRs
 	if err := nodebootstraptokenphase.AllowBootstrapTokensToPostCSRs(client); err != nil {

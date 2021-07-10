@@ -14,13 +14,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package e2e_node
+package e2enode
 
 import (
+	"context"
 	"k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/kubernetes/test/e2e/framework"
-	e2elog "k8s.io/kubernetes/test/e2e/framework/log"
 	e2epod "k8s.io/kubernetes/test/e2e/framework/pod"
 
 	"github.com/davecgh/go-spew/spew"
@@ -28,7 +28,7 @@ import (
 	"github.com/onsi/gomega"
 )
 
-var _ = framework.KubeDescribe("ImageID [NodeFeature: ImageID]", func() {
+var _ = SIGDescribe("ImageID [NodeFeature: ImageID]", func() {
 
 	busyBoxImage := "k8s.gcr.io/busybox@sha256:4bdd623e848417d96127e16037743f0cd8b528c026e9175e22a84f639eca58ff"
 
@@ -53,13 +53,13 @@ var _ = framework.KubeDescribe("ImageID [NodeFeature: ImageID]", func() {
 
 		framework.ExpectNoError(e2epod.WaitTimeoutForPodNoLongerRunningInNamespace(
 			f.ClientSet, pod.Name, f.Namespace.Name, framework.PodStartTimeout))
-		runningPod, err := f.PodClient().Get(pod.Name, metav1.GetOptions{})
+		runningPod, err := f.PodClient().Get(context.TODO(), pod.Name, metav1.GetOptions{})
 		framework.ExpectNoError(err)
 
 		status := runningPod.Status
 
 		if len(status.ContainerStatuses) == 0 {
-			e2elog.Failf("Unexpected pod status; %s", spew.Sdump(status))
+			framework.Failf("Unexpected pod status; %s", spew.Sdump(status))
 			return
 		}
 

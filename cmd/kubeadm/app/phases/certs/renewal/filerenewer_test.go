@@ -20,6 +20,8 @@ import (
 	"crypto/x509"
 	"testing"
 
+	pkiutil "k8s.io/kubernetes/cmd/kubeadm/app/util/pkiutil"
+
 	certutil "k8s.io/client-go/util/cert"
 )
 
@@ -28,12 +30,14 @@ func TestFileRenewer(t *testing.T) {
 	fr := NewFileRenewer(testCACert, testCAKey)
 
 	// renews a certificate
-	certCfg := &certutil.Config{
-		CommonName: "test-certs",
-		AltNames: certutil.AltNames{
-			DNSNames: []string{"test-domain.space"},
+	certCfg := &pkiutil.CertConfig{
+		Config: certutil.Config{
+			CommonName: "test-certs",
+			AltNames: certutil.AltNames{
+				DNSNames: []string{"test-domain.space"},
+			},
+			Usages: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
 		},
-		Usages: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
 	}
 
 	cert, _, err := fr.Renew(certCfg)

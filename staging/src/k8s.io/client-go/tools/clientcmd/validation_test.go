@@ -17,6 +17,8 @@ limitations under the License.
 package clientcmd
 
 import (
+	"errors"
+	"fmt"
 	"io/ioutil"
 	"os"
 	"strings"
@@ -375,6 +377,7 @@ func TestValidateAuthInfoExec(t *testing.T) {
 			Env: []clientcmdapi.ExecEnvVar{
 				{Name: "foo", Value: "bar"},
 			},
+			InteractiveMode: clientcmdapi.IfAvailableExecInteractiveMode,
 		},
 	}
 	test := configValidationTest{
@@ -389,7 +392,8 @@ func TestValidateAuthInfoExecNoVersion(t *testing.T) {
 	config := clientcmdapi.NewConfig()
 	config.AuthInfos["user"] = &clientcmdapi.AuthInfo{
 		Exec: &clientcmdapi.ExecConfig{
-			Command: "/bin/example",
+			Command:         "/bin/example",
+			InteractiveMode: clientcmdapi.IfAvailableExecInteractiveMode,
 		},
 	}
 	test := configValidationTest{
@@ -407,7 +411,8 @@ func TestValidateAuthInfoExecNoCommand(t *testing.T) {
 	config := clientcmdapi.NewConfig()
 	config.AuthInfos["user"] = &clientcmdapi.AuthInfo{
 		Exec: &clientcmdapi.ExecConfig{
-			APIVersion: "clientauthentication.k8s.io/v1alpha1",
+			APIVersion:      "clientauthentication.k8s.io/v1alpha1",
+			InteractiveMode: clientcmdapi.IfAvailableExecInteractiveMode,
 		},
 	}
 	test := configValidationTest{
@@ -428,8 +433,9 @@ func TestValidateAuthInfoExecWithAuthProvider(t *testing.T) {
 			Name: "oidc",
 		},
 		Exec: &clientcmdapi.ExecConfig{
-			Command:    "/bin/example",
-			APIVersion: "clientauthentication.k8s.io/v1alpha1",
+			Command:         "/bin/example",
+			APIVersion:      "clientauthentication.k8s.io/v1alpha1",
+			InteractiveMode: clientcmdapi.IfAvailableExecInteractiveMode,
 		},
 	}
 	test := configValidationTest{
@@ -452,10 +458,50 @@ func TestValidateAuthInfoExecNoEnv(t *testing.T) {
 			Env: []clientcmdapi.ExecEnvVar{
 				{Name: "foo", Value: ""},
 			},
+			InteractiveMode: clientcmdapi.IfAvailableExecInteractiveMode,
 		},
 	}
 	test := configValidationTest{
 		config: config,
+	}
+
+	test.testAuthInfo("user", t)
+	test.testConfig(t)
+}
+
+func TestValidateAuthInfoExecInteractiveModeMissing(t *testing.T) {
+	config := clientcmdapi.NewConfig()
+	config.AuthInfos["user"] = &clientcmdapi.AuthInfo{
+		Exec: &clientcmdapi.ExecConfig{
+			Command:    "/bin/example",
+			APIVersion: "clientauthentication.k8s.io/v1alpha1",
+		},
+	}
+	test := configValidationTest{
+		config: config,
+		expectedErrorSubstring: []string{
+			"interactiveMode must be specified for user to use exec authentication plugin",
+		},
+	}
+
+	test.testAuthInfo("user", t)
+	test.testConfig(t)
+}
+
+func TestValidateAuthInfoExecInteractiveModeInvalid(t *testing.T) {
+	config := clientcmdapi.NewConfig()
+	config.AuthInfos["user"] = &clientcmdapi.AuthInfo{
+		Exec: &clientcmdapi.ExecConfig{
+			Command:         "/bin/example",
+			APIVersion:      "clientauthentication.k8s.io/v1alpha1",
+			InteractiveMode: "invalid",
+		},
+	}
+	test := configValidationTest{
+		config: config,
+		expectedErrorSubstring: []string{
+			`invalid interactiveMode for user: "invalid"`,
+		},
 	}
 
 	test.testAuthInfo("user", t)
@@ -567,5 +613,102 @@ func (c configValidationTest) testAuthInfo(authInfoName string, t *testing.T) {
 		if len(errs) != 0 {
 			t.Errorf("Unexpected error: %v", utilerrors.NewAggregate(errs))
 		}
+	}
+}
+
+type alwaysMatchingError struct{}
+
+func (_ alwaysMatchingError) Error() string {
+	return "error"
+}
+
+func (_ alwaysMatchingError) Is(_ error) bool {
+	return true
+}
+
+type someError struct{ msg string }
+
+func (se someError) Error() string {
+	if se.msg != "" {
+		return se.msg
+	}
+	return "err"
+}
+
+func TestErrConfigurationInvalidWithErrorsIs(t *testing.T) {
+	testCases := []struct {
+		name         string
+		err          error
+		matchAgainst error
+		expectMatch  bool
+	}{
+		{
+			name:         "no match",
+			err:          errConfigurationInvalid{errors.New("my-error"), errors.New("my-other-error")},
+			matchAgainst: fmt.Errorf("no entry %s", "here"),
+		},
+		{
+			name:         "match via .Is()",
+			err:          errConfigurationInvalid{errors.New("forbidden"), alwaysMatchingError{}},
+			matchAgainst: errors.New("unauthorized"),
+			expectMatch:  true,
+		},
+		{
+			name:         "match via equality",
+			err:          errConfigurationInvalid{errors.New("err"), someError{}},
+			matchAgainst: someError{},
+			expectMatch:  true,
+		},
+		{
+			name:         "match via nested aggregate",
+			err:          errConfigurationInvalid{errors.New("closed today"), errConfigurationInvalid{errConfigurationInvalid{someError{}}}},
+			matchAgainst: someError{},
+			expectMatch:  true,
+		},
+		{
+			name:         "match via wrapped aggregate",
+			err:          fmt.Errorf("wrap: %w", errConfigurationInvalid{errors.New("err"), someError{}}),
+			matchAgainst: someError{},
+			expectMatch:  true,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			result := errors.Is(tc.err, tc.matchAgainst)
+			if result != tc.expectMatch {
+				t.Errorf("expected match: %t, got match: %t", tc.expectMatch, result)
+			}
+		})
+	}
+}
+
+type accessTrackingError struct {
+	wasAccessed bool
+}
+
+func (accessTrackingError) Error() string {
+	return "err"
+}
+
+func (ate *accessTrackingError) Is(_ error) bool {
+	ate.wasAccessed = true
+	return true
+}
+
+var _ error = &accessTrackingError{}
+
+func TestErrConfigurationInvalidWithErrorsIsShortCircuitsOnFirstMatch(t *testing.T) {
+	errC := errConfigurationInvalid{&accessTrackingError{}, &accessTrackingError{}}
+	_ = errors.Is(errC, &accessTrackingError{})
+
+	var numAccessed int
+	for _, err := range errC {
+		if ate := err.(*accessTrackingError); ate.wasAccessed {
+			numAccessed++
+		}
+	}
+	if numAccessed != 1 {
+		t.Errorf("expected exactly one error to get accessed, got %d", numAccessed)
 	}
 }

@@ -19,13 +19,13 @@ package phases
 import (
 	"fmt"
 
-	"github.com/pkg/errors"
-
 	"k8s.io/kubernetes/cmd/kubeadm/app/cmd/options"
 	"k8s.io/kubernetes/cmd/kubeadm/app/cmd/phases/workflow"
 	cmdutil "k8s.io/kubernetes/cmd/kubeadm/app/cmd/util"
 	kubeadmconstants "k8s.io/kubernetes/cmd/kubeadm/app/constants"
 	"k8s.io/kubernetes/cmd/kubeadm/app/phases/copycerts"
+
+	"github.com/pkg/errors"
 )
 
 // NewUploadCertsPhase returns the uploadCerts phase
@@ -37,6 +37,7 @@ func NewUploadCertsPhase() workflow.Phase {
 		Run:   runUploadCerts,
 		InheritFlags: []string{
 			options.CfgPath,
+			options.KubeconfigPath,
 			options.UploadCerts,
 			options.CertificateKey,
 			options.SkipCertificateKeyPrint,

@@ -14,9 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package e2e_node
+package e2enode
 
 import (
+	"context"
 	"time"
 
 	"k8s.io/api/core/v1"
@@ -30,10 +31,10 @@ import (
 	"github.com/onsi/ginkgo"
 )
 
-var _ = framework.KubeDescribe("Kubelet Volume Manager", func() {
+var _ = SIGDescribe("Kubelet Volume Manager", func() {
 	f := framework.NewDefaultFramework("kubelet-volume-manager")
 	ginkgo.Describe("Volume Manager", func() {
-		ginkgo.Context("On terminatation of pod with memory backed volume", func() {
+		ginkgo.Context("On termination of pod with memory backed volume", func() {
 			ginkgo.It("should remove the volume from the node [NodeConformance]", func() {
 				var (
 					memoryBackedPod *v1.Pod
@@ -114,7 +115,7 @@ var _ = framework.KubeDescribe("Kubelet Volume Manager", func() {
 						})
 						err = e2epod.WaitForPodSuccessInNamespace(f.ClientSet, pod.Name, f.Namespace.Name)
 						gp := int64(1)
-						f.PodClient().Delete(pod.Name, &metav1.DeleteOptions{GracePeriodSeconds: &gp})
+						f.PodClient().Delete(context.TODO(), pod.Name, metav1.DeleteOptions{GracePeriodSeconds: &gp})
 						if err == nil {
 							break
 						}

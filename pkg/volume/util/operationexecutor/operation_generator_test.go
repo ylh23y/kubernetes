@@ -17,50 +17,41 @@ limitations under the License.
 package operationexecutor
 
 import (
-	"fmt"
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_model/go"
+	"os"
+	"testing"
+
+	io_prometheus_client "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/assert"
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/uuid"
-	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	fakeclient "k8s.io/client-go/kubernetes/fake"
 	"k8s.io/client-go/tools/record"
-	"k8s.io/component-base/featuregate"
-	featuregatetesting "k8s.io/component-base/featuregate/testing"
+	"k8s.io/component-base/metrics/legacyregistry"
 	"k8s.io/csi-translation-lib/plugins"
-	"k8s.io/kubernetes/pkg/features"
 	"k8s.io/kubernetes/pkg/volume"
 	"k8s.io/kubernetes/pkg/volume/awsebs"
-	"k8s.io/kubernetes/pkg/volume/csi"
 	csitesting "k8s.io/kubernetes/pkg/volume/csi/testing"
 	"k8s.io/kubernetes/pkg/volume/gcepd"
 	volumetesting "k8s.io/kubernetes/pkg/volume/testing"
-	"os"
-	"testing"
+	volumetypes "k8s.io/kubernetes/pkg/volume/util/types"
 )
 
 // this method just tests the volume plugin name that's used in CompleteFunc, the same plugin is also used inside the
 // generated func so there is no need to test the plugin name that's used inside generated function
 func TestOperationGenerator_GenerateUnmapVolumeFunc_PluginName(t *testing.T) {
 	type testcase struct {
-		name                  string
-		isCsiMigrationEnabled bool
-		pluginName            string
-		csiDriverName         string
-		csiMigrationFeature   featuregate.Feature
-		pvSpec                v1.PersistentVolumeSpec
-		probVolumePlugins     []volume.VolumePlugin
+		name              string
+		pluginName        string
+		pvSpec            v1.PersistentVolumeSpec
+		probVolumePlugins []volume.VolumePlugin
 	}
 
 	testcases := []testcase{
 		{
-			name:                  "gce pd plugin: csi migration disabled",
-			isCsiMigrationEnabled: false,
-			pluginName:            plugins.GCEPDInTreePluginName,
-			csiMigrationFeature:   features.CSIMigrationGCE,
+			name:       "gce pd plugin: csi migration disabled",
+			pluginName: plugins.GCEPDInTreePluginName,
 			pvSpec: v1.PersistentVolumeSpec{
 				PersistentVolumeSource: v1.PersistentVolumeSource{
 					GCEPersistentDisk: &v1.GCEPersistentDiskVolumeSource{},
@@ -68,34 +59,8 @@ func TestOperationGenerator_GenerateUnmapVolumeFunc_PluginName(t *testing.T) {
 			probVolumePlugins: gcepd.ProbeVolumePlugins(),
 		},
 		{
-			name:                  "gce pd plugin: csi migration enabled",
-			isCsiMigrationEnabled: true,
-			pluginName:            plugins.GCEPDInTreePluginName,
-			csiDriverName:         plugins.GCEPDDriverName,
-			csiMigrationFeature:   features.CSIMigrationGCE,
-			pvSpec: v1.PersistentVolumeSpec{
-				PersistentVolumeSource: v1.PersistentVolumeSource{
-					GCEPersistentDisk: &v1.GCEPersistentDiskVolumeSource{},
-				}},
-			probVolumePlugins: gcepd.ProbeVolumePlugins(),
-		},
-		{
-			name:                  "aws ebs plugin: csi migration disabled",
-			isCsiMigrationEnabled: false,
-			pluginName:            plugins.AWSEBSInTreePluginName,
-			csiMigrationFeature:   features.CSIMigrationAWS,
-			pvSpec: v1.PersistentVolumeSpec{
-				PersistentVolumeSource: v1.PersistentVolumeSource{
-					AWSElasticBlockStore: &v1.AWSElasticBlockStoreVolumeSource{},
-				}},
-			probVolumePlugins: awsebs.ProbeVolumePlugins(),
-		},
-		{
-			name:                  "aws ebs plugin: csi migration enabled",
-			isCsiMigrationEnabled: true,
-			pluginName:            plugins.AWSEBSInTreePluginName,
-			csiDriverName:         plugins.AWSEBSDriverName,
-			csiMigrationFeature:   features.CSIMigrationAWS,
+			name:       "aws ebs plugin: csi migration disabled",
+			pluginName: plugins.AWSEBSInTreePluginName,
 			pvSpec: v1.PersistentVolumeSpec{
 				PersistentVolumeSource: v1.PersistentVolumeSource{
 					AWSElasticBlockStore: &v1.AWSElasticBlockStoreVolumeSource{},
@@ -106,34 +71,13 @@ func TestOperationGenerator_GenerateUnmapVolumeFunc_PluginName(t *testing.T) {
 
 	for _, tc := range testcases {
 		expectedPluginName := tc.pluginName
-		if tc.isCsiMigrationEnabled {
-			expectedPluginName = fmt.Sprintf("%s:%s", csi.CSIPluginName, tc.csiDriverName)
-		}
-		defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.CSIMigration, tc.isCsiMigrationEnabled)()
-		defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, tc.csiMigrationFeature, tc.isCsiMigrationEnabled)()
-
-		volumePluginMgr, plugin, tmpDir := initTestPlugins(t, tc.probVolumePlugins, tc.pluginName)
+		volumePluginMgr, tmpDir := initTestPlugins(t, tc.probVolumePlugins, tc.pluginName)
 		defer os.RemoveAll(tmpDir)
 
 		operationGenerator := getTestOperationGenerator(volumePluginMgr)
 
 		pod := &v1.Pod{ObjectMeta: metav1.ObjectMeta{UID: types.UID(string(uuid.NewUUID()))}}
 		volumeToUnmount := getTestVolumeToUnmount(pod, tc.pvSpec, tc.pluginName)
-
-		if tc.isCsiMigrationEnabled {
-			// GenerateUnmapVolumeFunc call blockVolumePlugin.NewBlockVolumeUnmapper and when the plugin is csi,
-			// csi plugin looks a file that contains some information about the volume,
-			// and GenerateUnmapVolumeFuncfails if csi plugin can't find that file.
-			// So the reason for calling plugin.NewBlockVolumeMapper for csi enabled case is creating that file.
-			csiSpec, err := translateSpec(volumeToUnmount.VolumeSpec)
-			if err != nil {
-				t.Fatalf("Can't translate volume to CSI")
-			}
-			_, mapperError := (*plugin).(volume.BlockVolumePlugin).NewBlockVolumeMapper(csiSpec, pod, volume.VolumeOptions{})
-			if mapperError != nil {
-				t.Fatalf("mapper error: %v\n", mapperError)
-			}
-		}
 
 		unmapVolumeFunc, e := operationGenerator.GenerateUnmapVolumeFunc(volumeToUnmount, nil)
 		if e != nil {
@@ -150,7 +94,7 @@ func TestOperationGenerator_GenerateUnmapVolumeFunc_PluginName(t *testing.T) {
 		storageOperationStatusCountMetricBefore := findMetricWithNameAndLabels(metricFamilyName, labelFilter)
 
 		var ee error
-		unmapVolumeFunc.CompleteFunc(&ee)
+		unmapVolumeFunc.CompleteFunc(volumetypes.CompleteFuncParam{Err: &ee})
 
 		storageOperationStatusCountMetricAfter := findMetricWithNameAndLabels(metricFamilyName, labelFilter)
 		if storageOperationStatusCountMetricAfter == nil {
@@ -229,7 +173,7 @@ func getTestVolumeToUnmount(pod *v1.Pod, pvSpec v1.PersistentVolumeSpec, pluginN
 }
 
 func getMetricFamily(metricFamilyName string) *io_prometheus_client.MetricFamily {
-	metricFamilies, _ := prometheus.DefaultGatherer.Gather()
+	metricFamilies, _ := legacyregistry.DefaultGatherer.Gather()
 	for _, mf := range metricFamilies {
 		if *mf.Name == metricFamilyName {
 			return mf
@@ -238,9 +182,9 @@ func getMetricFamily(metricFamilyName string) *io_prometheus_client.MetricFamily
 	return nil
 }
 
-func initTestPlugins(t *testing.T, plugs []volume.VolumePlugin, pluginName string) (*volume.VolumePluginMgr, *volume.VolumePlugin, string) {
+func initTestPlugins(t *testing.T, plugs []volume.VolumePlugin, pluginName string) (*volume.VolumePluginMgr, string) {
 	client := fakeclient.NewSimpleClientset()
-	pluginMgr, csiPlugin, tmpDir := csitesting.NewTestPlugin(t, client)
+	pluginMgr, _, tmpDir := csitesting.NewTestPlugin(t, client)
 
 	err := pluginMgr.InitPlugins(plugs, nil, pluginMgr.Host)
 	if err != nil {
@@ -252,5 +196,5 @@ func initTestPlugins(t *testing.T, plugs []volume.VolumePlugin, pluginName strin
 		t.Fatalf("Can't find the plugin by name: %s", pluginName)
 	}
 
-	return pluginMgr, csiPlugin, tmpDir
+	return pluginMgr, tmpDir
 }

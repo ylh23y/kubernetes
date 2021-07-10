@@ -17,12 +17,16 @@ limitations under the License.
 package phases
 
 import (
-	"github.com/pkg/errors"
-	"k8s.io/klog"
+	"fmt"
+
 	"k8s.io/kubernetes/cmd/kubeadm/app/cmd/options"
 	"k8s.io/kubernetes/cmd/kubeadm/app/cmd/phases/workflow"
 	cmdutil "k8s.io/kubernetes/cmd/kubeadm/app/cmd/util"
 	kubeletphase "k8s.io/kubernetes/cmd/kubeadm/app/phases/kubelet"
+
+	"k8s.io/klog/v2"
+
+	"github.com/pkg/errors"
 )
 
 var (
@@ -70,13 +74,13 @@ func runKubeletStart(c workflow.RunData) error {
 	}
 
 	// Write the kubelet configuration file to disk.
-	if err := kubeletphase.WriteConfigToDisk(data.Cfg().ComponentConfigs.Kubelet, data.KubeletDir()); err != nil {
+	if err := kubeletphase.WriteConfigToDisk(&data.Cfg().ClusterConfiguration, data.KubeletDir()); err != nil {
 		return errors.Wrap(err, "error writing kubelet configuration to disk")
 	}
 
 	// Try to start the kubelet service in case it's inactive
 	if !data.DryRun() {
-		klog.V(1).Infoln("Starting the kubelet")
+		fmt.Println("[kubelet-start] Starting the kubelet")
 		kubeletphase.TryStartKubelet()
 	}
 

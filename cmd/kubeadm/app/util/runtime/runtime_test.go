@@ -24,11 +24,12 @@ import (
 	"runtime"
 	"testing"
 
-	"github.com/pkg/errors"
-
 	"k8s.io/kubernetes/cmd/kubeadm/app/constants"
+
 	"k8s.io/utils/exec"
 	fakeexec "k8s.io/utils/exec/testing"
+
+	"github.com/pkg/errors"
 )
 
 func TestNewContainerRuntime(t *testing.T) {
@@ -83,11 +84,11 @@ func genFakeActions(fcmd *fakeexec.FakeCmd, num int) []fakeexec.FakeCommandActio
 
 func TestIsRunning(t *testing.T) {
 	fcmd := fakeexec.FakeCmd{
-		CombinedOutputScript: []fakeexec.FakeCombinedOutputAction{
-			func() ([]byte, error) { return nil, nil },
-			func() ([]byte, error) { return []byte("error"), &fakeexec.FakeExitError{Status: 1} },
-			func() ([]byte, error) { return nil, nil },
-			func() ([]byte, error) { return []byte("error"), &fakeexec.FakeExitError{Status: 1} },
+		CombinedOutputScript: []fakeexec.FakeAction{
+			func() ([]byte, []byte, error) { return nil, nil, nil },
+			func() ([]byte, []byte, error) { return []byte("error"), nil, &fakeexec.FakeExitError{Status: 1} },
+			func() ([]byte, []byte, error) { return nil, nil, nil },
+			func() ([]byte, []byte, error) { return []byte("error"), nil, &fakeexec.FakeExitError{Status: 1} },
 		},
 	}
 
@@ -132,10 +133,10 @@ func TestIsRunning(t *testing.T) {
 
 func TestListKubeContainers(t *testing.T) {
 	fcmd := fakeexec.FakeCmd{
-		CombinedOutputScript: []fakeexec.FakeCombinedOutputAction{
-			func() ([]byte, error) { return []byte("k8s_p1\nk8s_p2"), nil },
-			func() ([]byte, error) { return nil, &fakeexec.FakeExitError{Status: 1} },
-			func() ([]byte, error) { return []byte("k8s_p1\nk8s_p2"), nil },
+		CombinedOutputScript: []fakeexec.FakeAction{
+			func() ([]byte, []byte, error) { return []byte("k8s_p1\nk8s_p2"), nil, nil },
+			func() ([]byte, []byte, error) { return nil, nil, &fakeexec.FakeExitError{Status: 1} },
+			func() ([]byte, []byte, error) { return []byte("k8s_p1\nk8s_p2"), nil, nil },
 		},
 	}
 	execer := fakeexec.FakeExec{
@@ -178,15 +179,16 @@ func TestListKubeContainers(t *testing.T) {
 }
 
 func TestRemoveContainers(t *testing.T) {
-	fakeOK := func() ([]byte, error) { return nil, nil }
-	fakeErr := func() ([]byte, error) { return []byte("error"), &fakeexec.FakeExitError{Status: 1} }
+	fakeOK := func() ([]byte, []byte, error) { return nil, nil, nil }
+	fakeErr := func() ([]byte, []byte, error) { return []byte("error"), nil, &fakeexec.FakeExitError{Status: 1} }
 	fcmd := fakeexec.FakeCmd{
-		CombinedOutputScript: []fakeexec.FakeCombinedOutputAction{
+		CombinedOutputScript: []fakeexec.FakeAction{
 			fakeOK, fakeOK, fakeOK, fakeOK, fakeOK, fakeOK, // Test case 1
 			fakeOK, fakeOK, fakeOK, fakeErr, fakeOK, fakeOK,
 			fakeErr, fakeOK, fakeOK, fakeErr, fakeOK,
-			fakeOK, fakeOK, fakeOK,
-			fakeOK, fakeErr, fakeOK,
+			fakeOK, fakeOK, fakeOK, fakeOK, fakeOK, fakeOK,
+			fakeOK, fakeOK, fakeOK, fakeErr, fakeOK, fakeOK,
+			fakeErr, fakeOK, fakeOK, fakeErr, fakeOK,
 		},
 	}
 	execer := fakeexec.FakeExec{
@@ -204,7 +206,8 @@ func TestRemoveContainers(t *testing.T) {
 		{"invalid: CRI rmp failure", "unix:///var/run/crio/crio.sock", []string{"k8s_p1", "k8s_p2", "k8s_p3"}, true},
 		{"invalid: CRI stopp failure", "unix:///var/run/crio/crio.sock", []string{"k8s_p1", "k8s_p2", "k8s_p3"}, true},
 		{"valid: remove containers using docker", constants.DefaultDockerCRISocket, []string{"k8s_c1", "k8s_c2", "k8s_c3"}, false},
-		{"invalid: remove containers using docker", constants.DefaultDockerCRISocket, []string{"k8s_c1", "k8s_c2", "k8s_c3"}, true},
+		{"invalid: docker rm failure", constants.DefaultDockerCRISocket, []string{"k8s_c1", "k8s_c2", "k8s_c3"}, true},
+		{"invalid: docker stop failure", constants.DefaultDockerCRISocket, []string{"k8s_c1", "k8s_c2", "k8s_c3"}, true},
 	}
 
 	for _, tc := range cases {
@@ -219,7 +222,7 @@ func TestRemoveContainers(t *testing.T) {
 				t.Errorf("unexpected RemoveContainers errors: %v, criSocket: %s, containers: %v", err, tc.criSocket, tc.containers)
 			}
 			if tc.isError && err == nil {
-				t.Errorf("unexpected RemoveContnainers success, criSocket: %s, containers: %v", tc.criSocket, tc.containers)
+				t.Errorf("unexpected RemoveContainers success, criSocket: %s, containers: %v", tc.criSocket, tc.containers)
 			}
 		})
 	}
@@ -227,11 +230,21 @@ func TestRemoveContainers(t *testing.T) {
 
 func TestPullImage(t *testing.T) {
 	fcmd := fakeexec.FakeCmd{
-		CombinedOutputScript: []fakeexec.FakeCombinedOutputAction{
-			func() ([]byte, error) { return nil, nil },
-			func() ([]byte, error) { return []byte("error"), &fakeexec.FakeExitError{Status: 1} },
-			func() ([]byte, error) { return nil, nil },
-			func() ([]byte, error) { return []byte("error"), &fakeexec.FakeExitError{Status: 1} },
+		CombinedOutputScript: []fakeexec.FakeAction{
+			func() ([]byte, []byte, error) { return nil, nil, nil },
+			// If the pull fails, it will be retried 5 times (see PullImageRetry in constants/constants.go)
+			func() ([]byte, []byte, error) { return []byte("error"), nil, &fakeexec.FakeExitError{Status: 1} },
+			func() ([]byte, []byte, error) { return []byte("error"), nil, &fakeexec.FakeExitError{Status: 1} },
+			func() ([]byte, []byte, error) { return []byte("error"), nil, &fakeexec.FakeExitError{Status: 1} },
+			func() ([]byte, []byte, error) { return []byte("error"), nil, &fakeexec.FakeExitError{Status: 1} },
+			func() ([]byte, []byte, error) { return []byte("error"), nil, &fakeexec.FakeExitError{Status: 1} },
+			func() ([]byte, []byte, error) { return nil, nil, nil },
+			// If the pull fails, it will be retried 5 times (see PullImageRetry in constants/constants.go)
+			func() ([]byte, []byte, error) { return []byte("error"), nil, &fakeexec.FakeExitError{Status: 1} },
+			func() ([]byte, []byte, error) { return []byte("error"), nil, &fakeexec.FakeExitError{Status: 1} },
+			func() ([]byte, []byte, error) { return []byte("error"), nil, &fakeexec.FakeExitError{Status: 1} },
+			func() ([]byte, []byte, error) { return []byte("error"), nil, &fakeexec.FakeExitError{Status: 1} },
+			func() ([]byte, []byte, error) { return []byte("error"), nil, &fakeexec.FakeExitError{Status: 1} },
 		},
 	}
 	execer := fakeexec.FakeExec{
@@ -271,7 +284,7 @@ func TestPullImage(t *testing.T) {
 
 func TestImageExists(t *testing.T) {
 	fcmd := fakeexec.FakeCmd{
-		RunScript: []fakeexec.FakeRunAction{
+		RunScript: []fakeexec.FakeAction{
 			func() ([]byte, []byte, error) { return nil, nil, nil },
 			func() ([]byte, []byte, error) { return nil, nil, &fakeexec.FakeExitError{Status: 1} },
 			func() ([]byte, []byte, error) { return nil, nil, nil },

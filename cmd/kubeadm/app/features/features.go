@@ -22,26 +22,26 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/pkg/errors"
 	"k8s.io/apimachinery/pkg/util/version"
 	"k8s.io/component-base/featuregate"
+
+	"github.com/pkg/errors"
 )
 
 const (
-
-	// CoreDNS is GA in v1.11
-	CoreDNS = "CoreDNS"
-	// IPv6DualStack is expected to be alpha in v1.16
+	// IPv6DualStack is expected to be beta in v1.21
 	IPv6DualStack = "IPv6DualStack"
+	// PublicKeysECDSA is expected to be alpha in v1.19
+	PublicKeysECDSA = "PublicKeysECDSA"
+	// RootlessControlPlane is expected to be in alpha in v1.22
+	RootlessControlPlane = "RootlessControlPlane"
 )
-
-var coreDNSMessage = "featureGates:CoreDNS has been removed in v1.13\n" +
-	"\tUse kubeadm-config to select which DNS addon to install."
 
 // InitFeatureGates are the default feature gates for the init command
 var InitFeatureGates = FeatureList{
-	CoreDNS:       {FeatureSpec: featuregate.FeatureSpec{Default: true, PreRelease: featuregate.Deprecated}, HiddenInHelpText: true, DeprecationMessage: coreDNSMessage},
-	IPv6DualStack: {FeatureSpec: featuregate.FeatureSpec{Default: false, PreRelease: featuregate.Alpha}},
+	IPv6DualStack:        {FeatureSpec: featuregate.FeatureSpec{Default: true, PreRelease: featuregate.Beta}},
+	PublicKeysECDSA:      {FeatureSpec: featuregate.FeatureSpec{Default: false, PreRelease: featuregate.Alpha}},
+	RootlessControlPlane: {FeatureSpec: featuregate.FeatureSpec{Default: false, PreRelease: featuregate.Alpha}},
 }
 
 // Feature represents a feature being gated

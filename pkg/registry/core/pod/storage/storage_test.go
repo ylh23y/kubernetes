@@ -18,15 +18,16 @@ package storage
 
 import (
 	"context"
+	"fmt"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
 
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	metav1beta1 "k8s.io/apimachinery/pkg/apis/meta/v1beta1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -36,7 +37,7 @@ import (
 	genericregistry "k8s.io/apiserver/pkg/registry/generic/registry"
 	genericregistrytest "k8s.io/apiserver/pkg/registry/generic/testing"
 	"k8s.io/apiserver/pkg/registry/rest"
-	"k8s.io/apiserver/pkg/storage"
+	apiserverstorage "k8s.io/apiserver/pkg/storage"
 	storeerr "k8s.io/apiserver/pkg/storage/errors"
 	etcd3testing "k8s.io/apiserver/pkg/storage/etcd3/testing"
 	api "k8s.io/kubernetes/pkg/apis/core"
@@ -52,7 +53,10 @@ func newStorage(t *testing.T) (*REST, *BindingREST, *StatusREST, *etcd3testing.E
 		DeleteCollectionWorkers: 3,
 		ResourcePrefix:          "pods",
 	}
-	storage := NewStorage(restOptions, nil, nil, nil)
+	storage, err := NewStorage(restOptions, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("unexpected error from REST storage: %v", err)
+	}
 	return storage.Pod, storage.Binding, storage.Status, server
 }
 
@@ -81,7 +85,7 @@ func validNewPod() *api.Pod {
 				},
 			},
 			SecurityContext:    &api.PodSecurityContext{},
-			SchedulerName:      api.DefaultSchedulerName,
+			SchedulerName:      v1.DefaultSchedulerName,
 			EnableServiceLinks: &enableServiceLinks,
 		},
 	}
@@ -102,7 +106,7 @@ func TestCreate(t *testing.T) {
 	test := genericregistrytest.New(t, storage.Store)
 	pod := validNewPod()
 	pod.ObjectMeta = metav1.ObjectMeta{}
-	// Make an invalid pod with an an incorrect label.
+	// Make an invalid pod with an incorrect label.
 	invalidPod := validNewPod()
 	invalidPod.Namespace = test.TestNamespace()
 	invalidPod.Labels = map[string]string{
@@ -152,13 +156,13 @@ func TestDelete(t *testing.T) {
 }
 
 type FailDeletionStorage struct {
-	storage.Interface
+	apiserverstorage.Interface
 	Called *bool
 }
 
-func (f FailDeletionStorage) Delete(ctx context.Context, key string, out runtime.Object, precondition *storage.Preconditions, _ storage.ValidateObjectFunc) error {
+func (f FailDeletionStorage) Delete(_ context.Context, key string, _ runtime.Object, _ *apiserverstorage.Preconditions, _ apiserverstorage.ValidateObjectFunc, _ runtime.Object) error {
 	*f.Called = true
-	return storage.NewKeyNotFoundError(key, 0)
+	return apiserverstorage.NewKeyNotFoundError(key, 0)
 }
 
 func newFailDeleteStorage(t *testing.T, called *bool) (*REST, *etcd3testing.EtcdTestServer) {
@@ -169,7 +173,10 @@ func newFailDeleteStorage(t *testing.T, called *bool) (*REST, *etcd3testing.Etcd
 		DeleteCollectionWorkers: 3,
 		ResourcePrefix:          "pods",
 	}
-	storage := NewStorage(restOptions, nil, nil, nil)
+	storage, err := NewStorage(restOptions, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("unexpected error from REST storage: %v", err)
+	}
 	storage.Pod.Store.Storage = genericregistry.DryRunnableStorage{Storage: FailDeletionStorage{storage.Pod.Store.Storage.Storage, called}}
 	return storage.Pod, server
 }
@@ -246,7 +253,7 @@ func TestCreateSetsFields(t *testing.T) {
 
 func TestResourceLocation(t *testing.T) {
 	expectedIP := "1.2.3.4"
-	expectedIP6 := "2001:db8::"
+	expectedIP6 := "fd00:10:244:0:2::6b"
 	testCases := []struct {
 		pod      api.Pod
 		query    string
@@ -280,6 +287,19 @@ func TestResourceLocation(t *testing.T) {
 			},
 			query:    "foo",
 			location: expectedIP,
+		},
+		{
+			pod: api.Pod{
+				ObjectMeta: metav1.ObjectMeta{Name: "foo"},
+				Spec: api.PodSpec{
+					Containers: []api.Container{
+						{Name: "ctr"},
+					},
+				},
+				Status: api.PodStatus{PodIPs: []api.PodIP{{IP: expectedIP6}}},
+			},
+			query:    "foo",
+			location: "[" + expectedIP6 + "]",
 		},
 		{
 			pod: api.Pod{
@@ -349,18 +369,34 @@ func TestResourceLocation(t *testing.T) {
 			query:    "foo",
 			location: expectedIP + ":9376",
 		},
+		{
+			pod: api.Pod{
+				ObjectMeta: metav1.ObjectMeta{Name: "foo"},
+				Spec: api.PodSpec{
+					Containers: []api.Container{
+						{Name: "ctr1", Ports: []api.ContainerPort{{ContainerPort: 9376}}},
+						{Name: "ctr2", Ports: []api.ContainerPort{{ContainerPort: 1234}}},
+					},
+				},
+				Status: api.PodStatus{PodIPs: []api.PodIP{{IP: expectedIP6}, {IP: expectedIP}}},
+			},
+			query:    "foo",
+			location: "[" + expectedIP6 + "]:9376",
+		},
 	}
 
-	ctx := genericapirequest.NewDefaultContext()
-	for _, tc := range testCases {
-		storage, _, _, server := newStorage(t)
+	storage, _, _, server := newStorage(t)
+	defer server.Terminate(t)
+	for i, tc := range testCases {
+		// unique namespace/storage location per test
+		ctx := genericapirequest.WithNamespace(genericapirequest.NewDefaultContext(), fmt.Sprintf("namespace-%d", i))
 		key, _ := storage.KeyFunc(ctx, tc.pod.Name)
 		if err := storage.Storage.Create(ctx, key, &tc.pod, nil, 0, false); err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
 
 		redirector := rest.Redirector(storage)
-		location, _, err := redirector.ResourceLocation(genericapirequest.NewDefaultContext(), tc.query)
+		location, _, err := redirector.ResourceLocation(ctx, tc.query)
 		if err != nil {
 			t.Errorf("Unexpected error: %v", err)
 		}
@@ -374,7 +410,10 @@ func TestResourceLocation(t *testing.T) {
 		if location.Host != tc.location {
 			t.Errorf("Expected %v, but got %v", tc.location, location.Host)
 		}
-		server.Terminate(t)
+		if _, err := url.Parse(location.String()); err != nil {
+			t.Errorf("could not parse returned location %s: %v", location.String(), err)
+		}
+
 	}
 }
 
@@ -424,11 +463,11 @@ func TestConvertToTableList(t *testing.T) {
 	defer storage.Store.DestroyFunc()
 	ctx := genericapirequest.NewDefaultContext()
 
-	columns := []metav1beta1.TableColumnDefinition{
+	columns := []metav1.TableColumnDefinition{
 		{Name: "Name", Type: "string", Format: "name", Description: metav1.ObjectMeta{}.SwaggerDoc()["name"]},
 		{Name: "Ready", Type: "string", Description: "The aggregate readiness state of this pod for accepting traffic."},
 		{Name: "Status", Type: "string", Description: "The aggregate status of the containers in this pod."},
-		{Name: "Restarts", Type: "integer", Description: "The number of times the containers in this pod have been restarted."},
+		{Name: "Restarts", Type: "string", Description: "The number of times the containers in this pod have been restarted and when the last container in this pod has restarted."},
 		{Name: "Age", Type: "string", Description: metav1.ObjectMeta{}.SwaggerDoc()["creationTimestamp"]},
 		{Name: "IP", Type: "string", Priority: 1, Description: v1.PodStatus{}.SwaggerDoc()["podIP"]},
 		{Name: "Node", Type: "string", Priority: 1, Description: v1.PodSpec{}.SwaggerDoc()["nodeName"]},
@@ -516,7 +555,7 @@ func TestConvertToTableList(t *testing.T) {
 
 	testCases := []struct {
 		in  runtime.Object
-		out *metav1beta1.Table
+		out *metav1.Table
 		err bool
 	}{
 		{
@@ -525,32 +564,32 @@ func TestConvertToTableList(t *testing.T) {
 		},
 		{
 			in: &api.Pod{},
-			out: &metav1beta1.Table{
+			out: &metav1.Table{
 				ColumnDefinitions: columns,
-				Rows: []metav1beta1.TableRow{
-					{Cells: []interface{}{"", "0/0", "", int64(0), "<unknown>", "<none>", "<none>", "<none>", "<none>"}, Object: runtime.RawExtension{Object: &api.Pod{}}},
+				Rows: []metav1.TableRow{
+					{Cells: []interface{}{"", "0/0", "", "0", "<unknown>", "<none>", "<none>", "<none>", "<none>"}, Object: runtime.RawExtension{Object: &api.Pod{}}},
 				},
 			},
 		},
 		{
 			in: pod1,
-			out: &metav1beta1.Table{
+			out: &metav1.Table{
 				ColumnDefinitions: columns,
-				Rows: []metav1beta1.TableRow{
-					{Cells: []interface{}{"foo", "1/2", "Pending", int64(10), "370d", "10.1.2.3", "test-node", "nominated-node", "1/2"}, Object: runtime.RawExtension{Object: pod1}},
+				Rows: []metav1.TableRow{
+					{Cells: []interface{}{"foo", "1/2", "Pending", "10", "370d", "10.1.2.3", "test-node", "nominated-node", "1/2"}, Object: runtime.RawExtension{Object: pod1}},
 				},
 			},
 		},
 		{
 			in:  &api.PodList{},
-			out: &metav1beta1.Table{ColumnDefinitions: columns},
+			out: &metav1.Table{ColumnDefinitions: columns},
 		},
 		{
 			in: multiIPsPod,
-			out: &metav1beta1.Table{
+			out: &metav1.Table{
 				ColumnDefinitions: columns,
-				Rows: []metav1beta1.TableRow{
-					{Cells: []interface{}{"foo", "1/2", "Pending", int64(10), "370d", "10.1.2.3", "test-node", "nominated-node", "1/2"}, Object: runtime.RawExtension{Object: multiIPsPod}},
+				Rows: []metav1.TableRow{
+					{Cells: []interface{}{"foo", "1/2", "Pending", "10", "370d", "10.1.2.3", "test-node", "nominated-node", "1/2"}, Object: runtime.RawExtension{Object: multiIPsPod}},
 				},
 			},
 		},
@@ -581,7 +620,7 @@ func TestEtcdCreate(t *testing.T) {
 	}
 
 	// Suddenly, a wild scheduler appears:
-	_, err = bindingStorage.Create(ctx, &api.Binding{
+	_, err = bindingStorage.Create(ctx, "foo", &api.Binding{
 		ObjectMeta: metav1.ObjectMeta{Namespace: metav1.NamespaceDefault, Name: "foo"},
 		Target:     api.ObjectReference{Name: "machine"},
 	}, rest.ValidateAllObjectFunc, &metav1.CreateOptions{})
@@ -607,7 +646,7 @@ func TestEtcdCreateBindingNoPod(t *testing.T) {
 	// - Create (apiserver)
 	// - Schedule (scheduler)
 	// - Delete (apiserver)
-	_, err := bindingStorage.Create(ctx, &api.Binding{
+	_, err := bindingStorage.Create(ctx, "foo", &api.Binding{
 		ObjectMeta: metav1.ObjectMeta{Namespace: metav1.NamespaceDefault, Name: "foo"},
 		Target:     api.ObjectReference{Name: "machine"},
 	}, rest.ValidateAllObjectFunc, &metav1.CreateOptions{})
@@ -651,7 +690,7 @@ func TestEtcdCreateWithContainersNotFound(t *testing.T) {
 	}
 
 	// Suddenly, a wild scheduler appears:
-	_, err = bindingStorage.Create(ctx, &api.Binding{
+	_, err = bindingStorage.Create(ctx, "foo", &api.Binding{
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace:   metav1.NamespaceDefault,
 			Name:        "foo",
@@ -694,12 +733,12 @@ func TestEtcdCreateWithConflict(t *testing.T) {
 		},
 		Target: api.ObjectReference{Name: "machine"},
 	}
-	_, err = bindingStorage.Create(ctx, &binding, rest.ValidateAllObjectFunc, &metav1.CreateOptions{})
+	_, err = bindingStorage.Create(ctx, binding.Name, &binding, rest.ValidateAllObjectFunc, &metav1.CreateOptions{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	_, err = bindingStorage.Create(ctx, &binding, rest.ValidateAllObjectFunc, &metav1.CreateOptions{})
+	_, err = bindingStorage.Create(ctx, binding.Name, &binding, rest.ValidateAllObjectFunc, &metav1.CreateOptions{})
 	if err == nil || !errors.IsConflict(err) {
 		t.Fatalf("expected resource conflict error, not: %v", err)
 	}
@@ -716,7 +755,7 @@ func TestEtcdCreateWithExistingContainers(t *testing.T) {
 	}
 
 	// Suddenly, a wild scheduler appears:
-	_, err = bindingStorage.Create(ctx, &api.Binding{
+	_, err = bindingStorage.Create(ctx, "foo", &api.Binding{
 		ObjectMeta: metav1.ObjectMeta{Namespace: metav1.NamespaceDefault, Name: "foo"},
 		Target:     api.ObjectReference{Name: "machine"},
 	}, rest.ValidateAllObjectFunc, &metav1.CreateOptions{})
@@ -731,11 +770,10 @@ func TestEtcdCreateWithExistingContainers(t *testing.T) {
 }
 
 func TestEtcdCreateBinding(t *testing.T) {
-	ctx := genericapirequest.NewDefaultContext()
-
 	testCases := map[string]struct {
-		binding api.Binding
-		errOK   func(error) bool
+		binding      api.Binding
+		badNameInURL bool
+		errOK        func(error) bool
 	}{
 		"noName": {
 			binding: api.Binding{
@@ -743,6 +781,14 @@ func TestEtcdCreateBinding(t *testing.T) {
 				Target:     api.ObjectReference{},
 			},
 			errOK: func(err error) bool { return err != nil },
+		},
+		"badNameInURL": {
+			binding: api.Binding{
+				ObjectMeta: metav1.ObjectMeta{Namespace: metav1.NamespaceDefault, Name: "foo"},
+				Target:     api.ObjectReference{},
+			},
+			badNameInURL: true,
+			errOK:        func(err error) bool { return err != nil },
 		},
 		"badKind": {
 			binding: api.Binding{
@@ -766,25 +812,32 @@ func TestEtcdCreateBinding(t *testing.T) {
 			errOK: func(err error) bool { return err == nil },
 		},
 	}
-	for k, test := range testCases {
-		storage, bindingStorage, _, server := newStorage(t)
+	storage, bindingStorage, _, server := newStorage(t)
+	defer server.Terminate(t)
+	defer storage.Store.DestroyFunc()
 
-		if _, err := storage.Create(ctx, validNewPod(), rest.ValidateAllObjectFunc, &metav1.CreateOptions{}); err != nil {
+	for k, test := range testCases {
+		pod := validNewPod()
+		pod.Namespace = fmt.Sprintf("namespace-%s", strings.ToLower(k))
+		ctx := genericapirequest.WithNamespace(genericapirequest.NewDefaultContext(), pod.Namespace)
+		if _, err := storage.Create(ctx, pod, rest.ValidateAllObjectFunc, &metav1.CreateOptions{}); err != nil {
 			t.Fatalf("%s: unexpected error: %v", k, err)
 		}
-		if _, err := bindingStorage.Create(ctx, &test.binding, rest.ValidateAllObjectFunc, &metav1.CreateOptions{}); !test.errOK(err) {
+		name := test.binding.Name
+		if test.badNameInURL {
+			name += "badNameInURL"
+		}
+		if _, err := bindingStorage.Create(ctx, name, &test.binding, rest.ValidateAllObjectFunc, &metav1.CreateOptions{}); !test.errOK(err) {
 			t.Errorf("%s: unexpected error: %v", k, err)
 		} else if err == nil {
 			// If bind succeeded, verify Host field in pod's Spec.
-			pod, err := storage.Get(ctx, validNewPod().ObjectMeta.Name, &metav1.GetOptions{})
+			pod, err := storage.Get(ctx, pod.ObjectMeta.Name, &metav1.GetOptions{})
 			if err != nil {
 				t.Errorf("%s: unexpected error: %v", k, err)
 			} else if pod.(*api.Pod).Spec.NodeName != test.binding.Target.Name {
 				t.Errorf("%s: expected: %v, got: %v", k, pod.(*api.Pod).Spec.NodeName, test.binding.Target.Name)
 			}
 		}
-		storage.Store.DestroyFunc()
-		server.Terminate(t)
 	}
 }
 
@@ -836,7 +889,7 @@ func TestEtcdUpdateScheduled(t *testing.T) {
 				},
 			},
 			SecurityContext: &api.PodSecurityContext{},
-			SchedulerName:   api.DefaultSchedulerName,
+			SchedulerName:   v1.DefaultSchedulerName,
 		},
 	}, nil, 1, false)
 	if err != nil {
@@ -867,7 +920,7 @@ func TestEtcdUpdateScheduled(t *testing.T) {
 
 			TerminationGracePeriodSeconds: &grace,
 			SecurityContext:               &api.PodSecurityContext{},
-			SchedulerName:                 api.DefaultSchedulerName,
+			SchedulerName:                 v1.DefaultSchedulerName,
 			EnableServiceLinks:            &enableServiceLinks,
 		},
 	}
@@ -909,7 +962,7 @@ func TestEtcdUpdateStatus(t *testing.T) {
 				},
 			},
 			SecurityContext: &api.PodSecurityContext{},
-			SchedulerName:   api.DefaultSchedulerName,
+			SchedulerName:   v1.DefaultSchedulerName,
 		},
 	}
 	err := storage.Storage.Create(ctx, key, &podStart, nil, 0, false)
@@ -935,7 +988,7 @@ func TestEtcdUpdateStatus(t *testing.T) {
 					},
 				},
 				SecurityContext: &api.PodSecurityContext{},
-				SchedulerName:   api.DefaultSchedulerName,
+				SchedulerName:   v1.DefaultSchedulerName,
 			},
 			Status: api.PodStatus{
 				Phase:   api.PodRunning,
@@ -960,7 +1013,7 @@ func TestEtcdUpdateStatus(t *testing.T) {
 					},
 				},
 				SecurityContext: &api.PodSecurityContext{},
-				SchedulerName:   api.DefaultSchedulerName,
+				SchedulerName:   v1.DefaultSchedulerName,
 			},
 			Status: api.PodStatus{
 				Phase:   api.PodRunning,

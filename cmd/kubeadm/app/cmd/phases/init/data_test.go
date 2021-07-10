@@ -19,9 +19,10 @@ package phases
 import (
 	"io"
 
+	kubeadmapi "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm"
+
 	"k8s.io/apimachinery/pkg/util/sets"
 	clientset "k8s.io/client-go/kubernetes"
-	kubeadmapi "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm"
 )
 
 // a package local type for testing purposes.
@@ -48,3 +49,4 @@ func (t *testInitData) ExternalCA() bool                     { return false }
 func (t *testInitData) OutputWriter() io.Writer              { return nil }
 func (t *testInitData) Client() (clientset.Interface, error) { return nil, nil }
 func (t *testInitData) Tokens() []string                     { return nil }
+func (t *testInitData) PatchesDir() string                   { return "" }

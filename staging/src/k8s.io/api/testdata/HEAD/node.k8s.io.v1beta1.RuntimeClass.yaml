@@ -1,11 +1,11 @@
 apiVersion: node.k8s.io/v1beta1
-handler: "18"
+handler: "20"
 kind: RuntimeClass
 metadata:
   annotations:
     "9": "10"
   clusterName: "15"
-  creationTimestamp: null
+  creationTimestamp: "2061-09-19T18:13:36Z"
   deletionGracePeriodSeconds: -4955867275792137171
   finalizers:
   - "14"
@@ -15,8 +15,10 @@ metadata:
     "7": "8"
   managedFields:
   - apiVersion: "17"
+    fieldsType: "18"
     manager: "16"
     operation: 鐊唊飙Ş-U圴÷a/ɔ}摁(湗Ć]
+    subresource: "19"
   name: "2"
   namespace: "4"
   ownerReferences:
@@ -32,3 +34,11 @@ metadata:
 overhead:
   podFixed:
     qJ枊a8衍`Ĩ: "652"
+scheduling:
+  nodeSelector:
+    "21": "22"
+  tolerations:
+  - effect: 6ċ
+    key: "23"
+    tolerationSeconds: -5658031457286093454
+    value: "24"

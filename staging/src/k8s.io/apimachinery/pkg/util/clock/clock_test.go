@@ -33,19 +33,49 @@ var (
 	_ = Ticker(&fakeTicker{})
 )
 
+type SettablePassiveClock interface {
+	PassiveClock
+	SetTime(time.Time)
+}
+
+func exercisePassiveClock(t *testing.T, pc SettablePassiveClock) {
+	t1 := time.Now()
+	t2 := t1.Add(time.Hour)
+	pc.SetTime(t1)
+	tx := pc.Now()
+	if tx != t1 {
+		t.Errorf("SetTime(%#+v); Now() => %#+v", t1, tx)
+	}
+	dx := pc.Since(t1)
+	if dx != 0 {
+		t.Errorf("Since() => %v", dx)
+	}
+	pc.SetTime(t2)
+	dx = pc.Since(t1)
+	if dx != time.Hour {
+		t.Errorf("Since() => %v", dx)
+	}
+	tx = pc.Now()
+	if tx != t2 {
+		t.Errorf("Now() => %#+v", tx)
+	}
+}
+
+func TestFakePassiveClock(t *testing.T) {
+	startTime := time.Now()
+	tc := NewFakePassiveClock(startTime)
+	exercisePassiveClock(t, tc)
+}
+
 func TestFakeClock(t *testing.T) {
 	startTime := time.Now()
 	tc := NewFakeClock(startTime)
+	exercisePassiveClock(t, tc)
+	tc.SetTime(startTime)
 	tc.Step(time.Second)
 	now := tc.Now()
 	if now.Sub(startTime) != time.Second {
 		t.Errorf("input: %s now=%s gap=%s expected=%s", startTime, now, now.Sub(startTime), time.Second)
-	}
-
-	tt := tc.Now()
-	tc.SetTime(tt.Add(time.Hour))
-	if tc.Since(tt) != time.Hour {
-		t.Errorf("input: %s now=%s gap=%s expected=%s", tt, tc.Now(), tc.Since(tt), time.Hour)
 	}
 }
 
@@ -115,6 +145,66 @@ func TestFakeAfter(t *testing.T) {
 	default:
 		t.Errorf("unexpected non-channel read")
 	}
+}
+
+func TestFakeAfterFunc(t *testing.T) {
+	tc := NewFakeClock(time.Now())
+	if tc.HasWaiters() {
+		t.Errorf("unexpected waiter?")
+	}
+	expectOneSecTimerFire := false
+	oneSecTimerFire := 0
+	tc.AfterFunc(time.Second, func() {
+		if !expectOneSecTimerFire {
+			t.Errorf("oneSecTimer func fired")
+		} else {
+			oneSecTimerFire++
+		}
+	})
+	if !tc.HasWaiters() {
+		t.Errorf("unexpected lack of waiter?")
+	}
+
+	expectOneOhOneSecTimerFire := false
+	oneOhOneSecTimerFire := 0
+	tc.AfterFunc(time.Second+time.Millisecond, func() {
+		if !expectOneOhOneSecTimerFire {
+			t.Errorf("oneOhOneSecTimer func fired")
+		} else {
+			oneOhOneSecTimerFire++
+		}
+	})
+
+	expectTwoSecTimerFire := false
+	twoSecTimerFire := 0
+	twoSecTimer := tc.AfterFunc(2*time.Second, func() {
+		if !expectTwoSecTimerFire {
+			t.Errorf("twoSecTimer func fired")
+		} else {
+			twoSecTimerFire++
+		}
+	})
+
+	tc.Step(999 * time.Millisecond)
+
+	expectOneSecTimerFire = true
+	tc.Step(time.Millisecond)
+	if oneSecTimerFire != 1 {
+		t.Errorf("expected oneSecTimerFire=1, got %d", oneSecTimerFire)
+	}
+	expectOneSecTimerFire = false
+
+	expectOneOhOneSecTimerFire = true
+	tc.Step(time.Millisecond)
+	if oneOhOneSecTimerFire != 1 {
+		// should not double-trigger!
+		t.Errorf("expected oneOhOneSecTimerFire=1, got %d", oneOhOneSecTimerFire)
+	}
+	expectOneOhOneSecTimerFire = false
+
+	// ensure a canceled timer doesn't fire
+	twoSecTimer.Stop()
+	tc.Step(time.Second)
 }
 
 func TestFakeTimer(t *testing.T) {
@@ -187,8 +277,8 @@ func TestFakeTimer(t *testing.T) {
 		t.Errorf("unexpected channel read")
 	default:
 	}
-	if twoSec.Reset(time.Second) {
-		t.Errorf("Expected twoSec.Reset() to return false")
+	if !twoSec.Reset(time.Second) {
+		t.Errorf("Expected twoSec.Reset() to return true")
 	}
 	if !treSec.Reset(time.Second) {
 		t.Errorf("Expected treSec.Reset() to return true")
@@ -208,8 +298,9 @@ func TestFakeTimer(t *testing.T) {
 	case <-oneSec.C():
 		t.Errorf("unexpected channel read")
 	case <-twoSec.C():
-		t.Errorf("unexpected channel read")
+		// Expected!
 	default:
+		t.Errorf("unexpected channel non-read")
 	}
 	select {
 	case <-treSec.C():

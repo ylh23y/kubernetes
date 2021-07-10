@@ -19,11 +19,12 @@ package node
 import (
 	"fmt"
 
+	"k8s.io/kubernetes/cmd/kubeadm/app/constants"
+	"k8s.io/kubernetes/cmd/kubeadm/app/util/apiclient"
+
 	rbac "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	clientset "k8s.io/client-go/kubernetes"
-	"k8s.io/kubernetes/cmd/kubeadm/app/constants"
-	"k8s.io/kubernetes/cmd/kubeadm/app/util/apiclient"
 )
 
 const (
@@ -32,6 +33,8 @@ const (
 	NodeBootstrapperClusterRoleName = "system:node-bootstrapper"
 	// NodeKubeletBootstrap defines the name of the ClusterRoleBinding that lets kubelets post CSRs
 	NodeKubeletBootstrap = "kubeadm:kubelet-bootstrap"
+	// GetNodesClusterRoleName defines the name of the ClusterRole and ClusterRoleBinding to get nodes
+	GetNodesClusterRoleName = "kubeadm:get-nodes"
 
 	// CSRAutoApprovalClusterRoleName defines the name of the auto-bootstrapped ClusterRole for making the csrapprover controller auto-approve the CSR
 	// TODO: This value should be defined in an other, generic authz package instead of here
@@ -57,6 +60,45 @@ func AllowBootstrapTokensToPostCSRs(client clientset.Interface) error {
 			APIGroup: rbac.GroupName,
 			Kind:     "ClusterRole",
 			Name:     NodeBootstrapperClusterRoleName,
+		},
+		Subjects: []rbac.Subject{
+			{
+				Kind: rbac.GroupKind,
+				Name: constants.NodeBootstrapTokenAuthGroup,
+			},
+		},
+	})
+}
+
+// AllowBoostrapTokensToGetNodes creates RBAC rules to allow Node Bootstrap Tokens to list nodes
+func AllowBoostrapTokensToGetNodes(client clientset.Interface) error {
+	fmt.Println("[bootstrap-token] configured RBAC rules to allow Node Bootstrap tokens to get nodes")
+
+	if err := apiclient.CreateOrUpdateClusterRole(client, &rbac.ClusterRole{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      GetNodesClusterRoleName,
+			Namespace: metav1.NamespaceSystem,
+		},
+		Rules: []rbac.PolicyRule{
+			{
+				Verbs:     []string{"get"},
+				APIGroups: []string{""},
+				Resources: []string{"nodes"},
+			},
+		},
+	}); err != nil {
+		return err
+	}
+
+	return apiclient.CreateOrUpdateClusterRoleBinding(client, &rbac.ClusterRoleBinding{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      GetNodesClusterRoleName,
+			Namespace: metav1.NamespaceSystem,
+		},
+		RoleRef: rbac.RoleRef{
+			APIGroup: rbac.GroupName,
+			Kind:     "ClusterRole",
+			Name:     GetNodesClusterRoleName,
 		},
 		Subjects: []rbac.Subject{
 			{

@@ -21,13 +21,14 @@ import (
 	"fmt"
 	"path/filepath"
 
-	"k8s.io/klog"
 	kubeadmapi "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm"
 	"k8s.io/kubernetes/cmd/kubeadm/app/cmd/options"
 	"k8s.io/kubernetes/cmd/kubeadm/app/cmd/phases/workflow"
 	kubeadmconstants "k8s.io/kubernetes/cmd/kubeadm/app/constants"
 	etcdphase "k8s.io/kubernetes/cmd/kubeadm/app/phases/etcd"
 	utilstaticpod "k8s.io/kubernetes/cmd/kubeadm/app/util/staticpod"
+
+	"k8s.io/klog/v2"
 )
 
 // NewRemoveETCDMemberPhase creates a kubeadm workflow phase for remove-etcd-member
@@ -58,7 +59,7 @@ func runRemoveETCDMemberPhase(c workflow.RunData) error {
 		r.AddDirsToClean(etcdDataDir)
 		if cfg != nil {
 			if err := etcdphase.RemoveStackedEtcdMemberFromCluster(r.Client(), cfg); err != nil {
-				klog.Warningf("[reset] failed to remove etcd member: %v\n.Please manually remove this etcd member using etcdctl", err)
+				klog.Warningf("[reset] failed to remove etcd member: %v, please manually remove this etcd member using etcdctl", err)
 			}
 		}
 	} else {

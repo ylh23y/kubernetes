@@ -17,20 +17,20 @@ limitations under the License.
 package integration
 
 import (
+	"context"
 	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	"k8s.io/apiextensions-apiserver/test/integration/fixtures"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/dynamic"
-
-	apiextensionsv1beta1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1beta1"
-	"k8s.io/apiextensions-apiserver/test/integration/fixtures"
 )
 
 func TestHandlerScope(t *testing.T) {
@@ -40,15 +40,32 @@ func TestHandlerScope(t *testing.T) {
 	}
 	defer tearDown()
 
-	for _, scope := range []apiextensionsv1beta1.ResourceScope{apiextensionsv1beta1.ClusterScoped, apiextensionsv1beta1.NamespaceScoped} {
+	for _, scope := range []apiextensionsv1.ResourceScope{apiextensionsv1.ClusterScoped, apiextensionsv1.NamespaceScoped} {
 		t.Run(string(scope), func(t *testing.T) {
 
-			crd := &apiextensionsv1beta1.CustomResourceDefinition{
-				ObjectMeta: metav1.ObjectMeta{Name: strings.ToLower(string(scope)) + "s.test.apiextensions-apiserver.k8s.io"},
-				Spec: apiextensionsv1beta1.CustomResourceDefinitionSpec{
-					Group:   "test.apiextensions-apiserver.k8s.io",
-					Version: "v1beta1",
-					Names: apiextensionsv1beta1.CustomResourceDefinitionNames{
+			crd := &apiextensionsv1.CustomResourceDefinition{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:        strings.ToLower(string(scope)) + "s.test.apiextensions-apiserver.k8s.io",
+					Annotations: map[string]string{"api-approved.kubernetes.io": "unapproved, test-only"},
+				},
+				Spec: apiextensionsv1.CustomResourceDefinitionSpec{
+					Group: "test.apiextensions-apiserver.k8s.io",
+					Versions: []apiextensionsv1.CustomResourceDefinitionVersion{
+						{
+							Name:    "v1beta1",
+							Served:  true,
+							Storage: true,
+							Subresources: &apiextensionsv1.CustomResourceSubresources{
+								Status: &apiextensionsv1.CustomResourceSubresourceStatus{},
+								Scale: &apiextensionsv1.CustomResourceSubresourceScale{
+									SpecReplicasPath:   ".spec.replicas",
+									StatusReplicasPath: ".status.replicas",
+								},
+							},
+							Schema: fixtures.AllowAllSchema(),
+						},
+					},
+					Names: apiextensionsv1.CustomResourceDefinitionNames{
 						Plural:   strings.ToLower(string(scope)) + "s",
 						Singular: strings.ToLower(string(scope)),
 						Kind:     string(scope),
@@ -57,14 +74,7 @@ func TestHandlerScope(t *testing.T) {
 					Scope: scope,
 				},
 			}
-			crd.Spec.Subresources = &apiextensionsv1beta1.CustomResourceSubresources{
-				Status: &apiextensionsv1beta1.CustomResourceSubresourceStatus{},
-				Scale: &apiextensionsv1beta1.CustomResourceSubresourceScale{
-					SpecReplicasPath:   ".spec.replicas",
-					StatusReplicasPath: ".status.replicas",
-				},
-			}
-			crd, err = fixtures.CreateNewCustomResourceDefinition(crd, apiExtensionClient, dynamicClient)
+			crd, err = fixtures.CreateNewV1CustomResourceDefinition(crd, apiExtensionClient, dynamicClient)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -74,7 +84,7 @@ func TestHandlerScope(t *testing.T) {
 			ns := "test"
 			var client dynamic.ResourceInterface = dynamicClient.Resource(gvr)
 			var otherScopeClient dynamic.ResourceInterface = dynamicClient.Resource(gvr).Namespace(ns)
-			if crd.Spec.Scope == apiextensionsv1beta1.NamespaceScoped {
+			if crd.Spec.Scope == apiextensionsv1.NamespaceScoped {
 				client, otherScopeClient = otherScopeClient, client
 			}
 
@@ -89,68 +99,68 @@ func TestHandlerScope(t *testing.T) {
 				},
 			}
 
-			_, err := otherScopeClient.Create(cr, metav1.CreateOptions{})
+			_, err := otherScopeClient.Create(context.TODO(), cr, metav1.CreateOptions{})
 			assert.True(t, apierrors.IsNotFound(err))
 
-			_, err = otherScopeClient.Create(cr, metav1.CreateOptions{}, "status")
+			_, err = otherScopeClient.Create(context.TODO(), cr, metav1.CreateOptions{}, "status")
 			assert.True(t, apierrors.IsNotFound(err))
 
-			_, err = otherScopeClient.Create(cr, metav1.CreateOptions{}, "scale")
+			_, err = otherScopeClient.Create(context.TODO(), cr, metav1.CreateOptions{}, "scale")
 			assert.True(t, apierrors.IsNotFound(err))
 
-			_, err = client.Create(cr, metav1.CreateOptions{})
+			_, err = client.Create(context.TODO(), cr, metav1.CreateOptions{})
 			assert.NoError(t, err)
 
-			_, err = otherScopeClient.Get(name, metav1.GetOptions{})
+			_, err = otherScopeClient.Get(context.TODO(), name, metav1.GetOptions{})
 			assert.True(t, apierrors.IsNotFound(err))
 
-			_, err = otherScopeClient.Get(name, metav1.GetOptions{}, "status")
+			_, err = otherScopeClient.Get(context.TODO(), name, metav1.GetOptions{}, "status")
 			assert.True(t, apierrors.IsNotFound(err))
 
-			_, err = otherScopeClient.Get(name, metav1.GetOptions{}, "scale")
+			_, err = otherScopeClient.Get(context.TODO(), name, metav1.GetOptions{}, "scale")
 			assert.True(t, apierrors.IsNotFound(err))
 
-			_, err = otherScopeClient.Update(cr, metav1.UpdateOptions{})
+			_, err = otherScopeClient.Update(context.TODO(), cr, metav1.UpdateOptions{})
 			assert.True(t, apierrors.IsNotFound(err))
 
-			_, err = otherScopeClient.Update(cr, metav1.UpdateOptions{}, "status")
+			_, err = otherScopeClient.Update(context.TODO(), cr, metav1.UpdateOptions{}, "status")
 			assert.True(t, apierrors.IsNotFound(err))
 
-			_, err = otherScopeClient.Update(cr, metav1.UpdateOptions{}, "scale")
+			_, err = otherScopeClient.Update(context.TODO(), cr, metav1.UpdateOptions{}, "scale")
 			assert.True(t, apierrors.IsNotFound(err))
 
-			_, err = otherScopeClient.Patch(name, types.MergePatchType, []byte(`{"metadata":{"annotations":{"test":"1"}}}`), metav1.PatchOptions{})
+			_, err = otherScopeClient.Patch(context.TODO(), name, types.MergePatchType, []byte(`{"metadata":{"annotations":{"test":"1"}}}`), metav1.PatchOptions{})
 			assert.True(t, apierrors.IsNotFound(err))
 
-			_, err = otherScopeClient.Patch(name, types.MergePatchType, []byte(`{"metadata":{"annotations":{"test":"1"}}}`), metav1.PatchOptions{}, "status")
+			_, err = otherScopeClient.Patch(context.TODO(), name, types.MergePatchType, []byte(`{"metadata":{"annotations":{"test":"1"}}}`), metav1.PatchOptions{}, "status")
 			assert.True(t, apierrors.IsNotFound(err))
 
-			_, err = otherScopeClient.Patch(name, types.MergePatchType, []byte(`{"metadata":{"annotations":{"test":"1"}}}`), metav1.PatchOptions{}, "scale")
+			_, err = otherScopeClient.Patch(context.TODO(), name, types.MergePatchType, []byte(`{"metadata":{"annotations":{"test":"1"}}}`), metav1.PatchOptions{}, "scale")
 			assert.True(t, apierrors.IsNotFound(err))
 
-			err = otherScopeClient.Delete(name, &metav1.DeleteOptions{})
+			err = otherScopeClient.Delete(context.TODO(), name, metav1.DeleteOptions{})
 			assert.True(t, apierrors.IsNotFound(err))
 
-			err = otherScopeClient.Delete(name, &metav1.DeleteOptions{}, "status")
+			err = otherScopeClient.Delete(context.TODO(), name, metav1.DeleteOptions{}, "status")
 			assert.True(t, apierrors.IsNotFound(err))
 
-			err = otherScopeClient.Delete(name, &metav1.DeleteOptions{}, "scale")
+			err = otherScopeClient.Delete(context.TODO(), name, metav1.DeleteOptions{}, "scale")
 			assert.True(t, apierrors.IsNotFound(err))
 
-			err = otherScopeClient.DeleteCollection(&metav1.DeleteOptions{}, metav1.ListOptions{})
+			err = otherScopeClient.DeleteCollection(context.TODO(), metav1.DeleteOptions{}, metav1.ListOptions{})
 			assert.True(t, apierrors.IsNotFound(err))
 
-			if scope == apiextensionsv1beta1.ClusterScoped {
-				_, err = otherScopeClient.List(metav1.ListOptions{})
+			if scope == apiextensionsv1.ClusterScoped {
+				_, err = otherScopeClient.List(context.TODO(), metav1.ListOptions{})
 				assert.True(t, apierrors.IsNotFound(err))
 
-				_, err = otherScopeClient.Watch(metav1.ListOptions{})
+				_, err = otherScopeClient.Watch(context.TODO(), metav1.ListOptions{})
 				assert.True(t, apierrors.IsNotFound(err))
 			} else {
-				_, err = otherScopeClient.List(metav1.ListOptions{})
+				_, err = otherScopeClient.List(context.TODO(), metav1.ListOptions{})
 				assert.NoError(t, err)
 
-				w, err := otherScopeClient.Watch(metav1.ListOptions{})
+				w, err := otherScopeClient.Watch(context.TODO(), metav1.ListOptions{})
 				assert.NoError(t, err)
 				if w != nil {
 					w.Stop()

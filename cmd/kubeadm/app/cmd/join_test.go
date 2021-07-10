@@ -17,17 +17,20 @@ limitations under the License.
 package cmd
 
 import (
+	"fmt"
 	"io/ioutil"
 	"os"
 	"path/filepath"
 	"testing"
 
-	"k8s.io/apimachinery/pkg/util/sets"
+	kubeadmapiv1 "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm/v1beta3"
 	"k8s.io/kubernetes/cmd/kubeadm/app/cmd/options"
+	kubeconfigutil "k8s.io/kubernetes/cmd/kubeadm/app/util/kubeconfig"
+
+	"k8s.io/apimachinery/pkg/util/sets"
 )
 
-const (
-	testJoinConfig = `apiVersion: kubeadm.k8s.io/v1beta2
+var testJoinConfig = fmt.Sprintf(`apiVersion: %s
 kind: JoinConfiguration
 discovery:
   bootstrapToken:
@@ -40,8 +43,7 @@ nodeRegistration:
   ignorePreflightErrors:
     - c
     - d
-`
-)
+`, kubeadmapiv1.SchemeGroupVersion.String())
 
 func TestNewJoinData(t *testing.T) {
 	// create temp directory
@@ -50,6 +52,11 @@ func TestNewJoinData(t *testing.T) {
 		t.Errorf("Unable to create temporary directory: %v", err)
 	}
 	defer os.RemoveAll(tmpDir)
+
+	// create kubeconfig
+	kubeconfigFilePath := filepath.Join(tmpDir, "test-kubeconfig-file")
+	kubeconfig := kubeconfigutil.CreateBasic("", "", "", []byte{})
+	kubeconfigutil.WriteToDisk(kubeconfigFilePath, kubeconfig)
 
 	// create config file
 	configFilePath := filepath.Join(tmpDir, "test-config-file")
@@ -197,15 +204,11 @@ func TestNewJoinData(t *testing.T) {
 		{
 			name: "--cri-socket and --node-name flags override config from file",
 			flags: map[string]string{
-				options.CfgPath:       configFilePath,
-				options.NodeCRISocket: "/var/run/crio/crio.sock",
-				options.NodeName:      "anotherName",
+				options.CfgPath:  configFilePath,
+				options.NodeName: "anotherName",
 			},
 			validate: func(t *testing.T, data *joinData) {
-				// validate that cri-socket and node-name are overwritten
-				if data.cfg.NodeRegistration.CRISocket != "/var/run/crio/crio.sock" {
-					t.Errorf("Invalid NodeRegistration.CRISocket")
-				}
+				// validate that node-name is overwritten
 				if data.cfg.NodeRegistration.Name != "anotherName" {
 					t.Errorf("Invalid NodeRegistration.Name")
 				}
@@ -249,7 +252,7 @@ func TestNewJoinData(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			// initialize an external join option and inject it to the join cmd
 			joinOptions := newJoinOptions()
-			cmd := NewCmdJoin(nil, joinOptions)
+			cmd := newCmdJoin(nil, joinOptions)
 
 			// sets cmd flags (that will be reflected on the join options)
 			for f, v := range tc.flags {
@@ -257,7 +260,7 @@ func TestNewJoinData(t *testing.T) {
 			}
 
 			// test newJoinData method
-			data, err := newJoinData(cmd, tc.args, joinOptions, nil)
+			data, err := newJoinData(cmd, tc.args, joinOptions, nil, kubeconfigFilePath)
 			if err != nil && !tc.expectError {
 				t.Fatalf("newJoinData returned unexpected error: %v", err)
 			}

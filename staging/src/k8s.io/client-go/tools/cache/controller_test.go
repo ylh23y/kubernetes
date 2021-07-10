@@ -44,7 +44,10 @@ func Example() {
 	// This will hold incoming changes. Note how we pass downstream in as a
 	// KeyLister, that way resync operations will result in the correct set
 	// of update/delete deltas.
-	fifo := NewDeltaFIFO(MetaNamespaceKeyFunc, downstream)
+	fifo := NewDeltaFIFOWithOptions(DeltaFIFOOptions{
+		KeyFunction:  MetaNamespaceKeyFunc,
+		KnownObjects: downstream,
+	})
 
 	// Let's do threadsafe output to get predictable test results.
 	deletionCounter := make(chan string, 1000)
@@ -401,4 +404,50 @@ func TestUpdate(t *testing.T) {
 	// Let's wait for the controller to process the things we just added.
 	testDoneWG.Wait()
 	close(stop)
+}
+
+func TestPanicPropagated(t *testing.T) {
+	// source simulates an apiserver object endpoint.
+	source := fcache.NewFakeControllerSource()
+
+	// Make a controller that just panic if the AddFunc is called.
+	_, controller := NewInformer(
+		source,
+		&v1.Pod{},
+		time.Millisecond*100,
+		ResourceEventHandlerFuncs{
+			AddFunc: func(obj interface{}) {
+				// Create a panic.
+				panic("Just panic.")
+			},
+		},
+	)
+
+	// Run the controller and run it until we close stop.
+	stop := make(chan struct{})
+	defer close(stop)
+
+	propagated := make(chan interface{})
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				propagated <- r
+			}
+		}()
+		controller.Run(stop)
+	}()
+	// Let's add a object to the source. It will trigger a panic.
+	source.Add(&v1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "test"}})
+
+	// Check if the panic propagated up.
+	select {
+	case p := <-propagated:
+		if p == "Just panic." {
+			t.Logf("Test Passed")
+		} else {
+			t.Errorf("unrecognized panic in controller run: %v", p)
+		}
+	case <-time.After(wait.ForeverTestTimeout):
+		t.Errorf("timeout: the panic failed to propagate from the controller run method!")
+	}
 }

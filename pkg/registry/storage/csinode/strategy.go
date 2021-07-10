@@ -22,11 +22,9 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	"k8s.io/apiserver/pkg/storage/names"
-	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/kubernetes/pkg/api/legacyscheme"
 	"k8s.io/kubernetes/pkg/apis/storage"
 	"k8s.io/kubernetes/pkg/apis/storage/validation"
-	"k8s.io/kubernetes/pkg/features"
 )
 
 // csiNodeStrategy implements behavior for CSINode objects
@@ -45,22 +43,24 @@ func (csiNodeStrategy) NamespaceScoped() bool {
 
 // PrepareForCreate clears fields that are not allowed to be set on creation.
 func (csiNodeStrategy) PrepareForCreate(ctx context.Context, obj runtime.Object) {
-	csiNode := obj.(*storage.CSINode)
-	if !utilfeature.DefaultFeatureGate.Enabled(features.AttachVolumeLimit) {
-		for i := range csiNode.Spec.Drivers {
-			csiNode.Spec.Drivers[i].Allocatable = nil
-		}
-	}
 }
 
 func (csiNodeStrategy) Validate(ctx context.Context, obj runtime.Object) field.ErrorList {
 	csiNode := obj.(*storage.CSINode)
 
-	errs := validation.ValidateCSINode(csiNode)
-	errs = append(errs, validation.ValidateCSINode(csiNode)...)
+	// in 1.22, on create, set AllowLongNodeID=false
+	// in 1.23, on create, set AllowLongNodeID=true
+	validateOptions := validation.CSINodeValidationOptions{
+		AllowLongNodeID: false,
+	}
+
+	errs := validation.ValidateCSINode(csiNode, validateOptions)
 
 	return errs
 }
+
+// WarningsOnCreate returns warnings for the creation of the given object.
+func (csiNodeStrategy) WarningsOnCreate(ctx context.Context, obj runtime.Object) []string { return nil }
 
 // Canonicalize normalizes the object after validation.
 func (csiNodeStrategy) Canonicalize(obj runtime.Object) {
@@ -72,38 +72,30 @@ func (csiNodeStrategy) AllowCreateOnUpdate() bool {
 
 // PrepareForUpdate sets the driver's Allocatable fields that are not allowed to be set by an end user updating a CSINode.
 func (csiNodeStrategy) PrepareForUpdate(ctx context.Context, obj, old runtime.Object) {
-	newCSINode := obj.(*storage.CSINode)
-	oldCSINode := old.(*storage.CSINode)
-
-	inUse := getAllocatablesInUse(oldCSINode)
-
-	if !utilfeature.DefaultFeatureGate.Enabled(features.AttachVolumeLimit) {
-		for i := range newCSINode.Spec.Drivers {
-			if !inUse[newCSINode.Spec.Drivers[i].Name] {
-				newCSINode.Spec.Drivers[i].Allocatable = nil
-			}
-		}
-	}
-}
-
-func getAllocatablesInUse(obj *storage.CSINode) map[string]bool {
-	inUse := make(map[string]bool)
-	if obj == nil {
-		return inUse
-	}
-	for i := range obj.Spec.Drivers {
-		if obj.Spec.Drivers[i].Allocatable != nil {
-			inUse[obj.Spec.Drivers[i].Name] = true
-		}
-	}
-	return inUse
 }
 
 func (csiNodeStrategy) ValidateUpdate(ctx context.Context, obj, old runtime.Object) field.ErrorList {
 	newCSINodeObj := obj.(*storage.CSINode)
 	oldCSINodeObj := old.(*storage.CSINode)
-	errorList := validation.ValidateCSINode(newCSINodeObj)
-	return append(errorList, validation.ValidateCSINodeUpdate(newCSINodeObj, oldCSINodeObj)...)
+	// in 1.22 on update, set AllowLongNodeID to true only if the old object already has a long node ID
+	// in 1.23 on update, set AllowLongNodeID=true
+	allowLongNodeID := false
+	for _, nodeDriver := range oldCSINodeObj.Spec.Drivers {
+		if validation.CSINodeLongerID(nodeDriver.NodeID) {
+			allowLongNodeID = true
+		}
+	}
+	validateOptions := validation.CSINodeValidationOptions{
+		AllowLongNodeID: allowLongNodeID,
+	}
+
+	errorList := validation.ValidateCSINode(newCSINodeObj, validateOptions)
+	return append(errorList, validation.ValidateCSINodeUpdate(newCSINodeObj, oldCSINodeObj, validateOptions)...)
+}
+
+// WarningsOnUpdate returns warnings for the given update.
+func (csiNodeStrategy) WarningsOnUpdate(ctx context.Context, obj, old runtime.Object) []string {
+	return nil
 }
 
 func (csiNodeStrategy) AllowUnconditionalUpdate() bool {

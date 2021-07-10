@@ -17,6 +17,7 @@ limitations under the License.
 package copycerts
 
 import (
+	"context"
 	"encoding/hex"
 	"fmt"
 	"io/ioutil"
@@ -24,7 +25,12 @@ import (
 	"path"
 	"strings"
 
-	"github.com/pkg/errors"
+	bootstraptokenv1 "k8s.io/kubernetes/cmd/kubeadm/app/apis/bootstraptoken/v1"
+	kubeadmapi "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm"
+	kubeadmconstants "k8s.io/kubernetes/cmd/kubeadm/app/constants"
+	nodebootstraptokenphase "k8s.io/kubernetes/cmd/kubeadm/app/phases/bootstraptoken/node"
+	"k8s.io/kubernetes/cmd/kubeadm/app/util/apiclient"
+	cryptoutil "k8s.io/kubernetes/cmd/kubeadm/app/util/crypto"
 
 	v1 "k8s.io/api/core/v1"
 	rbac "k8s.io/api/rbac/v1"
@@ -35,12 +41,9 @@ import (
 	certutil "k8s.io/client-go/util/cert"
 	keyutil "k8s.io/client-go/util/keyutil"
 	bootstraputil "k8s.io/cluster-bootstrap/token/util"
-	"k8s.io/klog"
-	kubeadmapi "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm"
-	kubeadmconstants "k8s.io/kubernetes/cmd/kubeadm/app/constants"
-	nodebootstraptokenphase "k8s.io/kubernetes/cmd/kubeadm/app/phases/bootstraptoken/node"
-	"k8s.io/kubernetes/cmd/kubeadm/app/util/apiclient"
-	cryptoutil "k8s.io/kubernetes/cmd/kubeadm/app/util/crypto"
+	"k8s.io/klog/v2"
+
+	"github.com/pkg/errors"
 )
 
 const (
@@ -56,11 +59,11 @@ func createShortLivedBootstrapToken(client clientset.Interface) (string, error) 
 	if err != nil {
 		return "", errors.Wrap(err, "error generating token to upload certs")
 	}
-	token, err := kubeadmapi.NewBootstrapTokenString(tokenStr)
+	token, err := bootstraptokenv1.NewBootstrapTokenString(tokenStr)
 	if err != nil {
 		return "", errors.Wrap(err, "error creating upload certs token")
 	}
-	tokens := []kubeadmapi.BootstrapToken{{
+	tokens := []bootstraptokenv1.BootstrapToken{{
 		Token:       token,
 		Description: "Proxy for managing TTL for the kubeadm-certs secret",
 		TTL: &metav1.Duration{
@@ -159,7 +162,7 @@ func createRBAC(client clientset.Interface) error {
 
 func getSecretOwnerRef(client clientset.Interface, tokenID string) ([]metav1.OwnerReference, error) {
 	secretName := bootstraputil.BootstrapTokenSecretName(tokenID)
-	secret, err := client.CoreV1().Secrets(metav1.NamespaceSystem).Get(secretName, metav1.GetOptions{})
+	secret, err := client.CoreV1().Secrets(metav1.NamespaceSystem).Get(context.TODO(), secretName, metav1.GetOptions{})
 	if err != nil {
 		return nil, errors.Wrap(err, "error to get token reference")
 	}
@@ -204,7 +207,7 @@ func getDataFromDisk(cfg *kubeadmapi.InitConfiguration, key []byte) (map[string]
 	secretData := map[string][]byte{}
 	for certName, certPath := range certsToTransfer(cfg) {
 		cert, err := loadAndEncryptCert(certPath, key)
-		if err == nil || (err != nil && os.IsNotExist(err)) {
+		if err == nil || os.IsNotExist(err) {
 			secretData[certOrKeyNameToSecretName(certName)] = cert
 		} else {
 			return nil, err
@@ -250,16 +253,16 @@ func DownloadCerts(client clientset.Interface, cfg *kubeadmapi.InitConfiguration
 }
 
 func writeCertOrKey(certOrKeyPath string, certOrKeyData []byte) error {
-	if _, err := keyutil.ParsePublicKeysPEM(certOrKeyData); err == nil {
+	if _, err := keyutil.ParsePrivateKeyPEM(certOrKeyData); err == nil {
 		return keyutil.WriteKey(certOrKeyPath, certOrKeyData)
-	} else if _, err := certutil.ParseCertsPEM(certOrKeyData); err == nil {
+	} else if _, err := keyutil.ParsePublicKeysPEM(certOrKeyData); err == nil {
 		return certutil.WriteCert(certOrKeyPath, certOrKeyData)
 	}
 	return errors.New("unknown data found in Secret entry")
 }
 
 func getSecret(client clientset.Interface) (*v1.Secret, error) {
-	secret, err := client.CoreV1().Secrets(metav1.NamespaceSystem).Get(kubeadmconstants.KubeadmCertsSecret, metav1.GetOptions{})
+	secret, err := client.CoreV1().Secrets(metav1.NamespaceSystem).Get(context.TODO(), kubeadmconstants.KubeadmCertsSecret, metav1.GetOptions{})
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			return nil, errors.Errorf("Secret %q was not found in the %q Namespace. This Secret might have expired. Please, run `kubeadm init phase upload-certs --upload-certs` on a control plane to generate a new one", kubeadmconstants.KubeadmCertsSecret, metav1.NamespaceSystem)

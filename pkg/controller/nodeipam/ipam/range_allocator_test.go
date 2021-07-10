@@ -17,11 +17,12 @@ limitations under the License.
 package ipam
 
 import (
+	"context"
 	"net"
 	"testing"
 	"time"
 
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/informers"
@@ -31,9 +32,7 @@ import (
 	"k8s.io/kubernetes/pkg/controller/testutil"
 )
 
-const (
-	nodePollInterval = 100 * time.Millisecond
-)
+const testNodePollInterval = 10 * time.Millisecond
 
 var alwaysReady = func() bool { return true }
 
@@ -62,15 +61,270 @@ func getFakeNodeInformer(fakeNodeHandler *testutil.FakeNodeHandler) coreinformer
 type testCase struct {
 	description     string
 	fakeNodeHandler *testutil.FakeNodeHandler
-	clusterCIDRs    []*net.IPNet
-	serviceCIDR     *net.IPNet
-	subNetMaskSize  int
+	allocatorParams CIDRAllocatorParams
 	// key is index of the cidr allocated
 	expectedAllocatedCIDR map[int]string
 	allocatedCIDRs        map[int][]string
+	// should controller creation fail?
+	ctrlCreateFail bool
+}
+
+func TestOccupyPreExistingCIDR(t *testing.T) {
+	// all tests operate on a single node
+	testCases := []testCase{
+		{
+			description: "success, single stack no node allocation",
+			fakeNodeHandler: &testutil.FakeNodeHandler{
+				Existing: []*v1.Node{
+					{
+						ObjectMeta: metav1.ObjectMeta{
+							Name: "node0",
+						},
+					},
+				},
+				Clientset: fake.NewSimpleClientset(),
+			},
+			allocatorParams: CIDRAllocatorParams{
+				ClusterCIDRs: func() []*net.IPNet {
+					_, clusterCIDRv4, _ := net.ParseCIDR("10.10.0.0/16")
+					return []*net.IPNet{clusterCIDRv4}
+				}(),
+				ServiceCIDR:          nil,
+				SecondaryServiceCIDR: nil,
+				NodeCIDRMaskSizes:    []int{24},
+			},
+			allocatedCIDRs:        nil,
+			expectedAllocatedCIDR: nil,
+			ctrlCreateFail:        false,
+		},
+		{
+			description: "success, dual stack no node allocation",
+			fakeNodeHandler: &testutil.FakeNodeHandler{
+				Existing: []*v1.Node{
+					{
+						ObjectMeta: metav1.ObjectMeta{
+							Name: "node0",
+						},
+					},
+				},
+				Clientset: fake.NewSimpleClientset(),
+			},
+			allocatorParams: CIDRAllocatorParams{
+				ClusterCIDRs: func() []*net.IPNet {
+					_, clusterCIDRv4, _ := net.ParseCIDR("10.10.0.0/16")
+					_, clusterCIDRv6, _ := net.ParseCIDR("ace:cab:deca::/8")
+					return []*net.IPNet{clusterCIDRv4, clusterCIDRv6}
+				}(),
+				ServiceCIDR:          nil,
+				SecondaryServiceCIDR: nil,
+				NodeCIDRMaskSizes:    []int{24, 24},
+			},
+			allocatedCIDRs:        nil,
+			expectedAllocatedCIDR: nil,
+			ctrlCreateFail:        false,
+		},
+		{
+			description: "success, single stack correct node allocation",
+			fakeNodeHandler: &testutil.FakeNodeHandler{
+				Existing: []*v1.Node{
+					{
+						ObjectMeta: metav1.ObjectMeta{
+							Name: "node0",
+						},
+						Spec: v1.NodeSpec{
+							PodCIDRs: []string{"10.10.0.1/24"},
+						},
+					},
+				},
+				Clientset: fake.NewSimpleClientset(),
+			},
+			allocatorParams: CIDRAllocatorParams{
+				ClusterCIDRs: func() []*net.IPNet {
+					_, clusterCIDRv4, _ := net.ParseCIDR("10.10.0.0/16")
+					return []*net.IPNet{clusterCIDRv4}
+				}(),
+				ServiceCIDR:          nil,
+				SecondaryServiceCIDR: nil,
+				NodeCIDRMaskSizes:    []int{24},
+			},
+			allocatedCIDRs:        nil,
+			expectedAllocatedCIDR: nil,
+			ctrlCreateFail:        false,
+		},
+		{
+			description: "success, dual stack both allocated correctly",
+			fakeNodeHandler: &testutil.FakeNodeHandler{
+				Existing: []*v1.Node{
+					{
+						ObjectMeta: metav1.ObjectMeta{
+							Name: "node0",
+						},
+						Spec: v1.NodeSpec{
+							PodCIDRs: []string{"10.10.0.1/24", "a00::/86"},
+						},
+					},
+				},
+				Clientset: fake.NewSimpleClientset(),
+			},
+			allocatorParams: CIDRAllocatorParams{
+				ClusterCIDRs: func() []*net.IPNet {
+					_, clusterCIDRv4, _ := net.ParseCIDR("10.10.0.0/16")
+					_, clusterCIDRv6, _ := net.ParseCIDR("ace:cab:deca::/8")
+					return []*net.IPNet{clusterCIDRv4, clusterCIDRv6}
+				}(),
+				ServiceCIDR:          nil,
+				SecondaryServiceCIDR: nil,
+				NodeCIDRMaskSizes:    []int{24, 24},
+			},
+			allocatedCIDRs:        nil,
+			expectedAllocatedCIDR: nil,
+			ctrlCreateFail:        false,
+		},
+		// failure cases
+		{
+			description: "fail, single stack incorrect node allocation",
+			fakeNodeHandler: &testutil.FakeNodeHandler{
+				Existing: []*v1.Node{
+					{
+						ObjectMeta: metav1.ObjectMeta{
+							Name: "node0",
+						},
+						Spec: v1.NodeSpec{
+							PodCIDRs: []string{"172.10.0.1/24"},
+						},
+					},
+				},
+				Clientset: fake.NewSimpleClientset(),
+			},
+			allocatorParams: CIDRAllocatorParams{
+				ClusterCIDRs: func() []*net.IPNet {
+					_, clusterCIDRv4, _ := net.ParseCIDR("10.10.0.0/16")
+					return []*net.IPNet{clusterCIDRv4}
+				}(),
+				ServiceCIDR:          nil,
+				SecondaryServiceCIDR: nil,
+				NodeCIDRMaskSizes:    []int{24},
+			},
+			allocatedCIDRs:        nil,
+			expectedAllocatedCIDR: nil,
+			ctrlCreateFail:        true,
+		},
+		{
+			description: "fail, dualstack node allocating from non existing cidr",
+
+			fakeNodeHandler: &testutil.FakeNodeHandler{
+				Existing: []*v1.Node{
+					{
+						ObjectMeta: metav1.ObjectMeta{
+							Name: "node0",
+						},
+						Spec: v1.NodeSpec{
+							PodCIDRs: []string{"10.10.0.1/24", "a00::/86"},
+						},
+					},
+				},
+				Clientset: fake.NewSimpleClientset(),
+			},
+			allocatorParams: CIDRAllocatorParams{
+				ClusterCIDRs: func() []*net.IPNet {
+					_, clusterCIDRv4, _ := net.ParseCIDR("10.10.0.0/16")
+					return []*net.IPNet{clusterCIDRv4}
+				}(),
+				ServiceCIDR:          nil,
+				SecondaryServiceCIDR: nil,
+				NodeCIDRMaskSizes:    []int{24},
+			},
+			allocatedCIDRs:        nil,
+			expectedAllocatedCIDR: nil,
+			ctrlCreateFail:        true,
+		},
+		{
+			description: "fail, dualstack node allocating bad v4",
+
+			fakeNodeHandler: &testutil.FakeNodeHandler{
+				Existing: []*v1.Node{
+					{
+						ObjectMeta: metav1.ObjectMeta{
+							Name: "node0",
+						},
+						Spec: v1.NodeSpec{
+							PodCIDRs: []string{"172.10.0.1/24", "a00::/86"},
+						},
+					},
+				},
+				Clientset: fake.NewSimpleClientset(),
+			},
+			allocatorParams: CIDRAllocatorParams{
+				ClusterCIDRs: func() []*net.IPNet {
+					_, clusterCIDRv4, _ := net.ParseCIDR("10.10.0.0/16")
+					_, clusterCIDRv6, _ := net.ParseCIDR("ace:cab:deca::/8")
+					return []*net.IPNet{clusterCIDRv4, clusterCIDRv6}
+				}(),
+				ServiceCIDR:          nil,
+				SecondaryServiceCIDR: nil,
+				NodeCIDRMaskSizes:    []int{24, 24},
+			},
+			allocatedCIDRs:        nil,
+			expectedAllocatedCIDR: nil,
+			ctrlCreateFail:        true,
+		},
+		{
+			description: "fail, dualstack node allocating bad v6",
+
+			fakeNodeHandler: &testutil.FakeNodeHandler{
+				Existing: []*v1.Node{
+					{
+						ObjectMeta: metav1.ObjectMeta{
+							Name: "node0",
+						},
+						Spec: v1.NodeSpec{
+							PodCIDRs: []string{"10.10.0.1/24", "cdd::/86"},
+						},
+					},
+				},
+				Clientset: fake.NewSimpleClientset(),
+			},
+			allocatorParams: CIDRAllocatorParams{
+				ClusterCIDRs: func() []*net.IPNet {
+					_, clusterCIDRv4, _ := net.ParseCIDR("10.10.0.0/16")
+					_, clusterCIDRv6, _ := net.ParseCIDR("ace:cab:deca::/8")
+					return []*net.IPNet{clusterCIDRv4, clusterCIDRv6}
+				}(),
+				ServiceCIDR:          nil,
+				SecondaryServiceCIDR: nil,
+				NodeCIDRMaskSizes:    []int{24, 24},
+			},
+			allocatedCIDRs:        nil,
+			expectedAllocatedCIDR: nil,
+			ctrlCreateFail:        true,
+		},
+	}
+
+	// test function
+	for _, tc := range testCases {
+		t.Run(tc.description, func(t *testing.T) {
+			// Initialize the range allocator.
+			fakeNodeInformer := getFakeNodeInformer(tc.fakeNodeHandler)
+			nodeList, _ := tc.fakeNodeHandler.List(context.TODO(), metav1.ListOptions{})
+			_, err := NewCIDRRangeAllocator(tc.fakeNodeHandler, fakeNodeInformer, tc.allocatorParams, nodeList)
+			if err == nil && tc.ctrlCreateFail {
+				t.Fatalf("creating range allocator was expected to fail, but it did not")
+			}
+			if err != nil && !tc.ctrlCreateFail {
+				t.Fatalf("creating range allocator was expected to succeed, but it did not")
+			}
+		})
+	}
 }
 
 func TestAllocateOrOccupyCIDRSuccess(t *testing.T) {
+	// Non-parallel test (overrides global var)
+	oldNodePollInterval := nodePollInterval
+	nodePollInterval = testNodePollInterval
+	defer func() {
+		nodePollInterval = oldNodePollInterval
+	}()
+
 	// all tests operate on a single node
 	testCases := []testCase{
 		{
@@ -85,12 +339,15 @@ func TestAllocateOrOccupyCIDRSuccess(t *testing.T) {
 				},
 				Clientset: fake.NewSimpleClientset(),
 			},
-			clusterCIDRs: func() []*net.IPNet {
-				_, clusterCIDR, _ := net.ParseCIDR("127.123.234.0/24")
-				return []*net.IPNet{clusterCIDR}
-			}(),
-			serviceCIDR:    nil,
-			subNetMaskSize: 30,
+			allocatorParams: CIDRAllocatorParams{
+				ClusterCIDRs: func() []*net.IPNet {
+					_, clusterCIDR, _ := net.ParseCIDR("127.123.234.0/24")
+					return []*net.IPNet{clusterCIDR}
+				}(),
+				ServiceCIDR:          nil,
+				SecondaryServiceCIDR: nil,
+				NodeCIDRMaskSizes:    []int{30},
+			},
 			expectedAllocatedCIDR: map[int]string{
 				0: "127.123.234.0/30",
 			},
@@ -107,15 +364,18 @@ func TestAllocateOrOccupyCIDRSuccess(t *testing.T) {
 				},
 				Clientset: fake.NewSimpleClientset(),
 			},
-			clusterCIDRs: func() []*net.IPNet {
-				_, clusterCIDR, _ := net.ParseCIDR("127.123.234.0/24")
-				return []*net.IPNet{clusterCIDR}
-			}(),
-			serviceCIDR: func() *net.IPNet {
-				_, serviceCIDR, _ := net.ParseCIDR("127.123.234.0/26")
-				return serviceCIDR
-			}(),
-			subNetMaskSize: 30,
+			allocatorParams: CIDRAllocatorParams{
+				ClusterCIDRs: func() []*net.IPNet {
+					_, clusterCIDR, _ := net.ParseCIDR("127.123.234.0/24")
+					return []*net.IPNet{clusterCIDR}
+				}(),
+				ServiceCIDR: func() *net.IPNet {
+					_, serviceCIDR, _ := net.ParseCIDR("127.123.234.0/26")
+					return serviceCIDR
+				}(),
+				SecondaryServiceCIDR: nil,
+				NodeCIDRMaskSizes:    []int{30},
+			},
 			// it should return first /30 CIDR after service range
 			expectedAllocatedCIDR: map[int]string{
 				0: "127.123.234.64/30",
@@ -133,15 +393,18 @@ func TestAllocateOrOccupyCIDRSuccess(t *testing.T) {
 				},
 				Clientset: fake.NewSimpleClientset(),
 			},
-			clusterCIDRs: func() []*net.IPNet {
-				_, clusterCIDR, _ := net.ParseCIDR("127.123.234.0/24")
-				return []*net.IPNet{clusterCIDR}
-			}(),
-			serviceCIDR: func() *net.IPNet {
-				_, serviceCIDR, _ := net.ParseCIDR("127.123.234.0/26")
-				return serviceCIDR
-			}(),
-			subNetMaskSize: 30,
+			allocatorParams: CIDRAllocatorParams{
+				ClusterCIDRs: func() []*net.IPNet {
+					_, clusterCIDR, _ := net.ParseCIDR("127.123.234.0/24")
+					return []*net.IPNet{clusterCIDR}
+				}(),
+				ServiceCIDR: func() *net.IPNet {
+					_, serviceCIDR, _ := net.ParseCIDR("127.123.234.0/26")
+					return serviceCIDR
+				}(),
+				SecondaryServiceCIDR: nil,
+				NodeCIDRMaskSizes:    []int{30},
+			},
 			allocatedCIDRs: map[int][]string{
 				0: {"127.123.234.64/30", "127.123.234.68/30", "127.123.234.72/30", "127.123.234.80/30"},
 			},
@@ -161,15 +424,19 @@ func TestAllocateOrOccupyCIDRSuccess(t *testing.T) {
 				},
 				Clientset: fake.NewSimpleClientset(),
 			},
-			clusterCIDRs: func() []*net.IPNet {
-				_, clusterCIDRv4, _ := net.ParseCIDR("127.123.234.0/8")
-				_, clusterCIDRv6, _ := net.ParseCIDR("ace:cab:deca::/8")
-				return []*net.IPNet{clusterCIDRv4, clusterCIDRv6}
-			}(),
-			serviceCIDR: func() *net.IPNet {
-				_, serviceCIDR, _ := net.ParseCIDR("127.123.234.0/26")
-				return serviceCIDR
-			}(),
+			allocatorParams: CIDRAllocatorParams{
+				ClusterCIDRs: func() []*net.IPNet {
+					_, clusterCIDRv4, _ := net.ParseCIDR("127.123.234.0/8")
+					_, clusterCIDRv6, _ := net.ParseCIDR("ace:cab:deca::/84")
+					return []*net.IPNet{clusterCIDRv4, clusterCIDRv6}
+				}(),
+				ServiceCIDR: func() *net.IPNet {
+					_, serviceCIDR, _ := net.ParseCIDR("127.123.234.0/26")
+					return serviceCIDR
+				}(),
+				SecondaryServiceCIDR: nil,
+				NodeCIDRMaskSizes:    []int{24, 98},
+			},
 		},
 		{
 			description: "Dualstack CIDRs v6,v4",
@@ -183,17 +450,20 @@ func TestAllocateOrOccupyCIDRSuccess(t *testing.T) {
 				},
 				Clientset: fake.NewSimpleClientset(),
 			},
-			clusterCIDRs: func() []*net.IPNet {
-				_, clusterCIDRv4, _ := net.ParseCIDR("127.123.234.0/8")
-				_, clusterCIDRv6, _ := net.ParseCIDR("ace:cab:deca::/8")
-				return []*net.IPNet{clusterCIDRv6, clusterCIDRv4}
-			}(),
-			serviceCIDR: func() *net.IPNet {
-				_, serviceCIDR, _ := net.ParseCIDR("127.123.234.0/26")
-				return serviceCIDR
-			}(),
+			allocatorParams: CIDRAllocatorParams{
+				ClusterCIDRs: func() []*net.IPNet {
+					_, clusterCIDRv4, _ := net.ParseCIDR("127.123.234.0/8")
+					_, clusterCIDRv6, _ := net.ParseCIDR("ace:cab:deca::/84")
+					return []*net.IPNet{clusterCIDRv6, clusterCIDRv4}
+				}(),
+				ServiceCIDR: func() *net.IPNet {
+					_, serviceCIDR, _ := net.ParseCIDR("127.123.234.0/26")
+					return serviceCIDR
+				}(),
+				SecondaryServiceCIDR: nil,
+				NodeCIDRMaskSizes:    []int{98, 24},
+			},
 		},
-
 		{
 			description: "Dualstack CIDRs, more than two",
 			fakeNodeHandler: &testutil.FakeNodeHandler{
@@ -206,23 +476,70 @@ func TestAllocateOrOccupyCIDRSuccess(t *testing.T) {
 				},
 				Clientset: fake.NewSimpleClientset(),
 			},
-			clusterCIDRs: func() []*net.IPNet {
-				_, clusterCIDRv4, _ := net.ParseCIDR("127.123.234.0/8")
-				_, clusterCIDRv6, _ := net.ParseCIDR("ace:cab:deca::/8")
-				_, clusterCIDRv4_2, _ := net.ParseCIDR("10.0.0.0/8")
-				return []*net.IPNet{clusterCIDRv4, clusterCIDRv6, clusterCIDRv4_2}
-			}(),
-			serviceCIDR: func() *net.IPNet {
-				_, serviceCIDR, _ := net.ParseCIDR("127.123.234.0/26")
-				return serviceCIDR
-			}(),
+			allocatorParams: CIDRAllocatorParams{
+				ClusterCIDRs: func() []*net.IPNet {
+					_, clusterCIDRv4, _ := net.ParseCIDR("127.123.234.0/8")
+					_, clusterCIDRv6, _ := net.ParseCIDR("ace:cab:deca::/84")
+					_, clusterCIDRv4_2, _ := net.ParseCIDR("10.0.0.0/8")
+					return []*net.IPNet{clusterCIDRv4, clusterCIDRv6, clusterCIDRv4_2}
+				}(),
+				ServiceCIDR: func() *net.IPNet {
+					_, serviceCIDR, _ := net.ParseCIDR("127.123.234.0/26")
+					return serviceCIDR
+				}(),
+				SecondaryServiceCIDR: nil,
+				NodeCIDRMaskSizes:    []int{24, 98, 24},
+			},
+		},
+		{
+			description: "no double counting",
+			fakeNodeHandler: &testutil.FakeNodeHandler{
+				Existing: []*v1.Node{
+					{
+						ObjectMeta: metav1.ObjectMeta{
+							Name: "node0",
+						},
+						Spec: v1.NodeSpec{
+							PodCIDRs: []string{"10.10.0.0/24"},
+						},
+					},
+					{
+						ObjectMeta: metav1.ObjectMeta{
+							Name: "node1",
+						},
+						Spec: v1.NodeSpec{
+							PodCIDRs: []string{"10.10.2.0/24"},
+						},
+					},
+					{
+						ObjectMeta: metav1.ObjectMeta{
+							Name: "node2",
+						},
+					},
+				},
+				Clientset: fake.NewSimpleClientset(),
+			},
+			allocatorParams: CIDRAllocatorParams{
+				ClusterCIDRs: func() []*net.IPNet {
+					_, clusterCIDR, _ := net.ParseCIDR("10.10.0.0/22")
+					return []*net.IPNet{clusterCIDR}
+				}(),
+				ServiceCIDR:          nil,
+				SecondaryServiceCIDR: nil,
+				NodeCIDRMaskSizes:    []int{24},
+			},
+			expectedAllocatedCIDR: map[int]string{
+				0: "10.10.1.0/24",
+			},
 		},
 	}
 
 	// test function
 	testFunc := func(tc testCase) {
+		fakeNodeInformer := getFakeNodeInformer(tc.fakeNodeHandler)
+		nodeList, _ := tc.fakeNodeHandler.List(context.TODO(), metav1.ListOptions{})
 		// Initialize the range allocator.
-		allocator, err := NewCIDRRangeAllocator(tc.fakeNodeHandler, getFakeNodeInformer(tc.fakeNodeHandler), tc.clusterCIDRs, tc.serviceCIDR, tc.subNetMaskSize, nil)
+		allocator, err := NewCIDRRangeAllocator(tc.fakeNodeHandler, fakeNodeInformer, tc.allocatorParams, nodeList)
 		if err != nil {
 			t.Errorf("%v: failed to create CIDRRangeAllocator with error %v", tc.description, err)
 			return
@@ -248,12 +565,22 @@ func TestAllocateOrOccupyCIDRSuccess(t *testing.T) {
 					t.Fatalf("%v: unexpected error when occupying CIDR %v: %v", tc.description, allocated, err)
 				}
 			}
-			if err := allocator.AllocateOrOccupyCIDR(tc.fakeNodeHandler.Existing[0]); err != nil {
+		}
+
+		updateCount := 0
+		for _, node := range tc.fakeNodeHandler.Existing {
+			if node.Spec.PodCIDRs == nil {
+				updateCount++
+			}
+			if err := allocator.AllocateOrOccupyCIDR(node); err != nil {
 				t.Errorf("%v: unexpected error in AllocateOrOccupyCIDR: %v", tc.description, err)
 			}
-			if err := waitForUpdatedNodeWithTimeout(tc.fakeNodeHandler, 1, wait.ForeverTestTimeout); err != nil {
-				t.Fatalf("%v: timeout while waiting for Node update: %v", tc.description, err)
-			}
+		}
+		if updateCount != 1 {
+			t.Fatalf("test error: all tests must update exactly one node")
+		}
+		if err := waitForUpdatedNodeWithTimeout(tc.fakeNodeHandler, updateCount, wait.ForeverTestTimeout); err != nil {
+			t.Fatalf("%v: timeout while waiting for Node update: %v", tc.description, err)
 		}
 
 		if len(tc.expectedAllocatedCIDR) == 0 {
@@ -294,12 +621,15 @@ func TestAllocateOrOccupyCIDRFailure(t *testing.T) {
 				},
 				Clientset: fake.NewSimpleClientset(),
 			},
-			clusterCIDRs: func() []*net.IPNet {
-				_, clusterCIDR, _ := net.ParseCIDR("127.123.234.0/28")
-				return []*net.IPNet{clusterCIDR}
-			}(),
-			serviceCIDR:    nil,
-			subNetMaskSize: 30,
+			allocatorParams: CIDRAllocatorParams{
+				ClusterCIDRs: func() []*net.IPNet {
+					_, clusterCIDR, _ := net.ParseCIDR("127.123.234.0/28")
+					return []*net.IPNet{clusterCIDR}
+				}(),
+				ServiceCIDR:          nil,
+				SecondaryServiceCIDR: nil,
+				NodeCIDRMaskSizes:    []int{30},
+			},
 			allocatedCIDRs: map[int][]string{
 				0: {"127.123.234.0/30", "127.123.234.4/30", "127.123.234.8/30", "127.123.234.12/30"},
 			},
@@ -308,7 +638,7 @@ func TestAllocateOrOccupyCIDRFailure(t *testing.T) {
 
 	testFunc := func(tc testCase) {
 		// Initialize the range allocator.
-		allocator, err := NewCIDRRangeAllocator(tc.fakeNodeHandler, getFakeNodeInformer(tc.fakeNodeHandler), tc.clusterCIDRs, tc.serviceCIDR, tc.subNetMaskSize, nil)
+		allocator, err := NewCIDRRangeAllocator(tc.fakeNodeHandler, getFakeNodeInformer(tc.fakeNodeHandler), tc.allocatorParams, nil)
 		if err != nil {
 			t.Logf("%v: failed to create CIDRRangeAllocator with error %v", tc.description, err)
 		}
@@ -367,9 +697,7 @@ func TestAllocateOrOccupyCIDRFailure(t *testing.T) {
 type releaseTestCase struct {
 	description                      string
 	fakeNodeHandler                  *testutil.FakeNodeHandler
-	clusterCIDRs                     []*net.IPNet
-	serviceCIDR                      *net.IPNet
-	subNetMaskSize                   int
+	allocatorParams                  CIDRAllocatorParams
 	expectedAllocatedCIDRFirstRound  map[int]string
 	expectedAllocatedCIDRSecondRound map[int]string
 	allocatedCIDRs                   map[int][]string
@@ -377,6 +705,13 @@ type releaseTestCase struct {
 }
 
 func TestReleaseCIDRSuccess(t *testing.T) {
+	// Non-parallel test (overrides global var)
+	oldNodePollInterval := nodePollInterval
+	nodePollInterval = testNodePollInterval
+	defer func() {
+		nodePollInterval = oldNodePollInterval
+	}()
+
 	testCases := []releaseTestCase{
 		{
 			description: "Correctly release preallocated CIDR",
@@ -390,12 +725,15 @@ func TestReleaseCIDRSuccess(t *testing.T) {
 				},
 				Clientset: fake.NewSimpleClientset(),
 			},
-			clusterCIDRs: func() []*net.IPNet {
-				_, clusterCIDR, _ := net.ParseCIDR("127.123.234.0/28")
-				return []*net.IPNet{clusterCIDR}
-			}(),
-			serviceCIDR:    nil,
-			subNetMaskSize: 30,
+			allocatorParams: CIDRAllocatorParams{
+				ClusterCIDRs: func() []*net.IPNet {
+					_, clusterCIDR, _ := net.ParseCIDR("127.123.234.0/28")
+					return []*net.IPNet{clusterCIDR}
+				}(),
+				ServiceCIDR:          nil,
+				SecondaryServiceCIDR: nil,
+				NodeCIDRMaskSizes:    []int{30},
+			},
 			allocatedCIDRs: map[int][]string{
 				0: {"127.123.234.0/30", "127.123.234.4/30", "127.123.234.8/30", "127.123.234.12/30"},
 			},
@@ -419,12 +757,15 @@ func TestReleaseCIDRSuccess(t *testing.T) {
 				},
 				Clientset: fake.NewSimpleClientset(),
 			},
-			clusterCIDRs: func() []*net.IPNet {
-				_, clusterCIDR, _ := net.ParseCIDR("127.123.234.0/28")
-				return []*net.IPNet{clusterCIDR}
-			}(),
-			serviceCIDR:    nil,
-			subNetMaskSize: 30,
+			allocatorParams: CIDRAllocatorParams{
+				ClusterCIDRs: func() []*net.IPNet {
+					_, clusterCIDR, _ := net.ParseCIDR("127.123.234.0/28")
+					return []*net.IPNet{clusterCIDR}
+				}(),
+				ServiceCIDR:          nil,
+				SecondaryServiceCIDR: nil,
+				NodeCIDRMaskSizes:    []int{30},
+			},
 			allocatedCIDRs: map[int][]string{
 				0: {"127.123.234.4/30", "127.123.234.8/30", "127.123.234.12/30"},
 			},
@@ -442,7 +783,7 @@ func TestReleaseCIDRSuccess(t *testing.T) {
 
 	testFunc := func(tc releaseTestCase) {
 		// Initialize the range allocator.
-		allocator, _ := NewCIDRRangeAllocator(tc.fakeNodeHandler, getFakeNodeInformer(tc.fakeNodeHandler), tc.clusterCIDRs, tc.serviceCIDR, tc.subNetMaskSize, nil)
+		allocator, _ := NewCIDRRangeAllocator(tc.fakeNodeHandler, getFakeNodeInformer(tc.fakeNodeHandler), tc.allocatorParams, nil)
 		rangeAllocator, ok := allocator.(*rangeAllocator)
 		if !ok {
 			t.Logf("%v: found non-default implementation of CIDRAllocator, skipping white-box test...", tc.description)
