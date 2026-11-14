@@ -14,17 +14,22 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package e2e_node
+package e2enode
 
 import (
-	"github.com/onsi/ginkgo"
-	"k8s.io/api/core/v1"
+	"context"
+
+	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/uuid"
+	"k8s.io/klog/v2"
 	"k8s.io/kubernetes/pkg/kubelet"
 	kubecontainer "k8s.io/kubernetes/pkg/kubelet/container"
 	"k8s.io/kubernetes/test/e2e/framework"
 	e2epod "k8s.io/kubernetes/test/e2e/framework/pod"
+	admissionapi "k8s.io/pod-security-admission/api"
+
+	"github.com/onsi/ginkgo/v2"
 )
 
 const (
@@ -32,9 +37,10 @@ const (
 	logContainerName = "logger"
 )
 
-var _ = framework.KubeDescribe("ContainerLogPath [NodeConformance]", func() {
+var _ = SIGDescribe("ContainerLogPath", framework.WithNodeConformance(), func() {
 	f := framework.NewDefaultFramework("kubelet-container-log-path")
-	var podClient *framework.PodClient
+	f.NamespacePodSecurityLevel = admissionapi.LevelPrivileged
+	var podClient *e2epod.PodClient
 
 	ginkgo.Describe("Pod with a container", func() {
 		ginkgo.Context("printed log to stdout", func() {
@@ -71,7 +77,12 @@ var _ = framework.KubeDescribe("ContainerLogPath [NodeConformance]", func() {
 						Containers: []v1.Container{
 							{
 								Image: busyboxImage,
-								Name:  podName,
+								SecurityContext: &v1.SecurityContext{
+									SELinuxOptions: &v1.SELinuxOptions{
+										Type: "container_logreader_t",
+									},
+								},
+								Name: podName,
 								// If we find expected log file and contains right content, exit 0
 								// else, keep checking until test timeout
 								Command: []string{"sh", "-c", "while true; do if [ -e " + expectedLogPath + " ] && grep -q " + log + " " + expectedLogPath + "; then exit 0; fi; sleep 1; done"},
@@ -100,64 +111,42 @@ var _ = framework.KubeDescribe("ContainerLogPath [NodeConformance]", func() {
 				}
 			}
 
-			createAndWaitPod := func(pod *v1.Pod) error {
-				podClient.Create(pod)
-				return e2epod.WaitForPodSuccessInNamespace(f.ClientSet, pod.Name, f.Namespace.Name)
+			createAndWaitPod := func(ctx context.Context, pod *v1.Pod) error {
+				podClient.Create(ctx, pod)
+				return e2epod.WaitForPodSuccessInNamespace(ctx, f.ClientSet, pod.Name, f.Namespace.Name)
 			}
 
 			var logPodName string
-			ginkgo.BeforeEach(func() {
-				if framework.TestContext.ContainerRuntime == "docker" {
-					// Container Log Path support requires JSON logging driver.
-					// It does not work when Docker daemon is logging to journald.
-					d, err := getDockerLoggingDriver()
-					framework.ExpectNoError(err)
-					if d != "json-file" {
-						framework.Skipf("Skipping because Docker daemon is using a logging driver other than \"json-file\": %s", d)
-					}
-					// Even if JSON logging is in use, this test fails if SELinux support
-					// is enabled, since the isolation provided by the SELinux policy
-					// prevents processes running inside Docker containers (under SELinux
-					// type svirt_lxc_net_t) from accessing the log files which are owned
-					// by Docker (and labeled with the container_var_lib_t type.)
-					//
-					// Therefore, let's also skip this test when running with SELinux
-					// support enabled.
-					e, err := isDockerSELinuxSupportEnabled()
-					framework.ExpectNoError(err)
-					if e {
-						framework.Skipf("Skipping because Docker daemon is running with SELinux support enabled")
-					}
-				}
-
-				podClient = f.PodClient()
+			ginkgo.BeforeEach(func(ctx context.Context) {
+				podClient = e2epod.NewPodClient(f)
 				logPodName = "log-pod-" + string(uuid.NewUUID())
-				err := createAndWaitPod(makeLogPod(logPodName, logString))
+				err := createAndWaitPod(ctx, makeLogPod(logPodName, logString))
 				framework.ExpectNoError(err, "Failed waiting for pod: %s to enter success state", logPodName)
 			})
-			ginkgo.It("should print log to correct log path", func() {
+			ginkgo.It("should print log to correct log path", func(ctx context.Context) {
 
 				logDir := kubelet.ContainerLogsDir
 
 				// get containerID from created Pod
-				createdLogPod, err := podClient.Get(logPodName, metav1.GetOptions{})
-				logContainerID := kubecontainer.ParseContainerID(createdLogPod.Status.ContainerStatuses[0].ContainerID)
+				createdLogPod, err := podClient.Get(ctx, logPodName, metav1.GetOptions{})
+				logContainerID := kubecontainer.ParseContainerID(klog.FromContext(ctx), createdLogPod.Status.ContainerStatuses[0].ContainerID)
 				framework.ExpectNoError(err, "Failed to get pod: %s", logPodName)
 
 				// build log file path
 				expectedlogFile := logDir + "/" + logPodName + "_" + f.Namespace.Name + "_" + logContainerName + "-" + logContainerID.ID + ".log"
 
 				logCheckPodName := "log-check-" + string(uuid.NewUUID())
-				err = createAndWaitPod(makeLogCheckPod(logCheckPodName, logString, expectedlogFile))
+				err = createAndWaitPod(ctx, makeLogCheckPod(logCheckPodName, logString, expectedlogFile))
 				framework.ExpectNoError(err, "Failed waiting for pod: %s to enter success state", logCheckPodName)
 			})
 
-			ginkgo.It("should print log to correct cri log path", func() {
+			ginkgo.It("should print log to correct cri log path", func(ctx context.Context) {
 
 				logCRIDir := "/var/log/pods"
 
 				// get podID from created Pod
-				createdLogPod, err := podClient.Get(logPodName, metav1.GetOptions{})
+				createdLogPod, err := podClient.Get(ctx, logPodName, metav1.GetOptions{})
+				framework.ExpectNoError(err, "Failed to get pod: %s", logPodName)
 				podNs := createdLogPod.Namespace
 				podName := createdLogPod.Name
 				podID := string(createdLogPod.UID)
@@ -166,7 +155,7 @@ var _ = framework.KubeDescribe("ContainerLogPath [NodeConformance]", func() {
 				expectedCRILogFile := logCRIDir + "/" + podNs + "_" + podName + "_" + podID + "/" + logContainerName + "/0.log"
 
 				logCRICheckPodName := "log-cri-check-" + string(uuid.NewUUID())
-				err = createAndWaitPod(makeLogCheckPod(logCRICheckPodName, logString, expectedCRILogFile))
+				err = createAndWaitPod(ctx, makeLogCheckPod(logCRICheckPodName, logString, expectedCRILogFile))
 				framework.ExpectNoError(err, "Failed waiting for pod: %s to enter success state", logCRICheckPodName)
 			})
 		})

@@ -19,36 +19,50 @@ package staticpod
 import (
 	"bytes"
 	"fmt"
-	"io/ioutil"
-	"net"
+	"hash"
+	"hash/fnv"
+	"io"
+	"math"
 	"net/url"
 	"os"
 	"sort"
 	"strings"
+	"sync"
 
-	"github.com/pkg/errors"
+	"github.com/pmezard/go-difflib/difflib"
 
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	utilerrors "k8s.io/apimachinery/pkg/util/errors"
+	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/utils/dump"
+
 	kubeadmapi "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm"
 	kubeadmconstants "k8s.io/kubernetes/cmd/kubeadm/app/constants"
-	"k8s.io/kubernetes/cmd/kubeadm/app/util"
+	kubeadmutil "k8s.io/kubernetes/cmd/kubeadm/app/util"
+	"k8s.io/kubernetes/cmd/kubeadm/app/util/errors"
+	"k8s.io/kubernetes/cmd/kubeadm/app/util/patches"
+	"k8s.io/kubernetes/cmd/kubeadm/app/util/users"
 )
 
 const (
-	// kubeControllerManagerAddressArg represents the address argument of the kube-controller-manager configuration.
-	kubeControllerManagerAddressArg = "address"
+	// kubeControllerManagerBindAddressArg represents the bind-address argument of the kube-controller-manager configuration.
+	kubeControllerManagerBindAddressArg = "bind-address"
 
-	// kubeSchedulerAddressArg represents the address argument of the kube-scheduler configuration.
-	kubeSchedulerAddressArg = "address"
-
-	// etcdListenClientURLsArg represents the listen-client-urls argument of the etcd configuration.
-	etcdListenClientURLsArg = "listen-client-urls"
+	// kubeSchedulerBindAddressArg represents the bind-address argument of the kube-scheduler configuration.
+	kubeSchedulerBindAddressArg = "bind-address"
 )
 
-// ComponentPod returns a Pod object from the container and volume specifications
-func ComponentPod(container v1.Container, volumes map[string]v1.Volume) v1.Pod {
+var (
+	usersAndGroups     *users.UsersAndGroups
+	usersAndGroupsOnce sync.Once
+)
+
+// ComponentPod returns a Pod object from the container, volume and annotations specifications
+func ComponentPod(container v1.Container, volumes map[string]v1.Volume, annotations map[string]string) v1.Pod {
+	// priority value for system-node-critical class
+	priority := int32(2000001000)
 	return v1.Pod{
 		TypeMeta: metav1.TypeMeta{
 			APIVersion: "v1",
@@ -59,13 +73,20 @@ func ComponentPod(container v1.Container, volumes map[string]v1.Volume) v1.Pod {
 			Namespace: metav1.NamespaceSystem,
 			// The component and tier labels are useful for quickly identifying the control plane Pods when doing a .List()
 			// against Pods in the kube-system namespace. Can for example be used together with the WaitForPodsWithLabel function
-			Labels: map[string]string{"component": container.Name, "tier": "control-plane"},
+			Labels:      map[string]string{"component": container.Name, "tier": kubeadmconstants.ControlPlaneTier},
+			Annotations: annotations,
 		},
 		Spec: v1.PodSpec{
 			Containers:        []v1.Container{container},
-			PriorityClassName: "system-cluster-critical",
+			Priority:          &priority,
+			PriorityClassName: "system-node-critical",
 			HostNetwork:       true,
 			Volumes:           VolumeMapToSlice(volumes),
+			SecurityContext: &v1.PodSecurityContext{
+				SeccompProfile: &v1.SeccompProfile{
+					Type: v1.SeccompProfileTypeRuntimeDefault,
+				},
+			},
 		},
 	}
 }
@@ -74,26 +95,8 @@ func ComponentPod(container v1.Container, volumes map[string]v1.Volume) v1.Pod {
 func ComponentResources(cpu string) v1.ResourceRequirements {
 	return v1.ResourceRequirements{
 		Requests: v1.ResourceList{
-			v1.ResourceName(v1.ResourceCPU): resource.MustParse(cpu),
+			v1.ResourceCPU: resource.MustParse(cpu),
 		},
-	}
-}
-
-// EtcdProbe is a helper function for building a shell-based, etcdctl v1.Probe object to healthcheck etcd
-func EtcdProbe(cfg *kubeadmapi.Etcd, port int, certsDir string, CACertName string, CertName string, KeyName string) *v1.Probe {
-	tlsFlags := fmt.Sprintf("--cacert=%[1]s/%[2]s --cert=%[1]s/%[3]s --key=%[1]s/%[4]s", certsDir, CACertName, CertName, KeyName)
-	// etcd pod is alive if a linearizable get succeeds.
-	cmd := fmt.Sprintf("ETCDCTL_API=3 etcdctl --endpoints=https://[%s]:%d %s get foo", GetEtcdProbeAddress(cfg), port, tlsFlags)
-
-	return &v1.Probe{
-		Handler: v1.Handler{
-			Exec: &v1.ExecAction{
-				Command: []string{"/bin/sh", "-ec", cmd},
-			},
-		},
-		InitialDelaySeconds: 15,
-		TimeoutSeconds:      15,
-		FailureThreshold:    8,
 	}
 }
 
@@ -149,20 +152,39 @@ func VolumeMountMapToSlice(volumeMounts map[string]v1.VolumeMount) []v1.VolumeMo
 	return v
 }
 
-// GetExtraParameters builds a list of flag arguments two string-string maps, one with default, base commands and one with overrides
-func GetExtraParameters(overrides map[string]string, defaults map[string]string) []string {
-	var command []string
-	for k, v := range overrides {
-		if len(v) > 0 {
-			command = append(command, fmt.Sprintf("--%s=%s", k, v))
-		}
+// PatchStaticPod applies patches stored in patchesDir to a static Pod.
+func PatchStaticPod(pod *v1.Pod, patchesDir string, output io.Writer) (*v1.Pod, error) {
+	// Marshal the Pod manifest into YAML.
+	podYAML, err := kubeadmutil.MarshalToYaml(pod, v1.SchemeGroupVersion)
+	if err != nil {
+		return pod, errors.Wrapf(err, "failed to marshal Pod manifest to YAML")
 	}
-	for k, v := range defaults {
-		if _, overrideExists := overrides[k]; !overrideExists {
-			command = append(command, fmt.Sprintf("--%s=%s", k, v))
-		}
+
+	patchManager, err := patches.GetPatchManagerForPath(patchesDir, patches.KnownTargets(), output)
+	if err != nil {
+		return pod, err
 	}
-	return command
+
+	patchTarget := &patches.PatchTarget{
+		Name:                      pod.Name,
+		StrategicMergePatchObject: v1.Pod{},
+		Data:                      podYAML,
+	}
+	if err := patchManager.ApplyPatchesToTarget(patchTarget); err != nil {
+		return pod, err
+	}
+
+	obj, err := kubeadmutil.UniversalUnmarshal(patchTarget.Data)
+	if err != nil {
+		return pod, errors.Wrap(err, "failed to unmarshal patched manifest")
+	}
+
+	pod2, ok := obj.(*v1.Pod)
+	if !ok {
+		return pod, errors.Wrap(err, "patched manifest is not a valid Pod object")
+	}
+
+	return pod2, nil
 }
 
 // WriteStaticPodToDisk writes a static pod file to disk
@@ -174,14 +196,14 @@ func WriteStaticPodToDisk(componentName, manifestDir string, pod v1.Pod) error {
 	}
 
 	// writes the pod to disk
-	serialized, err := util.MarshalToYaml(&pod, v1.SchemeGroupVersion)
+	serialized, err := kubeadmutil.MarshalToYaml(&pod, v1.SchemeGroupVersion)
 	if err != nil {
 		return errors.Wrapf(err, "failed to marshal manifest for %q to YAML", componentName)
 	}
 
 	filename := kubeadmconstants.GetStaticPodFilepath(componentName, manifestDir)
 
-	if err := ioutil.WriteFile(filename, serialized, 0600); err != nil {
+	if err := os.WriteFile(filename, serialized, 0600); err != nil {
 		return errors.Wrapf(err, "failed to write static pod manifest file for %q (%q)", componentName, filename)
 	}
 
@@ -190,32 +212,93 @@ func WriteStaticPodToDisk(componentName, manifestDir string, pod v1.Pod) error {
 
 // ReadStaticPodFromDisk reads a static pod file from disk
 func ReadStaticPodFromDisk(manifestPath string) (*v1.Pod, error) {
-	buf, err := ioutil.ReadFile(manifestPath)
+	buf, err := os.ReadFile(manifestPath)
 	if err != nil {
 		return &v1.Pod{}, errors.Wrapf(err, "failed to read manifest for %q", manifestPath)
 	}
 
-	obj, err := util.UnmarshalFromYaml(buf, v1.SchemeGroupVersion)
+	obj, err := kubeadmutil.UniversalUnmarshal(buf)
 	if err != nil {
-		return &v1.Pod{}, errors.Errorf("failed to unmarshal manifest for %q from YAML: %v", manifestPath, err)
+		return &v1.Pod{}, errors.Errorf("failed to unmarshal manifest for %q: %v", manifestPath, err)
 	}
 
-	pod := obj.(*v1.Pod)
+	pod, ok := obj.(*v1.Pod)
+	if !ok {
+		return &v1.Pod{}, errors.Errorf("failed to parse Pod object defined in %q", manifestPath)
+	}
 
 	return pod, nil
 }
 
+// ReadMultipleStaticPodsFromDisk reads multiple known component static Pods from manifestDir
+// and returns a list of Pods objects.
+func ReadMultipleStaticPodsFromDisk(manifestDir string, components ...string) (map[string]*v1.Pod, error) {
+	var (
+		podMap = map[string]*v1.Pod{}
+		errs   []error
+	)
+	for _, c := range components {
+		path := kubeadmconstants.GetStaticPodFilepath(c, manifestDir)
+		pod, err := ReadStaticPodFromDisk(path)
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		podMap[c] = pod
+	}
+	if len(errs) > 0 {
+		return nil, utilerrors.NewAggregate(errs)
+	}
+	return podMap, nil
+}
+
+// LivenessProbe creates a Probe object with a HTTPGet handler
+func LivenessProbe(host, path, port string, scheme v1.URIScheme) *v1.Probe {
+	// sets initialDelaySeconds same as periodSeconds to skip one period before running a check
+	return createHTTPProbe(host, path, port, scheme, 10, 15, 8, 10)
+}
+
+// ReadinessProbe creates a Probe object with a HTTPGet handler
+func ReadinessProbe(host, path, port string, scheme v1.URIScheme) *v1.Probe {
+	// sets initialDelaySeconds as '0' because we don't want to delay user infrastructure checks
+	// looking for "ready" status on kubeadm static Pods
+	return createHTTPProbe(host, path, port, scheme, 0, 15, 3, 1)
+}
+
+// StartupProbe creates a Probe object with a HTTPGet handler
+func StartupProbe(host, path, port string, scheme v1.URIScheme, timeoutForControlPlane *metav1.Duration) *v1.Probe {
+	periodSeconds, timeoutForControlPlaneSeconds := int32(10), kubeadmconstants.ControlPlaneComponentHealthCheckTimeout.Seconds()
+	if timeoutForControlPlane != nil {
+		timeoutForControlPlaneSeconds = timeoutForControlPlane.Seconds()
+	}
+	// sets failureThreshold big enough to guarantee the full timeout can cover the worst case scenario for the control-plane to come alive
+	// we ignore initialDelaySeconds in the calculation here for simplicity
+	failureThreshold := int32(math.Ceil(timeoutForControlPlaneSeconds / float64(periodSeconds)))
+	// sets initialDelaySeconds same as periodSeconds to skip one period before running a check
+	return createHTTPProbe(host, path, port, scheme, periodSeconds, 15, failureThreshold, periodSeconds)
+}
+
+func createHTTPProbe(host, path, port string, scheme v1.URIScheme, initialDelaySeconds, timeoutSeconds, failureThreshold, periodSeconds int32) *v1.Probe {
+	return &v1.Probe{
+		ProbeHandler: v1.ProbeHandler{
+			HTTPGet: &v1.HTTPGetAction{
+				Host:   host,
+				Path:   path,
+				Port:   intstr.FromString(port),
+				Scheme: scheme,
+			},
+		},
+		InitialDelaySeconds: initialDelaySeconds,
+		TimeoutSeconds:      timeoutSeconds,
+		FailureThreshold:    failureThreshold,
+		PeriodSeconds:       periodSeconds,
+	}
+}
+
 // GetAPIServerProbeAddress returns the probe address for the API server
 func GetAPIServerProbeAddress(endpoint *kubeadmapi.APIEndpoint) string {
-	// In the case of a self-hosted deployment, the initial host on which kubeadm --init is run,
-	// will generate a DaemonSet with a nodeSelector such that all nodes with the label
-	// node-role.kubernetes.io/master='' will have the API server deployed to it. Since the init
-	// is run only once on an initial host, the API advertise address will be invalid for any
-	// future hosts that do not have the same address. Furthermore, since liveness and readiness
-	// probes do not support the Downward API we cannot dynamically set the advertise address to
-	// the node's IP. The only option then is to use localhost.
 	if endpoint != nil && endpoint.AdvertiseAddress != "" {
-		return endpoint.AdvertiseAddress
+		return getProbeAddress(endpoint.AdvertiseAddress)
 	}
 
 	return "127.0.0.1"
@@ -223,77 +306,148 @@ func GetAPIServerProbeAddress(endpoint *kubeadmapi.APIEndpoint) string {
 
 // GetControllerManagerProbeAddress returns the kubernetes controller manager probe address
 func GetControllerManagerProbeAddress(cfg *kubeadmapi.ClusterConfiguration) string {
-	if addr, exists := cfg.ControllerManager.ExtraArgs[kubeControllerManagerAddressArg]; exists {
-		return addr
+	if addr, idx := kubeadmapi.GetArgValue(cfg.ControllerManager.ExtraArgs, kubeControllerManagerBindAddressArg, -1); idx > -1 {
+		return getProbeAddress(addr)
 	}
 	return "127.0.0.1"
 }
 
 // GetSchedulerProbeAddress returns the kubernetes scheduler probe address
 func GetSchedulerProbeAddress(cfg *kubeadmapi.ClusterConfiguration) string {
-	if addr, exists := cfg.Scheduler.ExtraArgs[kubeSchedulerAddressArg]; exists {
-		return addr
+	if addr, idx := kubeadmapi.GetArgValue(cfg.Scheduler.ExtraArgs, kubeSchedulerBindAddressArg, -1); idx > -1 {
+		return getProbeAddress(addr)
 	}
 	return "127.0.0.1"
 }
 
-// GetEtcdProbeAddress returns the etcd probe address
-func GetEtcdProbeAddress(cfg *kubeadmapi.Etcd) string {
-	if cfg.Local != nil && cfg.Local.ExtraArgs != nil {
-		if arg, exists := cfg.Local.ExtraArgs[etcdListenClientURLsArg]; exists {
-			// Use the first url in the listen-client-urls if multiple url's are specified.
-			if strings.ContainsAny(arg, ",") {
-				arg = strings.Split(arg, ",")[0]
-			}
-			parsedURL, err := url.Parse(arg)
-			if err != nil || parsedURL.Hostname() == "" {
-				return "127.0.0.1"
-			}
-			// Return the IP if the URL contains an address instead of a name.
-			if ip := net.ParseIP(parsedURL.Hostname()); ip != nil {
-				// etcdctl doesn't support auto-converting zero addresses into loopback addresses
-				if ip.Equal(net.IPv4zero) {
-					return "127.0.0.1"
-				}
-				if ip.Equal(net.IPv6zero) {
-					return net.IPv6loopback.String()
-				}
-				return ip.String()
-			}
-			// Use the local resolver to try resolving the name within the URL.
-			// If the name can not be resolved, return an IPv4 loopback address.
-			// Otherwise, select the first valid IPv4 address.
-			// If the name does not resolve to an IPv4 address, select the first valid IPv6 address.
-			addrs, err := net.LookupIP(parsedURL.Hostname())
-			if err != nil {
-				return "127.0.0.1"
-			}
-			var ip net.IP
-			for _, addr := range addrs {
-				if addr.To4() != nil {
-					ip = addr
-					break
-				}
-				if addr.To16() != nil && ip == nil {
-					ip = addr
-				}
-			}
-			return ip.String()
-		}
+// GetEtcdProbeEndpoint takes a kubeadm Etcd configuration object and attempts to parse
+// the first URL in the listen-metrics-urls argument, returning an etcd probe hostname,
+// port and scheme
+func GetEtcdProbeEndpoint(cfg *kubeadmapi.Etcd, isIPv6 bool) (string, int32, v1.URIScheme) {
+	localhost := "127.0.0.1"
+	if isIPv6 {
+		localhost = "::1"
 	}
-	return "127.0.0.1"
+	if cfg.Local == nil || cfg.Local.ExtraArgs == nil {
+		return localhost, kubeadmconstants.EtcdMetricsPort, v1.URISchemeHTTP
+	}
+	if arg, idx := kubeadmapi.GetArgValue(cfg.Local.ExtraArgs, "listen-metrics-urls", -1); idx > -1 {
+		// Use the first url in the listen-metrics-urls if multiple URL's are specified.
+		arg = strings.Split(arg, ",")[0]
+		parsedURL, err := url.Parse(arg)
+		if err != nil {
+			return localhost, kubeadmconstants.EtcdMetricsPort, v1.URISchemeHTTP
+		}
+		// Parse scheme
+		scheme := v1.URISchemeHTTP
+		if parsedURL.Scheme == "https" {
+			scheme = v1.URISchemeHTTPS
+		}
+		// Parse hostname
+		hostname := parsedURL.Hostname()
+		if len(hostname) == 0 {
+			hostname = localhost
+		}
+		// Parse port
+		port := kubeadmconstants.EtcdMetricsPort
+		portStr := parsedURL.Port()
+		if len(portStr) != 0 {
+			p, err := kubeadmutil.ParsePort(portStr)
+			if err == nil {
+				port = p
+			}
+		}
+		return hostname, int32(port), scheme
+	}
+	return localhost, kubeadmconstants.EtcdMetricsPort, v1.URISchemeHTTP
 }
 
 // ManifestFilesAreEqual compares 2 files. It returns true if their contents are equal, false otherwise
-func ManifestFilesAreEqual(path1, path2 string) (bool, error) {
-	content1, err := ioutil.ReadFile(path1)
+func ManifestFilesAreEqual(path1, path2 string) (bool, string, error) {
+	pod1, err := ReadStaticPodFromDisk(path1)
 	if err != nil {
-		return false, err
+		return false, "", err
 	}
-	content2, err := ioutil.ReadFile(path2)
+	pod2, err := ReadStaticPodFromDisk(path2)
 	if err != nil {
-		return false, err
+		return false, "", err
 	}
 
-	return bytes.Equal(content1, content2), nil
+	hasher := fnv.New128a()
+	DeepHashObject(hasher, pod1)
+	hash1 := hasher.Sum(nil)[0:]
+	DeepHashObject(hasher, pod2)
+	hash2 := hasher.Sum(nil)[0:]
+	if bytes.Equal(hash1, hash2) {
+		return true, "", nil
+	}
+
+	manifest1, err := kubeadmutil.MarshalToYaml(pod1, v1.SchemeGroupVersion)
+	if err != nil {
+		return false, "", errors.Wrapf(err, "failed to marshal Pod manifest for %q to YAML", path1)
+	}
+
+	manifest2, err := kubeadmutil.MarshalToYaml(pod2, v1.SchemeGroupVersion)
+	if err != nil {
+		return false, "", errors.Wrapf(err, "failed to marshal Pod manifest for %q to YAML", path2)
+	}
+
+	diff := difflib.UnifiedDiff{
+		A: difflib.SplitLines(string(manifest1)),
+		B: difflib.SplitLines(string(manifest2)),
+	}
+
+	diffStr, err := difflib.GetUnifiedDiffString(diff)
+	if err != nil {
+		return false, "", errors.Wrapf(err, "failed to generate the differences between manifest %q and manifest %q", path1, path2)
+	}
+
+	return false, diffStr, nil
+}
+
+// getProbeAddress returns a valid probe address.
+// Kubeadm uses the bind-address to configure the probe address. It's common to use the
+// unspecified address "0.0.0.0" or "::" as bind-address when we want to listen in all interfaces,
+// however this address can't be used as probe #86504.
+// If the address is an unspecified address getProbeAddress returns empty,
+// that means that kubelet will use the PodIP as probe address.
+func getProbeAddress(addr string) string {
+	if addr == "0.0.0.0" || addr == "::" {
+		return ""
+	}
+	return addr
+}
+
+// GetUsersAndGroups returns the local usersAndGroups, but first creates it
+// in a thread safe way once.
+func GetUsersAndGroups() (*users.UsersAndGroups, error) {
+	var err error
+	usersAndGroupsOnce.Do(func() {
+		usersAndGroups, err = users.AddUsersAndGroups()
+	})
+	return usersAndGroups, err
+}
+
+// DeepHashObject writes specified object to hash using the spew library
+// which follows pointers and prints actual values of the nested objects
+// ensuring the hash does not change when a pointer changes.
+// Copied from k8s.io/kubernetes/pkg/util/hash/hash.go#DeepHashObject
+func DeepHashObject(hasher hash.Hash, objectToWrite interface{}) {
+	hasher.Reset()
+	fmt.Fprintf(hasher, "%v", dump.ForHash(objectToWrite))
+}
+
+// IsControlPlaneNode returns true if the kube-apiserver static pod manifest is present
+// on the host.
+func IsControlPlaneNode() bool {
+	isControlPlaneNode := true
+
+	filepath := kubeadmconstants.GetStaticPodFilepath(kubeadmconstants.KubeAPIServer,
+		kubeadmconstants.GetStaticPodDirectory())
+
+	if _, err := os.Stat(filepath); os.IsNotExist(err) {
+		isControlPlaneNode = false
+	}
+
+	return isControlPlaneNode
 }

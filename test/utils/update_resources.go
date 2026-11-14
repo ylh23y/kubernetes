@@ -17,6 +17,7 @@ limitations under the License.
 package utils
 
 import (
+	"context"
 	"fmt"
 	"time"
 
@@ -35,30 +36,27 @@ const (
 	waitRetryTimeout    = 5 * time.Minute
 )
 
-func RetryErrorCondition(condition wait.ConditionFunc) wait.ConditionFunc {
-	return func() (bool, error) {
-		done, err := condition()
-		if err != nil && IsRetryableAPIError(err) {
-			return false, nil
-		}
+func RetryErrorCondition(condition wait.ConditionWithContextFunc) wait.ConditionWithContextFunc {
+	return func(ctx context.Context) (bool, error) {
+		done, err := condition(ctx)
 		return done, err
 	}
 }
 
-func ScaleResourceWithRetries(scalesGetter scaleclient.ScalesGetter, namespace, name string, size uint, gr schema.GroupResource) error {
+func ScaleResourceWithRetries(scalesGetter scaleclient.ScalesGetter, namespace, name string, size uint, gvr schema.GroupVersionResource) error {
 	scaler := scale.NewScaler(scalesGetter)
 	preconditions := &scale.ScalePrecondition{
 		Size:            -1,
 		ResourceVersion: "",
 	}
 	waitForReplicas := scale.NewRetryParams(waitRetryInterval, waitRetryTimeout)
-	cond := RetryErrorCondition(scale.ScaleCondition(scaler, preconditions, namespace, name, size, nil, gr))
-	err := wait.PollImmediate(updateRetryInterval, updateRetryTimeout, cond)
+	cond := RetryErrorCondition(scale.ScaleCondition(scaler, preconditions, namespace, name, size, nil, nil, gvr, false))
+	err := wait.PollUntilContextTimeout(context.Background(), updateRetryInterval, updateRetryTimeout, true, cond)
 	if err == nil {
-		err = scale.WaitForScaleHasDesiredReplicas(scalesGetter, gr, name, namespace, size, waitForReplicas)
+		err = scale.WaitForScaleHasDesiredReplicas(scalesGetter, gvr.GroupResource(), name, namespace, size, waitForReplicas)
 	}
 	if err != nil {
-		return fmt.Errorf("Error while scaling %s to %d replicas: %v", name, size, err)
+		return fmt.Errorf("error while scaling %s to %d replicas: %v", name, size, err)
 	}
 	return nil
 }

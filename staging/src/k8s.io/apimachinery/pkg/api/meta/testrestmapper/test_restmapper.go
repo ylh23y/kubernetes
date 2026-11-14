@@ -27,6 +27,7 @@ import (
 //  1. legacy kube group preferred version, extensions preferred version, metrics preferred version, legacy
 //     kube any version, extensions any version, metrics any version, all other groups alphabetical preferred version,
 //     all other groups alphabetical.
+//
 // TODO callers of this method should be updated to build their own specific restmapper based on their scheme for their tests
 // TODO the things being tested are related to whether various cases are handled, not tied to the particular types being checked.
 func TestOnlyStaticRESTMapper(scheme *runtime.Scheme, versionPatterns ...schema.GroupVersion) meta.RESTMapper {
@@ -127,12 +128,6 @@ var rootScopedKinds = map[schema.GroupKind]bool{
 	{Group: "", Kind: "PersistentVolume"}: true,
 	{Group: "", Kind: "ComponentStatus"}:  true,
 
-	{Group: "extensions", Kind: "PodSecurityPolicy"}: true,
-
-	{Group: "policy", Kind: "PodSecurityPolicy"}: true,
-
-	{Group: "extensions", Kind: "PodSecurityPolicy"}: true,
-
 	{Group: "rbac.authorization.k8s.io", Kind: "ClusterRole"}:        true,
 	{Group: "rbac.authorization.k8s.io", Kind: "ClusterRoleBinding"}: true,
 
@@ -152,7 +147,7 @@ var rootScopedKinds = map[schema.GroupKind]bool{
 
 	{Group: "metrics.k8s.io", Kind: "NodeMetrics"}: true,
 
-	{Group: "wardle.k8s.io", Kind: "Fischer"}: true,
+	{Group: "wardle.example.com", Kind: "Fischer"}: true,
 }
 
 // hardcoded is good enough for the test we're running

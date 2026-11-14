@@ -2,11 +2,11 @@ package netlink
 
 import (
 	"fmt"
-	"syscall"
 	"time"
 
 	"github.com/vishvananda/netlink/nl"
 	"github.com/vishvananda/netns"
+	"golang.org/x/sys/unix"
 )
 
 // Empty handle used by the netlink package methods
@@ -15,10 +15,26 @@ var pkgHandle = &Handle{}
 // Handle is an handle for the netlink requests on a
 // specific network namespace. All the requests on the
 // same netlink family share the same netlink socket,
-// which gets released when the handle is deleted.
+// which gets released when the handle is Close'd.
 type Handle struct {
 	sockets      map[int]*nl.SocketHandle
 	lookupByDump bool
+}
+
+// SetSocketTimeout configures timeout for default netlink sockets
+func SetSocketTimeout(to time.Duration) error {
+	if to < time.Microsecond {
+		return fmt.Errorf("invalid timeout, minimul value is %s", time.Microsecond)
+	}
+
+	nl.SocketTimeoutTv = unix.NsecToTimeval(to.Nanoseconds())
+	return nil
+}
+
+// GetSocketTimeout returns the timeout value used by default netlink sockets
+func GetSocketTimeout() time.Duration {
+	nsec := unix.TimevalToNsec(nl.SocketTimeoutTv)
+	return time.Duration(nsec) * time.Nanosecond
 }
 
 // SupportsNetlinkFamily reports whether the passed netlink family is supported by this Handle
@@ -43,7 +59,7 @@ func (h *Handle) SetSocketTimeout(to time.Duration) error {
 	if to < time.Microsecond {
 		return fmt.Errorf("invalid timeout, minimul value is %s", time.Microsecond)
 	}
-	tv := syscall.NsecToTimeval(to.Nanoseconds())
+	tv := unix.NsecToTimeval(to.Nanoseconds())
 	for _, sh := range h.sockets {
 		if err := sh.Socket.SetSendTimeout(&tv); err != nil {
 			return err
@@ -59,13 +75,13 @@ func (h *Handle) SetSocketTimeout(to time.Duration) error {
 // socket in the netlink handle. The maximum value is capped by
 // /proc/sys/net/core/rmem_max.
 func (h *Handle) SetSocketReceiveBufferSize(size int, force bool) error {
-	opt := syscall.SO_RCVBUF
+	opt := unix.SO_RCVBUF
 	if force {
-		opt = syscall.SO_RCVBUFFORCE
+		opt = unix.SO_RCVBUFFORCE
 	}
 	for _, sh := range h.sockets {
 		fd := sh.Socket.GetFd()
-		err := syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, opt, size)
+		err := unix.SetsockoptInt(fd, unix.SOL_SOCKET, opt, size)
 		if err != nil {
 			return err
 		}
@@ -81,7 +97,7 @@ func (h *Handle) GetSocketReceiveBufferSize() ([]int, error) {
 	i := 0
 	for _, sh := range h.sockets {
 		fd := sh.Socket.GetFd()
-		size, err := syscall.GetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_RCVBUF)
+		size, err := unix.GetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_RCVBUF)
 		if err != nil {
 			return nil, err
 		}
@@ -91,7 +107,22 @@ func (h *Handle) GetSocketReceiveBufferSize() ([]int, error) {
 	return results, nil
 }
 
-// NewHandle returns a netlink handle on the network namespace
+// SetStrictCheck sets the strict check socket option for each socket in the netlink handle. Returns early if any set operation fails
+func (h *Handle) SetStrictCheck(state bool) error {
+	for _, sh := range h.sockets {
+		var stateInt int = 0
+		if state {
+			stateInt = 1
+		}
+		err := unix.SetsockoptInt(sh.Socket.GetFd(), unix.SOL_NETLINK, unix.NETLINK_GET_STRICT_CHK, stateInt)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// NewHandleAt returns a netlink handle on the network namespace
 // specified by ns. If ns=netns.None(), current network namespace
 // will be assumed
 func NewHandleAt(ns netns.NsHandle, nlFamilies ...int) (*Handle, error) {
@@ -120,12 +151,20 @@ func newHandle(newNs, curNs netns.NsHandle, nlFamilies ...int) (*Handle, error) 
 	return h, nil
 }
 
-// Delete releases the resources allocated to this handle
-func (h *Handle) Delete() {
+// Close releases the resources allocated to this handle
+func (h *Handle) Close() {
 	for _, sh := range h.sockets {
 		sh.Close()
 	}
 	h.sockets = nil
+}
+
+// Delete releases the resources allocated to this handle
+//
+// Deprecated: use Close instead which is in line with typical resource release
+// patterns for files and other resources.
+func (h *Handle) Delete() {
+	h.Close()
 }
 
 func (h *Handle) newNetlinkRequest(proto, flags int) *nl.NetlinkRequest {
@@ -134,10 +173,10 @@ func (h *Handle) newNetlinkRequest(proto, flags int) *nl.NetlinkRequest {
 		return nl.NewNetlinkRequest(proto, flags)
 	}
 	return &nl.NetlinkRequest{
-		NlMsghdr: syscall.NlMsghdr{
-			Len:   uint32(syscall.SizeofNlMsghdr),
+		NlMsghdr: unix.NlMsghdr{
+			Len:   uint32(unix.SizeofNlMsghdr),
 			Type:  uint16(proto),
-			Flags: syscall.NLM_F_REQUEST | uint16(flags),
+			Flags: unix.NLM_F_REQUEST | uint16(flags),
 		},
 		Sockets: h.sockets,
 	}

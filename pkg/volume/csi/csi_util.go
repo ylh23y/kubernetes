@@ -17,19 +17,24 @@ limitations under the License.
 package csi
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
+	"strconv"
+	"strings"
 	"time"
 
 	api "k8s.io/api/core/v1"
+	storage "k8s.io/api/storage/v1"
 	meta "k8s.io/apimachinery/pkg/apis/meta/v1"
-	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/client-go/kubernetes"
-	"k8s.io/klog"
-	"k8s.io/kubernetes/pkg/features"
+	"k8s.io/klog/v2"
 	"k8s.io/kubernetes/pkg/volume"
+	volumeutil "k8s.io/kubernetes/pkg/volume/util"
 	utilstrings "k8s.io/utils/strings"
 )
 
@@ -42,10 +47,9 @@ const (
 
 func getCredentialsFromSecret(k8s kubernetes.Interface, secretRef *api.SecretReference) (map[string]string, error) {
 	credentials := map[string]string{}
-	secret, err := k8s.CoreV1().Secrets(secretRef.Namespace).Get(secretRef.Name, meta.GetOptions{})
+	secret, err := k8s.CoreV1().Secrets(secretRef.Namespace).Get(context.TODO(), secretRef.Name, meta.GetOptions{})
 	if err != nil {
-		klog.Errorf("failed to find the secret %s in the namespace %s with error: %v\n", secretRef.Name, secretRef.Namespace, err)
-		return credentials, err
+		return credentials, errors.New(log("failed to find the secret %s in the namespace %s with error: %v", secretRef.Name, secretRef.Namespace, err))
 	}
 	for key, value := range secret.Data {
 		credentials[key] = string(value)
@@ -60,13 +64,11 @@ func saveVolumeData(dir string, fileName string, data map[string]string) error {
 	klog.V(4).Info(log("saving volume data file [%s]", dataFilePath))
 	file, err := os.Create(dataFilePath)
 	if err != nil {
-		klog.Error(log("failed to save volume data file %s: %v", dataFilePath, err))
-		return err
+		return errors.New(log("failed to save volume data file %s: %v", dataFilePath, err))
 	}
 	defer file.Close()
 	if err := json.NewEncoder(file).Encode(data); err != nil {
-		klog.Error(log("failed to save volume data file %s: %v", dataFilePath, err))
-		return err
+		return errors.New(log("failed to save volume data file %s: %v", dataFilePath, err))
 	}
 	klog.V(4).Info(log("volume data file saved successfully [%s]", dataFilePath))
 	return nil
@@ -80,17 +82,107 @@ func loadVolumeData(dir string, fileName string) (map[string]string, error) {
 
 	file, err := os.Open(dataFileName)
 	if err != nil {
-		klog.Error(log("failed to open volume data file [%s]: %v", dataFileName, err))
-		return nil, err
+		return nil, fmt.Errorf("%s: %w", log("failed to open volume data file [%s]", dataFileName), err)
 	}
 	defer file.Close()
 	data := map[string]string{}
 	if err := json.NewDecoder(file).Decode(&data); err != nil {
-		klog.Error(log("failed to parse volume data file [%s]: %v", dataFileName, err))
-		return nil, err
+		return nil, errors.New(log("failed to parse volume data file [%s]: %v", dataFileName, err))
 	}
 
 	return data, nil
+}
+
+// findGlobalMountDataFromPodMount locates the CSI global mount of volume
+// specVolID that the given pod-local mount is bound to, and returns its data
+// directory along with the parsed vol_data.json stored next to it.
+//
+// Used as a fallback when the pod-local vol_data.json is missing or corrupt
+// during kubelet volume reconstruction, see issue #101791. The mount table is
+// the authoritative link between the two: MountDevice stages the volume at
+// <pluginDir>/<driver>/<sha256(volumeHandle)>/globalmount and SetUpAt bind
+// mounts that into the pod directory, so the global mount is a mount reference
+// of the pod-local one. Matching on the directory name instead would be
+// ambiguous: an inline ephemeral volume is named after its entry in the pod
+// spec, which is not unique on the node, and it never stages a global mount of
+// its own, so every name match it produced would be someone else's volume.
+func findGlobalMountDataFromPodMount(host volume.VolumeHost, mountPath, specVolID string) (string, map[string]string, error) {
+	podMountPath := GetCSIMounterPath(mountPath)
+	refs, err := volumeutil.GetReliableMountRefs(host.GetMounter(), podMountPath)
+	if err != nil {
+		return "", nil, fmt.Errorf("failed to read mount references for %q: %w", podMountPath, err)
+	}
+
+	var unnamedDir string
+	var unnamedData map[string]string
+	unnamed := 0
+	for _, ref := range refs {
+		driver, volSha, ok := parseGlobalMountRef(ref)
+		if !ok {
+			continue
+		}
+		// The data is read from the plugin directory rather than from the path
+		// the mount table reports, which differs from it when the kubelet root
+		// is reached through a symlink.
+		dir := filepath.Join(host.GetPluginDir(CSIPluginName), driver, volSha)
+		data, err := loadVolumeData(dir, volDataFileName)
+		if err != nil {
+			klog.V(4).Info(log("skipping mount reference %s with no readable volume data: %v", ref, err))
+			continue
+		}
+		if data[volDataKey.driverName] == "" || data[volDataKey.volHandle] == "" {
+			klog.V(4).Info(log("skipping mount reference %s, volume data names no driver or handle", ref))
+			continue
+		}
+		// MountDevice names the directory after the driver and the hash of the
+		// volume handle, so data naming anything else is not this mount's.
+		if data[volDataKey.driverName] != driver || globalVolumeDirName(data[volDataKey.volHandle]) != volSha {
+			klog.V(4).Info(log("skipping mount reference %s, its volume data names another volume", ref))
+			continue
+		}
+		// References match by superblock and root, so every volume staged from one export shows up here.
+		// A file from a kubelet older than this feature names no volume; the KEP accepts it on the mount
+		// reference alone, so it is taken when it is the only unnamed one, and two of them are ambiguous.
+		switch got := data[volDataKey.specVolID]; got {
+		case specVolID:
+			return dir, data, nil
+		case "":
+			unnamed++
+			unnamedDir, unnamedData = dir, data
+		default:
+			klog.V(4).Info(log("skipping mount reference %s, it belongs to volume %q", ref, got))
+		}
+	}
+	switch unnamed {
+	case 0:
+		return "", nil, fmt.Errorf("no CSI global mount of volume %q is bind mounted at %q", specVolID, podMountPath)
+	case 1:
+		return unnamedDir, unnamedData, nil
+	default:
+		return "", nil, fmt.Errorf("%d CSI global mounts that name no volume are bind mounted at %q", unnamed, podMountPath)
+	}
+}
+
+// parseGlobalMountRef returns the driver and volume hash of a mount reference
+// that lies in a CSI global mount, that is, at or below
+// kubernetes.io/csi/<driver>/<sha>/globalmount. A driver may publish from any
+// subdirectory of globalmount, as ceph-csi RBD does with globalmount/<volID>,
+// since CSI does not say how deep the published path may be. Anything else,
+// including a directory that happens to be named globalmount elsewhere on the
+// node, is not reported.
+func parseGlobalMountRef(ref string) (string, string, bool) {
+	parts := strings.Split(filepath.Clean(ref), string(filepath.Separator))
+	plugin := strings.Split(CSIPluginName, "/")
+	for i := 0; i+len(plugin)+2 < len(parts); i++ {
+		if !slices.Equal(parts[i:i+len(plugin)], plugin) {
+			continue
+		}
+		rest := parts[i+len(plugin):]
+		if rest[2] == globalMountInGlobalPath && rest[0] != "" && rest[1] != "" {
+			return rest[0], rest[1], true
+		}
+	}
+	return "", "", false
 }
 
 func getCSISourceFromSpec(spec *volume.Spec) (*api.CSIPersistentVolumeSource, error) {
@@ -111,20 +203,24 @@ func log(msg string, parts ...interface{}) string {
 	return fmt.Sprintf(fmt.Sprintf("%s: %s", CSIPluginName, msg), parts...)
 }
 
+// getVolumePluginDir returns the path where CSI plugin keeps metadata for given volume
+func getVolumePluginDir(specVolID string, host volume.VolumeHost) string {
+	sanitizedSpecVolID := utilstrings.EscapeQualifiedName(specVolID)
+	return filepath.Join(host.GetVolumeDevicePluginDir(CSIPluginName), sanitizedSpecVolID)
+}
+
 // getVolumeDevicePluginDir returns the path where the CSI plugin keeps the
 // symlink for a block device associated with a given specVolumeID.
 // path: plugins/kubernetes.io/csi/volumeDevices/{specVolumeID}/dev
 func getVolumeDevicePluginDir(specVolID string, host volume.VolumeHost) string {
-	sanitizedSpecVolID := utilstrings.EscapeQualifiedName(specVolID)
-	return filepath.Join(host.GetVolumeDevicePluginDir(CSIPluginName), sanitizedSpecVolID, "dev")
+	return filepath.Join(getVolumePluginDir(specVolID, host), "dev")
 }
 
 // getVolumeDeviceDataDir returns the path where the CSI plugin keeps the
 // volume data for a block device associated with a given specVolumeID.
 // path: plugins/kubernetes.io/csi/volumeDevices/{specVolumeID}/data
 func getVolumeDeviceDataDir(specVolID string, host volume.VolumeHost) string {
-	sanitizedSpecVolID := utilstrings.EscapeQualifiedName(specVolID)
-	return filepath.Join(host.GetVolumeDevicePluginDir(CSIPluginName), sanitizedSpecVolID, "data")
+	return filepath.Join(getVolumePluginDir(specVolID, host), "data")
 }
 
 // hasReadWriteOnce returns true if modes contains v1.ReadWriteOnce
@@ -133,7 +229,8 @@ func hasReadWriteOnce(modes []api.PersistentVolumeAccessMode) bool {
 		return false
 	}
 	for _, mode := range modes {
-		if mode == api.ReadWriteOnce {
+		if mode == api.ReadWriteOnce ||
+			mode == api.ReadWriteOncePod {
 			return true
 		}
 	}
@@ -148,7 +245,7 @@ func getSourceFromSpec(spec *volume.Spec) (*api.CSIVolumeSource, *api.CSIPersist
 	if spec.Volume != nil && spec.PersistentVolume != nil {
 		return nil, nil, fmt.Errorf("volume.Spec has both volume and persistent volume sources")
 	}
-	if spec.Volume != nil && spec.Volume.CSI != nil && utilfeature.DefaultFeatureGate.Enabled(features.CSIInlineVolume) {
+	if spec.Volume != nil && spec.Volume.CSI != nil {
 		return spec.Volume.CSI, nil, nil
 	}
 	if spec.PersistentVolume != nil &&
@@ -169,4 +266,47 @@ func getPVSourceFromSpec(spec *volume.Spec) (*api.CSIPersistentVolumeSource, err
 		return nil, fmt.Errorf("unexpected api.CSIVolumeSource found in volume.Spec")
 	}
 	return pvSrc, nil
+}
+
+// GetCSIMounterPath returns the mounter path given the base path.
+func GetCSIMounterPath(path string) string {
+	return filepath.Join(path, "/mount")
+}
+
+// GetCSIDriverName returns the csi driver name
+func GetCSIDriverName(spec *volume.Spec) (string, error) {
+	volSrc, pvSrc, err := getSourceFromSpec(spec)
+	if err != nil {
+		return "", err
+	}
+
+	switch {
+	case volSrc != nil:
+		return volSrc.Driver, nil
+	case pvSrc != nil:
+		return pvSrc.Driver, nil
+	default:
+		return "", errors.New(log("volume source not found in volume.Spec"))
+	}
+}
+
+func createCSIOperationContext(volumeSpec *volume.Spec, timeout time.Duration) (context.Context, context.CancelFunc) {
+	migrated := false
+	if volumeSpec != nil {
+		migrated = volumeSpec.Migrated
+	}
+	ctx := context.WithValue(context.Background(), additionalInfoKey, additionalInfo{Migrated: strconv.FormatBool(migrated)})
+	return context.WithTimeout(ctx, timeout)
+}
+
+// getPodInfoAttrs returns pod info for NodePublish
+func getPodInfoAttrs(pod *api.Pod, volumeMode storage.VolumeLifecycleMode) map[string]string {
+	attrs := map[string]string{
+		"csi.storage.k8s.io/pod.name":            pod.Name,
+		"csi.storage.k8s.io/pod.namespace":       pod.Namespace,
+		"csi.storage.k8s.io/pod.uid":             string(pod.UID),
+		"csi.storage.k8s.io/serviceAccount.name": pod.Spec.ServiceAccountName,
+		"csi.storage.k8s.io/ephemeral":           strconv.FormatBool(volumeMode == storage.VolumeLifecycleEphemeral),
+	}
+	return attrs
 }

@@ -18,6 +18,9 @@ limitations under the License.
 // +k8s:conversion-gen=k8s.io/apiserver/pkg/apis/apiserver
 // +k8s:defaulter-gen=TypeMeta
 // +groupName=apiserver.k8s.io
+// +groupName=apiserver.config.k8s.io
+// +k8s:validation-gen=TypesWithSuffix=StorageCompressionConfiguration
+// +k8s:validation-gen-scheme-registry=nil
 
 // Package v1alpha1 is the v1alpha1 version of the API.
-package v1alpha1 // import "k8s.io/apiserver/pkg/apis/apiserver/v1alpha1"
+package v1alpha1

@@ -20,13 +20,19 @@ import (
 	"crypto"
 	"crypto/tls"
 	"crypto/x509"
-	"io/ioutil"
 	"os"
-	"path"
+	"path/filepath"
 	"testing"
+	"time"
 
+	"github.com/google/go-cmp/cmp"
+
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	certutil "k8s.io/client-go/util/cert"
+
 	kubeadmapi "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm"
+	kubeadmconstants "k8s.io/kubernetes/cmd/kubeadm/app/constants"
+	"k8s.io/kubernetes/cmd/kubeadm/app/util/pkiutil"
 )
 
 func TestCertListOrder(t *testing.T) {
@@ -143,7 +149,7 @@ func TestMakeCertTree(t *testing.T) {
 }
 
 func TestCreateCertificateChain(t *testing.T) {
-	dir, err := ioutil.TempDir("", t.Name())
+	dir, err := os.MkdirTemp("", t.Name())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -160,16 +166,18 @@ func TestCreateCertificateChain(t *testing.T) {
 
 	caCfg := Certificates{
 		{
-			config:   certutil.Config{},
+			config:   pkiutil.CertConfig{},
 			Name:     "test-ca",
 			BaseName: "test-ca",
 		},
 		{
-			config: certutil.Config{
-				AltNames: certutil.AltNames{
-					DNSNames: []string{"test-domain.space"},
+			config: pkiutil.CertConfig{
+				Config: certutil.Config{
+					AltNames: certutil.AltNames{
+						DNSNames: []string{"test-domain.space"},
+					},
+					Usages: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
 				},
-				Usages: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
 			},
 			configMutators: []configMutatorsFunc{
 				setCommonNameToNodeName(),
@@ -185,12 +193,12 @@ func TestCreateCertificateChain(t *testing.T) {
 		t.Fatalf("unexpected error getting tree: %v", err)
 	}
 
-	if certTree.CreateTree(ic); err != nil {
+	if err := certTree.CreateTree(ic); err != nil {
 		t.Fatal(err)
 	}
 
-	caCert, _ := parseCertAndKey(path.Join(dir, "test-ca"), t)
-	daughterCert, _ := parseCertAndKey(path.Join(dir, "test-daughter"), t)
+	caCert, _ := parseCertAndKey(filepath.Join(dir, "test-ca"), t)
+	daughterCert, _ := parseCertAndKey(filepath.Join(dir, "test-daughter"), t)
 
 	pool := x509.NewCertPool()
 	pool.AddCert(caCert)
@@ -218,4 +226,181 @@ func parseCertAndKey(basePath string, t *testing.T) (*x509.Certificate, crypto.P
 	}
 
 	return parsedCert, certPair.PrivateKey
+}
+
+func TestCreateKeyAndCSR(t *testing.T) {
+	dir, err := os.MkdirTemp("", t.Name())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+
+	validKubeadmConfig := &kubeadmapi.InitConfiguration{
+		NodeRegistration: kubeadmapi.NodeRegistrationOptions{
+			Name: "test-node",
+		},
+		ClusterConfiguration: kubeadmapi.ClusterConfiguration{
+			CertificatesDir: dir,
+		},
+	}
+	validKubeadmCert := &KubeadmCert{
+		Name:     "ca",
+		LongName: "self-signed Kubernetes CA to provision identities for other Kubernetes components",
+		BaseName: kubeadmconstants.CACertAndKeyBaseName,
+		config: pkiutil.CertConfig{
+			Config: certutil.Config{
+				CommonName: "kubernetes",
+			},
+		},
+	}
+
+	type args struct {
+		kubeadmConfig *kubeadmapi.InitConfiguration
+		cert          *KubeadmCert
+	}
+	tests := []struct {
+		name       string
+		args       args
+		wantErr    bool
+		createfile bool
+	}{
+		{
+			name: "kubeadmConfig is nil",
+			args: args{
+				kubeadmConfig: nil,
+				cert:          validKubeadmCert,
+			},
+			wantErr: true,
+		},
+		{
+			name: "cert is nil",
+			args: args{
+				kubeadmConfig: validKubeadmConfig,
+				cert:          nil,
+			},
+			wantErr: true,
+		},
+		{
+			name: "key and CSR do not exist",
+			args: args{
+				kubeadmConfig: validKubeadmConfig,
+				cert:          validKubeadmCert,
+			},
+			wantErr: false,
+		},
+		{
+			name: "key or CSR already exist",
+			args: args{
+				kubeadmConfig: validKubeadmConfig,
+				cert:          validKubeadmCert,
+			},
+			wantErr: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := createKeyAndCSR(tt.args.kubeadmConfig, tt.args.cert); (err != nil) != tt.wantErr {
+				t.Errorf("createKeyAndCSR() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestGetConfig(t *testing.T) {
+	var (
+		now      = time.Now()
+		backdate = kubeadmconstants.CertificateBackdate
+	)
+
+	tests := []struct {
+		name           string
+		cert           *KubeadmCert
+		cfg            *kubeadmapi.InitConfiguration
+		expectedConfig *pkiutil.CertConfig
+	}{
+		{
+			name: "encryption algorithm is set to ECDSA P256",
+			cert: &KubeadmCert{
+				creationTime: now,
+			},
+			cfg: &kubeadmapi.InitConfiguration{
+				ClusterConfiguration: kubeadmapi.ClusterConfiguration{
+					EncryptionAlgorithm: kubeadmapi.EncryptionAlgorithmECDSAP256,
+				},
+			},
+			expectedConfig: &pkiutil.CertConfig{
+				Config: certutil.Config{
+					NotBefore: now.Add(-backdate),
+				},
+				EncryptionAlgorithm: kubeadmapi.EncryptionAlgorithmECDSAP256,
+			},
+		},
+		{
+			name: "encryption algorithm is set to ECDSA P384",
+			cert: &KubeadmCert{
+				creationTime: now,
+			},
+			cfg: &kubeadmapi.InitConfiguration{
+				ClusterConfiguration: kubeadmapi.ClusterConfiguration{
+					EncryptionAlgorithm: kubeadmapi.EncryptionAlgorithmECDSAP384,
+				},
+			},
+			expectedConfig: &pkiutil.CertConfig{
+				Config: certutil.Config{
+					NotBefore: now.Add(-backdate),
+				},
+				EncryptionAlgorithm: kubeadmapi.EncryptionAlgorithmECDSAP384,
+			},
+		},
+		{
+			name: "cert validity is set",
+			cert: &KubeadmCert{
+				CAName:       "some-ca",
+				creationTime: now,
+			},
+			cfg: &kubeadmapi.InitConfiguration{
+				ClusterConfiguration: kubeadmapi.ClusterConfiguration{
+					CertificateValidityPeriod: &metav1.Duration{
+						Duration: time.Hour * 1,
+					},
+				},
+			},
+			expectedConfig: &pkiutil.CertConfig{
+				Config: certutil.Config{
+					NotBefore: now.Add(-backdate),
+				},
+				NotAfter: now.Add(time.Hour * 1)},
+		},
+		{
+			name: "CA cert validity is set",
+			cert: &KubeadmCert{
+				CAName:       "",
+				creationTime: now,
+			},
+			cfg: &kubeadmapi.InitConfiguration{
+				ClusterConfiguration: kubeadmapi.ClusterConfiguration{
+					CACertificateValidityPeriod: &metav1.Duration{
+						Duration: time.Hour * 10,
+					},
+				},
+			},
+			expectedConfig: &pkiutil.CertConfig{
+				Config: certutil.Config{
+					NotBefore: now.Add(-backdate),
+				},
+				NotAfter: now.Add(time.Hour * 10),
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			actual, err := tt.cert.GetConfig(tt.cfg)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if diff := cmp.Diff(actual, tt.expectedConfig); diff != "" {
+				t.Fatalf("GetConfig() returned diff (-want,+got):\n%s", diff)
+			}
+		})
+	}
 }

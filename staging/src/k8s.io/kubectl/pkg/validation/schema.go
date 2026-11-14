@@ -22,7 +22,10 @@ import (
 	"fmt"
 
 	ejson "github.com/exponent-io/jsonpath"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
+	"k8s.io/cli-runtime/pkg/resource"
+	"k8s.io/klog/v2"
 )
 
 // Schema is an interface that knows how to validate an API object serialized to a byte array.
@@ -100,4 +103,91 @@ func (c ConjunctiveSchema) ValidateBytes(data []byte) error {
 		}
 	}
 	return utilerrors.NewAggregate(list)
+}
+
+func NewParamVerifyingSchema(s Schema, verifier resource.Verifier, directive string) Schema {
+	return &paramVerifyingSchema{
+		schema:    s,
+		verifier:  verifier,
+		directive: directive,
+	}
+}
+
+// paramVerifyingSchema only performs validation
+// based on the fieldValidation query param
+// being unsupported by the apiserver, because
+// server-side validation will be performed instead
+// of client-side validation.
+type paramVerifyingSchema struct {
+	schema    Schema
+	verifier  resource.Verifier
+	directive string
+}
+
+// ValidateBytes validates bytes per a ParamVerifyingSchema
+func (c *paramVerifyingSchema) ValidateBytes(data []byte) error {
+	obj, err := parse(data)
+	if err != nil {
+		return err
+	}
+
+	err = c.hasSupport(obj)
+	if resource.IsParamUnsupportedError(err) {
+		switch c.directive {
+		case metav1.FieldValidationStrict:
+			return c.schema.ValidateBytes(data)
+		case metav1.FieldValidationWarn:
+			klog.Warningf("cannot perform warn validation if server-side field validation is unsupported, skipping validation")
+		default:
+			// can't be reached
+			klog.Warningf("unexpected field validation directive: %s, skipping validation", c.directive)
+		}
+		return nil
+	}
+	return err
+}
+
+// hasSupport returns nil if the apiserver supports the fieldValidation query
+// parameter for the object, a ParamUnsupportedError if it does not, or any
+// other error from the verifier.
+//
+// A list (an object with an "items" array, the same test
+// resource.FlattenListVisitor applies) is checked per item, recursively: the
+// list is split into its items before they are sent to the server, so the
+// items' kinds, not the list kind, decide whether server-side validation
+// applies. The list kind itself never supports fieldValidation; checking it
+// would force client-side validation of every list.
+func (c *paramVerifyingSchema) hasSupport(obj interface{}) error {
+	items, ok := listItems(obj)
+	if !ok {
+		gvk, errs := getObjectKind(obj)
+		if errs != nil {
+			return utilerrors.NewAggregate(errs)
+		}
+		return c.verifier.HasSupport(gvk)
+	}
+	var unsupported error
+	for _, item := range items {
+		err := c.hasSupport(item)
+		if resource.IsParamUnsupportedError(err) {
+			// Keep looking: a verifier failure on a later item should
+			// not be hidden by an unsupported earlier one.
+			unsupported = err
+			continue
+		}
+		if err != nil {
+			return err
+		}
+	}
+	return unsupported
+}
+
+// listItems returns the object's items if it is a list.
+func listItems(obj interface{}) ([]interface{}, bool) {
+	fields, ok := obj.(map[string]interface{})
+	if !ok {
+		return nil, false
+	}
+	items, ok := fields["items"].([]interface{})
+	return items, ok
 }

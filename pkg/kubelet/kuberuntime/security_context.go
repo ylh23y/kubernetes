@@ -17,16 +17,19 @@ limitations under the License.
 package kuberuntime
 
 import (
+	"context"
 	"fmt"
 
-	"k8s.io/api/core/v1"
-	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
-	"k8s.io/kubernetes/pkg/security/apparmor"
+	v1 "k8s.io/api/core/v1"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1"
+	"k8s.io/kubernetes/pkg/features"
+	runtimeutil "k8s.io/kubernetes/pkg/kubelet/kuberuntime/util"
 	"k8s.io/kubernetes/pkg/securitycontext"
 )
 
 // determineEffectiveSecurityContext gets container's security context from v1.Pod and v1.Container.
-func (m *kubeGenericRuntimeManager) determineEffectiveSecurityContext(pod *v1.Pod, container *v1.Container, uid *int64, username string) *runtimeapi.LinuxContainerSecurityContext {
+func (m *kubeGenericRuntimeManager) determineEffectiveSecurityContext(ctx context.Context, pod *v1.Pod, container *v1.Container, uid *int64, username string) (*runtimeapi.LinuxContainerSecurityContext, error) {
 	effectiveSc := securitycontext.DetermineEffectiveSecurityContext(pod, container)
 	synthesized := convertToRuntimeSecurityContext(effectiveSc)
 	if synthesized == nil {
@@ -35,12 +38,18 @@ func (m *kubeGenericRuntimeManager) determineEffectiveSecurityContext(pod *v1.Po
 			ReadonlyPaths: securitycontext.ConvertToRuntimeReadonlyPaths(effectiveSc.ProcMount),
 		}
 	}
+	var err error
 
-	// set SeccompProfilePath.
-	synthesized.SeccompProfilePath = m.getSeccompProfileFromAnnotations(pod.Annotations, container.Name)
+	synthesized.Seccomp, err = m.getSeccompProfile(pod.Annotations, container.Name, pod.Spec.SecurityContext, container.SecurityContext, m.seccompDefault)
+	if err != nil {
+		return nil, err
+	}
 
 	// set ApparmorProfile.
-	synthesized.ApparmorProfile = apparmor.GetProfileNameFromPodAnnotations(pod.Annotations, container.Name)
+	synthesized.Apparmor, synthesized.ApparmorProfile, err = getAppArmorProfile(pod, container)
+	if err != nil {
+		return nil, err
+	}
 
 	// set RunAsUser.
 	if synthesized.RunAsUser == nil {
@@ -51,7 +60,11 @@ func (m *kubeGenericRuntimeManager) determineEffectiveSecurityContext(pod *v1.Po
 	}
 
 	// set namespace options and supplemental groups.
-	synthesized.NamespaceOptions = namespacesForPod(pod)
+	namespaceOptions, err := runtimeutil.NamespacesForPod(ctx, pod, m.runtimeHelper, m.runtimeClassManager)
+	if err != nil {
+		return nil, err
+	}
+	synthesized.NamespaceOptions = namespaceOptions
 	podSc := pod.Spec.SecurityContext
 	if podSc != nil {
 		if podSc.FSGroup != nil {
@@ -63,6 +76,14 @@ func (m *kubeGenericRuntimeManager) determineEffectiveSecurityContext(pod *v1.Po
 				synthesized.SupplementalGroups = append(synthesized.SupplementalGroups, int64(sg))
 			}
 		}
+
+		if podSc.SupplementalGroupsPolicy != nil {
+			policyValue, ok := runtimeapi.SupplementalGroupsPolicy_value[string(*podSc.SupplementalGroupsPolicy)]
+			if !ok {
+				return nil, fmt.Errorf("unsupported supplementalGroupsPolicy: %s", string(*podSc.SupplementalGroupsPolicy))
+			}
+			synthesized.SupplementalGroupsPolicy = runtimeapi.SupplementalGroupsPolicy(policyValue)
+		}
 	}
 	if groups := m.runtimeHelper.GetExtraSupplementalGroupsForPod(pod); len(groups) > 0 {
 		synthesized.SupplementalGroups = append(synthesized.SupplementalGroups, groups...)
@@ -73,32 +94,36 @@ func (m *kubeGenericRuntimeManager) determineEffectiveSecurityContext(pod *v1.Po
 	synthesized.MaskedPaths = securitycontext.ConvertToRuntimeMaskedPaths(effectiveSc.ProcMount)
 	synthesized.ReadonlyPaths = securitycontext.ConvertToRuntimeReadonlyPaths(effectiveSc.ProcMount)
 
-	return synthesized
+	if utilfeature.DefaultFeatureGate.Enabled(features.CgroupOptions) &&
+		effectiveSc.CgroupOptions != nil && effectiveSc.CgroupOptions.MountMode != nil {
+		switch *effectiveSc.CgroupOptions.MountMode {
+		case v1.CgroupMountModeReadWrite:
+			if err := m.checkWritableCgroupNodeRequirements(); err != nil {
+				return nil, err
+			}
+			synthesized.CgroupMountMode = runtimeapi.CgroupMountMode_CGROUP_MOUNT_MODE_READ_WRITE
+		case v1.CgroupMountModeReadOnly:
+			synthesized.CgroupMountMode = runtimeapi.CgroupMountMode_CGROUP_MOUNT_MODE_READ_ONLY
+		default:
+			return nil, fmt.Errorf("unsupported cgroup mount mode: %s", string(*effectiveSc.CgroupOptions.MountMode))
+		}
+	}
+
+	return synthesized, nil
 }
 
-// verifyRunAsNonRoot verifies RunAsNonRoot.
-func verifyRunAsNonRoot(pod *v1.Pod, container *v1.Container, uid *int64, username string) error {
-	effectiveSc := securitycontext.DetermineEffectiveSecurityContext(pod, container)
-	// If the option is not set, or if running as root is allowed, return nil.
-	if effectiveSc == nil || effectiveSc.RunAsNonRoot == nil || !*effectiveSc.RunAsNonRoot {
-		return nil
+func (m *kubeGenericRuntimeManager) checkWritableCgroupNodeRequirements() error {
+	nodeConfig := m.containerManager.GetNodeConfig()
+	if nodeConfig.CgroupVersion != 2 {
+		return fmt.Errorf("writable cgroups require cgroup v2")
 	}
-
-	if effectiveSc.RunAsUser != nil {
-		if *effectiveSc.RunAsUser == 0 {
-			return fmt.Errorf("container's runAsUser breaks non-root policy")
-		}
-		return nil
+	if !nodeConfig.CgroupNsdelegate {
+		return fmt.Errorf("writable cgroups require the cgroup filesystem to be mounted with nsdelegate")
 	}
-
-	switch {
-	case uid != nil && *uid == 0:
-		return fmt.Errorf("container has runAsNonRoot and image will run as root")
-	case uid == nil && len(username) > 0:
-		return fmt.Errorf("container has runAsNonRoot and image has non-numeric user (%s), cannot verify user is non-root", username)
-	default:
-		return nil
+	if !nodeConfig.CgroupsPerQOS {
+		return fmt.Errorf("writable cgroups require the kubelet to manage a cgroup per pod (--cgroups-per-qos)")
 	}
+	return nil
 }
 
 // convertToRuntimeSecurityContext converts v1.SecurityContext to runtimeapi.SecurityContext.

@@ -1,66 +1,62 @@
 # See the OWNERS docs at https://go.k8s.io/owners
 
+options:
+  # make root approval non-recursive
+  no_parent_owners: true
 reviewers:
-  - bowei
-  - rramkumar1
-  - MrHohn
-  - deads2k
-  - enisoc
-  - janetkuo
-  - liggitt
-  - mikedanese
-  - msau42
-  - ncdc
-  - pwittrock # for test/e2e/kubectl.go
-  - saad-ali
-  - shyamjvs
-  - smarterclayton
-  - sig-testing-reviewers
-  - sttts
-  - timothysc
-  - zmerlynn
-  - vishh
-  - xichengliudui
-  - andrewsykim
-  - neolit123
-  - stevesloka
+  - aojea
+  - dchen1107
   - johnSchnake
+  - liggitt
   - SataQiu
+  - thockin
+  - wojtek-t
 approvers:
+  - andrewsykim
+  - aojea
+  - BenTheElder
   - bowei # for test/e2e/{dns*,network}.go
+  - caseydavenport # for test/e2e/{dns*,network}.go
   - cblecker
-  - rramkumar1
-  - MrHohn
+  - dchen1107
   - deads2k
-  - enisoc
+  - dims
+  - enj
   - janetkuo
   - liggitt
-  - mikedanese
+  - MrHohn
   - msau42
-  - ncdc
   - oomichi
+  - pohly
   - pwittrock # for test/e2e/kubectl.go
   - saad-ali
-  - shyamjvs
-  - sig-testing-approvers
-  - smarterclayton
+  - SataQiu
   - soltysh
   - sttts
-  - timothysc
-  - vishh
+  - thockin
+  - wojtek-t
 emeritus_approvers:
-  - enj
   - eparis
-  - erictune
   - foxish
   - gmarek
+  - ixdy
   - krousey
+  - krzyzacy
   - kow3ns
+  - lavalamp
   - madhusudancs
   - marun
   - zmerlynn
   - MaciekPytel
-
+  - rramkumar1
+  - ncdc
+  - vishh
+  - shyamjvs
+  - spiffxp
+  - enisoc
+  - alejandrox1
+  - timothysc
+  - neolit123
 labels:
-- area/test
-- sig/testing
+  - area/test
+  - sig/testing

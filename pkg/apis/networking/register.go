@@ -50,6 +50,12 @@ func addKnownTypes(scheme *runtime.Scheme) error {
 		&NetworkPolicyList{},
 		&Ingress{},
 		&IngressList{},
+		&IngressClass{},
+		&IngressClassList{},
+		&IPAddress{},
+		&IPAddressList{},
+		&ServiceCIDR{},
+		&ServiceCIDRList{},
 	)
 	return nil
 }

@@ -32,9 +32,10 @@ package nettest
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -215,7 +216,7 @@ func main(cmd *cobra.Command, args []string) {
 	}
 
 	if delayShutdown > 0 {
-		termCh := make(chan os.Signal)
+		termCh := make(chan os.Signal, 1)
 		signal.Notify(termCh, syscall.SIGTERM)
 		go func() {
 			<-termCh
@@ -303,7 +304,7 @@ func contactOthers(state *State) {
 
 	// Do this repeatedly, in case there's some propagation delay with getting
 	// newly started pods into the endpoints list.
-	for i := 0; i < 15; i++ {
+	for range 15 {
 		eps := getWebserverEndpoints(client)
 		for ep := range eps {
 			state.Logf("Attempting to contact %s", ep)
@@ -313,9 +314,9 @@ func contactOthers(state *State) {
 	}
 }
 
-//getWebserverEndpoints returns the webserver endpoints as a set of String, each in the format like "http://{ip}:{port}"
+// getWebserverEndpoints returns the webserver endpoints as a set of String, each in the format like "http://{ip}:{port}"
 func getWebserverEndpoints(client clientset.Interface) sets.String {
-	endpoints, err := client.CoreV1().Endpoints(namespace).Get(service, v1.GetOptions{})
+	endpoints, err := client.CoreV1().Endpoints(namespace).Get(context.TODO(), service, v1.GetOptions{})
 	eps := sets.String{}
 	if err != nil {
 		state.Logf("Unable to read the endpoints for %v/%v: %v.", namespace, service, err)
@@ -348,7 +349,7 @@ func contactSingle(e string, state *State) {
 	}
 	defer resp.Body.Close()
 
-	body, err = ioutil.ReadAll(resp.Body)
+	body, err = io.ReadAll(resp.Body)
 	if err != nil {
 		state.Logf("Warning: unable to read response from '%v': '%v'", e, err)
 		return

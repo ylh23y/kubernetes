@@ -37,21 +37,15 @@ type NodeRegistry struct {
 }
 
 // MakeNodeList constructs api.NodeList from list of node names and a NodeResource.
-func MakeNodeList(nodes []string, nodeResources api.NodeResources) *api.NodeList {
+func MakeNodeList(nodes []string, nodeResources api.ResourceList) *api.NodeList {
 	list := api.NodeList{
 		Items: make([]api.Node, len(nodes)),
 	}
 	for i := range nodes {
 		list.Items[i].Name = nodes[i]
-		list.Items[i].Status.Capacity = nodeResources.Capacity
+		list.Items[i].Status.Capacity = nodeResources
 	}
 	return &list
-}
-
-func NewNodeRegistry(nodes []string, nodeResources api.NodeResources) *NodeRegistry {
-	return &NodeRegistry{
-		Nodes: *MakeNodeList(nodes, nodeResources),
-	}
 }
 
 func (r *NodeRegistry) SetError(err error) {
@@ -114,5 +108,7 @@ func (r *NodeRegistry) DeleteNode(ctx context.Context, nodeID string) error {
 }
 
 func (r *NodeRegistry) WatchNodes(ctx context.Context, options *metainternalversion.ListOptions) (watch.Interface, error) {
+	r.Lock()
+	defer r.Unlock()
 	return nil, r.Err
 }

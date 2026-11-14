@@ -17,26 +17,28 @@ limitations under the License.
 package bootstrappolicy_test
 
 import (
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"testing"
 
+	"github.com/google/go-cmp/cmp"
 	"sigs.k8s.io/yaml"
 
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/util/diff"
 	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/apiserver/pkg/util/feature"
+	featuregatetesting "k8s.io/component-base/featuregate/testing"
+	"k8s.io/component-helpers/auth/rbac/validation"
 	"k8s.io/kubernetes/pkg/api/legacyscheme"
 	api "k8s.io/kubernetes/pkg/apis/core"
 	_ "k8s.io/kubernetes/pkg/apis/core/install"
 	_ "k8s.io/kubernetes/pkg/apis/rbac/install"
 	rbacv1helpers "k8s.io/kubernetes/pkg/apis/rbac/v1"
-	rbacregistryvalidation "k8s.io/kubernetes/pkg/registry/rbac/validation"
 	"k8s.io/kubernetes/plugin/pkg/auth/authorizer/rbac/bootstrappolicy"
 )
 
@@ -100,7 +102,7 @@ func TestEditViewRelationship(t *testing.T) {
 
 	// confirm that the view role doesn't already have extra powers
 	for _, rule := range viewEscalatingNamespaceResources {
-		if covers, _ := rbacregistryvalidation.Covers(semanticRoles.view.Rules, []rbacv1.PolicyRule{rule}); covers {
+		if covers, _ := validation.Covers(semanticRoles.view.Rules, []rbacv1.PolicyRule{rule}); covers {
 			t.Errorf("view has extra powers: %#v", rule)
 		}
 	}
@@ -108,7 +110,7 @@ func TestEditViewRelationship(t *testing.T) {
 
 	// confirm that the view role doesn't have ungettable resources
 	for _, rule := range ungettableResources {
-		if covers, _ := rbacregistryvalidation.Covers(semanticRoles.view.Rules, []rbacv1.PolicyRule{rule}); covers {
+		if covers, _ := validation.Covers(semanticRoles.view.Rules, []rbacv1.PolicyRule{rule}); covers {
 			t.Errorf("view has ungettable resource: %#v", rule)
 		}
 	}
@@ -175,6 +177,55 @@ func TestBootstrapClusterRoles(t *testing.T) {
 	testObjects(t, list, "cluster-roles.yaml")
 }
 
+func TestBootstrapClusterRolesWithFeatureGatesEnabled(t *testing.T) {
+	featuregatetesting.SetFeatureGatesDuringTest(t, feature.DefaultFeatureGate, featuregatetesting.FeatureOverrides{
+		"AllAlpha": true,
+		"AllBeta":  true,
+	})
+
+	bootstrapRoles := bootstrappolicy.ClusterRoles()
+	featureGateList := &api.List{}
+	featureGateNames := sets.NewString()
+	featureGateRoles := map[string]runtime.Object{}
+	for i := range bootstrapRoles {
+		role := bootstrapRoles[i]
+		featureGateNames.Insert(role.Name)
+		featureGateRoles[role.Name] = &role
+	}
+	for _, featureGateName := range featureGateNames.List() {
+		featureGateList.Items = append(featureGateList.Items, featureGateRoles[featureGateName])
+	}
+
+	testObjects(t, featureGateList, "cluster-roles-featuregates.yaml")
+}
+
+// Modifying the containers of a running pod must be explicitly granted, so the
+// default user-facing roles must not allow writing to pods/dynamic.
+func TestDefaultRolesDoNotGrantPodsDynamic(t *testing.T) {
+	featuregatetesting.SetFeatureGatesDuringTest(t, feature.DefaultFeatureGate, featuregatetesting.FeatureOverrides{
+		"AllAlpha": true,
+		"AllBeta":  true,
+	})
+
+	userFacingRoles := sets.New("admin", "edit", "view", "system:aggregate-to-admin", "system:aggregate-to-edit", "system:aggregate-to-view")
+	found := sets.New[string]()
+	for _, role := range bootstrappolicy.ClusterRoles() {
+		if !userFacingRoles.Has(role.Name) {
+			continue
+		}
+		found.Insert(role.Name)
+		for _, verb := range []string{"create", "update", "patch"} {
+			rule := rbacv1helpers.NewRule(verb).Groups("").Resources("pods/dynamic").RuleOrDie()
+			if covers, _ := validation.Covers(role.Rules, []rbacv1.PolicyRule{rule}); covers {
+				t.Errorf("role %q must not grant %q on pods/dynamic", role.Name, verb)
+			}
+		}
+	}
+	if missing := userFacingRoles.Difference(found); missing.Len() > 0 {
+		t.Errorf("roles not found in bootstrap policy: %v", sets.List(missing))
+	}
+}
+
 func TestBootstrapClusterRoleBindings(t *testing.T) {
 	list := &api.List{}
 	names := sets.NewString()
@@ -207,6 +258,28 @@ func TestBootstrapControllerRoles(t *testing.T) {
 	testObjects(t, list, "controller-roles.yaml")
 }
 
+func TestBootstrapControllerRolesWithFeatureGatesEnabled(t *testing.T) {
+	featuregatetesting.SetFeatureGatesDuringTest(t, feature.DefaultFeatureGate, featuregatetesting.FeatureOverrides{
+		"AllAlpha": true,
+		"AllBeta":  true,
+	})
+
+	roles := bootstrappolicy.ControllerRoles()
+	featureGateList := &api.List{}
+	featureGateNames := sets.NewString()
+	featureGateRoles := map[string]runtime.Object{}
+	for i := range roles {
+		role := roles[i]
+		featureGateNames.Insert(role.Name)
+		featureGateRoles[role.Name] = &role
+	}
+	for _, featureGateName := range featureGateNames.List() {
+		featureGateList.Items = append(featureGateList.Items, featureGateRoles[featureGateName])
+	}
+
+	testObjects(t, featureGateList, "controller-roles-featuregates.yaml")
+}
+
 func TestBootstrapControllerRoleBindings(t *testing.T) {
 	list := &api.List{}
 	names := sets.NewString()
@@ -225,7 +298,7 @@ func TestBootstrapControllerRoleBindings(t *testing.T) {
 
 func testObjects(t *testing.T, list *api.List, fixtureFilename string) {
 	filename := filepath.Join("testdata", fixtureFilename)
-	expectedYAML, err := ioutil.ReadFile(filename)
+	expectedYAML, err := os.ReadFile(filename)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -247,14 +320,14 @@ func testObjects(t *testing.T, list *api.List, fixtureFilename string) {
 
 		const updateEnvVar = "UPDATE_BOOTSTRAP_POLICY_FIXTURE_DATA"
 		if os.Getenv(updateEnvVar) == "true" {
-			if err := ioutil.WriteFile(filename, []byte(yamlData), os.FileMode(0755)); err == nil {
+			if err := os.WriteFile(filename, []byte(yamlData), os.FileMode(0755)); err == nil {
 				t.Logf("Updated data in %s", filename)
 				t.Logf("Verify the diff, commit changes, and rerun the tests")
 			} else {
 				t.Logf("Could not update data in %s: %v", filename, err)
 			}
 		} else {
-			t.Logf("Diff between bootstrap data and fixture data in %s:\n-------------\n%s", filename, diff.StringDiff(string(yamlData), string(expectedYAML)))
+			t.Logf("Diff between bootstrap data and fixture data in %s:\n-------------\n%s", filename, cmp.Diff(string(yamlData), string(expectedYAML)))
 			t.Logf("If the change is expected, re-run with %s=true to update the fixtures", updateEnvVar)
 		}
 	}
@@ -283,6 +356,42 @@ func TestClusterRoleLabel(t *testing.T) {
 		}
 		if got, want := accessor.GetLabels(), map[string]string{"kubernetes.io/bootstrapping": "rbac-defaults"}; !reflect.DeepEqual(got, want) {
 			t.Errorf("ClusterRoleBinding: %s GetLabels() = %s, want %s", accessor.GetName(), got, want)
+		}
+	}
+}
+
+func TestNodeRuleVerbsConsistency(t *testing.T) {
+	rules := bootstrappolicy.NodeRules()
+	for _, rule := range rules {
+		verbs := rule.Verbs
+		if slices.Contains(verbs, "list") && !slices.Contains(verbs, "watch") {
+			t.Errorf("The NodeRule has Verb `List` but does not have Verb `Watch`.")
+		}
+	}
+}
+
+func TestClusterRoleVerbsConsistency(t *testing.T) {
+	roles := bootstrappolicy.ClusterRoles()
+	for _, role := range roles {
+		for _, rule := range role.Rules {
+			verbs := rule.Verbs
+			if slices.Contains(verbs, "list") && !slices.Contains(verbs, "watch") {
+				t.Errorf("The ClusterRole %s has Verb `List` but does not have Verb `Watch`.", role.Name)
+			}
+		}
+	}
+}
+
+func TestNamespaceRoleVerbsConsistency(t *testing.T) {
+	namespaceRoles := bootstrappolicy.NamespaceRoles()
+	for namespace, roles := range namespaceRoles {
+		for _, role := range roles {
+			for _, rule := range role.Rules {
+				verbs := rule.Verbs
+				if slices.Contains(verbs, "list") && !slices.Contains(verbs, "watch") {
+					t.Errorf("The Role %s/%s has Verb `List` but does not have Verb `Watch`.", namespace, role.Name)
+				}
+			}
 		}
 	}
 }

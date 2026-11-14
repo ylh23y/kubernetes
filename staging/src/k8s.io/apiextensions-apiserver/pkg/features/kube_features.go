@@ -17,61 +17,42 @@ limitations under the License.
 package features
 
 import (
+	"k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/apimachinery/pkg/util/version"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/component-base/featuregate"
 )
 
+// Every feature gate should have an entry here following this template:
+//
+// // owner: @username
+// MyFeature() bool
+//
+// Feature gates should be listed in alphabetical, case-sensitive
+// (upper before any lower case character) order. This reduces the risk
+// of code conflicts because changes are more likely to be scattered
+// across the file.
 const (
-	// Every feature gate should add method here following this template:
+	// owner: @michaelasp
+	// kep: https://kep.k8s.io/4192
 	//
-	// // owner: @username
-	// // alpha: v1.4
-	// MyFeature() bool
-
-	// owner: @sttts, @nikhita
-	// alpha: v1.8
-	// beta: v1.9
-	//
-	// CustomResourceValidation is a list of validation methods for CustomResources
-	CustomResourceValidation featuregate.Feature = "CustomResourceValidation"
-
-	// owner: @roycaihw, @sttts
-	// alpha: v1.14
-	//
-	// CustomResourcePublishOpenAPI enables publishing of CRD OpenAPI specs.
-	CustomResourcePublishOpenAPI featuregate.Feature = "CustomResourcePublishOpenAPI"
-
-	// owner: @sttts, @nikhita
-	// alpha: v1.10
-	// beta: v1.11
-	//
-	// CustomResourceSubresources defines the subresources for CustomResources
-	CustomResourceSubresources featuregate.Feature = "CustomResourceSubresources"
-
-	// owner: @mbohlool, @roycaihw
-	// alpha: v1.13
-	//
-	// CustomResourceWebhookConversion defines the webhook conversion for Custom Resources.
-	CustomResourceWebhookConversion featuregate.Feature = "CustomResourceWebhookConversion"
-
-	// owner: @sttts
-	// alpha: v1.15
-	//
-	// CustomResourceDefaulting enables OpenAPI defaulting in CustomResources.
-	CustomResourceDefaulting featuregate.Feature = "CustomResourceDefaulting"
+	// Enables the tracking of observed generation in CRD status and conditions.
+	CRDObservedGenerationTracking featuregate.Feature = "CRDObservedGenerationTracking"
 )
 
 func init() {
-	utilfeature.DefaultMutableFeatureGate.Add(defaultKubernetesFeatureGates)
+	runtime.Must(utilfeature.DefaultMutableFeatureGate.AddVersioned(defaultVersionedKubernetesFeatureGates))
 }
 
-// defaultKubernetesFeatureGates consists of all known Kubernetes-specific feature keys.
-// To add a new feature, define a key for it above and add it here. The features will be
+// defaultVersionedKubernetesFeatureGates consists of all known Kubernetes-specific feature keys with VersionedSpecs.
+// To add a new feature, define a key for it above and add it below. The features will be
 // available throughout Kubernetes binaries.
-var defaultKubernetesFeatureGates = map[featuregate.Feature]featuregate.FeatureSpec{
-	CustomResourceValidation:        {Default: true, PreRelease: featuregate.Beta},
-	CustomResourceSubresources:      {Default: true, PreRelease: featuregate.Beta},
-	CustomResourceWebhookConversion: {Default: true, PreRelease: featuregate.Beta},
-	CustomResourcePublishOpenAPI:    {Default: true, PreRelease: featuregate.Beta},
-	CustomResourceDefaulting:        {Default: false, PreRelease: featuregate.Alpha},
+// To support n-3 compatibility version, features may only be removed 3 releases after graduation.
+//
+// Entries are alphabetized.
+var defaultVersionedKubernetesFeatureGates = map[featuregate.Feature]featuregate.VersionedSpecs{
+	CRDObservedGenerationTracking: {
+		{Version: version.MustParse("1.35"), PreRelease: featuregate.Beta, Default: false},
+		{Version: version.MustParse("1.36"), PreRelease: featuregate.Beta, Default: true},
+	},
 }

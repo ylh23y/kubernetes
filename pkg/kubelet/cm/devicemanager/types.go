@@ -17,52 +17,90 @@ limitations under the License.
 package devicemanager
 
 import (
+	"context"
 	"time"
 
 	v1 "k8s.io/api/core/v1"
-	podresourcesapi "k8s.io/kubernetes/pkg/kubelet/apis/podresources/v1alpha1"
+	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/apiserver/pkg/server/healthz"
+	"k8s.io/klog/v2"
+	"k8s.io/kubernetes/pkg/kubelet/cm/containermap"
+	"k8s.io/kubernetes/pkg/kubelet/cm/resourceupdates"
+	"k8s.io/kubernetes/pkg/kubelet/cm/topologymanager"
 	"k8s.io/kubernetes/pkg/kubelet/config"
 	kubecontainer "k8s.io/kubernetes/pkg/kubelet/container"
 	"k8s.io/kubernetes/pkg/kubelet/lifecycle"
 	"k8s.io/kubernetes/pkg/kubelet/pluginmanager/cache"
-	schedulernodeinfo "k8s.io/kubernetes/pkg/scheduler/nodeinfo"
+	schedulerframework "k8s.io/kubernetes/pkg/scheduler/framework"
 )
 
 // Manager manages all the Device Plugins running on a node.
 type Manager interface {
 	// Start starts device plugin registration service.
-	Start(activePods ActivePodsFunc, sourcesReady config.SourcesReady) error
+	Start(logger klog.Logger, activePods ActivePodsFunc, sourcesReady config.SourcesReady, initialContainers containermap.ContainerMap, initialContainerRunningSet sets.Set[string]) error
 
-	// Allocate configures and assigns devices to pods. The pods are provided
-	// through the pod admission attributes in the attrs argument. From the
-	// requested device resources, Allocate will communicate with the owning
-	// device plugin to allow setup procedures to take place, and for the
-	// device plugin to provide runtime settings to use the device (environment
-	// variables, mount points and device files). The node object is provided
-	// for the device manager to update the node capacity to reflect the
-	// currently available devices.
-	Allocate(node *schedulernodeinfo.NodeInfo, attrs *lifecycle.PodAdmitAttributes) error
+	// Allocate configures and assigns devices to a container in a pod. From
+	// the requested device resources, Allocate will communicate with the
+	// owning device plugin to allow setup procedures to take place, and for
+	// the device plugin to provide runtime settings to use the device
+	// (environment variables, mount points and device files).
+	Allocate(ctx context.Context, pod *v1.Pod, container *v1.Container, operation lifecycle.Operation) error
+
+	// UpdatePluginResources updates node resources based on devices already
+	// allocated to pods. The node object is provided for the device manager to
+	// update the node capacity to reflect the currently available devices.
+	UpdatePluginResources(node *schedulerframework.NodeInfo, attrs *lifecycle.PodAdmitAttributes) error
 
 	// Stop stops the manager.
-	Stop() error
+	Stop(logger klog.Logger) error
 
 	// GetDeviceRunContainerOptions checks whether we have cached containerDevices
 	// for the passed-in <pod, container> and returns its DeviceRunContainerOptions
 	// for the found one. An empty struct is returned in case no cached state is found.
-	GetDeviceRunContainerOptions(pod *v1.Pod, container *v1.Container) (*DeviceRunContainerOptions, error)
+	GetDeviceRunContainerOptions(ctx context.Context, pod *v1.Pod, container *v1.Container) (*DeviceRunContainerOptions, error)
 
 	// GetCapacity returns the amount of available device plugin resource capacity, resource allocatable
 	// and inactive device plugin resources previously registered on the node.
-	GetCapacity() (v1.ResourceList, v1.ResourceList, []string)
+	GetCapacity(logger klog.Logger) (v1.ResourceList, v1.ResourceList, []string)
+
+	// GetWatcherHandler returns the plugin handler for the device manager.
 	GetWatcherHandler() cache.PluginHandler
+	GetHealthChecker() healthz.HealthChecker
 
 	// GetDevices returns information about the devices assigned to pods and containers
-	GetDevices(podUID, containerName string) []*podresourcesapi.ContainerDevices
+	GetDevices(podUID, containerName string) ResourceDeviceInstances
+
+	// UpdateAllocatedResourcesStatus updates the status of allocated resources for the pod.
+	UpdateAllocatedResourcesStatus(logger klog.Logger, pod *v1.Pod, status *v1.PodStatus)
+
+	// GetAllocatableDevices returns information about all the devices known to the manager
+	GetAllocatableDevices(logger klog.Logger) ResourceDeviceInstances
 
 	// ShouldResetExtendedResourceCapacity returns whether the extended resources should be reset or not,
 	// depending on the checkpoint file availability. Absence of the checkpoint file strongly indicates
 	// the node has been recreated.
 	ShouldResetExtendedResourceCapacity() bool
+
+	// TopologyManager HintProvider provider indicates the Device Manager implements the Topology Manager Interface
+	// and is consulted to make Topology aware resource alignments
+	GetTopologyHints(logger klog.Logger, pod *v1.Pod, container *v1.Container, operation lifecycle.Operation) map[string][]topologymanager.TopologyHint
+
+	// TopologyManager HintProvider provider indicates the Device Manager implements the Topology Manager Interface
+	// and is consulted to make Topology aware resource alignments per Pod
+	GetPodTopologyHints(logger klog.Logger, pod *v1.Pod, operation lifecycle.Operation) map[string][]topologymanager.TopologyHint
+
+	// AllocatePod is called to trigger the allocation of resources to a pod.
+	AllocatePod(logger klog.Logger, pod *v1.Pod, operation lifecycle.Operation) error
+
+	// UpdateAllocatedDevices frees any Devices that are bound to terminated pods.
+	UpdateAllocatedDevices(logger klog.Logger)
+
+	// Updates returns a channel that receives an Update when the device changed its status.
+	Updates() <-chan resourceupdates.Update
+
+	// CanAllocateExclusively reports whether the manager knows the device resource
+	// and supports exclusive assignment of its device IDs, regardless of free or healthy capacity.
+	CanAllocateExclusively(res v1.ResourceName) bool
 }
 
 // DeviceRunContainerOptions contains the combined container runtime settings to consume its allocated devices.
@@ -75,27 +113,13 @@ type DeviceRunContainerOptions struct {
 	Devices []kubecontainer.DeviceInfo
 	// The Annotations for the container
 	Annotations []kubecontainer.Annotation
+	// CDI Devices for the container
+	CDIDevices []kubecontainer.CDIDevice
 }
 
-// TODO: evaluate whether we need these error definitions.
+// TODO: evaluate whether we need this error definition.
 const (
-	// errFailedToDialDevicePlugin is the error raised when the device plugin could not be
-	// reached on the registered socket
-	errFailedToDialDevicePlugin = "failed to dial device plugin:"
-	// errUnsupportedVersion is the error raised when the device plugin uses an API version not
-	// supported by the Kubelet registry
-	errUnsupportedVersion = "requested API version %q is not supported by kubelet. Supported version is %q"
-	// errInvalidResourceName is the error raised when a device plugin is registering
-	// itself with an invalid ResourceName
-	errInvalidResourceName = "the ResourceName %q is invalid"
-	// errEndpointStopped indicates that the endpoint has been stopped
 	errEndpointStopped = "endpoint %v has been stopped"
-	// errBadSocket is the error raised when the registry socket path is not absolute
-	errBadSocket = "bad socketPath, must be an absolute path:"
-	// errListenSocket is the error raised when the registry could not listen on the socket
-	errListenSocket = "failed to listen to socket while starting device plugin registry, with error"
-	// errListAndWatch is the error raised when ListAndWatch ended unsuccessfully
-	errListAndWatch = "listAndWatch ended unexpectedly for device plugin %s with error %v"
 )
 
 // endpointStopGracePeriod indicates the grace period after an endpoint is stopped

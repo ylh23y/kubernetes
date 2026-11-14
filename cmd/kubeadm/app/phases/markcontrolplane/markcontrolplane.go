@@ -18,17 +18,25 @@ package markcontrolplane
 
 import (
 	"fmt"
+	"slices"
 
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	clientset "k8s.io/client-go/kubernetes"
+
 	"k8s.io/kubernetes/cmd/kubeadm/app/constants"
 	"k8s.io/kubernetes/cmd/kubeadm/app/util/apiclient"
 )
 
+// labelsToAdd holds a list of labels that are applied on kubeadm managed control plane nodes
+var labelsToAdd = []string{
+	constants.LabelNodeRoleControlPlane,
+	constants.LabelExcludeFromExternalLB,
+}
+
 // MarkControlPlane taints the control-plane and sets the control-plane label
 func MarkControlPlane(client clientset.Interface, controlPlaneName string, taints []v1.Taint) error {
-
-	fmt.Printf("[mark-control-plane] Marking the node %s as control-plane by adding the label \"%s=''\"\n", controlPlaneName, constants.LabelNodeRoleMaster)
+	fmt.Printf("[mark-control-plane] Marking the node %s as control-plane by adding the labels: %v\n",
+		controlPlaneName, labelsToAdd)
 
 	if len(taints) > 0 {
 		taintStrs := []string{}
@@ -43,21 +51,13 @@ func MarkControlPlane(client clientset.Interface, controlPlaneName string, taint
 	})
 }
 
-func taintExists(taint v1.Taint, taints []v1.Taint) bool {
-	for _, t := range taints {
-		if t == taint {
-			return true
-		}
+func markControlPlaneNode(n *v1.Node, taints []v1.Taint) {
+	for _, label := range labelsToAdd {
+		n.ObjectMeta.Labels[label] = ""
 	}
 
-	return false
-}
-
-func markControlPlaneNode(n *v1.Node, taints []v1.Taint) {
-	n.ObjectMeta.Labels[constants.LabelNodeRoleMaster] = ""
-
 	for _, nt := range n.Spec.Taints {
-		if !taintExists(nt, taints) {
+		if !slices.Contains(taints, nt) {
 			taints = append(taints, nt)
 		}
 	}

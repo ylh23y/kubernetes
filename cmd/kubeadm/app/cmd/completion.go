@@ -21,11 +21,11 @@ import (
 	"io"
 
 	"github.com/lithammer/dedent"
-	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
-	"k8s.io/klog"
 
-	kubeadmutil "k8s.io/kubernetes/cmd/kubeadm/app/util"
+	"k8s.io/klog/v2"
+
+	"k8s.io/kubernetes/cmd/kubeadm/app/util/errors"
 )
 
 const defaultBoilerPlate = `
@@ -98,16 +98,15 @@ func GetSupportedShells() []string {
 	return shells
 }
 
-// NewCmdCompletion returns the "kubeadm completion" command
-func NewCmdCompletion(out io.Writer, boilerPlate string) *cobra.Command {
+// newCmdCompletion returns the "kubeadm completion" command
+func newCmdCompletion(out io.Writer, boilerPlate string) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:     "completion SHELL",
 		Short:   "Output shell completion code for the specified shell (bash or zsh)",
 		Long:    completionLong,
 		Example: completionExample,
-		Run: func(cmd *cobra.Command, args []string) {
-			err := RunCompletion(out, boilerPlate, cmd, args)
-			kubeadmutil.CheckErr(err)
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return RunCompletion(out, boilerPlate, cmd, args)
 		},
 		ValidArgs: GetSupportedShells(),
 	}
@@ -124,7 +123,7 @@ func RunCompletion(out io.Writer, boilerPlate string, cmd *cobra.Command, args [
 	}
 	run, found := completionShells[args[0]]
 	if !found {
-		return errors.Errorf("unsupported shell type %q", args[0])
+		return errors.Errorf("unsupported shell type %q, the supported shell types are %v", args[0], GetSupportedShells())
 	}
 
 	if len(boilerPlate) == 0 {
@@ -263,7 +262,7 @@ autoload -U +X bashcompinit && bashcompinit
 # use word boundary patterns for BSD or GNU sed
 LWORD='[[:<:]]'
 RWORD='[[:>:]]'
-if sed --help 2>&1 | grep -q GNU; then
+if sed --version 2>&1 | grep -q GNU; then
 	LWORD='\<'
 	RWORD='\>'
 fi

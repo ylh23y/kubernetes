@@ -17,34 +17,24 @@ limitations under the License.
 package apiserver
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"reflect"
 	"strings"
 	"testing"
 	"time"
 
-	appsv1beta1 "k8s.io/api/apps/v1beta1"
-	appsv1beta2 "k8s.io/api/apps/v1beta2"
-	auditregv1alpha1 "k8s.io/api/auditregistration/v1alpha1"
-	batchv2alpha1 "k8s.io/api/batch/v2alpha1"
-	extensionsv1beta1 "k8s.io/api/extensions/v1beta1"
-	nodev1alpha1 "k8s.io/api/node/v1alpha1"
-	rbacv1alpha1 "k8s.io/api/rbac/v1alpha1"
-	schedulerapi "k8s.io/api/scheduling/v1"
-	settingsv1alpha1 "k8s.io/api/settings/v1alpha1"
-	storagev1alpha1 "k8s.io/api/storage/v1alpha1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1beta1 "k8s.io/apimachinery/pkg/apis/meta/v1beta1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/cli-runtime/pkg/genericclioptions"
 	diskcached "k8s.io/client-go/discovery/cached/disk"
 	"k8s.io/client-go/tools/clientcmd"
 	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
-	"k8s.io/gengo/examples/set-gen/sets"
 	"k8s.io/kubectl/pkg/cmd/util"
 	"k8s.io/kubernetes/pkg/api/legacyscheme"
 	"k8s.io/kubernetes/pkg/printers"
@@ -52,7 +42,7 @@ import (
 	"k8s.io/kubernetes/test/integration/framework"
 )
 
-var kindWhiteList = sets.NewString(
+var kindAllowList = sets.NewString(
 	// k8s.io/api/core
 	"APIGroup",
 	"APIVersions",
@@ -71,7 +61,6 @@ var kindWhiteList = sets.NewString(
 	"PodPortForwardOptions",
 	"PodLogOptions",
 	"PodProxyOptions",
-	"PodStatusResult",
 	"RangeAllocation",
 	"ServiceProxyOptions",
 	"SerializedReference",
@@ -105,10 +94,6 @@ var kindWhiteList = sets.NewString(
 	"JobTemplate",
 	// --
 
-	// k8s.io/api/extensions
-	"ReplicationControllerDummy",
-	// --
-
 	// k8s.io/api/imagepolicy
 	"ImageReview",
 	// --
@@ -127,58 +112,52 @@ var kindWhiteList = sets.NewString(
 var missingHanlders = sets.NewString(
 	"ClusterRole",
 	"LimitRange",
-	"MutatingWebhookConfiguration",
 	"ResourceQuota",
 	"Role",
-	"ValidatingWebhookConfiguration",
-	"VolumeAttachment",
 	"PriorityClass",
-	"PodPreset",
 	"AuditSink",
-	"CSINode",
-	"CSIDriver",
 )
 
 func TestServerSidePrint(t *testing.T) {
-	s, _, closeFn := setupWithResources(t,
+	_, clientSet, kubeConfig, tearDownFn := setupWithResources(t,
 		// additional groupversions needed for the test to run
 		[]schema.GroupVersion{
-			auditregv1alpha1.SchemeGroupVersion,
-			batchv2alpha1.SchemeGroupVersion,
-			rbacv1alpha1.SchemeGroupVersion,
-			settingsv1alpha1.SchemeGroupVersion,
-			schedulerapi.SchemeGroupVersion,
-			storagev1alpha1.SchemeGroupVersion,
-			appsv1beta1.SchemeGroupVersion,
-			appsv1beta2.SchemeGroupVersion,
-			extensionsv1beta1.SchemeGroupVersion,
-			nodev1alpha1.SchemeGroupVersion,
+			{Group: "discovery.k8s.io", Version: "v1"},
+			{Group: "discovery.k8s.io", Version: "v1beta1"},
+			{Group: "rbac.authorization.k8s.io", Version: "v1alpha1"},
+			{Group: "scheduling.k8s.io", Version: "v1"},
+			{Group: "storage.k8s.io", Version: "v1alpha1"},
+			{Group: "storage.k8s.io", Version: "v1beta1"},
+			{Group: "extensions", Version: "v1beta1"},
+			{Group: "node.k8s.io", Version: "v1"},
+			{Group: "node.k8s.io", Version: "v1alpha1"},
+			{Group: "node.k8s.io", Version: "v1beta1"},
+			{Group: "flowcontrol.apiserver.k8s.io", Version: "v1alpha1"},
+			{Group: "flowcontrol.apiserver.k8s.io", Version: "v1beta1"},
+			{Group: "flowcontrol.apiserver.k8s.io", Version: "v1beta2"},
+			{Group: "flowcontrol.apiserver.k8s.io", Version: "v1beta3"},
+			{Group: "flowcontrol.apiserver.k8s.io", Version: "v1"},
+			{Group: "internal.apiserver.k8s.io", Version: "v1alpha1"},
 		},
-		[]schema.GroupVersionResource{
-			extensionsv1beta1.SchemeGroupVersion.WithResource("daemonsets"),
-			extensionsv1beta1.SchemeGroupVersion.WithResource("deployments"),
-			extensionsv1beta1.SchemeGroupVersion.WithResource("networkpolicies"),
-			extensionsv1beta1.SchemeGroupVersion.WithResource("podsecuritypolicies"),
-			extensionsv1beta1.SchemeGroupVersion.WithResource("replicasets"),
-		},
+		[]schema.GroupVersionResource{},
 	)
-	defer closeFn()
+	defer tearDownFn()
 
-	ns := framework.CreateTestingNamespace("server-print", s, t)
-	defer framework.DeleteTestingNamespace(ns, s, t)
+	ns := framework.CreateNamespaceOrDie(clientSet, "server-print", t)
+	defer framework.DeleteNamespaceOrDie(clientSet, ns, t)
 
 	tableParam := fmt.Sprintf("application/json;as=Table;g=%s;v=%s, application/json", metav1beta1.GroupName, metav1beta1.SchemeGroupVersion.Version)
 	printer := newFakePrinter(printersinternal.AddHandlers)
 
 	configFlags := genericclioptions.NewTestConfigFlags().
-		WithClientConfig(clientcmd.NewDefaultClientConfig(*createKubeConfig(s.URL), &clientcmd.ConfigOverrides{}))
+		WithClientConfig(clientcmd.NewDefaultClientConfig(*createKubeConfig(kubeConfig.Host), &clientcmd.ConfigOverrides{}))
 
 	restConfig, err := configFlags.ToRESTConfig()
 	if err != nil {
 		t.Errorf("unexpected error: %v", err)
 	}
 
-	cacheDir, err := ioutil.TempDir(os.TempDir(), "test-integration-apiserver-print")
+	cacheDir, err := os.MkdirTemp(os.TempDir(), "test-integration-apiserver-print")
 	if err != nil {
 		t.Errorf("unexpected error: %v", err)
 	}
@@ -204,7 +183,7 @@ func TestServerSidePrint(t *testing.T) {
 		if gvk.Version == runtime.APIVersionInternal || strings.HasSuffix(apiType.Name(), "List") {
 			continue
 		}
-		if kindWhiteList.Has(gvk.Kind) || missingHanlders.Has(gvk.Kind) {
+		if kindAllowList.Has(gvk.Kind) || missingHanlders.Has(gvk.Kind) {
 			continue
 		}
 
@@ -212,7 +191,8 @@ func TestServerSidePrint(t *testing.T) {
 		// read table definition as returned by the server
 		mapping, err := mapper.RESTMapping(gvk.GroupKind(), gvk.Version)
 		if err != nil {
-			t.Errorf("unexpected error getting mapping for GVK %s: %v", gvk, err)
+			// if we have no mapping, we aren't serving it and we don't need to check its printer.
+			t.Logf("unexpected error getting mapping for GVK %s: %v", gvk, err)
 			continue
 		}
 		client, err := factory.ClientForMapping(mapping)
@@ -224,7 +204,7 @@ func TestServerSidePrint(t *testing.T) {
 		if mapping.Scope.Name() == meta.RESTScopeNameNamespace {
 			req = req.Namespace(ns.Name)
 		}
-		body, err := req.Resource(mapping.Resource.Resource).SetHeader("Accept", tableParam).Do().Raw()
+		body, err := req.Resource(mapping.Resource.Resource).SetHeader("Accept", tableParam).Do(context.TODO()).Raw()
 		if err != nil {
 			t.Errorf("unexpected error getting %s: %v", gvk, err)
 			continue

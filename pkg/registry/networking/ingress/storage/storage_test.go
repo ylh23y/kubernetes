@@ -19,6 +19,8 @@ package storage
 import (
 	"testing"
 
+	"github.com/google/go-cmp/cmp"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
@@ -26,9 +28,11 @@ import (
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apiserver/pkg/registry/generic"
 	genericregistrytest "k8s.io/apiserver/pkg/registry/generic/testing"
+	"k8s.io/apiserver/pkg/registry/rest"
 	etcd3testing "k8s.io/apiserver/pkg/storage/etcd3/testing"
-	api "k8s.io/kubernetes/pkg/apis/core"
+	_ "k8s.io/kubernetes/pkg/apis/extensions/install"
 	"k8s.io/kubernetes/pkg/apis/networking"
+	_ "k8s.io/kubernetes/pkg/apis/networking/install"
 	"k8s.io/kubernetes/pkg/registry/registrytest"
 )
 
@@ -40,21 +44,32 @@ func newStorage(t *testing.T) (*REST, *StatusREST, *etcd3testing.EtcdTestServer)
 		DeleteCollectionWorkers: 1,
 		ResourcePrefix:          "ingresses",
 	}
-	ingressStorage, statusStorage := NewREST(restOptions)
+	ingressStorage, statusStorage, err := NewREST(restOptions)
+	if err != nil {
+		t.Fatalf("unexpected error from REST storage: %v", err)
+	}
 	return ingressStorage, statusStorage, server
 }
 
 var (
-	namespace           = metav1.NamespaceNone
+	namespace           = "test" // genericregistrytest.Tester hardcode namespace that will be used when creating contexts.
 	name                = "foo-ingress"
 	defaultHostname     = "foo.bar.com"
 	defaultBackendName  = "default-backend"
-	defaultBackendPort  = intstr.FromInt(80)
+	defaultBackendPort  = intstr.FromInt32(80)
 	defaultLoadBalancer = "127.0.0.1"
 	defaultPath         = "/foo"
+	defaultPathType     = networking.PathTypeImplementationSpecific
 	defaultPathMap      = map[string]string{defaultPath: defaultBackendName}
 	defaultTLS          = []networking.IngressTLS{
-		{Hosts: []string{"foo.bar.com", "*.bar.com"}, SecretName: "fooSecret"},
+		{Hosts: []string{"foo.bar.com", "*.bar.com"}, SecretName: "foosecret"},
+	}
+	serviceBackend = &networking.IngressServiceBackend{
+		Name: "defaultbackend",
+		Port: networking.ServiceBackendPort{
+			Name:   "",
+			Number: 80,
+		},
 	}
 )
 
@@ -64,10 +79,16 @@ func toHTTPIngressPaths(pathMap map[string]string) []networking.HTTPIngressPath 
 	httpPaths := []networking.HTTPIngressPath{}
 	for path, backend := range pathMap {
 		httpPaths = append(httpPaths, networking.HTTPIngressPath{
-			Path: path,
+			Path:     path,
+			PathType: &defaultPathType,
 			Backend: networking.IngressBackend{
-				ServiceName: backend,
-				ServicePort: defaultBackendPort,
+				Service: &networking.IngressServiceBackend{
+					Name: backend,
+					Port: networking.ServiceBackendPort{
+						Name:   defaultBackendPort.StrVal,
+						Number: defaultBackendPort.IntVal,
+					},
+				},
 			},
 		})
 	}
@@ -96,9 +117,8 @@ func newIngress(pathMap map[string]string) *networking.Ingress {
 			Namespace: namespace,
 		},
 		Spec: networking.IngressSpec{
-			Backend: &networking.IngressBackend{
-				ServiceName: defaultBackendName,
-				ServicePort: defaultBackendPort,
+			DefaultBackend: &networking.IngressBackend{
+				Service: serviceBackend.DeepCopy(),
 			},
 			Rules: toIngressRules(map[string]IngressRuleValues{
 				defaultHostname: pathMap,
@@ -106,8 +126,8 @@ func newIngress(pathMap map[string]string) *networking.Ingress {
 			TLS: defaultTLS,
 		},
 		Status: networking.IngressStatus{
-			LoadBalancer: api.LoadBalancerStatus{
-				Ingress: []api.LoadBalancerIngress{
+			LoadBalancer: networking.IngressLoadBalancerStatus{
+				Ingress: []networking.IngressLoadBalancerIngress{
 					{IP: defaultLoadBalancer},
 				},
 			},
@@ -126,11 +146,11 @@ func TestCreate(t *testing.T) {
 	test := genericregistrytest.New(t, storage.Store)
 	ingress := validIngress()
 	noDefaultBackendAndRules := validIngress()
-	noDefaultBackendAndRules.Spec.Backend = &networking.IngressBackend{}
+	noDefaultBackendAndRules.Spec.DefaultBackend.Service = &networking.IngressServiceBackend{}
 	noDefaultBackendAndRules.Spec.Rules = []networking.IngressRule{}
 	badPath := validIngress()
 	badPath.Spec.Rules = toIngressRules(map[string]IngressRuleValues{
-		"foo.bar.com": {"/invalid[": "svc"}})
+		"foo.bar.com": {"invalid-no-leading-slash": "svc"}})
 	test.TestCreate(
 		// valid
 		ingress,
@@ -155,11 +175,11 @@ func TestUpdate(t *testing.T) {
 			})
 			object.Spec.TLS = append(object.Spec.TLS, networking.IngressTLS{
 				Hosts:      []string{"*.google.com"},
-				SecretName: "googleSecret",
+				SecretName: "googlesecret",
 			})
 			return object
 		},
-		// invalid updateFunc: ObjeceMeta is not to be tampered with.
+		// invalid updateFunc: ObjectMeta is not to be tampered with.
 		func(obj runtime.Object) runtime.Object {
 			object := obj.(*networking.Ingress)
 			object.Name = ""
@@ -169,7 +189,7 @@ func TestUpdate(t *testing.T) {
 		func(obj runtime.Object) runtime.Object {
 			object := obj.(*networking.Ingress)
 			object.Spec.Rules = toIngressRules(map[string]IngressRuleValues{
-				"foo.bar.com": {"/invalid[": "svc"}})
+				"foo.bar.com": {"invalid-no-leading-slash": "svc"}})
 			return object
 		},
 	)
@@ -225,6 +245,41 @@ func TestWatch(t *testing.T) {
 	)
 }
 
+func TestUpdateStatus(t *testing.T) {
+	storage, statusStorage, server := newStorage(t)
+	defer server.Terminate(t)
+	defer storage.Store.DestroyFunc()
+
+	ingStart := validIngress()
+	ctx := genericregistrytest.NewNamespaceScopeContext(storage.Store, namespace)
+	statusCtx := genericregistrytest.NewNamespaceScopeContext(storage.Store, namespace, "status")
+	key, _ := storage.KeyFunc(ctx, ingStart.Name)
+	err := storage.Storage.Create(ctx, key, ingStart, nil, 0, false)
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	ing := ingStart.DeepCopy()
+	ing.Status.LoadBalancer.Ingress = []networking.IngressLoadBalancerIngress{
+		{
+			IP: defaultLoadBalancer,
+		},
+	}
+	_, _, err = statusStorage.Update(statusCtx, ing.Name, rest.DefaultUpdatedObjectInfo(ing), rest.ValidateAllObjectFunc, rest.ValidateAllObjectUpdateFunc, false, &metav1.UpdateOptions{})
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	obj, err := storage.Get(ctx, ing.Name, &metav1.GetOptions{})
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+	ingOut := obj.(*networking.Ingress)
+	// only compare relevant changes b/c of difference in metadata
+	if !apiequality.Semantic.DeepEqual(ing.Status, ingOut.Status) {
+		t.Errorf("unexpected object: %s", cmp.Diff(ing.Status, ingOut.Status))
+	}
+}
+
 func TestShortNames(t *testing.T) {
 	storage, _, server := newStorage(t)
 	defer server.Terminate(t)
@@ -232,5 +287,3 @@ func TestShortNames(t *testing.T) {
 	expected := []string{"ing"}
 	registrytest.AssertShortNames(t, storage, expected)
 }
-
-// TODO TestUpdateStatus

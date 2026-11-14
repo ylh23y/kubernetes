@@ -22,38 +22,29 @@ import (
 	"testing"
 	"time"
 
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/watch"
+	"k8s.io/apiserver/pkg/storage"
 	"k8s.io/client-go/dynamic"
-	"k8s.io/kubernetes/cmd/kube-apiserver/app/options"
 )
 
 // TestCrossGroupStorage tests to make sure that all objects stored in an expected location in etcd can be converted/read.
 func TestCrossGroupStorage(t *testing.T) {
-	master := StartRealMasterOrDie(t, func(opts *options.ServerRunOptions) {
-		// force enable all resources so we can check storage.
-		// TODO: drop these once we stop allowing them to be served.
-		opts.APIEnablement.RuntimeConfig["extensions/v1beta1/deployments"] = "true"
-		opts.APIEnablement.RuntimeConfig["extensions/v1beta1/daemonsets"] = "true"
-		opts.APIEnablement.RuntimeConfig["extensions/v1beta1/replicasets"] = "true"
-		opts.APIEnablement.RuntimeConfig["extensions/v1beta1/podsecuritypolicies"] = "true"
-		opts.APIEnablement.RuntimeConfig["extensions/v1beta1/networkpolicies"] = "true"
-	})
-	defer master.Cleanup()
+	apiServer := StartRealAPIServerOrDie(t)
 
 	etcdStorageData := GetEtcdStorageData()
 
 	crossGroupResources := map[schema.GroupVersionKind][]Resource{}
 
-	master.Client.CoreV1().Namespaces().Create(&v1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: testNamespace}})
+	apiServer.Client.CoreV1().Namespaces().Create(context.TODO(), &v1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: testNamespace}}, metav1.CreateOptions{})
 
 	// Group by persisted GVK
-	for _, resourceToPersist := range master.Resources {
+	for _, resourceToPersist := range apiServer.Resources {
 		gvk := resourceToPersist.Mapping.GroupVersionKind
 		data, exists := etcdStorageData[resourceToPersist.Mapping.Resource]
 		if !exists {
@@ -96,11 +87,11 @@ func TestCrossGroupStorage(t *testing.T) {
 
 			data := etcdStorageData[resource.Mapping.Resource]
 			// create object
-			resourceClient, obj, err := JSONToUnstructured(data.Stub, ns, resource.Mapping, master.Dynamic)
+			resourceClient, obj, err := JSONToUnstructured(data.Stub, ns, resource.Mapping, apiServer.Dynamic)
 			if err != nil {
 				t.Fatal(err)
 			}
-			actual, err := resourceClient.Create(obj, metav1.CreateOptions{})
+			actual, err := resourceClient.Create(context.TODO(), obj, metav1.CreateOptions{})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -113,22 +104,25 @@ func TestCrossGroupStorage(t *testing.T) {
 				watches       = map[schema.GroupVersionResource]watch.Interface{}
 			)
 			for _, resource := range resources {
-				clients[resource.Mapping.Resource] = master.Dynamic.Resource(resource.Mapping.Resource).Namespace(ns)
-				versionedData[resource.Mapping.Resource], err = clients[resource.Mapping.Resource].Get(name, metav1.GetOptions{})
+				clients[resource.Mapping.Resource] = apiServer.Dynamic.Resource(resource.Mapping.Resource).Namespace(ns)
+				versionedData[resource.Mapping.Resource], err = clients[resource.Mapping.Resource].Get(context.TODO(), name, metav1.GetOptions{})
 				if err != nil {
 					t.Fatalf("error finding resource via %s: %v", resource.Mapping.Resource.GroupVersion().String(), err)
 				}
-				watches[resource.Mapping.Resource], err = clients[resource.Mapping.Resource].Watch(metav1.ListOptions{ResourceVersion: actual.GetResourceVersion()})
+				watches[resource.Mapping.Resource], err = clients[resource.Mapping.Resource].Watch(context.TODO(), metav1.ListOptions{ResourceVersion: actual.GetResourceVersion()})
 				if err != nil {
 					t.Fatalf("error opening watch via %s: %v", resource.Mapping.Resource.GroupVersion().String(), err)
 				}
 			}
 
+			versioner := storage.APIObjectVersioner{}
 			for _, resource := range resources {
 				// clear out the things cleared in etcd
 				versioned := versionedData[resource.Mapping.Resource]
-				versioned.SetResourceVersion("")
-				versioned.SetSelfLink("")
+				if err := versioner.PrepareObjectForStorage(versioned); err != nil {
+					t.Error(err)
+					continue
+				}
 				versionedJSON, err := versioned.MarshalJSON()
 				if err != nil {
 					t.Error(err)
@@ -136,7 +130,7 @@ func TestCrossGroupStorage(t *testing.T) {
 				}
 
 				// Update in etcd
-				if _, err := master.KV.Put(context.Background(), data.ExpectedEtcdPath, string(versionedJSON)); err != nil {
+				if _, err := apiServer.KV.Put(context.Background(), data.ExpectedEtcdPath, string(versionedJSON)); err != nil {
 					t.Error(err)
 					continue
 				}
@@ -167,7 +161,7 @@ func TestCrossGroupStorage(t *testing.T) {
 
 				// Ensure everyone can do a direct get and gets the right version
 				for clientResource, client := range clients {
-					obj, err := client.Get(name, metav1.GetOptions{})
+					obj, err := client.Get(context.TODO(), name, metav1.GetOptions{})
 					if err != nil {
 						t.Errorf("error looking up %s after persisting %s", clientResource.GroupVersion().String(), resource.Mapping.Resource.GroupVersion().String())
 						continue

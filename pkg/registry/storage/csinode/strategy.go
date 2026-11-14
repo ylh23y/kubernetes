@@ -19,8 +19,12 @@ package csinode
 import (
 	"context"
 
+	"sigs.k8s.io/structured-merge-diff/v7/fieldpath"
+
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/validation/field"
+	"k8s.io/apiserver/pkg/registry/rest"
 	"k8s.io/apiserver/pkg/storage/names"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/kubernetes/pkg/api/legacyscheme"
@@ -31,42 +35,49 @@ import (
 
 // csiNodeStrategy implements behavior for CSINode objects
 type csiNodeStrategy struct {
-	runtime.ObjectTyper
+	rest.DeclarativeValidation
 	names.NameGenerator
 }
 
 // Strategy is the default logic that applies when creating and updating
 // CSINode objects via the REST API.
-var Strategy = csiNodeStrategy{legacyscheme.Scheme, names.SimpleNameGenerator}
+var Strategy = csiNodeStrategy{rest.DeclarativeValidation{Scheme: legacyscheme.Scheme}, names.SimpleNameGenerator}
 
 func (csiNodeStrategy) NamespaceScoped() bool {
 	return false
 }
 
+// GetResetFields returns the set of fields that get reset by the strategy
+// and should not be modified by the user.
+func (csiNodeStrategy) GetResetFields() map[fieldpath.APIVersion]*fieldpath.Set {
+	fields := map[fieldpath.APIVersion]*fieldpath.Set{
+		"storage.k8s.io/v1": fieldpath.NewSet(
+			fieldpath.MakePathOrDie("status"),
+		),
+	}
+	return fields
+}
+
 // PrepareForCreate clears fields that are not allowed to be set on creation.
 func (csiNodeStrategy) PrepareForCreate(ctx context.Context, obj runtime.Object) {
 	csiNode := obj.(*storage.CSINode)
-	if !utilfeature.DefaultFeatureGate.Enabled(features.AttachVolumeLimit) {
-		for i := range csiNode.Spec.Drivers {
-			csiNode.Spec.Drivers[i].Allocatable = nil
-		}
-	}
+	csiNode.Status = storage.CSINodeStatus{}
+	dropDisabledCSINodeFields(csiNode, nil)
 }
 
 func (csiNodeStrategy) Validate(ctx context.Context, obj runtime.Object) field.ErrorList {
 	csiNode := obj.(*storage.CSINode)
-
-	errs := validation.ValidateCSINode(csiNode)
-	errs = append(errs, validation.ValidateCSINode(csiNode)...)
-
-	return errs
+	return validation.ValidateCSINode(csiNode)
 }
+
+// WarningsOnCreate returns warnings for the creation of the given object.
+func (csiNodeStrategy) WarningsOnCreate(ctx context.Context, obj runtime.Object) []string { return nil }
 
 // Canonicalize normalizes the object after validation.
 func (csiNodeStrategy) Canonicalize(obj runtime.Object) {
 }
 
-func (csiNodeStrategy) AllowCreateOnUpdate() bool {
+func (csiNodeStrategy) AllowCreateOnUpdate(ctx context.Context) bool {
 	return false
 }
 
@@ -74,38 +85,65 @@ func (csiNodeStrategy) AllowCreateOnUpdate() bool {
 func (csiNodeStrategy) PrepareForUpdate(ctx context.Context, obj, old runtime.Object) {
 	newCSINode := obj.(*storage.CSINode)
 	oldCSINode := old.(*storage.CSINode)
-
-	inUse := getAllocatablesInUse(oldCSINode)
-
-	if !utilfeature.DefaultFeatureGate.Enabled(features.AttachVolumeLimit) {
-		for i := range newCSINode.Spec.Drivers {
-			if !inUse[newCSINode.Spec.Drivers[i].Name] {
-				newCSINode.Spec.Drivers[i].Allocatable = nil
-			}
-		}
-	}
-}
-
-func getAllocatablesInUse(obj *storage.CSINode) map[string]bool {
-	inUse := make(map[string]bool)
-	if obj == nil {
-		return inUse
-	}
-	for i := range obj.Spec.Drivers {
-		if obj.Spec.Drivers[i].Allocatable != nil {
-			inUse[obj.Spec.Drivers[i].Name] = true
-		}
-	}
-	return inUse
+	newCSINode.Status = oldCSINode.Status
+	dropDisabledCSINodeFields(newCSINode, oldCSINode)
 }
 
 func (csiNodeStrategy) ValidateUpdate(ctx context.Context, obj, old runtime.Object) field.ErrorList {
 	newCSINodeObj := obj.(*storage.CSINode)
 	oldCSINodeObj := old.(*storage.CSINode)
-	errorList := validation.ValidateCSINode(newCSINodeObj)
-	return append(errorList, validation.ValidateCSINodeUpdate(newCSINodeObj, oldCSINodeObj)...)
+	return validation.ValidateCSINodeUpdate(newCSINodeObj, oldCSINodeObj)
 }
 
-func (csiNodeStrategy) AllowUnconditionalUpdate() bool {
+// WarningsOnUpdate returns warnings for the given update.
+func (csiNodeStrategy) WarningsOnUpdate(ctx context.Context, obj, old runtime.Object) []string {
+	return nil
+}
+
+func (csiNodeStrategy) AllowUnconditionalUpdate(ctx context.Context) bool {
 	return false
+}
+
+// csiNodeStatusStrategy implements behavior for CSINode status subresource
+type csiNodeStatusStrategy struct {
+	csiNodeStrategy
+}
+
+// StatusStrategy is the default logic that applies when updating
+// CSINode status subresource via the REST API.
+var StatusStrategy = csiNodeStatusStrategy{Strategy}
+
+// GetResetFields returns the set of fields that get reset by the strategy
+// and should not be modified by the user.
+func (csiNodeStatusStrategy) GetResetFields() map[fieldpath.APIVersion]*fieldpath.Set {
+	fields := map[fieldpath.APIVersion]*fieldpath.Set{
+		"storage.k8s.io/v1": fieldpath.NewSet(
+			fieldpath.MakePathOrDie("metadata"),
+			fieldpath.MakePathOrDie("spec"),
+		),
+	}
+	return fields
+}
+
+// PrepareForUpdate preserves spec and resets metadata for status updates.
+func (csiNodeStatusStrategy) PrepareForUpdate(ctx context.Context, obj, old runtime.Object) {
+	newCSINode := obj.(*storage.CSINode)
+	oldCSINode := old.(*storage.CSINode)
+	newCSINode.Spec = oldCSINode.Spec
+	metav1.ResetObjectMetaForStatus(&newCSINode.ObjectMeta, &oldCSINode.ObjectMeta)
+	dropDisabledCSINodeFields(newCSINode, oldCSINode)
+}
+
+func (csiNodeStatusStrategy) ValidateUpdate(ctx context.Context, obj, old runtime.Object) field.ErrorList {
+	newCSINode := obj.(*storage.CSINode)
+	oldCSINode := old.(*storage.CSINode)
+	return validation.ValidateCSINodeStatusUpdate(newCSINode, oldCSINode)
+}
+
+func dropDisabledCSINodeFields(newObj, oldObj *storage.CSINode) {
+	if !utilfeature.DefaultFeatureGate.Enabled(features.CSIVolumeHealth) {
+		if oldObj == nil || len(oldObj.Status.StorageHealth) == 0 {
+			newObj.Status.StorageHealth = nil
+		}
+	}
 }

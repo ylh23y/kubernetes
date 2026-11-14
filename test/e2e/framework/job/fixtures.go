@@ -18,9 +18,12 @@ package job
 
 import (
 	batchv1 "k8s.io/api/batch/v1"
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/rand"
 	"k8s.io/kubernetes/test/e2e/framework"
+	imageutils "k8s.io/kubernetes/test/utils/image"
+	"k8s.io/utils/ptr"
 )
 
 // NewTestJob returns a Job which does one of several testing behaviors. notTerminate starts a Job that will run
@@ -30,6 +33,13 @@ import (
 // policy of the containers in which the Pod is running. Parallelism is the Job's parallelism, and completions is the
 // Job's required number of completions.
 func NewTestJob(behavior, name string, rPol v1.RestartPolicy, parallelism, completions int32, activeDeadlineSeconds *int64, backoffLimit int32) *batchv1.Job {
+	anyNode := ""
+	return NewTestJobOnNode(behavior, name, rPol, parallelism, completions, activeDeadlineSeconds, backoffLimit, anyNode)
+}
+
+// NewTestJobOnNode is similar to NewTestJob but supports specifying a Node on which the Job's Pods will run.
+// Empty nodeName means no node selection constraints.
+func NewTestJobOnNode(behavior, name string, rPol v1.RestartPolicy, parallelism, completions int32, activeDeadlineSeconds *int64, backoffLimit int32, nodeName string) *batchv1.Job {
 	manualSelector := false
 	job := &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
@@ -61,7 +71,7 @@ func NewTestJob(behavior, name string, rPol v1.RestartPolicy, parallelism, compl
 					Containers: []v1.Container{
 						{
 							Name:    "c",
-							Image:   framework.BusyBoxImage,
+							Image:   imageutils.GetE2EImage(imageutils.BusyBox),
 							Command: []string{},
 							VolumeMounts: []v1.VolumeMount{
 								{
@@ -76,11 +86,32 @@ func NewTestJob(behavior, name string, rPol v1.RestartPolicy, parallelism, compl
 			},
 		},
 	}
+	if len(nodeName) > 0 {
+		job.Spec.Template.Spec.NodeSelector = map[string]string{
+			"kubernetes.io/hostname": nodeName,
+		}
+	}
 	switch behavior {
-	case "notTerminate":
+	case "neverTerminate":
+		// this job is being used in an upgrade job see test/e2e/upgrades/apps/job.go
+		// it should never be optimized, as it always has to restart during an upgrade
+		// and continue running
 		job.Spec.Template.Spec.Containers[0].Command = []string{"sleep", "1000000"}
+		job.Spec.Template.Spec.TerminationGracePeriodSeconds = ptr.To(int64(1))
+	case "notTerminate":
+		job.Spec.Template.Spec.Containers[0].Image = imageutils.GetPauseImageName()
 	case "fail":
 		job.Spec.Template.Spec.Containers[0].Command = []string{"/bin/sh", "-c", "exit 1"}
+	case "failOddSucceedEven":
+		job.Spec.Template.Spec.Containers[0].Command = []string{"sh", "-c"}
+		job.Spec.Template.Spec.Containers[0].Args = []string{`
+			if [ $(expr ${JOB_COMPLETION_INDEX} % 2) -ne 0 ]; then
+				exit 1
+			else
+				exit 0
+			fi
+			`,
+		}
 	case "succeed":
 		job.Spec.Template.Spec.Containers[0].Command = []string{"/bin/sh", "-c", "exit 0"}
 	case "randomlySucceedOrFail":
@@ -89,22 +120,77 @@ func NewTestJob(behavior, name string, rPol v1.RestartPolicy, parallelism, compl
 		job.Spec.Template.Spec.Containers[0].Command = []string{"/bin/sh", "-c", "exit $(( $RANDOM / 16384 ))"}
 	case "failOnce":
 		// Fail the first the container of the pod is run, and
-		// succeed the second time. Checks for file on emptydir.
+		// succeed the second time. Checks for file on a data volume.
 		// If present, succeed.  If not, create but fail.
-		// Note that this cannot be used with RestartNever because
-		// it always fails the first time for a pod.
-		job.Spec.Template.Spec.Containers[0].Command = []string{"/bin/sh", "-c", "if [[ -r /data/foo ]] ; then exit 0 ; else touch /data/foo ; exit 1 ; fi"}
+		// If RestartPolicy is Never, the nodeName should be set to
+		// ensure all job pods run on a single node and the volume
+		// will be mounted from a hostPath instead.
+		setupHostPathDirectory(job)
+		job.Spec.Template.Spec.Containers[0].Command = []string{"/bin/sh", "-c"}
+		job.Spec.Template.Spec.Containers[0].Args = []string{`
+			if [[ -r /data/foo ]]
+			then
+				exit 0
+			else
+				touch /data/foo
+				exit 1
+			fi
+		`}
+	case "failOncePerIndex":
+		// Use marker files per index. If the given marker file already exists
+		// then terminate successfully. Otherwise create the marker file and
+		// fail with exit code 42.
+		setupHostPathDirectory(job)
+		job.Spec.Template.Spec.Containers[0].Command = []string{"/bin/sh", "-c"}
+		job.Spec.Template.Spec.Containers[0].Args = []string{`
+			if [[ -r /data/foo-$JOB_COMPLETION_INDEX ]]
+			then
+				exit 0
+			else
+				touch /data/foo-$JOB_COMPLETION_INDEX
+				exit 42
+			fi
+		`}
+	case "notTerminateOncePerIndex":
+		// Use marker files per index. If the given marker file already exists
+		// then terminate successfully. Otherwise create the marker file and
+		// sleep "forever" awaiting delete request.
+		setupHostPathDirectory(job)
+		job.Spec.Template.Spec.TerminationGracePeriodSeconds = ptr.To(int64(1))
+		job.Spec.Template.Spec.Containers[0].Command = []string{"/bin/sh", "-c"}
+		job.Spec.Template.Spec.Containers[0].Args = []string{`
+			if [[ -r /data/foo-$JOB_COMPLETION_INDEX ]]
+			then
+				exit 0
+			else
+				touch /data/foo-$JOB_COMPLETION_INDEX
+				sleep 1000000
+			fi
+		`}
+		// Add readiness probe to allow the test client to check if the marker
+		// file is already created before evicting the Pod.
+		job.Spec.Template.Spec.Containers[0].ReadinessProbe = &v1.Probe{
+			PeriodSeconds: 1,
+			ProbeHandler: v1.ProbeHandler{
+				Exec: &v1.ExecAction{
+					Command: []string{"/bin/sh", "-c", "cat /data/foo-$JOB_COMPLETION_INDEX"},
+				},
+			},
+		}
 	}
 	return job
 }
 
-// FinishTime returns finish time of the specified job.
-func FinishTime(finishedJob *batchv1.Job) metav1.Time {
-	var finishTime metav1.Time
-	for _, c := range finishedJob.Status.Conditions {
-		if (c.Type == batchv1.JobComplete || c.Type == batchv1.JobFailed) && c.Status == v1.ConditionTrue {
-			return c.LastTransitionTime
-		}
+// setup host path directory to pass information between pod restarts
+func setupHostPathDirectory(job *batchv1.Job) {
+	if _, nodeNameSpecified := job.Spec.Template.Spec.NodeSelector["kubernetes.io/hostname"]; nodeNameSpecified {
+		randomDir := "/tmp/job-e2e/" + rand.String(10)
+		hostPathType := v1.HostPathDirectoryOrCreate
+		job.Spec.Template.Spec.Volumes[0].VolumeSource = v1.VolumeSource{HostPath: &v1.HostPathVolumeSource{Path: randomDir, Type: &hostPathType}}
+		// Tests involving r/w operations on hostPath volume needs to run in
+		// privileged mode for SELinux enabled distro, while Windows platform
+		// neither supports nor needs privileged mode.
+		privileged := !framework.NodeOSDistroIs("windows")
+		job.Spec.Template.Spec.Containers[0].SecurityContext.Privileged = &privileged
 	}
-	return finishTime
 }

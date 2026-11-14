@@ -20,10 +20,13 @@ import (
 	"sync"
 	"time"
 
-	"github.com/prometheus/client_golang/prometheus"
 	v1 "k8s.io/api/core/v1"
-	"k8s.io/klog"
+	"k8s.io/component-base/metrics"
+	"k8s.io/component-base/metrics/legacyregistry"
+	storagehelpers "k8s.io/component-helpers/storage/volume"
+	"k8s.io/kubernetes/pkg/volume"
 	metricutil "k8s.io/kubernetes/pkg/volume/util"
+	"k8s.io/utils/ptr"
 )
 
 const (
@@ -31,95 +34,179 @@ const (
 	pvControllerSubsystem = "pv_collector"
 
 	// Metric names.
+	totalPVKey    = "total_pv_count"
 	boundPVKey    = "bound_pv_count"
 	unboundPVKey  = "unbound_pv_count"
 	boundPVCKey   = "bound_pvc_count"
 	unboundPVCKey = "unbound_pvc_count"
 
 	// Label names.
-	namespaceLabel    = "namespace"
-	storageClassLabel = "storage_class"
+	namespaceLabel             = "namespace"
+	storageClassLabel          = "storage_class"
+	volumeAttributesClassLabel = "volume_attributes_class"
+	pluginNameLabel            = "plugin_name"
+	volumeModeLabel            = "volume_mode"
+
+	// String to use when plugin name cannot be determined
+	pluginNameNotAvailable = "N/A"
 )
 
 var registerMetrics sync.Once
 
 // PVLister used to list persistent volumes.
 type PVLister interface {
-	List() []interface{}
+	List() []*v1.PersistentVolume
 }
 
 // PVCLister used to list persistent volume claims.
 type PVCLister interface {
-	List() []interface{}
+	List() []*v1.PersistentVolumeClaim
 }
 
 // Register all metrics for pv controller.
-func Register(pvLister PVLister, pvcLister PVCLister) {
+func Register(pvLister PVLister, pvcLister PVCLister, pluginMgr *volume.VolumePluginMgr) {
 	registerMetrics.Do(func() {
-		prometheus.MustRegister(newPVAndPVCCountCollector(pvLister, pvcLister))
-		prometheus.MustRegister(volumeOperationErrorsMetric)
+		legacyregistry.CustomMustRegister(newPVAndPVCCountCollector(pvLister, pvcLister, pluginMgr))
+		legacyregistry.MustRegister(volumeOperationErrorsMetric)
+		legacyregistry.MustRegister(volumeOperationErrorMetric)
+		legacyregistry.MustRegister(retroactiveStorageClassMetric)
+		legacyregistry.MustRegister(retroactiveStorageClassErrorMetric)
 	})
 }
 
-func newPVAndPVCCountCollector(pvLister PVLister, pvcLister PVCLister) *pvAndPVCCountCollector {
-	return &pvAndPVCCountCollector{pvLister, pvcLister}
+func newPVAndPVCCountCollector(pvLister PVLister, pvcLister PVCLister, pluginMgr *volume.VolumePluginMgr) *pvAndPVCCountCollector {
+	return &pvAndPVCCountCollector{pvLister: pvLister, pvcLister: pvcLister, pluginMgr: pluginMgr}
 }
 
 // Custom collector for current pod and container counts.
 type pvAndPVCCountCollector struct {
+	metrics.BaseStableCollector
+
 	// Cache for accessing information about PersistentVolumes.
 	pvLister PVLister
 	// Cache for accessing information about PersistentVolumeClaims.
 	pvcLister PVCLister
+	// Volume plugin manager
+	pluginMgr *volume.VolumePluginMgr
 }
 
+// Holds all dimensions for bound/unbound PVC metrics
+type pvcBindingMetricDimensions struct {
+	namespace, storageClassName, volumeAttributesClassName string
+}
+
+func getPVCMetricDimensions(pvc *v1.PersistentVolumeClaim) pvcBindingMetricDimensions {
+	return pvcBindingMetricDimensions{
+		namespace:                 pvc.Namespace,
+		storageClassName:          storagehelpers.GetPersistentVolumeClaimClass(pvc),
+		volumeAttributesClassName: ptr.Deref(pvc.Spec.VolumeAttributesClassName, ""),
+	}
+}
+
+// Check if our collector implements necessary collector interface
+var _ metrics.StableCollector = &pvAndPVCCountCollector{}
+
 var (
-	boundPVCountDesc = prometheus.NewDesc(
-		prometheus.BuildFQName("", pvControllerSubsystem, boundPVKey),
+	totalPVCountDesc = metrics.NewDesc(
+		metrics.BuildFQName("", pvControllerSubsystem, totalPVKey),
+		"Gauge measuring total number of persistent volumes",
+		[]string{pluginNameLabel, volumeModeLabel}, nil,
+		metrics.ALPHA, "")
+	boundPVCountDesc = metrics.NewDesc(
+		metrics.BuildFQName("", pvControllerSubsystem, boundPVKey),
 		"Gauge measuring number of persistent volume currently bound",
-		[]string{storageClassLabel}, nil)
-	unboundPVCountDesc = prometheus.NewDesc(
-		prometheus.BuildFQName("", pvControllerSubsystem, unboundPVKey),
+		[]string{storageClassLabel}, nil,
+		metrics.ALPHA, "")
+	unboundPVCountDesc = metrics.NewDesc(
+		metrics.BuildFQName("", pvControllerSubsystem, unboundPVKey),
 		"Gauge measuring number of persistent volume currently unbound",
-		[]string{storageClassLabel}, nil)
+		[]string{storageClassLabel}, nil,
+		metrics.ALPHA, "")
 
-	boundPVCCountDesc = prometheus.NewDesc(
-		prometheus.BuildFQName("", pvControllerSubsystem, boundPVCKey),
+	boundPVCCountDesc = metrics.NewDesc(
+		metrics.BuildFQName("", pvControllerSubsystem, boundPVCKey),
 		"Gauge measuring number of persistent volume claim currently bound",
-		[]string{namespaceLabel}, nil)
-	unboundPVCCountDesc = prometheus.NewDesc(
-		prometheus.BuildFQName("", pvControllerSubsystem, unboundPVCKey),
+		[]string{namespaceLabel, storageClassLabel, volumeAttributesClassLabel}, nil,
+		metrics.ALPHA, "")
+	unboundPVCCountDesc = metrics.NewDesc(
+		metrics.BuildFQName("", pvControllerSubsystem, unboundPVCKey),
 		"Gauge measuring number of persistent volume claim currently unbound",
-		[]string{namespaceLabel}, nil)
+		[]string{namespaceLabel, storageClassLabel, volumeAttributesClassLabel}, nil,
+		metrics.ALPHA, "")
 
-	volumeOperationErrorsMetric = prometheus.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "volume_operation_total_errors",
-			Help: "Total volume operation erros",
+	volumeOperationErrorsMetric = metrics.NewCounterVec(
+		&metrics.CounterOpts{
+			Name:              "volume_operation_total_errors",
+			Help:              "Total volume operation errors",
+			StabilityLevel:    metrics.ALPHA,
+			DeprecatedVersion: "1.36.0",
 		},
 		[]string{"plugin_name", "operation_name"})
+
+	volumeOperationErrorMetric = metrics.NewCounterVec(
+		&metrics.CounterOpts{
+			Name:           "volume_operation_errors_total",
+			Help:           "Total volume operation errors",
+			StabilityLevel: metrics.BETA,
+		},
+		[]string{"plugin_name", "operation_name"})
+
+	retroactiveStorageClassMetric = metrics.NewCounter(
+		&metrics.CounterOpts{
+			Name:           "retroactive_storageclass_total",
+			Help:           "Total number of retroactive StorageClass assignments to persistent volume claim",
+			StabilityLevel: metrics.ALPHA,
+		})
+
+	retroactiveStorageClassErrorMetric = metrics.NewCounter(
+		&metrics.CounterOpts{
+			Name:           "retroactive_storageclass_errors_total",
+			Help:           "Total number of failed retroactive StorageClass assignments to persistent volume claim",
+			StabilityLevel: metrics.ALPHA,
+		})
 )
 
-func (collector *pvAndPVCCountCollector) Describe(ch chan<- *prometheus.Desc) {
+// volumeCount counts by PluginName and VolumeMode.
+type volumeCount map[string]map[string]int
+
+func (v volumeCount) add(pluginName string, volumeMode string) {
+	count, ok := v[pluginName]
+	if !ok {
+		count = map[string]int{}
+	}
+	count[volumeMode]++
+	v[pluginName] = count
+}
+
+func (collector *pvAndPVCCountCollector) DescribeWithStability(ch chan<- *metrics.Desc) {
+	ch <- totalPVCountDesc
 	ch <- boundPVCountDesc
 	ch <- unboundPVCountDesc
 	ch <- boundPVCCountDesc
 	ch <- unboundPVCCountDesc
 }
 
-func (collector *pvAndPVCCountCollector) Collect(ch chan<- prometheus.Metric) {
+func (collector *pvAndPVCCountCollector) CollectWithStability(ch chan<- metrics.Metric) {
 	collector.pvCollect(ch)
 	collector.pvcCollect(ch)
 }
 
-func (collector *pvAndPVCCountCollector) pvCollect(ch chan<- prometheus.Metric) {
+func (collector *pvAndPVCCountCollector) getPVPluginName(pv *v1.PersistentVolume) string {
+	spec := volume.NewSpecFromPersistentVolume(pv, true)
+	fullPluginName := pluginNameNotAvailable
+	if plugin, err := collector.pluginMgr.FindPluginBySpec(spec); err == nil {
+		fullPluginName = metricutil.GetFullQualifiedPluginNameForVolume(plugin.GetPluginName(), spec)
+	}
+	return fullPluginName
+}
+
+func (collector *pvAndPVCCountCollector) pvCollect(ch chan<- metrics.Metric) {
 	boundNumberByStorageClass := make(map[string]int)
 	unboundNumberByStorageClass := make(map[string]int)
-	for _, pvObj := range collector.pvLister.List() {
-		pv, ok := pvObj.(*v1.PersistentVolume)
-		if !ok {
-			continue
-		}
+	totalCount := make(volumeCount)
+	for _, pv := range collector.pvLister.List() {
+		pluginName := collector.getPVPluginName(pv)
+		totalCount.add(pluginName, string(*pv.Spec.VolumeMode))
 		if pv.Status.Phase == v1.VolumeBound {
 			boundNumberByStorageClass[pv.Spec.StorageClassName]++
 		} else {
@@ -127,78 +214,77 @@ func (collector *pvAndPVCCountCollector) pvCollect(ch chan<- prometheus.Metric) 
 		}
 	}
 	for storageClassName, number := range boundNumberByStorageClass {
-		metric, err := prometheus.NewConstMetric(
+		ch <- metrics.NewLazyConstMetric(
 			boundPVCountDesc,
-			prometheus.GaugeValue,
+			metrics.GaugeValue,
 			float64(number),
 			storageClassName)
-		if err != nil {
-			klog.Warningf("Create bound pv number metric failed: %v", err)
-			continue
-		}
-		ch <- metric
 	}
 	for storageClassName, number := range unboundNumberByStorageClass {
-		metric, err := prometheus.NewConstMetric(
+		ch <- metrics.NewLazyConstMetric(
 			unboundPVCountDesc,
-			prometheus.GaugeValue,
+			metrics.GaugeValue,
 			float64(number),
 			storageClassName)
-		if err != nil {
-			klog.Warningf("Create unbound pv number metric failed: %v", err)
-			continue
+	}
+	for pluginName, volumeModeCount := range totalCount {
+		for volumeMode, number := range volumeModeCount {
+			ch <- metrics.NewLazyConstMetric(
+				totalPVCountDesc,
+				metrics.GaugeValue,
+				float64(number),
+				pluginName,
+				volumeMode)
 		}
-		ch <- metric
 	}
 }
 
-func (collector *pvAndPVCCountCollector) pvcCollect(ch chan<- prometheus.Metric) {
-	boundNumberByNamespace := make(map[string]int)
-	unboundNumberByNamespace := make(map[string]int)
-	for _, pvcObj := range collector.pvcLister.List() {
-		pvc, ok := pvcObj.(*v1.PersistentVolumeClaim)
-		if !ok {
-			continue
-		}
+func (collector *pvAndPVCCountCollector) pvcCollect(ch chan<- metrics.Metric) {
+	boundNumber := make(map[pvcBindingMetricDimensions]int)
+	unboundNumber := make(map[pvcBindingMetricDimensions]int)
+	for _, pvc := range collector.pvcLister.List() {
 		if pvc.Status.Phase == v1.ClaimBound {
-			boundNumberByNamespace[pvc.Namespace]++
+			boundNumber[getPVCMetricDimensions(pvc)]++
 		} else {
-			unboundNumberByNamespace[pvc.Namespace]++
+			unboundNumber[getPVCMetricDimensions(pvc)]++
 		}
 	}
-	for namespace, number := range boundNumberByNamespace {
-		metric, err := prometheus.NewConstMetric(
+	for pvcLabels, number := range boundNumber {
+		ch <- metrics.NewLazyConstMetric(
 			boundPVCCountDesc,
-			prometheus.GaugeValue,
+			metrics.GaugeValue,
 			float64(number),
-			namespace)
-		if err != nil {
-			klog.Warningf("Create bound pvc number metric failed: %v", err)
-			continue
-		}
-		ch <- metric
+			pvcLabels.namespace, pvcLabels.storageClassName, pvcLabels.volumeAttributesClassName)
 	}
-	for namespace, number := range unboundNumberByNamespace {
-		metric, err := prometheus.NewConstMetric(
+	for pvcLabels, number := range unboundNumber {
+		ch <- metrics.NewLazyConstMetric(
 			unboundPVCCountDesc,
-			prometheus.GaugeValue,
+			metrics.GaugeValue,
 			float64(number),
-			namespace)
-		if err != nil {
-			klog.Warningf("Create unbound pvc number metric failed: %v", err)
-			continue
-		}
-		ch <- metric
+			pvcLabels.namespace, pvcLabels.storageClassName, pvcLabels.volumeAttributesClassName)
+	}
+}
+
+// RecordRetroactiveStorageClassMetric increments only retroactive_storageclass_total
+// metric or both retroactive_storageclass_total and retroactive_storageclass_errors_total
+// if success is false.
+func RecordRetroactiveStorageClassMetric(success bool) {
+	if !success {
+		retroactiveStorageClassMetric.Inc()
+		retroactiveStorageClassErrorMetric.Inc()
+	} else {
+		retroactiveStorageClassMetric.Inc()
 	}
 }
 
 // RecordVolumeOperationErrorMetric records error count into metric
-// volume_operation_total_errors for provisioning/deletion operations
+// volume_operation_errors_total for provisioning/deletion operations
 func RecordVolumeOperationErrorMetric(pluginName, opName string) {
 	if pluginName == "" {
 		pluginName = "N/A"
 	}
 	volumeOperationErrorsMetric.WithLabelValues(pluginName, opName).Inc()
+	volumeOperationErrorMetric.WithLabelValues(pluginName, opName).Inc()
 }
 
 // operationTimestamp stores the start time of an operation by a plugin
@@ -224,7 +310,7 @@ type OperationStartTimeCache struct {
 // NewOperationStartTimeCache creates a operation timestamp cache
 func NewOperationStartTimeCache() OperationStartTimeCache {
 	return OperationStartTimeCache{
-		cache: sync.Map{}, //[string]operationTimestamp {}
+		cache: sync.Map{}, // [string]operationTimestamp {}
 	}
 }
 

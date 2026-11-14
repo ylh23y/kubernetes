@@ -17,42 +17,46 @@ limitations under the License.
 package defaulttolerationseconds
 
 import (
-	"flag"
+	"context"
 	"fmt"
 	"io"
+	"sync"
 
+	"github.com/spf13/pflag"
+	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apiserver/pkg/admission"
+	"k8s.io/apiserver/pkg/admission/initializer"
+	"k8s.io/component-base/featuregate"
 	api "k8s.io/kubernetes/pkg/apis/core"
-	schedulerapi "k8s.io/kubernetes/pkg/scheduler/api"
 )
 
 // PluginName indicates name of admission plugin.
 const PluginName = "DefaultTolerationSeconds"
 
 var (
-	defaultNotReadyTolerationSeconds = flag.Int64("default-not-ready-toleration-seconds", 300,
+	// tolerationSecondsMutex protects registration and read in InspectFeatureGates, which is
+	// good enough for concurrent use in integration tests as long as the command
+	// line flags are not actually used by some test. In commands the registration,
+	// parsing and InspectFeatureGates are serialized.
+	tolerationSecondsMutex sync.RWMutex
+
+	defaultNotReadyTolerationSeconds    = int64(300)
+	defaultUnreachableTolerationSeconds = int64(300)
+)
+
+func RegisterFlags(fs *pflag.FlagSet) {
+	// Indirect writes of the default value!
+	tolerationSecondsMutex.Lock()
+	defer tolerationSecondsMutex.Unlock()
+
+	fs.Int64Var(&defaultNotReadyTolerationSeconds, "default-not-ready-toleration-seconds", defaultNotReadyTolerationSeconds,
 		"Indicates the tolerationSeconds of the toleration for notReady:NoExecute"+
 			" that is added by default to every pod that does not already have such a toleration.")
-
-	defaultUnreachableTolerationSeconds = flag.Int64("default-unreachable-toleration-seconds", 300,
+	fs.Int64Var(&defaultUnreachableTolerationSeconds, "default-unreachable-toleration-seconds", defaultUnreachableTolerationSeconds,
 		"Indicates the tolerationSeconds of the toleration for unreachable:NoExecute"+
 			" that is added by default to every pod that does not already have such a toleration.")
-
-	notReadyToleration = api.Toleration{
-		Key:               schedulerapi.TaintNodeNotReady,
-		Operator:          api.TolerationOpExists,
-		Effect:            api.TaintEffectNoExecute,
-		TolerationSeconds: defaultNotReadyTolerationSeconds,
-	}
-
-	unreachableToleration = api.Toleration{
-		Key:               schedulerapi.TaintNodeUnreachable,
-		Operator:          api.TolerationOpExists,
-		Effect:            api.TaintEffectNoExecute,
-		TolerationSeconds: defaultUnreachableTolerationSeconds,
-	}
-)
+}
 
 // Register registers a plugin
 func Register(plugins *admission.Plugins) {
@@ -69,9 +73,12 @@ func Register(plugins *admission.Plugins) {
 // or `unreachable:NoExecute`, the plugin won't touch it.
 type Plugin struct {
 	*admission.Handler
+	notReadyToleration    api.Toleration
+	unreachableToleration api.Toleration
 }
 
 var _ admission.MutationInterface = &Plugin{}
+var _ initializer.WantsFeatures = &Plugin{}
 
 // NewDefaultTolerationSeconds creates a new instance of the DefaultTolerationSeconds admission controller
 func NewDefaultTolerationSeconds() *Plugin {
@@ -80,14 +87,48 @@ func NewDefaultTolerationSeconds() *Plugin {
 	}
 }
 
+// InspectFeatureGates runs after command-line flags have been parsed
+func (p *Plugin) InspectFeatureGates(featureGates featuregate.FeatureGate) {
+	// Read the default values while holding a read lock.
+	tolerationSecondsMutex.RLock()
+	defer tolerationSecondsMutex.RUnlock()
+
+	notReadyTolerationSeconds := defaultNotReadyTolerationSeconds
+	unreachableTolerationSeconds := defaultUnreachableTolerationSeconds
+
+	p.notReadyToleration = api.Toleration{
+		Key:               v1.TaintNodeNotReady,
+		Operator:          api.TolerationOpExists,
+		Effect:            api.TaintEffectNoExecute,
+		TolerationSeconds: &notReadyTolerationSeconds,
+	}
+	p.unreachableToleration = api.Toleration{
+		Key:               v1.TaintNodeUnreachable,
+		Operator:          api.TolerationOpExists,
+		Effect:            api.TaintEffectNoExecute,
+		TolerationSeconds: &unreachableTolerationSeconds,
+	}
+}
+
+// ValidateInitialization validates the Plugin was initialized properly
+func (p *Plugin) ValidateInitialization() error {
+	if p.notReadyToleration == (api.Toleration{}) {
+		return fmt.Errorf("%s was not initialized correctly, notReadyToleration is not set", PluginName)
+	}
+	if p.unreachableToleration == (api.Toleration{}) {
+		return fmt.Errorf("%s was not initialized correctly, unreachableToleration is not set", PluginName)
+	}
+	return nil
+}
+
 // Admit makes an admission decision based on the request attributes
-func (p *Plugin) Admit(attributes admission.Attributes, o admission.ObjectInterfaces) (err error) {
+func (p *Plugin) Admit(ctx context.Context, attributes admission.Attributes, o admission.ObjectInterfaces) (err error) {
 	if attributes.GetResource().GroupResource() != api.Resource("pods") {
 		return nil
 	}
 
-	if len(attributes.GetSubresource()) > 0 {
-		// only run the checks below on pods proper and not subresources
+	if len(attributes.GetSubresource()) > 0 && attributes.GetSubresource() != "dynamic" {
+		// only run the checks below on pods proper and the dynamic subresource
 		return nil
 	}
 
@@ -101,23 +142,23 @@ func (p *Plugin) Admit(attributes admission.Attributes, o admission.ObjectInterf
 	toleratesNodeNotReady := false
 	toleratesNodeUnreachable := false
 	for _, toleration := range tolerations {
-		if (toleration.Key == schedulerapi.TaintNodeNotReady || len(toleration.Key) == 0) &&
+		if (toleration.Key == v1.TaintNodeNotReady || len(toleration.Key) == 0) &&
 			(toleration.Effect == api.TaintEffectNoExecute || len(toleration.Effect) == 0) {
 			toleratesNodeNotReady = true
 		}
 
-		if (toleration.Key == schedulerapi.TaintNodeUnreachable || len(toleration.Key) == 0) &&
+		if (toleration.Key == v1.TaintNodeUnreachable || len(toleration.Key) == 0) &&
 			(toleration.Effect == api.TaintEffectNoExecute || len(toleration.Effect) == 0) {
 			toleratesNodeUnreachable = true
 		}
 	}
 
 	if !toleratesNodeNotReady {
-		pod.Spec.Tolerations = append(pod.Spec.Tolerations, notReadyToleration)
+		pod.Spec.Tolerations = append(pod.Spec.Tolerations, p.notReadyToleration)
 	}
 
 	if !toleratesNodeUnreachable {
-		pod.Spec.Tolerations = append(pod.Spec.Tolerations, unreachableToleration)
+		pod.Spec.Tolerations = append(pod.Spec.Tolerations, p.unreachableToleration)
 	}
 
 	return nil

@@ -17,11 +17,17 @@ limitations under the License.
 package validating
 
 import (
+	"context"
+	"fmt"
 	"io"
 
+	"k8s.io/apimachinery/pkg/util/validation/field"
 	"k8s.io/apiserver/pkg/admission"
 	"k8s.io/apiserver/pkg/admission/configuration"
+	"k8s.io/apiserver/pkg/admission/initializer"
+	"k8s.io/apiserver/pkg/admission/plugin/webhook/config/apis/webhookadmission"
 	"k8s.io/apiserver/pkg/admission/plugin/webhook/generic"
+	"k8s.io/apiserver/pkg/admission/plugin/webhook/manifest/source"
 )
 
 const (
@@ -47,6 +53,22 @@ type Plugin struct {
 }
 
 var _ admission.ValidationInterface = &Plugin{}
+var _ initializer.WantsManifestLoaders = &Plugin{}
+
+// SetManifestLoaders provides the manifest load functions for scheme-based defaulting and validation.
+func (a *Plugin) SetManifestLoaders(loaders *initializer.ManifestLoaders) {
+	if loaders == nil || loaders.LoadValidatingWebhookManifests == nil {
+		return
+	}
+	loadFunc := loaders.LoadValidatingWebhookManifests
+	a.Webhook.SetStaticSourceFactory(func(manifestsDir string) (generic.ReloadableSource, error) {
+		src := source.NewValidatingSource(manifestsDir, a.Webhook.GetAPIServerID(), source.ValidatingWebhookLoadFunc(loadFunc))
+		if err := src.LoadInitial(); err != nil {
+			return nil, err
+		}
+		return src, nil
+	})
+}
 
 // NewValidatingAdmissionWebhook returns a generic admission webhook plugin.
 func NewValidatingAdmissionWebhook(configFile io.Reader) (*Plugin, error) {
@@ -57,10 +79,17 @@ func NewValidatingAdmissionWebhook(configFile io.Reader) (*Plugin, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Validating webhooks are dispatched in parallel against the same object, so the
+	// merge order between manifest-based and API-based webhooks is not observable.
+	// Reject anything but the default rather than silently ignoring the request.
+	if staticOrder := p.Webhook.GetStaticOrder(); staticOrder != webhookadmission.StaticFirst {
+		return nil, field.Invalid(field.NewPath("staticOrder"), staticOrder,
+			fmt.Sprintf("only %q is supported by %s", webhookadmission.StaticFirst, PluginName))
+	}
 	return p, nil
 }
 
 // Validate makes an admission decision based on the request attributes.
-func (a *Plugin) Validate(attr admission.Attributes, o admission.ObjectInterfaces) error {
-	return a.Webhook.Dispatch(attr, o)
+func (a *Plugin) Validate(ctx context.Context, attr admission.Attributes, o admission.ObjectInterfaces) error {
+	return a.Webhook.Dispatch(ctx, attr, o)
 }

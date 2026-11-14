@@ -17,6 +17,7 @@ limitations under the License.
 package resize
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"testing"
@@ -87,7 +88,7 @@ func TestPVCResizeAdmission(t *testing.T) {
 			oldObj: &api.PersistentVolumeClaim{
 				Spec: api.PersistentVolumeClaimSpec{
 					VolumeName: "volume1",
-					Resources: api.ResourceRequirements{
+					Resources: api.VolumeResourceRequirements{
 						Requests: getResourceList("1Gi"),
 					},
 					StorageClassName: &goldClassName,
@@ -100,7 +101,7 @@ func TestPVCResizeAdmission(t *testing.T) {
 			newObj: &api.PersistentVolumeClaim{
 				Spec: api.PersistentVolumeClaimSpec{
 					VolumeName: "volume1",
-					Resources: api.ResourceRequirements{
+					Resources: api.VolumeResourceRequirements{
 						Requests: getResourceList("2Gi"),
 					},
 					StorageClassName: &goldClassName,
@@ -118,7 +119,7 @@ func TestPVCResizeAdmission(t *testing.T) {
 			oldObj: &api.PersistentVolumeClaim{
 				Spec: api.PersistentVolumeClaimSpec{
 					VolumeName: "volume3",
-					Resources: api.ResourceRequirements{
+					Resources: api.VolumeResourceRequirements{
 						Requests: getResourceList("1Gi"),
 					},
 				},
@@ -130,7 +131,7 @@ func TestPVCResizeAdmission(t *testing.T) {
 			newObj: &api.PersistentVolumeClaim{
 				Spec: api.PersistentVolumeClaimSpec{
 					VolumeName: "volume3",
-					Resources: api.ResourceRequirements{
+					Resources: api.VolumeResourceRequirements{
 						Requests: getResourceList("2Gi"),
 					},
 				},
@@ -147,7 +148,7 @@ func TestPVCResizeAdmission(t *testing.T) {
 			oldObj: &api.PersistentVolumeClaim{
 				Spec: api.PersistentVolumeClaimSpec{
 					VolumeName: "volume4",
-					Resources: api.ResourceRequirements{
+					Resources: api.VolumeResourceRequirements{
 						Requests: getResourceList("1Gi"),
 					},
 					StorageClassName: &silverClassName,
@@ -160,7 +161,7 @@ func TestPVCResizeAdmission(t *testing.T) {
 			newObj: &api.PersistentVolumeClaim{
 				Spec: api.PersistentVolumeClaimSpec{
 					VolumeName: "volume4",
-					Resources: api.ResourceRequirements{
+					Resources: api.VolumeResourceRequirements{
 						Requests: getResourceList("2Gi"),
 					},
 					StorageClassName: &silverClassName,
@@ -177,7 +178,7 @@ func TestPVCResizeAdmission(t *testing.T) {
 			resource: api.SchemeGroupVersion.WithResource("persistentvolumeclaims"),
 			oldObj: &api.PersistentVolumeClaim{
 				Spec: api.PersistentVolumeClaimSpec{
-					Resources: api.ResourceRequirements{
+					Resources: api.VolumeResourceRequirements{
 						Requests: getResourceList("1Gi"),
 					},
 					StorageClassName: &silverClassName,
@@ -190,7 +191,7 @@ func TestPVCResizeAdmission(t *testing.T) {
 			newObj: &api.PersistentVolumeClaim{
 				Spec: api.PersistentVolumeClaimSpec{
 					VolumeName: "volume4",
-					Resources: api.ResourceRequirements{
+					Resources: api.VolumeResourceRequirements{
 						Requests: getResourceList("1Gi"),
 					},
 					StorageClassName: &silverClassName,
@@ -207,7 +208,7 @@ func TestPVCResizeAdmission(t *testing.T) {
 			resource: api.SchemeGroupVersion.WithResource("persistentvolumeclaims"),
 			oldObj: &api.PersistentVolumeClaim{
 				Spec: api.PersistentVolumeClaimSpec{
-					Resources: api.ResourceRequirements{
+					Resources: api.VolumeResourceRequirements{
 						Requests: getResourceList("1Gi"),
 					},
 					StorageClassName: &silverClassName,
@@ -219,7 +220,7 @@ func TestPVCResizeAdmission(t *testing.T) {
 			},
 			newObj: &api.PersistentVolumeClaim{
 				Spec: api.PersistentVolumeClaimSpec{
-					Resources: api.ResourceRequirements{
+					Resources: api.VolumeResourceRequirements{
 						Requests: getResourceList("2Gi"),
 					},
 					StorageClassName: &silverClassName,
@@ -257,7 +258,7 @@ func TestPVCResizeAdmission(t *testing.T) {
 		operationOptions := &metav1.CreateOptions{}
 		attributes := admission.NewAttributesRecord(tc.newObj, tc.oldObj, schema.GroupVersionKind{}, metav1.NamespaceDefault, "foo", tc.resource, tc.subresource, operation, operationOptions, false, nil)
 
-		err := ctrl.Validate(attributes, nil)
+		err := ctrl.Validate(context.TODO(), attributes, nil)
 		if !tc.checkError(err) {
 			t.Errorf("%v: unexpected err: %v", tc.name, err)
 		}

@@ -1,4 +1,4 @@
-// +build windows
+//go:build windows
 
 /*
 Copyright 2019 The Kubernetes Authors.
@@ -21,9 +21,10 @@ package winstats
 import (
 	"sync"
 
-	cadvisorapi "github.com/google/cadvisor/info/v1"
+	cadvisorapi "github.com/google/cadvisor/lib/model"
+
 	"k8s.io/apimachinery/pkg/util/sets"
-	"k8s.io/klog"
+	"k8s.io/klog/v2"
 )
 
 const (
@@ -39,14 +40,14 @@ const (
 
 // networkCounter contains the counters for network adapters.
 type networkCounter struct {
-	packetsReceivedPerSecondCounter *perfCounter
-	packetsSentPerSecondCounter     *perfCounter
-	bytesReceivedPerSecondCounter   *perfCounter
-	bytesSentPerSecondCounter       *perfCounter
-	packetsReceivedDiscardedCounter *perfCounter
-	packetsReceivedErrorsCounter    *perfCounter
-	packetsOutboundDiscardedCounter *perfCounter
-	packetsOutboundErrorsCounter    *perfCounter
+	packetsReceivedPerSecondCounter perfCounter
+	packetsSentPerSecondCounter     perfCounter
+	bytesReceivedPerSecondCounter   perfCounter
+	bytesSentPerSecondCounter       perfCounter
+	packetsReceivedDiscardedCounter perfCounter
+	packetsReceivedErrorsCounter    perfCounter
+	packetsOutboundDiscardedCounter perfCounter
+	packetsOutboundErrorsCounter    perfCounter
 
 	mu           sync.RWMutex
 	adapterStats map[string]cadvisorapi.InterfaceStats
@@ -106,52 +107,52 @@ func newNetworkCounters() (*networkCounter, error) {
 	}, nil
 }
 
-func (n *networkCounter) getData() ([]cadvisorapi.InterfaceStats, error) {
+func (n *networkCounter) getData(logger klog.Logger) ([]cadvisorapi.InterfaceStats, error) {
 	packetsReceivedPerSecondData, err := n.packetsReceivedPerSecondCounter.getDataList()
 	if err != nil {
-		klog.Errorf("Unable to get packetsReceivedPerSecond perf counter data; err: %v", err)
+		logger.Error(err, "Unable to get packetsReceivedPerSecond perf counter data")
 		return nil, err
 	}
 
 	packetsSentPerSecondData, err := n.packetsSentPerSecondCounter.getDataList()
 	if err != nil {
-		klog.Errorf("Unable to get packetsSentPerSecond perf counter data; err: %v", err)
+		logger.Error(err, "Unable to get packetsSentPerSecond perf counter data")
 		return nil, err
 	}
 
 	bytesReceivedPerSecondData, err := n.bytesReceivedPerSecondCounter.getDataList()
 	if err != nil {
-		klog.Errorf("Unable to get bytesReceivedPerSecond perf counter data; err: %v", err)
+		logger.Error(err, "Unable to get bytesReceivedPerSecond perf counter data")
 		return nil, err
 	}
 
 	bytesSentPerSecondData, err := n.bytesSentPerSecondCounter.getDataList()
 	if err != nil {
-		klog.Errorf("Unable to get bytesSentPerSecond perf counter data; err: %v", err)
+		logger.Error(err, "Unable to get bytesSentPerSecond perf counter data")
 		return nil, err
 	}
 
 	packetsReceivedDiscardedData, err := n.packetsReceivedDiscardedCounter.getDataList()
 	if err != nil {
-		klog.Errorf("Unable to get packetsReceivedDiscarded perf counter data; err: %v", err)
+		logger.Error(err, "Unable to get packetsReceivedDiscarded perf counter data")
 		return nil, err
 	}
 
 	packetsReceivedErrorsData, err := n.packetsReceivedErrorsCounter.getDataList()
 	if err != nil {
-		klog.Errorf("Unable to get packetsReceivedErrors perf counter data; err: %v", err)
+		logger.Error(err, "Unable to get packetsReceivedErrors perf counter data")
 		return nil, err
 	}
 
 	packetsOutboundDiscardedData, err := n.packetsOutboundDiscardedCounter.getDataList()
 	if err != nil {
-		klog.Errorf("Unable to get packetsOutboundDiscarded perf counter data; err: %v", err)
+		logger.Error(err, "Unable to get packetsOutboundDiscarded perf counter data")
 		return nil, err
 	}
 
 	packetsOutboundErrorsData, err := n.packetsOutboundErrorsCounter.getDataList()
 	if err != nil {
-		klog.Errorf("Unable to get packetsOutboundErrors perf counter data; err: %v", err)
+		logger.Error(err, "Unable to get packetsOutboundErrors perf counter data")
 		return nil, err
 	}
 
@@ -179,7 +180,7 @@ func (n *networkCounter) mergeCollectedData(packetsReceivedPerSecondData,
 	packetsReceivedErrorsData,
 	packetsOutboundDiscardedData,
 	packetsOutboundErrorsData map[string]uint64) {
-	adapters := sets.NewString()
+	adapters := sets.New[string]()
 
 	// merge the collected data and list of adapters.
 	adapters.Insert(n.mergePacketsReceivedPerSecondData(packetsReceivedPerSecondData)...)

@@ -37,29 +37,31 @@ func TestGetReferenceRefVersion(t *testing.T) {
 	tests := []struct {
 		name               string
 		input              *TestRuntimeObj
+		groupVersion       schema.GroupVersion
 		expectedRefVersion string
 	}{
 		{
-			name: "api from selflink",
+			name: "v1 GV from scheme",
 			input: &TestRuntimeObj{
-				ObjectMeta: metav1.ObjectMeta{SelfLink: "/api/v1/namespaces"},
+				ObjectMeta: metav1.ObjectMeta{},
 			},
+			groupVersion:       schema.GroupVersion{Group: "", Version: "v1"},
 			expectedRefVersion: "v1",
 		},
 		{
-			name: "foo.group/v3 from selflink",
+			name: "foo.group/v3 GV from scheme",
 			input: &TestRuntimeObj{
-				ObjectMeta: metav1.ObjectMeta{SelfLink: "/apis/foo.group/v3/namespaces"},
+				ObjectMeta: metav1.ObjectMeta{},
 			},
+			groupVersion:       schema.GroupVersion{Group: "foo.group", Version: "v3"},
 			expectedRefVersion: "foo.group/v3",
 		},
 	}
 
-	scheme := runtime.NewScheme()
-	scheme.AddKnownTypes(schema.GroupVersion{Group: "this", Version: "is ignored"}, &TestRuntimeObj{})
-
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
+			scheme := runtime.NewScheme()
+			scheme.AddKnownTypes(test.groupVersion, &TestRuntimeObj{})
 			ref, err := GetReference(scheme, test.input)
 			if err != nil {
 				t.Fatal(err)
@@ -68,5 +70,43 @@ func TestGetReferenceRefVersion(t *testing.T) {
 				t.Errorf("expected %q, got %q", test.expectedRefVersion, ref.APIVersion)
 			}
 		})
+	}
+}
+
+func TestGetReferenceNilScheme(t *testing.T) {
+	input := &TestRuntimeObj{
+		ObjectMeta: metav1.ObjectMeta{},
+	}
+	_, err := GetReference(nil, input)
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if err.Error() != "scheme is required to look up gvk" {
+		t.Errorf("expected %q, got %q", "scheme is required to look up gvk", err.Error())
+	}
+}
+
+func TestGetReferenceNilSchemeWithPopulatedGVK(t *testing.T) {
+	input := &TestRuntimeObj{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: "foo.group/v3",
+			Kind:       "Bar",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "a-name",
+		},
+	}
+	ref, err := GetReference(nil, input)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if ref.APIVersion != "foo.group/v3" {
+		t.Errorf("expected %q, got %q", "foo.group/v3", ref.APIVersion)
+	}
+	if ref.Kind != "Bar" {
+		t.Errorf("expected %q, got %q", "Bar", ref.Kind)
+	}
+	if ref.Name != "a-name" {
+		t.Errorf("expected %q, got %q", "a-name", ref.Name)
 	}
 }

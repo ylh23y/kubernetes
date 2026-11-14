@@ -17,13 +17,13 @@ limitations under the License.
 package priority
 
 import (
+	"context"
 	"fmt"
 	"io"
 
 	apiv1 "k8s.io/api/core/v1"
 	schedulingv1 "k8s.io/api/scheduling/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apiserver/pkg/admission"
 	genericadmissioninitializers "k8s.io/apiserver/pkg/admission/initializer"
@@ -32,10 +32,8 @@ import (
 	"k8s.io/client-go/kubernetes"
 	schedulingv1listers "k8s.io/client-go/listers/scheduling/v1"
 	"k8s.io/kubernetes/pkg/apis/core"
-	api "k8s.io/kubernetes/pkg/apis/core"
 	"k8s.io/kubernetes/pkg/apis/scheduling"
 	"k8s.io/kubernetes/pkg/features"
-	kubelettypes "k8s.io/kubernetes/pkg/kubelet/types"
 )
 
 const (
@@ -46,31 +44,31 @@ const (
 // Register registers a plugin
 func Register(plugins *admission.Plugins) {
 	plugins.Register(PluginName, func(config io.Reader) (admission.Interface, error) {
-		return newPlugin(), nil
+		return NewPlugin(), nil
 	})
 }
 
-// priorityPlugin is an implementation of admission.Interface.
-type priorityPlugin struct {
+// Plugin is an implementation of admission.Interface.
+type Plugin struct {
 	*admission.Handler
 	client kubernetes.Interface
 	lister schedulingv1listers.PriorityClassLister
 }
 
-var _ admission.MutationInterface = &priorityPlugin{}
-var _ admission.ValidationInterface = &priorityPlugin{}
-var _ = genericadmissioninitializers.WantsExternalKubeInformerFactory(&priorityPlugin{})
-var _ = genericadmissioninitializers.WantsExternalKubeClientSet(&priorityPlugin{})
+var _ admission.MutationInterface = &Plugin{}
+var _ admission.ValidationInterface = &Plugin{}
+var _ = genericadmissioninitializers.WantsExternalKubeInformerFactory(&Plugin{})
+var _ = genericadmissioninitializers.WantsExternalKubeClientSet(&Plugin{})
 
 // NewPlugin creates a new priority admission plugin.
-func newPlugin() *priorityPlugin {
-	return &priorityPlugin{
+func NewPlugin() *Plugin {
+	return &Plugin{
 		Handler: admission.NewHandler(admission.Create, admission.Update, admission.Delete),
 	}
 }
 
 // ValidateInitialization implements the InitializationValidator interface.
-func (p *priorityPlugin) ValidateInitialization() error {
+func (p *Plugin) ValidateInitialization() error {
 	if p.client == nil {
 		return fmt.Errorf("%s requires a client", PluginName)
 	}
@@ -80,46 +78,56 @@ func (p *priorityPlugin) ValidateInitialization() error {
 	return nil
 }
 
-// SetInternalKubeClientSet implements the WantsInternalKubeClientSet interface.
-func (p *priorityPlugin) SetExternalKubeClientSet(client kubernetes.Interface) {
+// SetExternalKubeClientSet implements the WantsInternalKubeClientSet interface.
+func (p *Plugin) SetExternalKubeClientSet(client kubernetes.Interface) {
 	p.client = client
 }
 
-// SetInternalKubeInformerFactory implements the WantsInternalKubeInformerFactory interface.
-func (p *priorityPlugin) SetExternalKubeInformerFactory(f informers.SharedInformerFactory) {
+// SetExternalKubeInformerFactory implements the WantsInternalKubeInformerFactory interface.
+func (p *Plugin) SetExternalKubeInformerFactory(f informers.SharedInformerFactory) {
 	priorityInformer := f.Scheduling().V1().PriorityClasses()
 	p.lister = priorityInformer.Lister()
 	p.SetReadyFunc(priorityInformer.Informer().HasSynced)
 }
 
 var (
-	podResource           = api.Resource("pods")
-	priorityClassResource = scheduling.Resource("priorityclasses")
+	podResource               = core.Resource("pods")
+	podGroupResource          = scheduling.Resource("podgroups")
+	compositePodGroupResource = scheduling.Resource("compositepodgroups")
+	priorityClassResource     = scheduling.Resource("priorityclasses")
 )
 
-// Admit checks Pods and admits or rejects them. It also resolves the priority of pods based on their PriorityClass.
-// Note that pod validation mechanism prevents update of a pod priority.
-func (p *priorityPlugin) Admit(a admission.Attributes, o admission.ObjectInterfaces) error {
+// Admit checks Pods, PodGroups and CompositePodGroups and admits or rejects them.
+// It also resolves the priority of Pods, PodGroups and CompositePodGroups based on their PriorityClass.
+func (p *Plugin) Admit(ctx context.Context, a admission.Attributes, o admission.ObjectInterfaces) error {
 	operation := a.GetOperation()
-	// Ignore all calls to subresources
-	if len(a.GetSubresource()) != 0 {
+	// Ignore calls to subresources that can't modify the pod spec.
+	if len(a.GetSubresource()) != 0 && (a.GetResource().GroupResource() != podResource || a.GetSubresource() != "dynamic") {
 		return nil
 	}
-
 	switch a.GetResource().GroupResource() {
 	case podResource:
 		if operation == admission.Create || operation == admission.Update {
 			return p.admitPod(a)
 		}
 		return nil
-
+	case podGroupResource:
+		if operation == admission.Create {
+			return p.admitPodGroup(a)
+		}
+		return nil
+	case compositePodGroupResource:
+		if operation == admission.Create {
+			return p.admitCompositePodGroup(a)
+		}
+		return nil
 	default:
 		return nil
 	}
 }
 
 // Validate checks PriorityClasses and admits or rejects them.
-func (p *priorityPlugin) Validate(a admission.Attributes, o admission.ObjectInterfaces) error {
+func (p *Plugin) Validate(ctx context.Context, a admission.Attributes, o admission.ObjectInterfaces) error {
 	operation := a.GetOperation()
 	// Ignore all calls to subresources
 	if len(a.GetSubresource()) != 0 {
@@ -138,30 +146,16 @@ func (p *priorityPlugin) Validate(a admission.Attributes, o admission.ObjectInte
 	}
 }
 
-// priorityClassPermittedInNamespace returns true if we allow the given priority class name in the
-// given namespace. It currently checks that system priorities are created only in the system namespace.
-func priorityClassPermittedInNamespace(priorityClassName string, namespace string) bool {
-	// Only allow system priorities in the system namespace. This is to prevent abuse or incorrect
-	// usage of these priorities. Pods created at these priorities could preempt system critical
-	// components.
-	for _, spc := range scheduling.SystemPriorityClasses() {
-		if spc.Name == priorityClassName && namespace != metav1.NamespaceSystem {
-			return false
-		}
-	}
-	return true
-}
-
 // admitPod makes sure a new pod does not set spec.Priority field. It also makes sure that the PriorityClassName exists if it is provided and resolves the pod priority from the PriorityClassName.
-func (p *priorityPlugin) admitPod(a admission.Attributes) error {
+func (p *Plugin) admitPod(a admission.Attributes) error {
 	operation := a.GetOperation()
-	pod, ok := a.GetObject().(*api.Pod)
+	pod, ok := a.GetObject().(*core.Pod)
 	if !ok {
 		return errors.NewBadRequest("resource was marked with kind Pod but was unable to be converted")
 	}
 
 	if operation == admission.Update {
-		oldPod, ok := a.GetOldObject().(*api.Pod)
+		oldPod, ok := a.GetOldObject().(*core.Pod)
 		if !ok {
 			return errors.NewBadRequest("resource was marked with kind Pod but was unable to be converted")
 		}
@@ -172,68 +166,123 @@ func (p *priorityPlugin) admitPod(a admission.Attributes) error {
 		if pod.Spec.Priority == nil && oldPod.Spec.Priority != nil {
 			pod.Spec.Priority = oldPod.Spec.Priority
 		}
+		if pod.Spec.PreemptionPolicy == nil && oldPod.Spec.PreemptionPolicy != nil {
+			pod.Spec.PreemptionPolicy = oldPod.Spec.PreemptionPolicy
+		}
 		return nil
 	}
 
 	if operation == admission.Create {
 		var priority int32
 		var preemptionPolicy *apiv1.PreemptionPolicy
-		// TODO: @ravig - This is for backwards compatibility to ensure that critical pods with annotations just work fine.
-		// Remove when no longer needed.
-		if len(pod.Spec.PriorityClassName) == 0 &&
-			utilfeature.DefaultFeatureGate.Enabled(features.ExperimentalCriticalPodAnnotation) &&
-			kubelettypes.IsCritical(a.GetNamespace(), pod.Annotations) {
-			pod.Spec.PriorityClassName = scheduling.SystemClusterCritical
+		pcName, priority, preemptionPolicy, err := p.establishPriority(a, &pod.Spec.PriorityClassName)
+		if err != nil {
+			return err
 		}
-		if len(pod.Spec.PriorityClassName) == 0 {
-			var err error
-			var pcName string
-			pcName, priority, preemptionPolicy, err = p.getDefaultPriority()
-			if err != nil {
-				return fmt.Errorf("failed to get default priority class: %v", err)
-			}
-			pod.Spec.PriorityClassName = pcName
-		} else {
-			pcName := pod.Spec.PriorityClassName
-			if !priorityClassPermittedInNamespace(pcName, a.GetNamespace()) {
-				return admission.NewForbidden(a, fmt.Errorf("pods with %v priorityClass is not permitted in %v namespace", pcName, a.GetNamespace()))
-			}
-
-			// Try resolving the priority class name.
-			pc, err := p.lister.Get(pod.Spec.PriorityClassName)
-			if err != nil {
-				if errors.IsNotFound(err) {
-					return admission.NewForbidden(a, fmt.Errorf("no PriorityClass with name %v was found", pod.Spec.PriorityClassName))
-				}
-
-				return fmt.Errorf("failed to get PriorityClass with name %s: %v", pod.Spec.PriorityClassName, err)
-			}
-
-			priority = pc.Value
-			preemptionPolicy = pc.PreemptionPolicy
-		}
+		pod.Spec.PriorityClassName = pcName
 		// if the pod contained a priority that differs from the one computed from the priority class, error
 		if pod.Spec.Priority != nil && *pod.Spec.Priority != priority {
 			return admission.NewForbidden(a, fmt.Errorf("the integer value of priority (%d) must not be provided in pod spec; priority admission controller computed %d from the given PriorityClass name", *pod.Spec.Priority, priority))
 		}
 		pod.Spec.Priority = &priority
 
-		if utilfeature.DefaultFeatureGate.Enabled(features.NonPreemptingPriority) {
-			var corePolicy core.PreemptionPolicy
-			if preemptionPolicy != nil {
-				corePolicy = core.PreemptionPolicy(*preemptionPolicy)
-				if pod.Spec.PreemptionPolicy != nil && *pod.Spec.PreemptionPolicy != corePolicy {
-					return admission.NewForbidden(a, fmt.Errorf("the string value of PreemptionPolicy (%s) must not be provided in pod spec; priority admission controller computed %s from the given PriorityClass name", *pod.Spec.PreemptionPolicy, corePolicy))
-				}
-				pod.Spec.PreemptionPolicy = &corePolicy
+		var corePolicy core.PreemptionPolicy
+		if preemptionPolicy != nil {
+			corePolicy = core.PreemptionPolicy(*preemptionPolicy)
+			if pod.Spec.PreemptionPolicy != nil && *pod.Spec.PreemptionPolicy != corePolicy {
+				return admission.NewForbidden(a, fmt.Errorf("the string value of PreemptionPolicy (%s) must not be provided in pod spec; priority admission controller computed %s from the given PriorityClass name", *pod.Spec.PreemptionPolicy, corePolicy))
 			}
+			pod.Spec.PreemptionPolicy = &corePolicy
 		}
 	}
 	return nil
 }
 
+// admitPodGroup makes sure a new pod group does not set spec.Priority field. It also makes sure that
+// the PriorityClassName exists if it is provided and resolves the pod group priority from the PriorityClassName.
+func (p *Plugin) admitPodGroup(attributes admission.Attributes) error {
+	if !utilfeature.DefaultFeatureGate.Enabled(features.GenericWorkload) {
+		return nil
+	}
+
+	pg, ok := attributes.GetObject().(*scheduling.PodGroup)
+	if !ok {
+		return errors.NewBadRequest("resource was marked with kind PodGroup but was unable to be converted")
+	}
+
+	priorityClassName, priority, preemptionPolicy, err := p.establishPriority(attributes, &pg.Spec.PriorityClassName)
+	if err != nil {
+		return err
+	}
+	// Reject if the pod group already contained a priority that differs from the one computed from the priority class.
+	if pg.Spec.Priority != nil && *pg.Spec.Priority != priority {
+		return admission.NewForbidden(attributes, fmt.Errorf("priority set in the pod group (%d) must match the priority computed (%d) based on the priority class set in the spec", *pg.Spec.Priority, priority))
+	}
+	pg.Spec.Priority = &priority
+	pg.Spec.PriorityClassName = priorityClassName
+
+	var schedulingPreemptionPolicy scheduling.PreemptionPolicy
+	if preemptionPolicy != nil {
+		switch *preemptionPolicy {
+		case apiv1.PreemptLowerPriority:
+			schedulingPreemptionPolicy = scheduling.PreemptLowerPriority
+		case apiv1.PreemptNever:
+			schedulingPreemptionPolicy = scheduling.PreemptNever
+		default:
+			return admission.NewForbidden(attributes, fmt.Errorf("preemptionPolicy set in the PriorityClass object (%v) must match one of the allowed values of PreemptionPolicy type in pod group", *preemptionPolicy))
+		}
+		if pg.Spec.PreemptionPolicy != nil && *pg.Spec.PreemptionPolicy != schedulingPreemptionPolicy {
+			return admission.NewForbidden(attributes, fmt.Errorf("the string value of PreemptionPolicy (%s) must not be provided in pod group spec; priority admission controller computed %s from the given PriorityClass name", *pg.Spec.PreemptionPolicy, schedulingPreemptionPolicy))
+		}
+		pg.Spec.PreemptionPolicy = &schedulingPreemptionPolicy
+	}
+	return nil
+}
+
+// admitCompositePodGroup makes sure a new composite pod group does not set spec.Priority field.
+// It also makes sure that the PriorityClassName exists if it is provided and resolves
+// the composite pod group priority from the PriorityClassName.
+func (p *Plugin) admitCompositePodGroup(attributes admission.Attributes) error {
+	if !utilfeature.DefaultFeatureGate.Enabled(features.CompositePodGroup) {
+		return nil
+	}
+
+	cpg, ok := attributes.GetObject().(*scheduling.CompositePodGroup)
+	if !ok {
+		return errors.NewBadRequest("resource was marked with kind CompositePodGroup but was unable to be converted")
+	}
+
+	priorityClassName, priority, preemptionPolicy, err := p.establishPriority(attributes, &cpg.Spec.PriorityClassName)
+	if err != nil {
+		return err
+	}
+	// Reject if the composite pod group already contained a priority that differs from the one computed from the priority class.
+	if cpg.Spec.Priority != nil && *cpg.Spec.Priority != priority {
+		return admission.NewForbidden(attributes, fmt.Errorf("priority set in the composite pod group (%d) must match the priority computed (%d) based on the priority class set in the spec", *cpg.Spec.Priority, priority))
+	}
+	cpg.Spec.Priority = &priority
+	cpg.Spec.PriorityClassName = priorityClassName
+
+	var schedulingPreemptionPolicy scheduling.PreemptionPolicy
+	if preemptionPolicy != nil {
+		switch *preemptionPolicy {
+		case apiv1.PreemptLowerPriority:
+			schedulingPreemptionPolicy = scheduling.PreemptLowerPriority
+		case apiv1.PreemptNever:
+			schedulingPreemptionPolicy = scheduling.PreemptNever
+		default:
+			return admission.NewForbidden(attributes, fmt.Errorf("preemptionPolicy set in the PriorityClass object (%v) must match one of the allowed values of PreemptionPolicy type in composite pod group", *preemptionPolicy))
+		}
+		if cpg.Spec.PreemptionPolicy != nil && *cpg.Spec.PreemptionPolicy != schedulingPreemptionPolicy {
+			return admission.NewForbidden(attributes, fmt.Errorf("the string value of PreemptionPolicy (%s) must not be provided in composite pod group spec; priority admission controller computed %s from the given PriorityClass name", *cpg.Spec.PreemptionPolicy, schedulingPreemptionPolicy))
+		}
+		cpg.Spec.PreemptionPolicy = &schedulingPreemptionPolicy
+	}
+	return nil
+}
+
 // validatePriorityClass ensures that the value field is not larger than the highest user definable priority. If the GlobalDefault is set, it ensures that there is no other PriorityClass whose GlobalDefault is set.
-func (p *priorityPlugin) validatePriorityClass(a admission.Attributes) error {
+func (p *Plugin) validatePriorityClass(a admission.Attributes) error {
 	operation := a.GetOperation()
 	pc, ok := a.GetObject().(*scheduling.PriorityClass)
 	if !ok {
@@ -255,7 +304,29 @@ func (p *priorityPlugin) validatePriorityClass(a admission.Attributes) error {
 	return nil
 }
 
-func (p *priorityPlugin) getDefaultPriorityClass() (*schedulingv1.PriorityClass, error) {
+// establishPriority is an auxiliary method for calculating the priority-specific fields
+// based on the provided priority class name.
+// If the provided name is empty, we fall back to getting the default priority class and
+// returning information contained there.
+// If the provided name is not empty, we get the priority class with such name and return
+// the information contained in that class.
+func (p *Plugin) establishPriority(attributes admission.Attributes, priorityClassName *string) (string, int32, *apiv1.PreemptionPolicy, error) {
+	if priorityClassName == nil || *priorityClassName == "" {
+		pcName, priority, preemptionPolicy, err := p.getDefaultPriority()
+		if err != nil {
+			return "", 0, nil, fmt.Errorf("error occurred while retrieving default priority class: %w", err)
+		}
+		return pcName, priority, preemptionPolicy, nil
+	}
+	// Try resolving the priority class name.
+	pc, err := p.resolvePriorityClass(attributes, *priorityClassName)
+	if err != nil {
+		return "", 0, nil, err
+	}
+	return *priorityClassName, pc.Value, pc.PreemptionPolicy, nil
+}
+
+func (p *Plugin) getDefaultPriorityClass() (*schedulingv1.PriorityClass, error) {
 	list, err := p.lister.List(labels.Everything())
 	if err != nil {
 		return nil, err
@@ -273,7 +344,7 @@ func (p *priorityPlugin) getDefaultPriorityClass() (*schedulingv1.PriorityClass,
 	return defaultPC, nil
 }
 
-func (p *priorityPlugin) getDefaultPriority() (string, int32, *apiv1.PreemptionPolicy, error) {
+func (p *Plugin) getDefaultPriority() (string, int32, *apiv1.PreemptionPolicy, error) {
 	dpc, err := p.getDefaultPriorityClass()
 	if err != nil {
 		return "", 0, nil, err
@@ -283,4 +354,15 @@ func (p *priorityPlugin) getDefaultPriority() (string, int32, *apiv1.PreemptionP
 	}
 	preemptLowerPriority := apiv1.PreemptLowerPriority
 	return "", int32(scheduling.DefaultPriorityWhenNoDefaultClassExists), &preemptLowerPriority, nil
+}
+
+func (p *Plugin) resolvePriorityClass(attributes admission.Attributes, priorityClassName string) (*schedulingv1.PriorityClass, error) {
+	priorityClass, err := p.lister.Get(priorityClassName)
+	if err != nil {
+		if errors.IsNotFound(err) {
+			return nil, admission.NewForbidden(attributes, fmt.Errorf("no PriorityClass with name %v was found", priorityClassName))
+		}
+		return nil, fmt.Errorf("failed to resolve PriorityClass with name %s: %w", priorityClassName, err)
+	}
+	return priorityClass, nil
 }

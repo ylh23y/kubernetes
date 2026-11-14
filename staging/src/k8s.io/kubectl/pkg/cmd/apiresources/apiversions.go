@@ -24,6 +24,7 @@ import (
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/cli-runtime/pkg/genericclioptions"
+	"k8s.io/cli-runtime/pkg/genericiooptions"
 	"k8s.io/client-go/discovery"
 	cmdutil "k8s.io/kubectl/pkg/cmd/util"
 	"k8s.io/kubectl/pkg/util/i18n"
@@ -36,47 +37,60 @@ var (
 		kubectl api-versions`))
 )
 
-// APIVersionsOptions have the data required for API versions
-type APIVersionsOptions struct {
-	discoveryClient discovery.CachedDiscoveryInterface
+// APIVersionsFlags directly reflect the information that CLI is gathering via flags
+type APIVersionsFlags struct {
+	RESTClientGetter genericclioptions.RESTClientGetter
 
-	genericclioptions.IOStreams
+	genericiooptions.IOStreams
 }
 
-// NewAPIVersionsOptions creates the options for APIVersions
-func NewAPIVersionsOptions(ioStreams genericclioptions.IOStreams) *APIVersionsOptions {
-	return &APIVersionsOptions{
-		IOStreams: ioStreams,
+// NewAPIVersionsFlags returns a default APIVersionsFlags
+func NewAPIVersionsFlags(restClientGetter genericclioptions.RESTClientGetter, ioStreams genericiooptions.IOStreams) *APIVersionsFlags {
+	return &APIVersionsFlags{
+		RESTClientGetter: restClientGetter,
+		IOStreams:        ioStreams,
 	}
 }
 
+// APIVersionsOptions is the start of the data required to perform the operation. As new fields are added,
+// add them here instead of referencing the cmd.Flags()
+type APIVersionsOptions struct {
+	discoveryClient discovery.CachedDiscoveryInterface
+
+	genericiooptions.IOStreams
+}
+
 // NewCmdAPIVersions creates the `api-versions` command
-func NewCmdAPIVersions(f cmdutil.Factory, ioStreams genericclioptions.IOStreams) *cobra.Command {
-	o := NewAPIVersionsOptions(ioStreams)
+func NewCmdAPIVersions(restClientGetter genericclioptions.RESTClientGetter, ioStreams genericiooptions.IOStreams) *cobra.Command {
+	flags := NewAPIVersionsFlags(restClientGetter, ioStreams)
 	cmd := &cobra.Command{
-		Use:     "api-versions",
-		Short:   "Print the supported API versions on the server, in the form of \"group/version\"",
-		Long:    "Print the supported API versions on the server, in the form of \"group/version\"",
-		Example: apiversionsExample,
+		Use:                   "api-versions",
+		Short:                 i18n.T("Print the supported API versions on the server, in the form of \"group/version\""),
+		Long:                  i18n.T("Print the supported API versions on the server, in the form of \"group/version\"."),
+		Example:               apiversionsExample,
+		DisableFlagsInUseLine: true,
 		Run: func(cmd *cobra.Command, args []string) {
-			cmdutil.CheckErr(o.Complete(f, cmd, args))
+			o, err := flags.ToOptions(args)
+			cmdutil.CheckErr(err)
 			cmdutil.CheckErr(o.RunAPIVersions())
 		},
 	}
 	return cmd
 }
 
-// Complete adapts from the command line args and factory to the data required
-func (o *APIVersionsOptions) Complete(f cmdutil.Factory, cmd *cobra.Command, args []string) error {
+// ToOptions converts from CLI inputs to runtime inputs
+func (flags *APIVersionsFlags) ToOptions(args []string) (*APIVersionsOptions, error) {
 	if len(args) != 0 {
-		return cmdutil.UsageErrorf(cmd, "unexpected arguments: %v", args)
+		return nil, fmt.Errorf("unexpected arguments: %v", args)
 	}
-	var err error
-	o.discoveryClient, err = f.ToDiscoveryClient()
+	discoveryClient, err := flags.RESTClientGetter.ToDiscoveryClient()
 	if err != nil {
-		return err
+		return nil, err
 	}
-	return nil
+	return &APIVersionsOptions{
+		discoveryClient: discoveryClient,
+		IOStreams:       flags.IOStreams,
+	}, nil
 }
 
 // RunAPIVersions does the work

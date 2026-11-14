@@ -27,27 +27,31 @@ type FixedItemIntervalRateLimiter struct {
 	interval time.Duration
 }
 
-var _ workqueue.RateLimiter = &FixedItemIntervalRateLimiter{}
+var _ workqueue.TypedRateLimiter[string] = &FixedItemIntervalRateLimiter{}
 
-func NewFixedItemIntervalRateLimiter(interval time.Duration) workqueue.RateLimiter {
+// NewFixedItemIntervalRateLimiter creates a new instance of a RateLimiter using a fixed interval
+func NewFixedItemIntervalRateLimiter(interval time.Duration) workqueue.TypedRateLimiter[string] {
 	return &FixedItemIntervalRateLimiter{
 		interval: interval,
 	}
 }
 
-func (r *FixedItemIntervalRateLimiter) When(item interface{}) time.Duration {
+// When returns the interval of the rate limiter
+func (r *FixedItemIntervalRateLimiter) When(item string) time.Duration {
 	return r.interval
 }
 
-func (r *FixedItemIntervalRateLimiter) NumRequeues(item interface{}) int {
+// NumRequeues returns back how many failures the item has had
+func (r *FixedItemIntervalRateLimiter) NumRequeues(item string) int {
 	return 1
 }
 
-func (r *FixedItemIntervalRateLimiter) Forget(item interface{}) {
+// Forget indicates that an item is finished being retried.
+func (r *FixedItemIntervalRateLimiter) Forget(item string) {
 }
 
 // NewDefaultHPARateLimiter creates a rate limiter which limits overall (as per the
 // default controller rate limiter), as well as per the resync interval
-func NewDefaultHPARateLimiter(interval time.Duration) workqueue.RateLimiter {
+func NewDefaultHPARateLimiter(interval time.Duration) workqueue.TypedRateLimiter[string] {
 	return NewFixedItemIntervalRateLimiter(interval)
 }

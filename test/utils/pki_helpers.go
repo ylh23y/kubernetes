@@ -23,11 +23,10 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"fmt"
 	"math"
 	"math/big"
 	"time"
-
-	"github.com/pkg/errors"
 
 	certutil "k8s.io/client-go/util/cert"
 )
@@ -54,15 +53,17 @@ func EncodeCertPEM(cert *x509.Certificate) []byte {
 
 // NewSignedCert creates a signed certificate using the given CA certificate and key
 func NewSignedCert(cfg *certutil.Config, key crypto.Signer, caCert *x509.Certificate, caKey crypto.Signer) (*x509.Certificate, error) {
-	serial, err := cryptorand.Int(cryptorand.Reader, new(big.Int).SetInt64(math.MaxInt64))
+	// returns a uniform random value in [0, max-1), then add 1 to serial to make it a uniform random value in [1, max).
+	serial, err := cryptorand.Int(cryptorand.Reader, new(big.Int).SetInt64(math.MaxInt64-1))
 	if err != nil {
 		return nil, err
 	}
+	serial = new(big.Int).Add(serial, big.NewInt(1))
 	if len(cfg.CommonName) == 0 {
-		return nil, errors.New("must specify a CommonName")
+		return nil, fmt.Errorf("must specify a CommonName")
 	}
 	if len(cfg.Usages) == 0 {
-		return nil, errors.New("must specify at least one ExtKeyUsage")
+		return nil, fmt.Errorf("must specify at least one ExtKeyUsage")
 	}
 
 	certTmpl := x509.Certificate{
@@ -75,8 +76,11 @@ func NewSignedCert(cfg *certutil.Config, key crypto.Signer, caCert *x509.Certifi
 		SerialNumber: serial,
 		NotBefore:    caCert.NotBefore,
 		NotAfter:     time.Now().Add(duration365d).UTC(),
-		KeyUsage:     x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
+		KeyUsage:     x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:  cfg.Usages,
+	}
+	if _, ok := key.Public().(*rsa.PublicKey); ok {
+		certTmpl.KeyUsage |= x509.KeyUsageKeyEncipherment
 	}
 	certDERBytes, err := x509.CreateCertificate(cryptorand.Reader, &certTmpl, caCert, key.Public(), caKey)
 	if err != nil {

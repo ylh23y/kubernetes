@@ -18,6 +18,13 @@ limitations under the License.
 // +k8s:conversion-gen-external-types=k8s.io/api/scheduling/v1
 // +groupName=scheduling.k8s.io
 // +k8s:defaulter-gen=TypeMeta
-// +k8s:defaulter-gen-input=../../../../vendor/k8s.io/api/scheduling/v1
+// +k8s:defaulter-gen-input=k8s.io/api/scheduling/v1
+// +k8s:validation-gen=TypesWithField=TypeMeta
+// +k8s:validation-gen-input=k8s.io/api/scheduling/v1
 
-package v1 // import "k8s.io/kubernetes/pkg/apis/scheduling/v1"
+// This is the registered copy of the scheduling/v1 declarative validation.
+// It registers with the apiserver scheme and is the package cross-package
+// references resolve to. A non-registering copy is generated in-package under
+// k8s.io/api/scheduling/v1 for out-of-tree consumers.
+
+package v1

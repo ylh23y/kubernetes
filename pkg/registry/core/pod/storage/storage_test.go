@@ -18,30 +18,41 @@ package storage
 
 import (
 	"context"
+	goerrors "errors"
+	"fmt"
+	"net/url"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
-	"k8s.io/api/core/v1"
+	"github.com/google/go-cmp/cmp"
+
+	v1 "k8s.io/api/core/v1"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/errors"
+	apivalidation "k8s.io/apimachinery/pkg/api/validation"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	metav1beta1 "k8s.io/apimachinery/pkg/apis/meta/v1beta1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/util/diff"
+	"k8s.io/apimachinery/pkg/types"
 	genericapirequest "k8s.io/apiserver/pkg/endpoints/request"
 	"k8s.io/apiserver/pkg/registry/generic"
 	genericregistry "k8s.io/apiserver/pkg/registry/generic/registry"
 	genericregistrytest "k8s.io/apiserver/pkg/registry/generic/testing"
 	"k8s.io/apiserver/pkg/registry/rest"
-	"k8s.io/apiserver/pkg/storage"
+	apiserverstorage "k8s.io/apiserver/pkg/storage"
 	storeerr "k8s.io/apiserver/pkg/storage/errors"
 	etcd3testing "k8s.io/apiserver/pkg/storage/etcd3/testing"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	featuregatetesting "k8s.io/component-base/featuregate/testing"
+	podtest "k8s.io/kubernetes/pkg/api/pod/testing"
 	api "k8s.io/kubernetes/pkg/apis/core"
+	kubefeatures "k8s.io/kubernetes/pkg/features"
 	"k8s.io/kubernetes/pkg/registry/registrytest"
 	"k8s.io/kubernetes/pkg/securitycontext"
+	"k8s.io/utils/ptr"
 )
 
 func newStorage(t *testing.T) (*REST, *BindingREST, *StatusREST, *etcd3testing.EtcdTestServer) {
@@ -52,39 +63,26 @@ func newStorage(t *testing.T) (*REST, *BindingREST, *StatusREST, *etcd3testing.E
 		DeleteCollectionWorkers: 3,
 		ResourcePrefix:          "pods",
 	}
-	storage := NewStorage(restOptions, nil, nil, nil)
+	storage, err := NewStorage(restOptions, nil, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("unexpected error from REST storage: %v", err)
+	}
 	return storage.Pod, storage.Binding, storage.Status, server
 }
 
 func validNewPod() *api.Pod {
-	grace := int64(30)
 	enableServiceLinks := v1.DefaultEnableServiceLinks
-	return &api.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "foo",
-			Namespace: metav1.NamespaceDefault,
-		},
-		Spec: api.PodSpec{
-			RestartPolicy: api.RestartPolicyAlways,
-			DNSPolicy:     api.DNSClusterFirst,
 
-			TerminationGracePeriodSeconds: &grace,
-			Containers: []api.Container{
-				{
-					Name:            "foo",
-					Image:           "test",
-					ImagePullPolicy: api.PullAlways,
+	pod := podtest.MakePod("foo",
+		podtest.SetContainers(podtest.MakeContainer("foo",
+			podtest.SetContainerSecurityContext(*securitycontext.ValidInternalSecurityContextWithContainerDefaults()))),
+		podtest.SetSecurityContext(&api.PodSecurityContext{}),
+	)
+	pod.Spec.SchedulerName = v1.DefaultSchedulerName
+	pod.Spec.EnableServiceLinks = &enableServiceLinks
+	pod.Spec.Containers[0].TerminationMessagePath = api.TerminationMessagePathDefault
 
-					TerminationMessagePath:   api.TerminationMessagePathDefault,
-					TerminationMessagePolicy: api.TerminationMessageReadFile,
-					SecurityContext:          securitycontext.ValidInternalSecurityContextWithContainerDefaults(),
-				},
-			},
-			SecurityContext:    &api.PodSecurityContext{},
-			SchedulerName:      api.DefaultSchedulerName,
-			EnableServiceLinks: &enableServiceLinks,
-		},
-	}
+	return pod
 }
 
 func validChangedPod() *api.Pod {
@@ -102,7 +100,7 @@ func TestCreate(t *testing.T) {
 	test := genericregistrytest.New(t, storage.Store)
 	pod := validNewPod()
 	pod.ObjectMeta = metav1.ObjectMeta{}
-	// Make an invalid pod with an an incorrect label.
+	// Make an invalid pod with an incorrect label.
 	invalidPod := validNewPod()
 	invalidPod.Namespace = test.TestNamespace()
 	invalidPod.Labels = map[string]string{
@@ -152,13 +150,13 @@ func TestDelete(t *testing.T) {
 }
 
 type FailDeletionStorage struct {
-	storage.Interface
+	apiserverstorage.Interface
 	Called *bool
 }
 
-func (f FailDeletionStorage) Delete(ctx context.Context, key string, out runtime.Object, precondition *storage.Preconditions, _ storage.ValidateObjectFunc) error {
+func (f FailDeletionStorage) Delete(_ context.Context, key string, _ runtime.Object, _ *apiserverstorage.Preconditions, _ apiserverstorage.ValidateObjectFunc, _ runtime.Object, _ apiserverstorage.DeleteOptions) error {
 	*f.Called = true
-	return storage.NewKeyNotFoundError(key, 0)
+	return apiserverstorage.NewKeyNotFoundError(key, 0)
 }
 
 func newFailDeleteStorage(t *testing.T, called *bool) (*REST, *etcd3testing.EtcdTestServer) {
@@ -169,18 +167,21 @@ func newFailDeleteStorage(t *testing.T, called *bool) (*REST, *etcd3testing.Etcd
 		DeleteCollectionWorkers: 3,
 		ResourcePrefix:          "pods",
 	}
-	storage := NewStorage(restOptions, nil, nil, nil)
+	storage, err := NewStorage(restOptions, nil, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("unexpected error from REST storage: %v", err)
+	}
 	storage.Pod.Store.Storage = genericregistry.DryRunnableStorage{Storage: FailDeletionStorage{storage.Pod.Store.Storage.Storage, called}}
 	return storage.Pod, server
 }
 
 func TestIgnoreDeleteNotFound(t *testing.T) {
 	pod := validNewPod()
-	testContext := genericapirequest.WithNamespace(genericapirequest.NewContext(), metav1.NamespaceDefault)
 	called := false
 	registry, server := newFailDeleteStorage(t, &called)
 	defer server.Terminate(t)
 	defer registry.Store.DestroyFunc()
+	testContext := genericregistrytest.NewNamespaceScopeContext(registry.Store, metav1.NamespaceDefault)
 
 	// should fail if pod A is not created yet.
 	_, _, err := registry.Delete(testContext, pod.Name, rest.ValidateAllObjectFunc, nil)
@@ -226,11 +227,11 @@ func TestCreateSetsFields(t *testing.T) {
 	defer server.Terminate(t)
 	defer storage.Store.DestroyFunc()
 	pod := validNewPod()
-	_, err := storage.Create(genericapirequest.NewDefaultContext(), pod, rest.ValidateAllObjectFunc, &metav1.CreateOptions{})
+	ctx := genericregistrytest.NewNamespaceScopeContext(storage.Store, metav1.NamespaceDefault)
+	_, err := storage.Create(ctx, pod, rest.ValidateAllObjectFunc, &metav1.CreateOptions{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	ctx := genericapirequest.NewDefaultContext()
 	object, err := storage.Get(ctx, "foo", &metav1.GetOptions{})
 	if err != nil {
 		t.Errorf("unexpected error: %v", err)
@@ -246,7 +247,7 @@ func TestCreateSetsFields(t *testing.T) {
 
 func TestResourceLocation(t *testing.T) {
 	expectedIP := "1.2.3.4"
-	expectedIP6 := "2001:db8::"
+	expectedIP6 := "fd00:10:244:0:2::6b"
 	testCases := []struct {
 		pod      api.Pod
 		query    string
@@ -280,6 +281,19 @@ func TestResourceLocation(t *testing.T) {
 			},
 			query:    "foo",
 			location: expectedIP,
+		},
+		{
+			pod: api.Pod{
+				ObjectMeta: metav1.ObjectMeta{Name: "foo"},
+				Spec: api.PodSpec{
+					Containers: []api.Container{
+						{Name: "ctr"},
+					},
+				},
+				Status: api.PodStatus{PodIPs: []api.PodIP{{IP: expectedIP6}}},
+			},
+			query:    "foo",
+			location: "[" + expectedIP6 + "]",
 		},
 		{
 			pod: api.Pod{
@@ -349,18 +363,34 @@ func TestResourceLocation(t *testing.T) {
 			query:    "foo",
 			location: expectedIP + ":9376",
 		},
+		{
+			pod: api.Pod{
+				ObjectMeta: metav1.ObjectMeta{Name: "foo"},
+				Spec: api.PodSpec{
+					Containers: []api.Container{
+						{Name: "ctr1", Ports: []api.ContainerPort{{ContainerPort: 9376}}},
+						{Name: "ctr2", Ports: []api.ContainerPort{{ContainerPort: 1234}}},
+					},
+				},
+				Status: api.PodStatus{PodIPs: []api.PodIP{{IP: expectedIP6}, {IP: expectedIP}}},
+			},
+			query:    "foo",
+			location: "[" + expectedIP6 + "]:9376",
+		},
 	}
 
-	ctx := genericapirequest.NewDefaultContext()
-	for _, tc := range testCases {
-		storage, _, _, server := newStorage(t)
+	storage, _, _, server := newStorage(t)
+	defer server.Terminate(t)
+	for i, tc := range testCases {
+		// unique namespace/storage location per test
+		ctx := genericregistrytest.NewNamespaceScopeContext(storage.Store, fmt.Sprintf("namespace-%d", i))
 		key, _ := storage.KeyFunc(ctx, tc.pod.Name)
 		if err := storage.Storage.Create(ctx, key, &tc.pod, nil, 0, false); err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
 
 		redirector := rest.Redirector(storage)
-		location, _, err := redirector.ResourceLocation(genericapirequest.NewDefaultContext(), tc.query)
+		location, _, err := redirector.ResourceLocation(ctx, tc.query)
 		if err != nil {
 			t.Errorf("Unexpected error: %v", err)
 		}
@@ -374,7 +404,10 @@ func TestResourceLocation(t *testing.T) {
 		if location.Host != tc.location {
 			t.Errorf("Expected %v, but got %v", tc.location, location.Host)
 		}
-		server.Terminate(t)
+		if _, err := url.Parse(location.String()); err != nil {
+			t.Errorf("could not parse returned location %s: %v", location.String(), err)
+		}
+
 	}
 }
 
@@ -422,13 +455,13 @@ func TestConvertToTableList(t *testing.T) {
 	storage, _, _, server := newStorage(t)
 	defer server.Terminate(t)
 	defer storage.Store.DestroyFunc()
-	ctx := genericapirequest.NewDefaultContext()
+	ctx := genericregistrytest.NewNamespaceScopeContext(storage.Store, metav1.NamespaceDefault)
 
-	columns := []metav1beta1.TableColumnDefinition{
+	columns := []metav1.TableColumnDefinition{
 		{Name: "Name", Type: "string", Format: "name", Description: metav1.ObjectMeta{}.SwaggerDoc()["name"]},
 		{Name: "Ready", Type: "string", Description: "The aggregate readiness state of this pod for accepting traffic."},
 		{Name: "Status", Type: "string", Description: "The aggregate status of the containers in this pod."},
-		{Name: "Restarts", Type: "integer", Description: "The number of times the containers in this pod have been restarted."},
+		{Name: "Restarts", Type: "string", Description: "The number of times the containers in this pod have been restarted and when the last container in this pod has restarted."},
 		{Name: "Age", Type: "string", Description: metav1.ObjectMeta{}.SwaggerDoc()["creationTimestamp"]},
 		{Name: "IP", Type: "string", Priority: 1, Description: v1.PodStatus{}.SwaggerDoc()["podIP"]},
 		{Name: "Node", Type: "string", Priority: 1, Description: v1.PodSpec{}.SwaggerDoc()["nodeName"]},
@@ -516,7 +549,7 @@ func TestConvertToTableList(t *testing.T) {
 
 	testCases := []struct {
 		in  runtime.Object
-		out *metav1beta1.Table
+		out *metav1.Table
 		err bool
 	}{
 		{
@@ -525,32 +558,32 @@ func TestConvertToTableList(t *testing.T) {
 		},
 		{
 			in: &api.Pod{},
-			out: &metav1beta1.Table{
+			out: &metav1.Table{
 				ColumnDefinitions: columns,
-				Rows: []metav1beta1.TableRow{
-					{Cells: []interface{}{"", "0/0", "", int64(0), "<unknown>", "<none>", "<none>", "<none>", "<none>"}, Object: runtime.RawExtension{Object: &api.Pod{}}},
+				Rows: []metav1.TableRow{
+					{Cells: []interface{}{"", "0/0", "", "0", "<unknown>", "<none>", "<none>", "<none>", "<none>"}, Object: runtime.RawExtension{Object: &api.Pod{}}},
 				},
 			},
 		},
 		{
 			in: pod1,
-			out: &metav1beta1.Table{
+			out: &metav1.Table{
 				ColumnDefinitions: columns,
-				Rows: []metav1beta1.TableRow{
-					{Cells: []interface{}{"foo", "1/2", "Pending", int64(10), "370d", "10.1.2.3", "test-node", "nominated-node", "1/2"}, Object: runtime.RawExtension{Object: pod1}},
+				Rows: []metav1.TableRow{
+					{Cells: []interface{}{"foo", "1/2", "Pending", "10", "370d", "10.1.2.3", "test-node", "nominated-node", "1/2"}, Object: runtime.RawExtension{Object: pod1}},
 				},
 			},
 		},
 		{
 			in:  &api.PodList{},
-			out: &metav1beta1.Table{ColumnDefinitions: columns},
+			out: &metav1.Table{ColumnDefinitions: columns},
 		},
 		{
 			in: multiIPsPod,
-			out: &metav1beta1.Table{
+			out: &metav1.Table{
 				ColumnDefinitions: columns,
-				Rows: []metav1beta1.TableRow{
-					{Cells: []interface{}{"foo", "1/2", "Pending", int64(10), "370d", "10.1.2.3", "test-node", "nominated-node", "1/2"}, Object: runtime.RawExtension{Object: multiIPsPod}},
+				Rows: []metav1.TableRow{
+					{Cells: []interface{}{"foo", "1/2", "Pending", "10", "370d", "10.1.2.3", "test-node", "nominated-node", "1/2"}, Object: runtime.RawExtension{Object: multiIPsPod}},
 				},
 			},
 		},
@@ -565,7 +598,7 @@ func TestConvertToTableList(t *testing.T) {
 			continue
 		}
 		if !apiequality.Semantic.DeepEqual(test.out, out) {
-			t.Errorf("%d: mismatch: %s", i, diff.ObjectReflectDiff(test.out, out))
+			t.Errorf("%d: mismatch: %s", i, cmp.Diff(test.out, out))
 		}
 	}
 }
@@ -574,14 +607,14 @@ func TestEtcdCreate(t *testing.T) {
 	storage, bindingStorage, _, server := newStorage(t)
 	defer server.Terminate(t)
 	defer storage.Store.DestroyFunc()
-	ctx := genericapirequest.NewDefaultContext()
+	ctx := genericregistrytest.NewNamespaceScopeContext(storage.Store, metav1.NamespaceDefault)
 	_, err := storage.Create(ctx, validNewPod(), rest.ValidateAllObjectFunc, &metav1.CreateOptions{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
 	// Suddenly, a wild scheduler appears:
-	_, err = bindingStorage.Create(ctx, &api.Binding{
+	_, err = bindingStorage.Create(ctx, "foo", &api.Binding{
 		ObjectMeta: metav1.ObjectMeta{Namespace: metav1.NamespaceDefault, Name: "foo"},
 		Target:     api.ObjectReference{Name: "machine"},
 	}, rest.ValidateAllObjectFunc, &metav1.CreateOptions{})
@@ -595,19 +628,76 @@ func TestEtcdCreate(t *testing.T) {
 	}
 }
 
+func TestEtcdCreateClearsNominatedNodeName(t *testing.T) {
+	for _, featureGateEnabled := range []bool{true, false} {
+		t.Run(fmt.Sprintf("FeatureGate=%v", featureGateEnabled), func(t *testing.T) {
+			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate,
+				kubefeatures.ClearingNominatedNodeNameAfterBinding, featureGateEnabled)
+
+			storage, bindingStorage, statusStorage, server := newStorage(t)
+			defer server.Terminate(t)
+			defer storage.DestroyFunc()
+			ctx := genericregistrytest.NewNamespaceScopeContext(storage.Store, metav1.NamespaceDefault)
+
+			pod := validNewPod()
+			created, err := storage.Create(ctx, pod, rest.ValidateAllObjectFunc, &metav1.CreateOptions{})
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+
+			// Set NominatedNodeName via status update
+			createdPod := created.(*api.Pod)
+			createdPod.Status.NominatedNodeName = "nominated-node"
+			_, _, err = statusStorage.Update(ctx, createdPod.Name, rest.DefaultUpdatedObjectInfo(createdPod),
+				rest.ValidateAllObjectFunc, rest.ValidateAllObjectUpdateFunc, false, &metav1.UpdateOptions{})
+			if err != nil {
+				t.Fatalf("unexpected error updating pod status: %v", err)
+			}
+
+			// Bind the pod
+			_, err = bindingStorage.Create(ctx, "foo", &api.Binding{
+				ObjectMeta: metav1.ObjectMeta{Namespace: metav1.NamespaceDefault, Name: "foo"},
+				Target:     api.ObjectReference{Name: "machine"},
+			}, rest.ValidateAllObjectFunc, &metav1.CreateOptions{})
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+
+			// Verify NominatedNodeName
+			obj, err := storage.Get(ctx, "foo", &metav1.GetOptions{})
+			if err != nil {
+				t.Fatalf("Unexpected error %v", err)
+			}
+			boundPod := obj.(*api.Pod)
+
+			if featureGateEnabled {
+				if boundPod.Status.NominatedNodeName != "" {
+					t.Errorf("expected NominatedNodeName to be cleared, but got: %s",
+						boundPod.Status.NominatedNodeName)
+				}
+			} else {
+				if boundPod.Status.NominatedNodeName != "nominated-node" {
+					t.Errorf("expected NominatedNodeName to be preserved, but got: %s",
+						boundPod.Status.NominatedNodeName)
+				}
+			}
+		})
+	}
+}
+
 // Ensure that when scheduler creates a binding for a pod that has already been deleted
 // by the API server, API server returns not-found error.
 func TestEtcdCreateBindingNoPod(t *testing.T) {
 	storage, bindingStorage, _, server := newStorage(t)
 	defer server.Terminate(t)
 	defer storage.Store.DestroyFunc()
-	ctx := genericapirequest.NewDefaultContext()
+	ctx := genericregistrytest.NewNamespaceScopeContext(storage.Store, metav1.NamespaceDefault)
 
 	// Assume that a pod has undergone the following:
 	// - Create (apiserver)
 	// - Schedule (scheduler)
 	// - Delete (apiserver)
-	_, err := bindingStorage.Create(ctx, &api.Binding{
+	_, err := bindingStorage.Create(ctx, "foo", &api.Binding{
 		ObjectMeta: metav1.ObjectMeta{Namespace: metav1.NamespaceDefault, Name: "foo"},
 		Target:     api.ObjectReference{Name: "machine"},
 	}, rest.ValidateAllObjectFunc, &metav1.CreateOptions{})
@@ -644,18 +734,20 @@ func TestEtcdCreateWithContainersNotFound(t *testing.T) {
 	storage, bindingStorage, _, server := newStorage(t)
 	defer server.Terminate(t)
 	defer storage.Store.DestroyFunc()
-	ctx := genericapirequest.NewDefaultContext()
+	ctx := genericregistrytest.NewNamespaceScopeContext(storage.Store, metav1.NamespaceDefault)
 	_, err := storage.Create(ctx, validNewPod(), rest.ValidateAllObjectFunc, &metav1.CreateOptions{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
+	featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, kubefeatures.PodTopologyLabelsAdmission, true)
 	// Suddenly, a wild scheduler appears:
-	_, err = bindingStorage.Create(ctx, &api.Binding{
+	_, err = bindingStorage.Create(ctx, "foo", &api.Binding{
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace:   metav1.NamespaceDefault,
 			Name:        "foo",
-			Annotations: map[string]string{"label1": "value1"},
+			Annotations: map[string]string{"annotation1": "value1"},
+			Labels:      map[string]string{"label1": "label-value1"},
 		},
 		Target: api.ObjectReference{Name: "machine"},
 	}, rest.ValidateAllObjectFunc, &metav1.CreateOptions{})
@@ -669,8 +761,11 @@ func TestEtcdCreateWithContainersNotFound(t *testing.T) {
 	}
 	pod := obj.(*api.Pod)
 
-	if !(pod.Annotations != nil && pod.Annotations["label1"] == "value1") {
+	if !(pod.Annotations != nil && pod.Annotations["annotation1"] == "value1") {
 		t.Fatalf("Pod annotations don't match the expected: %v", pod.Annotations)
+	}
+	if !(pod.Labels != nil && pod.Labels["label1"] == "label-value1") {
+		t.Fatalf("Pod labels don't match the expected: %v", pod.Labels)
 	}
 }
 
@@ -678,7 +773,7 @@ func TestEtcdCreateWithConflict(t *testing.T) {
 	storage, bindingStorage, _, server := newStorage(t)
 	defer server.Terminate(t)
 	defer storage.Store.DestroyFunc()
-	ctx := genericapirequest.NewDefaultContext()
+	ctx := genericregistrytest.NewNamespaceScopeContext(storage.Store, metav1.NamespaceDefault)
 
 	_, err := storage.Create(ctx, validNewPod(), rest.ValidateAllObjectFunc, &metav1.CreateOptions{})
 	if err != nil {
@@ -694,14 +789,193 @@ func TestEtcdCreateWithConflict(t *testing.T) {
 		},
 		Target: api.ObjectReference{Name: "machine"},
 	}
-	_, err = bindingStorage.Create(ctx, &binding, rest.ValidateAllObjectFunc, &metav1.CreateOptions{})
+	_, err = bindingStorage.Create(ctx, binding.Name, &binding, rest.ValidateAllObjectFunc, &metav1.CreateOptions{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	_, err = bindingStorage.Create(ctx, &binding, rest.ValidateAllObjectFunc, &metav1.CreateOptions{})
+	_, err = bindingStorage.Create(ctx, binding.Name, &binding, rest.ValidateAllObjectFunc, &metav1.CreateOptions{})
 	if err == nil || !errors.IsConflict(err) {
 		t.Fatalf("expected resource conflict error, not: %v", err)
+	}
+}
+
+func TestEtcdCreateWithSchedulingGates(t *testing.T) {
+	tests := []struct {
+		name            string
+		schedulingGates []api.PodSchedulingGate
+		wantErr         error
+	}{
+		{
+			name: "pod with non-nil schedulingGates",
+			schedulingGates: []api.PodSchedulingGate{
+				{Name: "foo"},
+				{Name: "bar"},
+			},
+			wantErr: goerrors.New(`Operation cannot be fulfilled on pods/binding "foo": pod foo has non-empty .spec.schedulingGates`),
+		},
+		{
+			name:            "pod with nil schedulingGates",
+			schedulingGates: nil,
+			wantErr:         nil,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			storage, bindingStorage, _, server := newStorage(t)
+			defer server.Terminate(t)
+			defer storage.Store.DestroyFunc()
+			ctx := genericregistrytest.NewNamespaceScopeContext(storage.Store, metav1.NamespaceDefault)
+
+			pod := validNewPod()
+			pod.Spec.SchedulingGates = tt.schedulingGates
+			if _, err := storage.Create(ctx, pod, rest.ValidateAllObjectFunc, &metav1.CreateOptions{}); err != nil {
+				t.Fatalf("Unexpected error: %v", err)
+			}
+			_, err := bindingStorage.Create(ctx, "foo", &api.Binding{
+				ObjectMeta: metav1.ObjectMeta{Namespace: metav1.NamespaceDefault, Name: "foo"},
+				Target:     api.ObjectReference{Name: "machine"},
+			}, rest.ValidateAllObjectFunc, &metav1.CreateOptions{})
+			if tt.wantErr == nil {
+				if err != nil {
+					t.Errorf("Want nil err, but got %v", err)
+				}
+			} else {
+				if err == nil {
+					t.Errorf("Want %v, but got nil err", tt.wantErr)
+				} else if tt.wantErr.Error() != err.Error() {
+					t.Errorf("Want %v, but got %v", tt.wantErr, err)
+				}
+			}
+		})
+	}
+}
+
+func validNewBinding() *api.Binding {
+	return &api.Binding{
+		ObjectMeta: metav1.ObjectMeta{Name: "foo"},
+		Target:     api.ObjectReference{Name: "machine", Kind: "Node"},
+	}
+}
+
+func TestEtcdCreateBindingWithUIDAndResourceVersion(t *testing.T) {
+	originUID := func(pod *api.Pod) types.UID {
+		return pod.UID
+	}
+	emptyUID := func(pod *api.Pod) types.UID {
+		return ""
+	}
+	changedUID := func(pod *api.Pod) types.UID {
+		return pod.UID + "-changed"
+	}
+
+	originResourceVersion := func(pod *api.Pod) string {
+		return pod.ResourceVersion
+	}
+	emptyResourceVersion := func(pod *api.Pod) string {
+		return ""
+	}
+	changedResourceVersion := func(pod *api.Pod) string {
+		return pod.ResourceVersion + "-changed"
+	}
+
+	noError := func(err error) bool {
+		return err == nil
+	}
+	conflictError := func(err error) bool {
+		return err != nil && errors.IsConflict(err)
+	}
+
+	testCases := map[string]struct {
+		podUIDGetter             func(pod *api.Pod) types.UID
+		podResourceVersionGetter func(pod *api.Pod) string
+		errOK                    func(error) bool
+		expectedNodeName         string
+	}{
+		"originUID-originResourceVersion": {
+			podUIDGetter:             originUID,
+			podResourceVersionGetter: originResourceVersion,
+			errOK:                    noError,
+			expectedNodeName:         "machine",
+		},
+		"originUID-emptyResourceVersion": {
+			podUIDGetter:             originUID,
+			podResourceVersionGetter: emptyResourceVersion,
+			errOK:                    noError,
+			expectedNodeName:         "machine",
+		},
+		"originUID-changedResourceVersion": {
+			podUIDGetter:             originUID,
+			podResourceVersionGetter: changedResourceVersion,
+			errOK:                    conflictError,
+			expectedNodeName:         "",
+		},
+		"emptyUID-originResourceVersion": {
+			podUIDGetter:             emptyUID,
+			podResourceVersionGetter: originResourceVersion,
+			errOK:                    noError,
+			expectedNodeName:         "machine",
+		},
+		"emptyUID-emptyResourceVersion": {
+			podUIDGetter:             emptyUID,
+			podResourceVersionGetter: emptyResourceVersion,
+			errOK:                    noError,
+			expectedNodeName:         "machine",
+		},
+		"emptyUID-changedResourceVersion": {
+			podUIDGetter:             emptyUID,
+			podResourceVersionGetter: changedResourceVersion,
+			errOK:                    conflictError,
+			expectedNodeName:         "",
+		},
+		"changedUID-originResourceVersion": {
+			podUIDGetter:             changedUID,
+			podResourceVersionGetter: originResourceVersion,
+			errOK:                    conflictError,
+			expectedNodeName:         "",
+		},
+		"changedUID-emptyResourceVersion": {
+			podUIDGetter:             changedUID,
+			podResourceVersionGetter: emptyResourceVersion,
+			errOK:                    conflictError,
+			expectedNodeName:         "",
+		},
+		"changedUID-changedResourceVersion": {
+			podUIDGetter:             changedUID,
+			podResourceVersionGetter: changedResourceVersion,
+			errOK:                    conflictError,
+			expectedNodeName:         "",
+		},
+	}
+
+	storage, bindingStorage, _, server := newStorage(t)
+	defer server.Terminate(t)
+	defer storage.Store.DestroyFunc()
+
+	for k, testCase := range testCases {
+		pod := validNewPod()
+		pod.Namespace = fmt.Sprintf("namespace-%s", strings.ToLower(k))
+		ctx := genericregistrytest.NewNamespaceScopeContext(storage.Store, pod.Namespace)
+
+		podCreated, err := storage.Create(ctx, pod, rest.ValidateAllObjectFunc, &metav1.CreateOptions{})
+		if err != nil {
+			t.Fatalf("%s: unexpected error: %v", k, err)
+		}
+
+		binding := validNewBinding()
+		binding.UID = testCase.podUIDGetter(podCreated.(*api.Pod))
+		binding.ResourceVersion = testCase.podResourceVersionGetter(podCreated.(*api.Pod))
+
+		if _, err := bindingStorage.Create(ctx, binding.Name, binding, rest.ValidateAllObjectFunc, &metav1.CreateOptions{}); !testCase.errOK(err) {
+			t.Errorf("%s: unexpected error: %v", k, err)
+		}
+
+		if pod, err := storage.Get(ctx, pod.Name, &metav1.GetOptions{}); err != nil {
+			t.Errorf("%s: unexpected error: %v", k, err)
+		} else if pod.(*api.Pod).Spec.NodeName != testCase.expectedNodeName {
+			t.Errorf("%s: expected: %v, got: %v", k, pod.(*api.Pod).Spec.NodeName, testCase.expectedNodeName)
+		}
 	}
 }
 
@@ -709,14 +983,14 @@ func TestEtcdCreateWithExistingContainers(t *testing.T) {
 	storage, bindingStorage, _, server := newStorage(t)
 	defer server.Terminate(t)
 	defer storage.Store.DestroyFunc()
-	ctx := genericapirequest.NewDefaultContext()
+	ctx := genericregistrytest.NewNamespaceScopeContext(storage.Store, metav1.NamespaceDefault)
 	_, err := storage.Create(ctx, validNewPod(), rest.ValidateAllObjectFunc, &metav1.CreateOptions{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
 	// Suddenly, a wild scheduler appears:
-	_, err = bindingStorage.Create(ctx, &api.Binding{
+	_, err = bindingStorage.Create(ctx, "foo", &api.Binding{
 		ObjectMeta: metav1.ObjectMeta{Namespace: metav1.NamespaceDefault, Name: "foo"},
 		Target:     api.ObjectReference{Name: "machine"},
 	}, rest.ValidateAllObjectFunc, &metav1.CreateOptions{})
@@ -731,11 +1005,10 @@ func TestEtcdCreateWithExistingContainers(t *testing.T) {
 }
 
 func TestEtcdCreateBinding(t *testing.T) {
-	ctx := genericapirequest.NewDefaultContext()
-
 	testCases := map[string]struct {
-		binding api.Binding
-		errOK   func(error) bool
+		binding      api.Binding
+		badNameInURL bool
+		errOK        func(error) bool
 	}{
 		"noName": {
 			binding: api.Binding{
@@ -743,6 +1016,14 @@ func TestEtcdCreateBinding(t *testing.T) {
 				Target:     api.ObjectReference{},
 			},
 			errOK: func(err error) bool { return err != nil },
+		},
+		"badNameInURL": {
+			binding: api.Binding{
+				ObjectMeta: metav1.ObjectMeta{Namespace: metav1.NamespaceDefault, Name: "foo"},
+				Target:     api.ObjectReference{},
+			},
+			badNameInURL: true,
+			errOK:        func(err error) bool { return err != nil },
 		},
 		"badKind": {
 			binding: api.Binding{
@@ -766,25 +1047,37 @@ func TestEtcdCreateBinding(t *testing.T) {
 			errOK: func(err error) bool { return err == nil },
 		},
 	}
-	for k, test := range testCases {
-		storage, bindingStorage, _, server := newStorage(t)
+	storage, bindingStorage, _, server := newStorage(t)
+	defer server.Terminate(t)
+	defer storage.Store.DestroyFunc()
 
-		if _, err := storage.Create(ctx, validNewPod(), rest.ValidateAllObjectFunc, &metav1.CreateOptions{}); err != nil {
+	for k, test := range testCases {
+		pod := validNewPod()
+		pod.Namespace = fmt.Sprintf("namespace-%s", strings.ToLower(k))
+		ctx := genericregistrytest.NewNamespaceScopeContext(storage.Store, pod.Namespace)
+		if _, err := storage.Create(ctx, pod, rest.ValidateAllObjectFunc, &metav1.CreateOptions{}); err != nil {
 			t.Fatalf("%s: unexpected error: %v", k, err)
 		}
-		if _, err := bindingStorage.Create(ctx, &test.binding, rest.ValidateAllObjectFunc, &metav1.CreateOptions{}); !test.errOK(err) {
+		name := test.binding.Name
+		if test.badNameInURL {
+			name += "badNameInURL"
+		}
+		if out, err := bindingStorage.Create(ctx, name, &test.binding, rest.ValidateAllObjectFunc, &metav1.CreateOptions{}); !test.errOK(err) {
 			t.Errorf("%s: unexpected error: %v", k, err)
 		} else if err == nil {
-			// If bind succeeded, verify Host field in pod's Spec.
-			pod, err := storage.Get(ctx, validNewPod().ObjectMeta.Name, &metav1.GetOptions{})
+			// If bind succeeded, verify Host field in pod's Spec and ResourceVersion in Status.
+			pod, err := storage.Get(ctx, pod.ObjectMeta.Name, &metav1.GetOptions{})
 			if err != nil {
 				t.Errorf("%s: unexpected error: %v", k, err)
-			} else if pod.(*api.Pod).Spec.NodeName != test.binding.Target.Name {
-				t.Errorf("%s: expected: %v, got: %v", k, pod.(*api.Pod).Spec.NodeName, test.binding.Target.Name)
+			} else {
+				if pod.(*api.Pod).Spec.NodeName != test.binding.Target.Name {
+					t.Errorf("%s: expected: %v, got: %v", k, pod.(*api.Pod).Spec.NodeName, test.binding.Target.Name)
+				}
+				if out.(*metav1.Status).ResourceVersion != pod.(*api.Pod).ResourceVersion {
+					t.Errorf("%s: expected ResourceVersion: %v, got: %v", k, pod.(*api.Pod).ResourceVersion, out.(*metav1.Status).ResourceVersion)
+				}
 			}
 		}
-		storage.Store.DestroyFunc()
-		server.Terminate(t)
 	}
 }
 
@@ -792,7 +1085,7 @@ func TestEtcdUpdateNotScheduled(t *testing.T) {
 	storage, _, _, server := newStorage(t)
 	defer server.Terminate(t)
 	defer storage.Store.DestroyFunc()
-	ctx := genericapirequest.NewDefaultContext()
+	ctx := genericregistrytest.NewNamespaceScopeContext(storage.Store, metav1.NamespaceDefault)
 
 	if _, err := storage.Create(ctx, validNewPod(), rest.ValidateAllObjectFunc, &metav1.CreateOptions{}); err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -810,7 +1103,7 @@ func TestEtcdUpdateNotScheduled(t *testing.T) {
 	podOut := obj.(*api.Pod)
 	// validChangedPod only changes the Labels, so were checking the update was valid
 	if !apiequality.Semantic.DeepEqual(podIn.Labels, podOut.Labels) {
-		t.Errorf("objects differ: %v", diff.ObjectDiff(podOut, podIn))
+		t.Errorf("objects differ: %v", cmp.Diff(podOut, podIn))
 	}
 }
 
@@ -818,7 +1111,7 @@ func TestEtcdUpdateScheduled(t *testing.T) {
 	storage, _, _, server := newStorage(t)
 	defer server.Terminate(t)
 	defer storage.Store.DestroyFunc()
-	ctx := genericapirequest.NewDefaultContext()
+	ctx := genericregistrytest.NewNamespaceScopeContext(storage.Store, metav1.NamespaceDefault)
 
 	key, _ := storage.KeyFunc(ctx, "foo")
 	err := storage.Storage.Create(ctx, key, &api.Pod{
@@ -836,7 +1129,7 @@ func TestEtcdUpdateScheduled(t *testing.T) {
 				},
 			},
 			SecurityContext: &api.PodSecurityContext{},
-			SchedulerName:   api.DefaultSchedulerName,
+			SchedulerName:   v1.DefaultSchedulerName,
 		},
 	}, nil, 1, false)
 	if err != nil {
@@ -867,7 +1160,7 @@ func TestEtcdUpdateScheduled(t *testing.T) {
 
 			TerminationGracePeriodSeconds: &grace,
 			SecurityContext:               &api.PodSecurityContext{},
-			SchedulerName:                 api.DefaultSchedulerName,
+			SchedulerName:                 v1.DefaultSchedulerName,
 			EnableServiceLinks:            &enableServiceLinks,
 		},
 	}
@@ -883,7 +1176,7 @@ func TestEtcdUpdateScheduled(t *testing.T) {
 	podOut := obj.(*api.Pod)
 	// Check to verify the Spec and Label updates match from change above.  Those are the fields changed.
 	if !apiequality.Semantic.DeepEqual(podOut.Spec, podIn.Spec) || !apiequality.Semantic.DeepEqual(podOut.Labels, podIn.Labels) {
-		t.Errorf("objects differ: %v", diff.ObjectDiff(podOut, podIn))
+		t.Errorf("objects differ: %v", cmp.Diff(podOut, podIn))
 	}
 
 }
@@ -892,7 +1185,8 @@ func TestEtcdUpdateStatus(t *testing.T) {
 	storage, _, statusStorage, server := newStorage(t)
 	defer server.Terminate(t)
 	defer storage.Store.DestroyFunc()
-	ctx := genericapirequest.NewDefaultContext()
+	ctx := genericregistrytest.NewNamespaceScopeContext(storage.Store, metav1.NamespaceDefault)
+	statusCtx := genericregistrytest.NewNamespaceScopeContext(storage.Store, metav1.NamespaceDefault, "status")
 
 	key, _ := storage.KeyFunc(ctx, "foo")
 	podStart := api.Pod{
@@ -909,7 +1203,7 @@ func TestEtcdUpdateStatus(t *testing.T) {
 				},
 			},
 			SecurityContext: &api.PodSecurityContext{},
-			SchedulerName:   api.DefaultSchedulerName,
+			SchedulerName:   v1.DefaultSchedulerName,
 		},
 	}
 	err := storage.Storage.Create(ctx, key, &podStart, nil, 0, false)
@@ -935,7 +1229,7 @@ func TestEtcdUpdateStatus(t *testing.T) {
 					},
 				},
 				SecurityContext: &api.PodSecurityContext{},
-				SchedulerName:   api.DefaultSchedulerName,
+				SchedulerName:   v1.DefaultSchedulerName,
 			},
 			Status: api.PodStatus{
 				Phase:   api.PodRunning,
@@ -960,7 +1254,7 @@ func TestEtcdUpdateStatus(t *testing.T) {
 					},
 				},
 				SecurityContext: &api.PodSecurityContext{},
-				SchedulerName:   api.DefaultSchedulerName,
+				SchedulerName:   v1.DefaultSchedulerName,
 			},
 			Status: api.PodStatus{
 				Phase:   api.PodRunning,
@@ -982,10 +1276,12 @@ func TestEtcdUpdateStatus(t *testing.T) {
 		expected.Spec.Containers[0].ImagePullPolicy = api.PullIfNotPresent
 		expected.Spec.Containers[0].TerminationMessagePath = api.TerminationMessagePathDefault
 		expected.Spec.Containers[0].TerminationMessagePolicy = api.TerminationMessageReadFile
+		// status updates are defaulted (podIP synced from podIPs) before reaching
+		podIn.Status.PodIP = podIn.Status.PodIPs[0].IP
 		expected.Labels = podIn.Labels
 		expected.Status = podIn.Status
 
-		_, _, err = statusStorage.Update(ctx, podIn.Name, rest.DefaultUpdatedObjectInfo(&podIn), rest.ValidateAllObjectFunc, rest.ValidateAllObjectUpdateFunc, false, &metav1.UpdateOptions{})
+		_, _, err = statusStorage.Update(statusCtx, podIn.Name, rest.DefaultUpdatedObjectInfo(&podIn), rest.ValidateAllObjectFunc, rest.ValidateAllObjectUpdateFunc, false, &metav1.UpdateOptions{})
 		if err != nil {
 			t.Fatalf("Unexpected error: %v", err)
 		}
@@ -998,7 +1294,7 @@ func TestEtcdUpdateStatus(t *testing.T) {
 		if !apiequality.Semantic.DeepEqual(podOut.Spec, expected.Spec) ||
 			!apiequality.Semantic.DeepEqual(podOut.Labels, expected.Labels) ||
 			!apiequality.Semantic.DeepEqual(podOut.Status, expected.Status) {
-			t.Errorf("objects differ: %v", diff.ObjectDiff(podOut, expected))
+			t.Errorf("objects differ: %v", cmp.Diff(podOut, expected))
 		}
 	}
 }
@@ -1017,4 +1313,262 @@ func TestCategories(t *testing.T) {
 	defer storage.Store.DestroyFunc()
 	expected := []string{"all"}
 	registrytest.AssertCategories(t, storage, expected)
+}
+
+func TestEtcdTerminationGracePeriodSecondsCompatibility(t *testing.T) {
+	storage, _, _, server := newStorage(t)
+	defer server.Terminate(t)
+	defer storage.Store.DestroyFunc()
+	ctx := genericregistrytest.NewNamespaceScopeContext(storage.Store, metav1.NamespaceDefault)
+
+	stored := validNewPod()
+	stored.Spec.TerminationGracePeriodSeconds = ptr.To[int64](-1)
+	key, _ := storage.KeyFunc(ctx, stored.Name)
+	if err := storage.Storage.Create(ctx, key, stored, nil, 0, false); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	obj, err := storage.Get(ctx, stored.Name, &metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	served := obj.(*api.Pod)
+	if served.Spec.TerminationGracePeriodSeconds == nil || *served.Spec.TerminationGracePeriodSeconds != 1 {
+		t.Fatalf("expected stored negative grace period clamped to 1 by storage-decode defaulting, got %v", served.Spec.TerminationGracePeriodSeconds)
+	}
+
+	updated := served.DeepCopy()
+	if _, _, err := storage.Update(ctx, updated.Name, rest.DefaultUpdatedObjectInfo(updated), rest.ValidateAllObjectFunc, rest.ValidateAllObjectUpdateFunc, false, &metav1.UpdateOptions{}); err != nil {
+		t.Fatalf("unexpected error updating pod: %v", err)
+	}
+	obj, err = storage.Get(ctx, stored.Name, &metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	healed := obj.(*api.Pod)
+	if healed.Spec.TerminationGracePeriodSeconds == nil || *healed.Spec.TerminationGracePeriodSeconds != 1 {
+		t.Fatalf("expected grace period of 1 after rewrite, got %v", healed.Spec.TerminationGracePeriodSeconds)
+	}
+}
+
+func TestEtcdPodIPsReadCompatibility(t *testing.T) {
+	storage, _, _, server := newStorage(t)
+	defer server.Terminate(t)
+	defer storage.Store.DestroyFunc()
+	ctx := genericregistrytest.NewNamespaceScopeContext(storage.Store, metav1.NamespaceDefault)
+
+	stored := validNewPod()
+	stored.Status.PodIP = "10.0.0.1"
+	stored.Status.PodIPs = nil
+	key, _ := storage.KeyFunc(ctx, stored.Name)
+	if err := storage.Storage.Create(ctx, key, stored, nil, 0, false); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	obj, err := storage.Get(ctx, stored.Name, &metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	served := obj.(*api.Pod)
+	if served.Status.PodIP != "10.0.0.1" {
+		t.Errorf("expected podIP 10.0.0.1, got %q", served.Status.PodIP)
+	}
+	if len(served.Status.PodIPs) != 1 || served.Status.PodIPs[0].IP != "10.0.0.1" {
+		t.Errorf("expected podIPs synthesized from podIP by storage-decode defaulting, got %#v", served.Status.PodIPs)
+	}
+}
+
+// TestEtcdCreateBindingScrubsLegacyAnnotations pins that binding annotations
+// receive the same legacy init-container annotation scrub Pod defaulting
+// applies, since the binding write path merges them into the pod without
+// passing through defaulting.
+func TestEtcdCreateBindingScrubsLegacyAnnotations(t *testing.T) {
+	storage, bindingStorage, _, server := newStorage(t)
+	defer server.Terminate(t)
+	defer storage.Store.DestroyFunc()
+	ctx := genericregistrytest.NewNamespaceScopeContext(storage.Store, metav1.NamespaceDefault)
+	if _, err := storage.Create(ctx, validNewPod(), rest.ValidateAllObjectFunc, &metav1.CreateOptions{}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if _, err := bindingStorage.Create(ctx, "foo", &api.Binding{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: metav1.NamespaceDefault,
+			Name:      "foo",
+			Annotations: map[string]string{
+				"pod.beta.kubernetes.io/init-containers": "[]",
+				"kept":                                   "value",
+			},
+		},
+		Target: api.ObjectReference{Name: "machine"},
+	}, rest.ValidateAllObjectFunc, &metav1.CreateOptions{}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	obj, err := storage.Get(ctx, "foo", &metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	pod := obj.(*api.Pod)
+	if _, ok := pod.Annotations["pod.beta.kubernetes.io/init-containers"]; ok {
+		t.Errorf("expected legacy init-container annotation to be scrubbed from binding, got %v", pod.Annotations)
+	}
+	if pod.Annotations["kept"] != "value" {
+		t.Errorf("expected unrelated binding annotation to be kept, got %v", pod.Annotations)
+	}
+}
+
+func TestBindingValidation(t *testing.T) {
+	testcases := []struct {
+		name         string
+		tweakPod     func(*api.Pod)
+		tweakBinding func(*api.Binding)
+		expectError  string
+	}{
+		{
+			name: "invalid label",
+			tweakBinding: func(b *api.Binding) {
+				b.Labels = map[string]string{"invalid label": "invalid value"}
+			},
+			expectError: "metadata.labels: Invalid value",
+		},
+		{
+			name: "invalid annotation",
+			tweakBinding: func(b *api.Binding) {
+				b.Annotations = map[string]string{"invalid annotation": "invalid value"}
+			},
+			expectError: "metadata.annotations: Invalid value",
+		},
+		{
+			name: "invalid annotations size when combined",
+			tweakPod: func(p *api.Pod) {
+				p.Annotations = map[string]string{
+					// one byte for the key, remaining bytes for the value
+					"a": strings.Repeat("a", apivalidation.TotalAnnotationSizeLimitB-1),
+				}
+			},
+			tweakBinding: func(b *api.Binding) {
+				b.Annotations = map[string]string{"b": ""}
+			},
+			expectError: "metadata.annotations: Too long",
+		},
+		{
+			name: "invalid pod-specific annotation format",
+			tweakBinding: func(b *api.Binding) {
+				b.Annotations = map[string]string{"controller.kubernetes.io/pod-deletion-cost": "foo"}
+			},
+			expectError: "must be a 32bit integer",
+		},
+		{
+			name: "invalid pod-specific annotation update",
+			tweakBinding: func(b *api.Binding) {
+				b.Annotations = map[string]string{"container.apparmor.security.beta.kubernetes.io/foo": "runtime/default"}
+			},
+			expectError: "may not add AppArmor annotations",
+		},
+		{
+			name: "invalid bind with scheduling gates",
+			tweakPod: func(p *api.Pod) {
+				p.Spec.SchedulingGates = []api.PodSchedulingGate{{Name: "foo"}}
+			},
+			expectError: "non-empty .spec.schedulingGates",
+		},
+	}
+
+	storage, bindingStorage, _, server := newStorage(t)
+	defer server.Terminate(t)
+	defer storage.Store.DestroyFunc()
+	ctx := genericregistrytest.NewNamespaceScopeContext(storage.Store, metav1.NamespaceDefault)
+
+	for i, tc := range testcases {
+		t.Run(tc.name, func(t *testing.T) {
+			pod := validNewPod()
+			pod.Name += strconv.Itoa(i)
+			if tc.tweakPod != nil {
+				tc.tweakPod(pod)
+			}
+			if _, err := storage.Create(ctx, pod, rest.ValidateAllObjectFunc, &metav1.CreateOptions{}); err != nil {
+				t.Fatalf("unexpected error creating pod: %v", err)
+			}
+
+			binding := &api.Binding{
+				ObjectMeta: metav1.ObjectMeta{Namespace: metav1.NamespaceDefault, Name: pod.Name},
+				Target:     api.ObjectReference{Name: "machine"},
+			}
+			if tc.tweakBinding != nil {
+				tc.tweakBinding(binding)
+			}
+
+			_, err := bindingStorage.Create(ctx, pod.Name, binding, rest.ValidateAllObjectFunc, &metav1.CreateOptions{})
+			if err == nil {
+				t.Fatalf("expected error binding, got none")
+			}
+			if !strings.Contains(err.Error(), tc.expectError) {
+				t.Fatalf("expected error containing %q, got %v", tc.expectError, err.Error())
+			}
+		})
+	}
+}
+
+func TestEtcdUpdateDynamic(t *testing.T) {
+	etcdStorage, server := registrytest.NewEtcdStorage(t, "")
+	defer server.Terminate(t)
+	restOptions := generic.RESTOptions{
+		StorageConfig:           etcdStorage,
+		Decorator:               generic.UndecoratedStorage,
+		DeleteCollectionWorkers: 3,
+		ResourcePrefix:          "pods",
+	}
+	podStorage, err := NewStorage(restOptions, nil, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("unexpected error from REST storage: %v", err)
+	}
+	defer podStorage.Pod.Store.DestroyFunc()
+	ctx := genericregistrytest.NewNamespaceScopeContext(podStorage.Pod.Store, metav1.NamespaceDefault)
+	// The subresource matters: declarative validation dispatches on it.
+	dynamicCtx := genericregistrytest.NewNamespaceScopeContext(podStorage.Pod.Store, metav1.NamespaceDefault, "dynamic")
+
+	podStart := validNewPod()
+	podStart.Spec.NodeName = "machine"
+	podStart.Status = api.PodStatus{
+		Phase:             api.PodRunning,
+		Conditions:        []api.PodCondition{{Type: api.PodInitialized, Status: api.ConditionTrue}},
+		ContainerStatuses: []api.ContainerStatus{{Name: "foo", State: api.ContainerState{Running: &api.ContainerStateRunning{}}}},
+	}
+	key, _ := podStorage.Pod.KeyFunc(ctx, podStart.Name)
+	if err := podStorage.Pod.Storage.Create(ctx, key, podStart, nil, 0, false); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	obj, err := podStorage.Dynamic.Get(dynamicCtx, podStart.Name, &metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	added := obj.(*api.Pod).DeepCopy()
+	added.Spec.Containers = append(added.Spec.Containers, added.Spec.Containers[0])
+	added.Spec.Containers[1].Name = "bar"
+
+	if _, _, err := podStorage.Dynamic.Update(dynamicCtx, added.Name, rest.DefaultUpdatedObjectInfo(added), rest.ValidateAllObjectFunc, rest.ValidateAllObjectUpdateFunc, false, &metav1.UpdateOptions{}); err != nil {
+		t.Fatalf("unexpected error adding a container: %v", err)
+	}
+	obj, err = podStorage.Pod.Get(ctx, podStart.Name, &metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	var names []string
+	for _, c := range obj.(*api.Pod).Spec.Containers {
+		names = append(names, c.Name)
+	}
+	if diff := cmp.Diff([]string{"foo", "bar"}, names); diff != "" {
+		t.Errorf("unexpected containers (-want, +got):\n%s", diff)
+	}
+
+	removed := obj.(*api.Pod).DeepCopy()
+	removed.Spec.Containers = removed.Spec.Containers[1:]
+	if _, _, err := podStorage.Pod.Update(ctx, removed.Name, rest.DefaultUpdatedObjectInfo(removed), rest.ValidateAllObjectFunc, rest.ValidateAllObjectUpdateFunc, false, &metav1.UpdateOptions{}); err == nil {
+		t.Error("expected the pods resource to reject removing a container")
+	}
+	if _, _, err := podStorage.Dynamic.Update(dynamicCtx, removed.Name, rest.DefaultUpdatedObjectInfo(removed), rest.ValidateAllObjectFunc, rest.ValidateAllObjectUpdateFunc, false, &metav1.UpdateOptions{}); err != nil {
+		t.Errorf("unexpected error removing a container: %v", err)
+	}
 }

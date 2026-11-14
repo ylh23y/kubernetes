@@ -17,14 +17,16 @@ limitations under the License.
 package services
 
 import (
+	"context"
 	"os"
-	"testing"
 
 	etcd3testing "k8s.io/apiserver/pkg/storage/etcd3/testing"
 	"k8s.io/apiserver/pkg/storage/storagebackend"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	"k8s.io/ktesting"
 	"k8s.io/kubernetes/test/e2e/framework"
 
-	"k8s.io/klog"
+	"k8s.io/klog/v2"
 )
 
 // e2eService manages e2e services in current process.
@@ -43,7 +45,7 @@ func newE2EServices() *e2eServices {
 
 // run starts all e2e services and wait for the termination signal. Once receives the
 // termination signal, it will stop the e2e services gracefully.
-func (es *e2eServices) run(t *testing.T) error {
+func (es *e2eServices) run(t ktesting.TB) error {
 	defer es.stop(t)
 	if err := es.start(t); err != nil {
 		return err
@@ -54,17 +56,18 @@ func (es *e2eServices) run(t *testing.T) error {
 }
 
 // start starts the tests embedded services or returns an error.
-func (es *e2eServices) start(t *testing.T) error {
+func (es *e2eServices) start(t ktesting.TB) error {
+	tCtx := ktesting.Init(t)
 	klog.Info("Starting e2e services...")
 	err := es.startEtcd(t)
 	if err != nil {
 		return err
 	}
-	err = es.startAPIServer(es.etcdStorage)
+	err = es.startAPIServer(tCtx, es.etcdStorage)
 	if err != nil {
 		return err
 	}
-	err = es.startNamespaceController()
+	err = es.startNamespaceController(tCtx)
 	if err != nil {
 		return nil
 	}
@@ -73,7 +76,7 @@ func (es *e2eServices) start(t *testing.T) error {
 }
 
 // stop stops the embedded e2e services.
-func (es *e2eServices) stop(t *testing.T) {
+func (es *e2eServices) stop(t ktesting.TB) {
 	klog.Info("Stopping e2e services...")
 	// TODO(random-liu): Use a loop to stop all services after introducing
 	// service interface.
@@ -108,7 +111,7 @@ func (es *e2eServices) stop(t *testing.T) {
 }
 
 // startEtcd starts the embedded etcd instance or returns an error.
-func (es *e2eServices) startEtcd(t *testing.T) error {
+func (es *e2eServices) startEtcd(t ktesting.TB) error {
 	klog.Info("Starting etcd")
 	server, etcdStorage := etcd3testing.NewUnsecuredEtcd3TestClientServer(t)
 	es.etcdServer = server
@@ -117,17 +120,17 @@ func (es *e2eServices) startEtcd(t *testing.T) error {
 }
 
 // startAPIServer starts the embedded API server or returns an error.
-func (es *e2eServices) startAPIServer(etcdStorage *storagebackend.Config) error {
+func (es *e2eServices) startAPIServer(ctx context.Context, etcdStorage *storagebackend.Config) error {
 	klog.Info("Starting API server")
 	es.apiServer = NewAPIServer(*etcdStorage)
-	return es.apiServer.Start()
+	return es.apiServer.Start(ctx)
 }
 
 // startNamespaceController starts the embedded namespace controller or returns an error.
-func (es *e2eServices) startNamespaceController() error {
-	klog.Info("Starting namespace controller")
+func (es *e2eServices) startNamespaceController(ctx context.Context) error {
+	klog.FromContext(ctx).Info("Starting namespace controller")
 	es.nsController = NewNamespaceController(framework.TestContext.Host)
-	return es.nsController.Start()
+	return es.nsController.Start(ctx)
 }
 
 // getServicesHealthCheckURLs returns the health check urls for the internal services.
@@ -135,4 +138,8 @@ func getServicesHealthCheckURLs() []string {
 	return []string{
 		getAPIServerHealthCheckURL(),
 	}
+}
+
+func SetFeatureGatesForInProcessComponents(featureGates map[string]bool) error {
+	return utilfeature.DefaultMutableFeatureGate.SetFromMap(featureGates)
 }

@@ -17,25 +17,29 @@ limitations under the License.
 package logs
 
 import (
-	"bytes"
+	"context"
 	"fmt"
-	"io"
-	"io/ioutil"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/client-go/util/workqueue"
+	"k8s.io/ktesting"
+	"k8s.io/kubernetes/pkg/kubelet/container"
 
-	"k8s.io/apimachinery/pkg/util/clock"
-	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
+	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1"
 	critest "k8s.io/cri-api/pkg/apis/testing"
+	testingclock "k8s.io/utils/clock/testing"
 )
 
 func TestGetAllLogs(t *testing.T) {
-	dir, err := ioutil.TempDir("", "test-get-all-logs")
+	dir, err := os.MkdirTemp("", "test-get-all-logs")
 	require.NoError(t, err)
 	defer os.RemoveAll(dir)
 	testLogs := []string{
@@ -74,7 +78,8 @@ func TestGetAllLogs(t *testing.T) {
 }
 
 func TestRotateLogs(t *testing.T) {
-	dir, err := ioutil.TempDir("", "test-rotate-logs")
+	tCtx := ktesting.Init(t)
+	dir, err := os.MkdirTemp("", "test-rotate-logs")
 	require.NoError(t, err)
 	defer os.RemoveAll(dir)
 
@@ -90,7 +95,15 @@ func TestRotateLogs(t *testing.T) {
 			MaxSize:  testMaxSize,
 			MaxFiles: testMaxFiles,
 		},
-		clock: clock.NewFakeClock(now),
+		osInterface: container.RealOS{},
+		clock:       testingclock.NewFakeClock(now),
+		mutex:       sync.Mutex{},
+		queue: workqueue.NewTypedRateLimitingQueueWithConfig(
+			workqueue.DefaultTypedControllerRateLimiter[string](),
+			workqueue.TypedRateLimitingQueueConfig[string]{Name: "kubelet_log_rotate_manager"},
+		),
+		maxWorkers:       10,
+		monitoringPeriod: v1.Duration{Duration: 10 * time.Second},
 	}
 	testLogs := []string{
 		"test-log-1",
@@ -146,10 +159,28 @@ func TestRotateLogs(t *testing.T) {
 		},
 	}
 	f.SetFakeContainers(testContainers)
-	require.NoError(t, c.rotateLogs())
+
+	// Push the items into the queue for before starting the worker to avoid issue with the queue being empty.
+	require.NoError(t, c.rotateLogs(tCtx))
+
+	// Start a routine that can monitor the queue and shutdown the queue to trigger the retrun from the processQueueItems
+	// Keeping the monitor duration smaller in order to keep the unwanted delay in the test to a minimal.
+	go func() {
+		pollTimeoutCtx, cancel := context.WithTimeout(tCtx, 10*time.Second)
+		defer cancel()
+		err = wait.PollUntilContextCancel(pollTimeoutCtx, 5*time.Millisecond, false, func(ctx context.Context) (done bool, err error) {
+			return c.queue.Len() == 0, nil
+		})
+		if err != nil {
+			t.Errorf("unexpected error %v", err)
+		}
+		c.queue.ShutDown()
+	}()
+	// This is a blocking call. But the above routine takes care of ensuring that this is terminated once the queue is shutdown
+	c.processQueueItems(tCtx, 1)
 
 	timestamp := now.Format(timestampFormat)
-	logs, err := ioutil.ReadDir(dir)
+	logs, err := os.ReadDir(dir)
 	require.NoError(t, err)
 	assert.Len(t, logs, 5)
 	assert.Equal(t, testLogs[0], logs[0].Name())
@@ -159,8 +190,87 @@ func TestRotateLogs(t *testing.T) {
 	assert.Equal(t, testLogs[3], logs[4].Name())
 }
 
+func TestClean(t *testing.T) {
+	tCtx := ktesting.Init(t)
+	dir, err := os.MkdirTemp("", "test-clean")
+	require.NoError(t, err)
+	defer os.RemoveAll(dir)
+
+	const (
+		testMaxFiles = 3
+		testMaxSize  = 10
+	)
+	now := time.Now()
+	f := critest.NewFakeRuntimeService()
+	c := &containerLogManager{
+		runtimeService: f,
+		policy: LogRotatePolicy{
+			MaxSize:  testMaxSize,
+			MaxFiles: testMaxFiles,
+		},
+		osInterface: container.RealOS{},
+		clock:       testingclock.NewFakeClock(now),
+		mutex:       sync.Mutex{},
+		queue: workqueue.NewTypedRateLimitingQueueWithConfig(
+			workqueue.DefaultTypedControllerRateLimiter[string](),
+			workqueue.TypedRateLimitingQueueConfig[string]{Name: "kubelet_log_rotate_manager"},
+		),
+		maxWorkers:       10,
+		monitoringPeriod: v1.Duration{Duration: 10 * time.Second},
+	}
+	testLogs := []string{
+		"test-log-1",
+		"test-log-2",
+		"test-log-3",
+		"test-log-2.00000000-000000.gz",
+		"test-log-2.00000000-000001",
+		"test-log-3.00000000-000000.gz",
+		"test-log-3.00000000-000001",
+	}
+	for i := range testLogs {
+		f, err := os.Create(filepath.Join(dir, testLogs[i]))
+		require.NoError(t, err)
+		f.Close()
+	}
+	testContainers := []*critest.FakeContainer{
+		{
+			ContainerStatus: runtimeapi.ContainerStatus{
+				Id:      "container-1",
+				State:   runtimeapi.ContainerState_CONTAINER_RUNNING,
+				LogPath: filepath.Join(dir, testLogs[0]),
+			},
+		},
+		{
+			ContainerStatus: runtimeapi.ContainerStatus{
+				Id:      "container-2",
+				State:   runtimeapi.ContainerState_CONTAINER_RUNNING,
+				LogPath: filepath.Join(dir, testLogs[1]),
+			},
+		},
+		{
+			ContainerStatus: runtimeapi.ContainerStatus{
+				Id:      "container-3",
+				State:   runtimeapi.ContainerState_CONTAINER_EXITED,
+				LogPath: filepath.Join(dir, testLogs[2]),
+			},
+		},
+	}
+	f.SetFakeContainers(testContainers)
+
+	err = c.Clean(tCtx, "container-3")
+	require.NoError(t, err)
+
+	logs, err := os.ReadDir(dir)
+	require.NoError(t, err)
+	assert.Len(t, logs, 4)
+	assert.Equal(t, testLogs[0], logs[0].Name())
+	assert.Equal(t, testLogs[1], logs[1].Name())
+	assert.Equal(t, testLogs[3], logs[2].Name())
+	assert.Equal(t, testLogs[4], logs[3].Name())
+}
+
 func TestCleanupUnusedLog(t *testing.T) {
-	dir, err := ioutil.TempDir("", "test-cleanup-unused-log")
+	dir, err := os.MkdirTemp("", "test-cleanup-unused-log")
 	require.NoError(t, err)
 	defer os.RemoveAll(dir)
 
@@ -178,13 +288,15 @@ func TestCleanupUnusedLog(t *testing.T) {
 		f.Close()
 	}
 
-	c := &containerLogManager{}
+	c := &containerLogManager{
+		osInterface: container.RealOS{},
+	}
 	got, err := c.cleanupUnusedLogs(testLogs)
 	require.NoError(t, err)
 	assert.Len(t, got, 2)
 	assert.Equal(t, []string{testLogs[0], testLogs[3]}, got)
 
-	logs, err := ioutil.ReadDir(dir)
+	logs, err := os.ReadDir(dir)
 	require.NoError(t, err)
 	assert.Len(t, logs, 2)
 	assert.Equal(t, testLogs[0], filepath.Join(dir, logs[0].Name()))
@@ -210,7 +322,7 @@ func TestRemoveExcessLog(t *testing.T) {
 		},
 	} {
 		t.Logf("TestCase %q", desc)
-		dir, err := ioutil.TempDir("", "test-remove-excess-log")
+		dir, err := os.MkdirTemp("", "test-remove-excess-log")
 		require.NoError(t, err)
 		defer os.RemoveAll(dir)
 
@@ -223,7 +335,10 @@ func TestRemoveExcessLog(t *testing.T) {
 			f.Close()
 		}
 
-		c := &containerLogManager{policy: LogRotatePolicy{MaxFiles: test.max}}
+		c := &containerLogManager{
+			policy:      LogRotatePolicy{MaxFiles: test.max},
+			osInterface: container.RealOS{},
+		}
 		got, err := c.removeExcessLogs(testLogs)
 		require.NoError(t, err)
 		require.Len(t, got, len(test.expect))
@@ -231,7 +346,7 @@ func TestRemoveExcessLog(t *testing.T) {
 			assert.Equal(t, name, filepath.Base(got[i]))
 		}
 
-		logs, err := ioutil.ReadDir(dir)
+		logs, err := os.ReadDir(dir)
 		require.NoError(t, err)
 		require.Len(t, logs, len(test.expect))
 		for i, name := range test.expect {
@@ -241,38 +356,40 @@ func TestRemoveExcessLog(t *testing.T) {
 }
 
 func TestCompressLog(t *testing.T) {
-	dir, err := ioutil.TempDir("", "test-compress-log")
+	dir, err := os.MkdirTemp("", "test-compress-log")
 	require.NoError(t, err)
 	defer os.RemoveAll(dir)
 
-	testFile, err := ioutil.TempFile(dir, "test-rotate-latest-log")
+	testFile, err := os.CreateTemp(dir, "test-rotate-latest-log")
 	require.NoError(t, err)
 	defer testFile.Close()
 	testContent := "test log content"
 	_, err = testFile.Write([]byte(testContent))
 	require.NoError(t, err)
+	testFile.Close()
 
 	testLog := testFile.Name()
-	c := &containerLogManager{}
+	testLogInfo, err := os.Stat(testLog)
+	assert.NoError(t, err)
+	c := &containerLogManager{osInterface: container.RealOS{}}
 	require.NoError(t, c.compressLog(testLog))
-	_, err = os.Stat(testLog + compressSuffix)
+	testLogCompressInfo, err := os.Stat(testLog + compressSuffix)
 	assert.NoError(t, err, "log should be compressed")
+	if testLogInfo.Mode() != testLogCompressInfo.Mode() {
+		t.Errorf("compressed and uncompressed test log file modes do not match")
+	}
+	if err := c.compressLog("test-unknown-log"); err == nil {
+		t.Errorf("compressing unknown log should return error")
+	}
 	_, err = os.Stat(testLog + tmpSuffix)
 	assert.Error(t, err, "temporary log should be renamed")
 	_, err = os.Stat(testLog)
 	assert.Error(t, err, "original log should be removed")
-
-	rc, err := UncompressLog(testLog + compressSuffix)
-	require.NoError(t, err)
-	defer rc.Close()
-	var buf bytes.Buffer
-	_, err = io.Copy(&buf, rc)
-	require.NoError(t, err)
-	assert.Equal(t, testContent, buf.String())
 }
 
 func TestRotateLatestLog(t *testing.T) {
-	dir, err := ioutil.TempDir("", "test-rotate-latest-log")
+	tCtx := ktesting.Init(t)
+	dir, err := os.MkdirTemp("", "test-rotate-latest-log")
 	require.NoError(t, err)
 	defer os.RemoveAll(dir)
 
@@ -303,17 +420,26 @@ func TestRotateLatestLog(t *testing.T) {
 		c := &containerLogManager{
 			runtimeService: f,
 			policy:         LogRotatePolicy{MaxFiles: test.maxFiles},
-			clock:          clock.NewFakeClock(now),
+			osInterface:    container.RealOS{},
+			clock:          testingclock.NewFakeClock(now),
+			mutex:          sync.Mutex{},
+			queue: workqueue.NewTypedRateLimitingQueueWithConfig(
+				workqueue.DefaultTypedControllerRateLimiter[string](),
+				workqueue.TypedRateLimitingQueueConfig[string]{Name: "kubelet_log_rotate_manager"},
+			),
+			maxWorkers:       10,
+			monitoringPeriod: v1.Duration{Duration: 10 * time.Second},
 		}
 		if test.runtimeError != nil {
 			f.InjectError("ReopenContainerLog", test.runtimeError)
 		}
-		testFile, err := ioutil.TempFile(dir, "test-rotate-latest-log")
+		testFile, err := os.CreateTemp(dir, "test-rotate-latest-log")
 		require.NoError(t, err)
+		testFile.Close()
 		defer testFile.Close()
 		testLog := testFile.Name()
 		rotatedLog := fmt.Sprintf("%s.%s", testLog, now.Format(timestampFormat))
-		err = c.rotateLatestLog("test-id", testLog)
+		err = c.rotateLatestLog(tCtx, "test-id", testLog)
 		assert.Equal(t, test.expectError, err != nil)
 		_, err = os.Stat(testLog)
 		assert.Equal(t, test.expectOriginal, err == nil)

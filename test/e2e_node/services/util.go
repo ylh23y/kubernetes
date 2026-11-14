@@ -18,12 +18,14 @@ package services
 
 import (
 	"fmt"
-	"k8s.io/klog"
-	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
+
+	"k8s.io/klog/v2"
+
+	e2enode "k8s.io/kubernetes/test/e2e/framework/node"
 )
 
 // terminationSignals are signals that cause the program to exit in the
@@ -42,6 +44,7 @@ func waitForTerminationSignal() {
 // and return the error.
 func readinessCheck(name string, urls []string, errCh <-chan error) error {
 	klog.Infof("Running readiness check for service %q", name)
+
 	endTime := time.Now().Add(*serverStartTimeout)
 	blockCh := make(chan error)
 	defer close(blockCh)
@@ -67,8 +70,7 @@ func readinessCheck(name string, urls []string, errCh <-chan error) error {
 		case <-time.After(time.Second):
 			ready := true
 			for _, url := range urls {
-				resp, err := http.Head(url)
-				if err != nil || resp.StatusCode != http.StatusOK {
+				if !e2enode.HealthCheck(url) {
 					ready = false
 					break
 				}

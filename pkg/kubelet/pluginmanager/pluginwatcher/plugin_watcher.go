@@ -17,50 +17,44 @@ limitations under the License.
 package pluginwatcher
 
 import (
+	"context"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
-	"time"
 
 	"github.com/fsnotify/fsnotify"
-	"k8s.io/klog"
+	"k8s.io/klog/v2"
 
 	"k8s.io/kubernetes/pkg/kubelet/pluginmanager/cache"
+	"k8s.io/kubernetes/pkg/kubelet/util"
 	utilfs "k8s.io/kubernetes/pkg/util/filesystem"
 )
 
 // Watcher is the plugin watcher
 type Watcher struct {
 	path                string
-	deprecatedPath      string
 	fs                  utilfs.Filesystem
 	fsWatcher           *fsnotify.Watcher
-	stopped             chan struct{}
 	desiredStateOfWorld cache.DesiredStateOfWorld
 }
 
-// NewWatcher provides a new watcher
-// deprecatedSockDir refers to a pre-GA directory that was used by older plugins
-// for socket registration. New plugins should not use this directory.
-func NewWatcher(sockDir string, deprecatedSockDir string, desiredStateOfWorld cache.DesiredStateOfWorld) *Watcher {
+// NewWatcher provides a new watcher for socket registration
+func NewWatcher(sockDir string, desiredStateOfWorld cache.DesiredStateOfWorld) *Watcher {
 	return &Watcher{
 		path:                sockDir,
-		deprecatedPath:      deprecatedSockDir,
 		fs:                  &utilfs.DefaultFs{},
 		desiredStateOfWorld: desiredStateOfWorld,
 	}
 }
 
 // Start watches for the creation and deletion of plugin sockets at the path
-func (w *Watcher) Start(stopCh <-chan struct{}) error {
-	klog.V(2).Infof("Plugin Watcher Start at %s", w.path)
-
-	w.stopped = make(chan struct{})
+func (w *Watcher) Start(ctx context.Context, stopCh <-chan struct{}) error {
+	logger := klog.FromContext(ctx)
+	logger.V(2).Info("Plugin Watcher Start", "path", w.path)
 
 	// Creating the directory to be watched if it doesn't exist yet,
 	// and walks through the directory to discover the existing plugins.
-	if err := w.init(); err != nil {
+	if err := w.init(ctx); err != nil {
 		return err
 	}
 
@@ -71,46 +65,30 @@ func (w *Watcher) Start(stopCh <-chan struct{}) error {
 	w.fsWatcher = fsWatcher
 
 	// Traverse plugin dir and add filesystem watchers before starting the plugin processing goroutine.
-	if err := w.traversePluginDir(w.path); err != nil {
-		klog.Errorf("failed to traverse plugin socket path %q, err: %v", w.path, err)
-	}
-
-	// Traverse deprecated plugin dir, if specified.
-	if len(w.deprecatedPath) != 0 {
-		if err := w.traversePluginDir(w.deprecatedPath); err != nil {
-			klog.Errorf("failed to traverse deprecated plugin socket path %q, err: %v", w.deprecatedPath, err)
-		}
+	if err := w.traversePluginDir(ctx, w.path); err != nil {
+		logger.Error(err, "Failed to traverse plugin socket path", "path", w.path)
 	}
 
 	go func(fsWatcher *fsnotify.Watcher) {
-		defer close(w.stopped)
 		for {
 			select {
 			case event := <-fsWatcher.Events:
 				//TODO: Handle errors by taking corrective measures
-				if event.Op&fsnotify.Create == fsnotify.Create {
-					err := w.handleCreateEvent(event)
+				if event.Has(fsnotify.Create) {
+					err := w.handleCreateEvent(ctx, event)
 					if err != nil {
-						klog.Errorf("error %v when handling create event: %s", err, event)
+						logger.Error(err, "Error when handling create event", "event", event)
 					}
-				} else if event.Op&fsnotify.Remove == fsnotify.Remove {
-					w.handleDeleteEvent(event)
+				} else if event.Has(fsnotify.Remove) {
+					w.handleDeleteEvent(ctx, event)
 				}
 				continue
 			case err := <-fsWatcher.Errors:
 				if err != nil {
-					klog.Errorf("fsWatcher received error: %v", err)
+					logger.Error(err, "FsWatcher received error")
 				}
 				continue
 			case <-stopCh:
-				// In case of plugin watcher being stopped by plugin manager, stop
-				// probing the creation/deletion of plugin sockets.
-				// Also give all pending go routines a chance to complete
-				select {
-				case <-w.stopped:
-				case <-time.After(11 * time.Second):
-					klog.Errorf("timeout on stopping watcher")
-				}
 				w.fsWatcher.Close()
 				return
 			}
@@ -120,8 +98,9 @@ func (w *Watcher) Start(stopCh <-chan struct{}) error {
 	return nil
 }
 
-func (w *Watcher) init() error {
-	klog.V(4).Infof("Ensuring Plugin directory at %s ", w.path)
+func (w *Watcher) init(ctx context.Context) error {
+	logger := klog.FromContext(ctx)
+	logger.V(4).Info("Ensuring Plugin directory", "path", w.path)
 
 	if err := w.fs.MkdirAll(w.path, 0755); err != nil {
 		return fmt.Errorf("error (re-)creating root %s: %v", w.path, err)
@@ -132,37 +111,46 @@ func (w *Watcher) init() error {
 
 // Walks through the plugin directory discover any existing plugin sockets.
 // Ignore all errors except root dir not being walkable
-func (w *Watcher) traversePluginDir(dir string) error {
+func (w *Watcher) traversePluginDir(ctx context.Context, dir string) error {
+	logger := klog.FromContext(ctx)
+
+	// watch the new dir
+	err := w.fsWatcher.Add(dir)
+	if err != nil {
+		return fmt.Errorf("failed to watch %s, err: %v", w.path, err)
+	}
+	// traverse existing children in the dir
 	return w.fs.Walk(dir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			if path == dir {
 				return fmt.Errorf("error accessing path: %s error: %v", path, err)
 			}
 
-			klog.Errorf("error accessing path: %s error: %v", path, err)
+			logger.Error(err, "Error accessing path", "path", path)
 			return nil
 		}
 
-		switch mode := info.Mode(); {
-		case mode.IsDir():
-			if w.containsBlacklistedDir(path) {
-				return filepath.SkipDir
-			}
+		// do not call fsWatcher.Add twice on the root dir to avoid potential problems.
+		if path == dir {
+			return nil
+		}
 
+		mode := info.Mode()
+		if mode.IsDir() {
 			if err := w.fsWatcher.Add(path); err != nil {
 				return fmt.Errorf("failed to watch %s, err: %v", path, err)
 			}
-		case mode&os.ModeSocket != 0:
+		} else if isSocket, _ := util.IsUnixDomainSocket(path); isSocket {
 			event := fsnotify.Event{
 				Name: path,
 				Op:   fsnotify.Create,
 			}
 			//TODO: Handle errors by taking corrective measures
-			if err := w.handleCreateEvent(event); err != nil {
-				klog.Errorf("error %v when handling create event: %s", err, event)
+			if err := w.handleCreateEvent(ctx, event); err != nil {
+				logger.Error(err, "Error when handling create", "event", event)
 			}
-		default:
-			klog.V(5).Infof("Ignoring file %s with mode %v", path, mode)
+		} else {
+			logger.V(5).Info("Ignoring file", "path", path, "mode", mode)
 		}
 
 		return nil
@@ -172,78 +160,57 @@ func (w *Watcher) traversePluginDir(dir string) error {
 // Handle filesystem notify event.
 // Files names:
 // - MUST NOT start with a '.'
-func (w *Watcher) handleCreateEvent(event fsnotify.Event) error {
-	klog.V(6).Infof("Handling create event: %v", event)
+func (w *Watcher) handleCreateEvent(ctx context.Context, event fsnotify.Event) error {
+	logger := klog.FromContext(ctx)
+	logger.V(6).Info("Handling create event", "event", event)
 
-	if w.containsBlacklistedDir(event.Name) {
-		return nil
-	}
-
-	fi, err := os.Stat(event.Name)
+	fi, err := getStat(event)
 	if err != nil {
 		return fmt.Errorf("stat file %s failed: %v", event.Name, err)
 	}
 
 	if strings.HasPrefix(fi.Name(), ".") {
-		klog.V(5).Infof("Ignoring file (starts with '.'): %s", fi.Name())
+		logger.V(5).Info("Ignoring file (starts with '.')", "path", fi.Name())
 		return nil
 	}
 
 	if !fi.IsDir() {
-		if fi.Mode()&os.ModeSocket == 0 {
-			klog.V(5).Infof("Ignoring non socket file %s", fi.Name())
+		isSocket, err := util.IsUnixDomainSocket(util.NormalizePath(event.Name))
+		if err != nil {
+			return fmt.Errorf("failed to determine if file: %s is a unix domain socket: %v", event.Name, err)
+		}
+		if !isSocket {
+			logger.V(5).Info("Ignoring non socket file", "path", fi.Name())
 			return nil
 		}
 
-		return w.handlePluginRegistration(event.Name)
+		return w.handlePluginRegistration(ctx, event.Name)
 	}
 
-	return w.traversePluginDir(event.Name)
+	return w.traversePluginDir(ctx, event.Name)
 }
 
-func (w *Watcher) handlePluginRegistration(socketPath string) error {
-	//TODO: Implement rate limiting to mitigate any DOS kind of attacks.
+func (w *Watcher) handlePluginRegistration(ctx context.Context, socketPath string) error {
+	logger := klog.FromContext(ctx)
+	socketPath = getSocketPath(socketPath)
 	// Update desired state of world list of plugins
 	// If the socket path does exist in the desired world cache, there's still
 	// a possibility that it has been deleted and recreated again before it is
 	// removed from the desired world cache, so we still need to call AddOrUpdatePlugin
 	// in this case to update the timestamp
-	klog.V(2).Infof("Adding socket path or updating timestamp %s to desired state cache", socketPath)
-	err := w.desiredStateOfWorld.AddOrUpdatePlugin(socketPath, w.foundInDeprecatedDir(socketPath))
+	logger.V(2).Info("Adding socket path or updating timestamp to desired state cache", "path", socketPath)
+	err := w.desiredStateOfWorld.AddOrUpdatePlugin(ctx, socketPath)
 	if err != nil {
 		return fmt.Errorf("error adding socket path %s or updating timestamp to desired state cache: %v", socketPath, err)
 	}
 	return nil
 }
 
-func (w *Watcher) handleDeleteEvent(event fsnotify.Event) {
-	klog.V(6).Infof("Handling delete event: %v", event)
+func (w *Watcher) handleDeleteEvent(ctx context.Context, event fsnotify.Event) {
+	logger := klog.FromContext(ctx)
+	logger.V(6).Info("Handling delete event", "event", event)
 
 	socketPath := event.Name
-	klog.V(2).Infof("Removing socket path %s from desired state cache", socketPath)
+	logger.V(2).Info("Removing socket path from desired state cache", "path", socketPath)
 	w.desiredStateOfWorld.RemovePlugin(socketPath)
-}
-
-// While deprecated dir is supported, to add extra protection around #69015
-// we will explicitly blacklist kubernetes.io directory.
-func (w *Watcher) containsBlacklistedDir(path string) bool {
-	return strings.HasPrefix(path, w.deprecatedPath+"/kubernetes.io/") ||
-		path == w.deprecatedPath+"/kubernetes.io"
-}
-
-func (w *Watcher) foundInDeprecatedDir(socketPath string) bool {
-	if len(w.deprecatedPath) != 0 {
-		if socketPath == w.deprecatedPath {
-			return true
-		}
-
-		deprecatedPath := w.deprecatedPath
-		if !strings.HasSuffix(deprecatedPath, "/") {
-			deprecatedPath = deprecatedPath + "/"
-		}
-		if strings.HasPrefix(socketPath, deprecatedPath) {
-			return true
-		}
-	}
-	return false
 }

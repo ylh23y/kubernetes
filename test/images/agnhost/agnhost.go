@@ -17,34 +17,55 @@ limitations under the License.
 package main
 
 import (
-	"flag"
+	"os"
 
 	"github.com/spf13/cobra"
 
-	"k8s.io/klog"
-	"k8s.io/kubernetes/test/images/agnhost/audit-proxy"
+	"k8s.io/component-base/cli"
+	auditproxy "k8s.io/kubernetes/test/images/agnhost/audit-proxy"
 	"k8s.io/kubernetes/test/images/agnhost/connect"
-	"k8s.io/kubernetes/test/images/agnhost/crd-conversion-webhook"
+	crdconvwebhook "k8s.io/kubernetes/test/images/agnhost/crd-conversion-webhook"
 	"k8s.io/kubernetes/test/images/agnhost/dns"
 	"k8s.io/kubernetes/test/images/agnhost/entrypoint-tester"
+	externalmetrics "k8s.io/kubernetes/test/images/agnhost/external-metrics"
 	"k8s.io/kubernetes/test/images/agnhost/fakegitserver"
+	"k8s.io/kubernetes/test/images/agnhost/fakeregistryserver"
+	grpchealthchecking "k8s.io/kubernetes/test/images/agnhost/grpc-health-checking"
+	"k8s.io/kubernetes/test/images/agnhost/guestbook"
+	h2cserver "k8s.io/kubernetes/test/images/agnhost/h2c-server"
 	"k8s.io/kubernetes/test/images/agnhost/inclusterclient"
 	"k8s.io/kubernetes/test/images/agnhost/liveness"
-	"k8s.io/kubernetes/test/images/agnhost/logs-generator"
+	logsgen "k8s.io/kubernetes/test/images/agnhost/logs-generator"
+	"k8s.io/kubernetes/test/images/agnhost/mounttest"
+	"k8s.io/kubernetes/test/images/agnhost/mtlsclient"
+	"k8s.io/kubernetes/test/images/agnhost/mtlsserver"
 	"k8s.io/kubernetes/test/images/agnhost/net"
 	"k8s.io/kubernetes/test/images/agnhost/netexec"
 	"k8s.io/kubernetes/test/images/agnhost/nettest"
-	"k8s.io/kubernetes/test/images/agnhost/no-snat-test"
-	"k8s.io/kubernetes/test/images/agnhost/no-snat-test-proxy"
+	nosnat "k8s.io/kubernetes/test/images/agnhost/no-snat-test"
+	nosnatproxy "k8s.io/kubernetes/test/images/agnhost/no-snat-test-proxy"
+	"k8s.io/kubernetes/test/images/agnhost/nonewprivs"
+	"k8s.io/kubernetes/test/images/agnhost/openidmetadata"
 	"k8s.io/kubernetes/test/images/agnhost/pause"
-	"k8s.io/kubernetes/test/images/agnhost/port-forward-tester"
+	"k8s.io/kubernetes/test/images/agnhost/podcertificatesigner"
+	portforwardtester "k8s.io/kubernetes/test/images/agnhost/port-forward-tester"
 	"k8s.io/kubernetes/test/images/agnhost/porter"
-	"k8s.io/kubernetes/test/images/agnhost/serve-hostname"
+	resconsumerctrl "k8s.io/kubernetes/test/images/agnhost/resource-consumer-controller"
+	servehostname "k8s.io/kubernetes/test/images/agnhost/serve-hostname"
+	tcpreset "k8s.io/kubernetes/test/images/agnhost/tcp-reset"
+	testwebserver "k8s.io/kubernetes/test/images/agnhost/test-webserver"
 	"k8s.io/kubernetes/test/images/agnhost/webhook"
+	"k8s.io/kubernetes/third_party/forked/vishhstress" // MIT License
 )
 
+var Version = "development"
+
 func main() {
-	rootCmd := &cobra.Command{Use: "app"}
+	rootCmd := &cobra.Command{
+		Use:     "app",
+		Version: Version,
+	}
+
 	rootCmd.AddCommand(auditproxy.CmdAuditProxy)
 	rootCmd.AddCommand(connect.CmdConnect)
 	rootCmd.AddCommand(crdconvwebhook.CmdCrdConversionWebhook)
@@ -53,9 +74,12 @@ func main() {
 	rootCmd.AddCommand(dns.CmdEtcHosts)
 	rootCmd.AddCommand(entrypoint.CmdEntrypointTester)
 	rootCmd.AddCommand(fakegitserver.CmdFakeGitServer)
+	rootCmd.AddCommand(fakeregistryserver.CmdFakeRegistryServer)
+	rootCmd.AddCommand(guestbook.CmdGuestbook)
 	rootCmd.AddCommand(inclusterclient.CmdInClusterClient)
 	rootCmd.AddCommand(liveness.CmdLiveness)
 	rootCmd.AddCommand(logsgen.CmdLogsGenerator)
+	rootCmd.AddCommand(mounttest.CmdMounttest)
 	rootCmd.AddCommand(net.CmdNet)
 	rootCmd.AddCommand(netexec.CmdNetexec)
 	rootCmd.AddCommand(nettest.CmdNettest)
@@ -64,13 +88,22 @@ func main() {
 	rootCmd.AddCommand(pause.CmdPause)
 	rootCmd.AddCommand(porter.CmdPorter)
 	rootCmd.AddCommand(portforwardtester.CmdPortForwardTester)
+	rootCmd.AddCommand(resconsumerctrl.CmdResourceConsumerController)
 	rootCmd.AddCommand(servehostname.CmdServeHostname)
+	rootCmd.AddCommand(testwebserver.CmdTestWebserver)
+	rootCmd.AddCommand(tcpreset.CmdTCPReset)
 	rootCmd.AddCommand(webhook.CmdWebhook)
-
+	rootCmd.AddCommand(openidmetadata.CmdTestServiceAccountIssuerDiscovery)
+	rootCmd.AddCommand(grpchealthchecking.CmdGrpcHealthChecking)
+	rootCmd.AddCommand(h2cserver.CmdH2CServer)
+	rootCmd.AddCommand(vishhstress.CmdStress)
+	rootCmd.AddCommand(podcertificatesigner.CmdPodCertificateSigner)
+	rootCmd.AddCommand(mtlsclient.CmdMtlsClient)
+	rootCmd.AddCommand(mtlsserver.CmdMtlsServer)
+	rootCmd.AddCommand(nonewprivs.CmdNoNewPrivs)
+	rootCmd.AddCommand(externalmetrics.CmdExternalMetricsServer)
 	// NOTE(claudiub): Some tests are passing logging related flags, so we need to be able to
 	// accept them. This will also include them in the printed help.
-	loggingFlags := &flag.FlagSet{}
-	klog.InitFlags(loggingFlags)
-	rootCmd.PersistentFlags().AddGoFlagSet(loggingFlags)
-	rootCmd.Execute()
+	code := cli.Run(rootCmd)
+	os.Exit(code)
 }

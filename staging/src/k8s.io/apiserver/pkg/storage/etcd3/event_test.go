@@ -17,11 +17,13 @@ limitations under the License.
 package etcd3
 
 import (
-	"github.com/coreos/etcd/clientv3"
-	"github.com/coreos/etcd/mvcc/mvccpb"
+	"testing"
+	"time"
+
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"testing"
+	"go.etcd.io/etcd/api/v3/mvccpb"
+	clientv3 "go.etcd.io/etcd/client/v3"
 )
 
 func TestParseEvent(t *testing.T) {
@@ -29,6 +31,7 @@ func TestParseEvent(t *testing.T) {
 		name          string
 		etcdEvent     *clientv3.Event
 		expectedEvent *event
+		expectPrevKV  bool
 		expectedErr   string
 	}{
 		{
@@ -52,12 +55,13 @@ func TestParseEvent(t *testing.T) {
 				isDeleted: false,
 				isCreated: true,
 			},
-			expectedErr: "",
+			expectPrevKV: true,
+			expectedErr:  "",
 		},
 		{
 			name: "unsuccessful delete",
 			etcdEvent: &clientv3.Event{
-				Type:   mvccpb.DELETE,
+				Type:   mvccpb.Event_DELETE,
 				PrevKv: nil,
 				Kv: &mvccpb.KeyValue{
 					Key:            []byte("key"),
@@ -66,12 +70,36 @@ func TestParseEvent(t *testing.T) {
 					Value:          nil,
 				},
 			},
-			expectedErr: "etcd event received with PrevKv=nil",
+			expectPrevKV: true,
+			expectedErr:  "etcd event received with PrevKv=nil",
+		},
+		{
+			name: "delete without previous value",
+			etcdEvent: &clientv3.Event{
+				Type:   mvccpb.Event_DELETE,
+				PrevKv: nil,
+				Kv: &mvccpb.KeyValue{
+					Key:            []byte("key"),
+					CreateRevision: 1,
+					ModRevision:    2,
+					Value:          nil,
+				},
+			},
+			expectPrevKV: false,
+			expectedEvent: &event{
+				key:       "key",
+				value:     nil,
+				prevValue: nil,
+				rev:       2,
+				isDeleted: true,
+				isCreated: false,
+			},
+			expectedErr: "",
 		},
 		{
 			name: "successful delete",
 			etcdEvent: &clientv3.Event{
-				Type: mvccpb.DELETE,
+				Type: mvccpb.Event_DELETE,
 				PrevKv: &mvccpb.KeyValue{
 					Key:            []byte("key"),
 					CreateRevision: 1,
@@ -93,16 +121,40 @@ func TestParseEvent(t *testing.T) {
 				isDeleted: true,
 				isCreated: false,
 			},
-			expectedErr: "",
+			expectPrevKV: true,
+			expectedErr:  "",
+		},
+		{
+			name: "update ignoring previous value",
+			etcdEvent: &clientv3.Event{
+				Type:   mvccpb.Event_PUT,
+				Kv:     &mvccpb.KeyValue{Key: []byte("key"), CreateRevision: 1, ModRevision: 2, Value: []byte("current")},
+				PrevKv: &mvccpb.KeyValue{Value: []byte("previous")},
+			},
+			expectedEvent: &event{
+				key: "key", value: []byte("current"), rev: 2,
+			},
+		},
+		{
+			name: "delete ignoring previous value",
+			etcdEvent: &clientv3.Event{
+				Type:   mvccpb.Event_DELETE,
+				Kv:     &mvccpb.KeyValue{Key: []byte("key"), CreateRevision: 1, ModRevision: 2},
+				PrevKv: &mvccpb.KeyValue{Value: []byte("previous")},
+			},
+			expectedEvent: &event{
+				key: "key", rev: 2, isDeleted: true,
+			},
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			actualEvent, err := parseEvent(tc.etcdEvent)
+			actualEvent, err := parseEvent(tc.etcdEvent, tc.expectPrevKV)
 			if tc.expectedErr != "" {
 				require.Error(t, err)
-				assert.Contains(t, err.Error(), tc.expectedErr)
+				assert.ErrorContains(t, err, tc.expectedErr)
 			} else {
 				require.NoError(t, err)
+				actualEvent.recordTime = time.Time{}
 				assert.Equal(t, tc.expectedEvent, actualEvent)
 			}
 		})

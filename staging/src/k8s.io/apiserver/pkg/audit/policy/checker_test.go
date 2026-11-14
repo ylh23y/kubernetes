@@ -26,6 +26,7 @@ import (
 	"k8s.io/apiserver/pkg/apis/audit"
 	"k8s.io/apiserver/pkg/authentication/user"
 	"k8s.io/apiserver/pkg/authorization/authorizer"
+	"k8s.io/utils/ptr"
 )
 
 var (
@@ -83,6 +84,17 @@ var (
 			ResourceRequest: true,
 			Path:            "/api/v1/namespaces/default/pods/busybox",
 		},
+		"ClusterRoleUpdate": &authorizer.AttributesRecord{
+			User:            tim,
+			Verb:            "update",
+			APIGroup:        "rbac.authorization.k8s.io",
+			APIVersion:      "v1beta1",
+			Resource:        "clusterroles",
+			Subresource:     "status",
+			Name:            "somerole",
+			ResourceRequest: true,
+			Path:            "/apis/rbac.authorization.k8s.io/v1beta1/clusterroles/somerole",
+		},
 	}
 
 	rules = map[string]audit.PolicyRule{
@@ -139,6 +151,14 @@ var (
 			}},
 			Namespaces: []string{""},
 		},
+		"getGroupWildCardMatchingWithSubresourceWildcardMatching": {
+			Level: audit.LevelRequestResponse,
+			Verbs: []string{"update"},
+			Resources: []audit.GroupResources{{
+				Group:     "*",
+				Resources: []string{"*/status"},
+			}},
+		},
 		"getLogs": {
 			Level: audit.LevelRequestResponse,
 			Verbs: []string{"get"},
@@ -185,10 +205,10 @@ func test(t *testing.T, req string, expLevel audit.Level, policyStages, expOmitS
 		policy.Rules = append(policy.Rules, rules[rule])
 	}
 	require.Contains(t, attrs, req)
-	actualLevel, actualOmitStages := NewChecker(&policy).LevelAndStages(attrs[req])
-	assert.Equal(t, expLevel, actualLevel, "request:%s rules:%s", req, strings.Join(ruleNames, ","))
-	assert.True(t, stageEqual(expOmitStages, actualOmitStages), "request:%s rules:%s, expected stages: %v, actual stages: %v",
-		req, strings.Join(ruleNames, ","), expOmitStages, actualOmitStages)
+	auditConfig := NewPolicyRuleEvaluator(&policy).EvaluatePolicyRule(attrs[req])
+	assert.Equal(t, expLevel, auditConfig.Level, "request:%s rules:%s", req, strings.Join(ruleNames, ","))
+	assert.True(t, stageEqual(expOmitStages, auditConfig.OmitStages), "request:%s rules:%s, expected stages: %v, actual stages: %v",
+		req, strings.Join(ruleNames, ","), expOmitStages, auditConfig.OmitStages)
 }
 
 func testAuditLevel(t *testing.T, stages []audit.Stage) {
@@ -241,6 +261,7 @@ func testAuditLevel(t *testing.T, stages []audit.Stage) {
 	test(t, "Unauthorized", audit.LevelMetadata, stages, stages, "tims", "default")
 	test(t, "Unauthorized", audit.LevelNone, stages, stages, "humans")
 	test(t, "Unauthorized", audit.LevelMetadata, stages, stages, "humans", "default")
+	test(t, "ClusterRoleUpdate", audit.LevelRequestResponse, stages, stages, "getGroupWildCardMatchingWithSubresourceWildcardMatching")
 }
 
 func TestChecker(t *testing.T) {
@@ -343,5 +364,86 @@ func TestUnionStages(t *testing.T) {
 			}
 			assert.True(t, ok)
 		}
+	}
+}
+
+func TestOmitManagedFields(t *testing.T) {
+	// this authorizer.Attributes should match all policy rules
+	// specified in this test.
+	attributes := &authorizer.AttributesRecord{
+		Verb: "get",
+	}
+	matchingPolicyRule := audit.PolicyRule{
+		Level: audit.LevelRequestResponse,
+		Verbs: []string{
+			attributes.GetVerb(),
+		},
+	}
+
+	tests := []struct {
+		name   string
+		policy func() audit.Policy
+		want   bool
+	}{
+		{
+			name: "global policy default is false, rule does not override",
+			policy: func() audit.Policy {
+				return audit.Policy{
+					OmitManagedFields: false,
+					Rules: []audit.PolicyRule{
+						*matchingPolicyRule.DeepCopy(),
+					},
+				}
+			},
+		},
+		{
+			name: "global policy default is true, rule does not override",
+			policy: func() audit.Policy {
+				return audit.Policy{
+					OmitManagedFields: true,
+					Rules: []audit.PolicyRule{
+						*matchingPolicyRule.DeepCopy(),
+					},
+				}
+			},
+			want: true,
+		},
+		{
+			name: "global policy default is true, rule overrides to false",
+			policy: func() audit.Policy {
+				rule := matchingPolicyRule.DeepCopy()
+				rule.OmitManagedFields = ptr.To(false)
+				return audit.Policy{
+					OmitManagedFields: true,
+					Rules:             []audit.PolicyRule{*rule},
+				}
+			},
+			want: false,
+		},
+		{
+			name: "global policy default is false, rule overrides to true",
+			policy: func() audit.Policy {
+				rule := matchingPolicyRule.DeepCopy()
+				rule.OmitManagedFields = ptr.To(true)
+				return audit.Policy{
+					OmitManagedFields: false,
+					Rules:             []audit.PolicyRule{*rule},
+				}
+			},
+			want: true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			evaluator := &policyRuleEvaluator{
+				Policy: test.policy(),
+			}
+
+			got := evaluator.EvaluatePolicyRule(attributes)
+			if test.want != got.OmitManagedFields {
+				t.Errorf("Expected OmitManagedFields to match, want: %t, got: %t", test.want, got.OmitManagedFields)
+			}
+		})
 	}
 }

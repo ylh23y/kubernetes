@@ -17,13 +17,17 @@ limitations under the License.
 package events
 
 import (
+	"context"
+	"fmt"
 	"testing"
 	"time"
 
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/fields"
 	clientset "k8s.io/client-go/kubernetes"
 
+	"github.com/onsi/gomega"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes/scheme"
 	typedv1 "k8s.io/client-go/kubernetes/typed/core/v1"
@@ -35,14 +39,13 @@ import (
 )
 
 func TestEventCompatibility(t *testing.T) {
-	result := kubeapiservertesting.StartTestServerOrDie(t, nil, []string{"--disable-admission-plugins", "ServiceAccount"}, framework.SharedEtcd())
+	result := kubeapiservertesting.StartTestServerOrDie(t, nil, framework.DefaultTestServerFlags(), framework.SharedEtcd())
 	defer result.TearDownFn()
 
 	client := clientset.NewForConfigOrDie(result.ClientConfig)
 
 	testPod := &v1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
-			SelfLink:  "/api/v1/namespaces/default/pods/foo",
 			Name:      "foo",
 			Namespace: "default",
 			UID:       "bar",
@@ -58,37 +61,103 @@ func TestEventCompatibility(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	stopCh := make(chan struct{})
+	defer close(stopCh)
 	oldBroadcaster := record.NewBroadcaster()
+	defer oldBroadcaster.Shutdown()
 	oldRecorder := oldBroadcaster.NewRecorder(scheme.Scheme, v1.EventSource{Component: "integration"})
 	oldBroadcaster.StartRecordingToSink(&typedv1.EventSinkImpl{Interface: client.CoreV1().Events("")})
 	oldRecorder.Eventf(regarding, v1.EventTypeNormal, "started", "note")
 
-	newBroadcaster := events.NewBroadcaster(&events.EventSinkImpl{Interface: client.EventsV1beta1().Events("")})
+	newBroadcaster := events.NewBroadcaster(&events.EventSinkImpl{Interface: client.EventsV1()})
+	defer newBroadcaster.Shutdown()
 	newRecorder := newBroadcaster.NewRecorder(scheme.Scheme, "k8s.io/kube-scheduler")
 	newBroadcaster.StartRecordingToSink(stopCh)
 	newRecorder.Eventf(regarding, related, v1.EventTypeNormal, "memoryPressure", "killed", "memory pressure")
+
+	// Select only events regarding the test pod. Internal controllers (e.g. the
+	// ipallocator-repair-controller emitting ClusterIPNotAllocated for the
+	// kubernetes service) emit unrelated events during apiserver startup that
+	// would otherwise race the assertion.
+	v1Selector := fields.SelectorFromSet(fields.Set{
+		"regarding.name": testPod.Name,
+		"regarding.uid":  string(testPod.UID),
+	}).String()
+	coreSelector := fields.SelectorFromSet(fields.Set{
+		"involvedObject.name": testPod.Name,
+		"involvedObject.uid":  string(testPod.UID),
+	}).String()
+	gomega.NewWithT(t).Eventually(func(g gomega.Gomega) {
+		v1Events, err := client.EventsV1().Events(testPod.Namespace).List(context.TODO(), metav1.ListOptions{FieldSelector: v1Selector})
+		g.Expect(err).NotTo(gomega.HaveOccurred())
+		g.Expect(v1Events.Items).To(gomega.HaveLen(2))
+
+		coreEvents, err := client.CoreV1().Events(testPod.Namespace).List(context.TODO(), metav1.ListOptions{FieldSelector: coreSelector})
+		g.Expect(err).NotTo(gomega.HaveOccurred())
+		g.Expect(coreEvents.Items).To(gomega.HaveLen(2))
+	}).WithPolling(100 * time.Millisecond).WithTimeout(20 * time.Second).Should(gomega.Succeed())
+}
+
+func TestEventSeries(t *testing.T) {
+	result := kubeapiservertesting.StartTestServerOrDie(t, nil, framework.DefaultTestServerFlags(), framework.SharedEtcd())
+	defer result.TearDownFn()
+
+	client := clientset.NewForConfigOrDie(result.ClientConfig)
+
+	testPod := &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "foo",
+			Namespace: "default",
+			UID:       "bar",
+		},
+	}
+
+	regarding, err := ref.GetReference(scheme.Scheme, testPod)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	related, err := ref.GetPartialReference(scheme.Scheme, testPod, ".spec.containers[0]")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	stopCh := make(chan struct{})
+	defer close(stopCh)
+
+	broadcaster := events.NewBroadcaster(&events.EventSinkImpl{Interface: client.EventsV1()})
+	defer broadcaster.Shutdown()
+	recorder := broadcaster.NewRecorder(scheme.Scheme, "k8s.io/kube-scheduler")
+	broadcaster.StartRecordingToSink(stopCh)
+	recorder.Eventf(regarding, related, v1.EventTypeNormal, "memoryPressure", "killed", "memory pressure")
+	recorder.Eventf(regarding, related, v1.EventTypeNormal, "memoryPressure", "killed", "memory pressure")
+	selector := fields.SelectorFromSet(fields.Set{
+		"regarding.name": testPod.Name,
+		"regarding.uid":  string(testPod.UID),
+	}).String()
 	err = wait.PollImmediate(100*time.Millisecond, 20*time.Second, func() (done bool, err error) {
-		v1beta1Events, err := client.EventsV1beta1().Events("").List(metav1.ListOptions{})
+		events, err := client.EventsV1().Events(testPod.Namespace).List(context.TODO(), metav1.ListOptions{FieldSelector: selector})
 		if err != nil {
 			return false, err
 		}
 
-		if len(v1beta1Events.Items) != 2 {
+		if len(events.Items) != 1 {
 			return false, nil
 		}
 
-		events, err := client.CoreV1().Events("").List(metav1.ListOptions{})
-		if err != nil {
-			return false, err
-		}
-
-		if len(events.Items) != 2 {
+		if events.Items[0].Series == nil {
 			return false, nil
 		}
+
+		if events.Items[0].Series.Count != 2 {
+			return false, fmt.Errorf("expected EventSeries to have a starting count of 2, got: %d", events.Items[0].Series.Count)
+		}
+
 		return true, nil
 	})
 	if err != nil {
-		t.Fatalf("unexpected err: %v", err)
+		t.Fatalf("error waiting for an Event with a non nil Series to be created: %v", err)
 	}
+
 }

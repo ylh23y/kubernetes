@@ -18,33 +18,102 @@ package certificate
 
 import (
 	"context"
+	"crypto"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	cryptorand "crypto/rand"
+	"crypto/rsa"
 	"crypto/tls"
 	"crypto/x509"
-	"encoding/pem"
+	"errors"
 	"fmt"
 	"reflect"
 	"sync"
 	"time"
 
-	"k8s.io/klog"
+	"k8s.io/klog/v2"
 
-	certificates "k8s.io/api/certificates/v1beta1"
-	"k8s.io/apimachinery/pkg/api/errors"
+	certificates "k8s.io/api/certificates/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/wait"
-	certificatesclient "k8s.io/client-go/kubernetes/typed/certificates/v1beta1"
+	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/util/cert"
 	"k8s.io/client-go/util/certificate/csr"
 	"k8s.io/client-go/util/keyutil"
 )
 
-// certificateWaitTimeout controls the amount of time we wait for certificate
-// approval in one iteration.
-var certificateWaitTimeout = 15 * time.Minute
+var (
+	// certificateWaitTimeout controls the amount of time we wait for certificate
+	// approval in one iteration.
+	certificateWaitTimeout = 15 * time.Minute
+
+	kubeletServingUsagesWithEncipherment = []certificates.KeyUsage{
+		// https://tools.ietf.org/html/rfc5280#section-4.2.1.3
+		//
+		// Digital signature allows the certificate to be used to verify
+		// digital signatures used during TLS negotiation.
+		certificates.UsageDigitalSignature,
+		// KeyEncipherment allows the cert/key pair to be used to encrypt
+		// keys, including the symmetric keys negotiated during TLS setup
+		// and used for data transfer.
+		certificates.UsageKeyEncipherment,
+		// ServerAuth allows the cert to be used by a TLS server to
+		// authenticate itself to a TLS client.
+		certificates.UsageServerAuth,
+	}
+	kubeletServingUsagesNoEncipherment = []certificates.KeyUsage{
+		// https://tools.ietf.org/html/rfc5280#section-4.2.1.3
+		//
+		// Digital signature allows the certificate to be used to verify
+		// digital signatures used during TLS negotiation.
+		certificates.UsageDigitalSignature,
+		// ServerAuth allows the cert to be used by a TLS server to
+		// authenticate itself to a TLS client.
+		certificates.UsageServerAuth,
+	}
+	DefaultKubeletServingGetUsages = func(privateKey interface{}) []certificates.KeyUsage {
+		switch privateKey.(type) {
+		case *rsa.PrivateKey:
+			return kubeletServingUsagesWithEncipherment
+		default:
+			return kubeletServingUsagesNoEncipherment
+		}
+	}
+	kubeletClientUsagesWithEncipherment = []certificates.KeyUsage{
+		// https://tools.ietf.org/html/rfc5280#section-4.2.1.3
+		//
+		// Digital signature allows the certificate to be used to verify
+		// digital signatures used during TLS negotiation.
+		certificates.UsageDigitalSignature,
+		// KeyEncipherment allows the cert/key pair to be used to encrypt
+		// keys, including the symmetric keys negotiated during TLS setup
+		// and used for data transfer.
+		certificates.UsageKeyEncipherment,
+		// ClientAuth allows the cert to be used by a TLS client to
+		// authenticate itself to the TLS server.
+		certificates.UsageClientAuth,
+	}
+	kubeletClientUsagesNoEncipherment = []certificates.KeyUsage{
+		// https://tools.ietf.org/html/rfc5280#section-4.2.1.3
+		//
+		// Digital signature allows the certificate to be used to verify
+		// digital signatures used during TLS negotiation.
+		certificates.UsageDigitalSignature,
+		// ClientAuth allows the cert to be used by a TLS client to
+		// authenticate itself to the TLS server.
+		certificates.UsageClientAuth,
+	}
+	DefaultKubeletClientGetUsages = func(privateKey interface{}) []certificates.KeyUsage {
+		switch privateKey.(type) {
+		case *rsa.PrivateKey:
+			return kubeletClientUsagesWithEncipherment
+		default:
+			return kubeletClientUsagesNoEncipherment
+		}
+	}
+)
 
 // Manager maintains and updates the certificates in use by this certificate
 // manager. In the background it communicates with the API server to get new
@@ -68,11 +137,11 @@ type Manager interface {
 
 // Config is the set of configuration parameters available for a new Manager.
 type Config struct {
-	// ClientFn will be used to create a client for
-	// signing new certificate requests generated when a key rotation occurs.
-	// It must be set at initialization. The function will never be invoked
-	// in parallel. It is passed the current client certificate if one exists.
-	ClientFn CSRClientFunc
+	// ClientsetFn will be used to create a clientset for
+	// creating/fetching new certificate requests generated when a key rotation occurs.
+	// The function will never be invoked in parallel.
+	// It is passed the current client certificate if one exists.
+	ClientsetFn ClientsetFunc
 	// Template is the CertificateRequest that will be used as a template for
 	// generating certificate signing requests for all new keys generated as
 	// part of rotation. It follows the same rules as the template parameter of
@@ -85,9 +154,21 @@ type Config struct {
 	// If no template is available, nil may be returned, and no certificate will be requested.
 	// If specified, takes precedence over Template.
 	GetTemplate func() *x509.CertificateRequest
+	// SignerName is the name of the certificate signer that should sign certificates
+	// generated by the manager.
+	SignerName string
+	// RequestedCertificateLifetime is the requested lifetime length for certificates generated by the manager.
+	// Optional.
+	// This will set the spec.expirationSeconds field on the CSR.  Controlling the lifetime of
+	// the issued certificate is not guaranteed as the signer may choose to ignore the request.
+	RequestedCertificateLifetime *time.Duration
 	// Usages is the types of usages that certificates generated by the manager
-	// can be used for.
+	// can be used for. It is mutually exclusive with GetUsages.
 	Usages []certificates.KeyUsage
+	// GetUsages is dynamic way to get the types of usages that certificates generated by the manager
+	// can be used for. If Usages is not nil, GetUsages has to be nil, vice versa.
+	// It is mutually exclusive with Usages.
+	GetUsages func(privateKey interface{}) []certificates.KeyUsage
 	// CertificateStore is a persistent store where the current cert/key is
 	// kept and future cert/key pairs will be persisted after they are
 	// generated.
@@ -111,10 +192,35 @@ type Config struct {
 	// This is intended to allow the first boot of a component to be
 	// initialized using a generic, multi-use cert/key pair which will be
 	// quickly replaced with a unique cert/key pair.
-	BootstrapKeyPEM []byte
-	// CertificateExpiration will record a metric that shows the remaining
-	// lifetime of the certificate.
-	CertificateExpiration Gauge
+	BootstrapKeyPEM []byte `datapolicy:"security-key"`
+	// CertificateRotation will record a metric showing the time in seconds
+	// that certificates lived before being rotated. This metric is a histogram
+	// because there is value in keeping a history of rotation cadences. It
+	// allows one to setup monitoring and alerting of unexpected rotation
+	// behavior and track trends in rotation frequency.
+	CertificateRotation Histogram
+	// CertifcateRenewFailure will record a metric that keeps track of
+	// certificate renewal failures.
+	CertificateRenewFailure Counter
+	// GenerateKey is an optional function to generate the private key for a new
+	// certificate signing request. If not set, an ECDSA P-256 key is generated.
+	// Currently *ecdsa.PrivateKey, *rsa.PrivateKey and *mldsa.PrivateKey are supported.
+	// The custom key must be strong enough or an error will be returned
+	// when attempting to generate a CSR. For RSA the minimum bits must be 2048,
+	// for ECDSA the minimum curve size must be 256 bits. ML-DSA keys have no
+	// minimum requirement.
+	GenerateKey func() (crypto.Signer, error)
+	// Name is an optional string that will be used when writing log output
+	// via logger.WithName or returning errors from manager methods.
+	//
+	// If not set, SignerName will
+	// be used, if SignerName is not set, if Usages includes client auth the
+	// name will be "client auth", otherwise the value will be "server".
+	Name string
+	// Ctx is an optional context. Cancelling it is equivalent to
+	// calling Stop. A logger is extracted from it if non-nil, otherwise
+	// klog.Background() is used.
+	Ctx *context.Context
 }
 
 // Store is responsible for getting and updating the current certificate.
@@ -139,12 +245,23 @@ type Gauge interface {
 	Set(float64)
 }
 
+// Histogram will record the time a rotated certificate was used before being
+// rotated.
+type Histogram interface {
+	Observe(float64)
+}
+
+// Counter will wrap a counter with labels
+type Counter interface {
+	Inc()
+}
+
 // NoCertKeyError indicates there is no cert/key currently available.
 type NoCertKeyError string
 
-// CSRClientFunc returns a new client for requesting CSRs. It passes the
-// current certificate if one is available and valid.
-type CSRClientFunc func(current *tls.Certificate) (certificatesclient.CertificateSigningRequestInterface, error)
+// ClientsetFunc returns a new clientset for discovering CSR API availability and requesting CSRs.
+// It is passed the current certificate if one is available and valid.
+type ClientsetFunc func(current *tls.Certificate) (clientset.Interface, error)
 
 func (e *NoCertKeyError) Error() string { return string(*e) }
 
@@ -156,54 +273,115 @@ type manager struct {
 	lastRequestCancel context.CancelFunc
 	lastRequest       *x509.CertificateRequest
 
-	dynamicTemplate bool
-	usages          []certificates.KeyUsage
-	forceRotation   bool
+	dynamicTemplate              bool
+	signerName                   string
+	requestedCertificateLifetime *time.Duration
+	getUsages                    func(privateKey interface{}) []certificates.KeyUsage
+	generateKey                  func() (crypto.Signer, error)
+	forceRotation                bool
 
 	certStore Store
 
-	certificateExpiration Gauge
+	certificateRotation     Histogram
+	certificateRenewFailure Counter
 
 	// the following variables must only be accessed under certAccessLock
 	certAccessLock sync.RWMutex
 	cert           *tls.Certificate
 	serverHealth   bool
 
+	// Context and cancel function for background goroutines.
+	ctx    context.Context
+	cancel func(err error)
+
 	// the clientFn must only be accessed under the clientAccessLock
 	clientAccessLock sync.Mutex
-	clientFn         CSRClientFunc
-	stopCh           chan struct{}
-	stopped          bool
+	clientsetFn      ClientsetFunc
+
+	// Set to time.Now but can be stubbed out for testing
+	now func() time.Time
 }
 
 // NewManager returns a new certificate manager. A certificate manager is
 // responsible for being the authoritative source of certificates in the
 // Kubelet and handling updates due to rotation.
 func NewManager(config *Config) (Manager, error) {
-	cert, forceRotation, err := getCurrentCertificateOrBootstrap(
-		config.CertificateStore,
-		config.BootstrapCertificatePEM,
-		config.BootstrapKeyPEM)
-	if err != nil {
-		return nil, err
-	}
 
 	getTemplate := config.GetTemplate
 	if getTemplate == nil {
 		getTemplate = func() *x509.CertificateRequest { return config.Template }
 	}
 
-	m := manager{
-		stopCh:                make(chan struct{}),
-		clientFn:              config.ClientFn,
-		getTemplate:           getTemplate,
-		dynamicTemplate:       config.GetTemplate != nil,
-		usages:                config.Usages,
-		certStore:             config.CertificateStore,
-		cert:                  cert,
-		forceRotation:         forceRotation,
-		certificateExpiration: config.CertificateExpiration,
+	if config.GetUsages != nil && config.Usages != nil {
+		return nil, errors.New("cannot specify both GetUsages and Usages")
 	}
+	if config.GetUsages == nil && config.Usages == nil {
+		return nil, errors.New("either GetUsages or Usages should be specified")
+	}
+	var getUsages func(interface{}) []certificates.KeyUsage
+	if config.GetUsages != nil {
+		getUsages = config.GetUsages
+	} else {
+		getUsages = func(interface{}) []certificates.KeyUsage { return config.Usages }
+	}
+	m := manager{
+		clientsetFn:                  config.ClientsetFn,
+		getTemplate:                  getTemplate,
+		dynamicTemplate:              config.GetTemplate != nil,
+		signerName:                   config.SignerName,
+		requestedCertificateLifetime: config.RequestedCertificateLifetime,
+		getUsages:                    getUsages,
+		generateKey:                  config.GenerateKey,
+		certStore:                    config.CertificateStore,
+		certificateRotation:          config.CertificateRotation,
+		certificateRenewFailure:      config.CertificateRenewFailure,
+		now:                          time.Now,
+	}
+
+	// Determine the name that is to be included in log output from this manager instance.
+	name := config.Name
+	if len(name) == 0 {
+		name = m.signerName
+	}
+	if len(name) == 0 {
+		usages := getUsages(nil)
+		switch {
+		case hasKeyUsage(usages, certificates.UsageClientAuth):
+			name = string(certificates.UsageClientAuth)
+		default:
+			name = "certificate"
+		}
+	}
+
+	// The name gets included through contextual logging.
+	logger := klog.Background()
+	if config.Ctx != nil {
+		logger = klog.FromContext(*config.Ctx)
+	}
+	logger = klog.LoggerWithName(logger, name)
+
+	cert, forceRotation, err := getCurrentCertificateOrBootstrap(
+		logger,
+		config.CertificateStore,
+		config.BootstrapCertificatePEM,
+		config.BootstrapKeyPEM)
+	if err != nil {
+		return nil, err
+	}
+	m.cert, m.forceRotation = cert, forceRotation
+
+	// cancel will be called by Stop, ctx.Done is our stop channel.
+	m.ctx, m.cancel = context.WithCancelCause(context.Background())
+	if config.Ctx != nil && (*config.Ctx).Done() != nil {
+		ctx := *config.Ctx
+		// If we have been passed a context and it has a Done channel, then
+		// we need to map its cancellation to our Done method.
+		go func() {
+			<-ctx.Done()
+			m.Stop()
+		}()
+	}
+	m.ctx = klog.NewContext(m.ctx, logger)
 
 	return &m, nil
 }
@@ -215,8 +393,8 @@ func NewManager(config *Config) (Manager, error) {
 func (m *manager) Current() *tls.Certificate {
 	m.certAccessLock.RLock()
 	defer m.certAccessLock.RUnlock()
-	if m.cert != nil && m.cert.Leaf != nil && time.Now().After(m.cert.Leaf.NotAfter) {
-		klog.V(2).Infof("Current certificate is expired.")
+	if m.cert != nil && m.cert.Leaf != nil && m.now().After(m.cert.Leaf.NotAfter) {
+		klog.FromContext(m.ctx).V(2).Info("Current certificate is expired")
 		return nil
 	}
 	return m.cert
@@ -232,32 +410,35 @@ func (m *manager) ServerHealthy() bool {
 
 // Stop terminates the manager.
 func (m *manager) Stop() {
-	m.clientAccessLock.Lock()
-	defer m.clientAccessLock.Unlock()
-	if m.stopped {
-		return
-	}
-	close(m.stopCh)
-	m.stopped = true
+	m.cancel(errors.New("asked to stop"))
 }
 
 // Start will start the background work of rotating the certificates.
 func (m *manager) Start() {
+	go m.run()
+}
+
+// run, in contrast to Start, blocks while the manager is running.
+// It waits for all goroutines to stop.
+func (m *manager) run() {
+	logger := klog.FromContext(m.ctx)
 	// Certificate rotation depends on access to the API server certificate
 	// signing API, so don't start the certificate manager if we don't have a
 	// client.
-	if m.clientFn == nil {
-		klog.V(2).Infof("Certificate rotation is not enabled, no connection to the apiserver.")
+	if m.clientsetFn == nil {
+		logger.V(2).Info("Certificate rotation is not enabled, no connection to the apiserver")
 		return
 	}
+	logger.V(2).Info("Certificate rotation is enabled")
 
-	klog.V(2).Infof("Certificate rotation is enabled.")
+	var wg sync.WaitGroup
+	defer wg.Wait()
 
 	templateChanged := make(chan struct{})
-	go wait.Until(func() {
-		deadline := m.nextRotationDeadline()
-		if sleepInterval := deadline.Sub(time.Now()); sleepInterval > 0 {
-			klog.V(2).Infof("Waiting %v for next certificate rotation", sleepInterval)
+	rotate := func(ctx context.Context) {
+		deadline := m.nextRotationDeadline(logger)
+		if sleepInterval := deadline.Sub(m.now()); sleepInterval > 0 {
+			logger.V(2).Info("Waiting for next certificate rotation", "sleep", sleepInterval)
 
 			timer := time.NewTimer(sleepInterval)
 			defer timer.Stop()
@@ -271,7 +452,7 @@ func (m *manager) Start() {
 					// if the template now matches what we last requested, restart the rotation deadline loop
 					return
 				}
-				klog.V(2).Infof("Certificate template changed, rotating")
+				logger.V(2).Info("Certificate template changed, rotating")
 			}
 		}
 
@@ -286,18 +467,24 @@ func (m *manager) Start() {
 			Jitter:   0.1,
 			Steps:    5,
 		}
-		if err := wait.ExponentialBackoff(backoff, m.rotateCerts); err != nil {
-			utilruntime.HandleError(fmt.Errorf("Reached backoff limit, still unable to rotate certs: %v", err))
-			wait.PollInfinite(32*time.Second, m.rotateCerts)
+		if err := wait.ExponentialBackoffWithContext(ctx, backoff, m.rotateCerts); err != nil {
+			utilruntime.HandleErrorWithContext(ctx, err, "Reached backoff limit, still unable to rotate certs")
+			wait.PollInfiniteWithContext(ctx, 32*time.Second, m.rotateCerts)
 		}
-	}, time.Second, m.stopCh)
+	}
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		wait.UntilWithContext(m.ctx, rotate, time.Second)
+	}()
 
 	if m.dynamicTemplate {
-		go wait.Until(func() {
+		template := func(ctx context.Context) {
 			// check if the current template matches what we last requested
 			lastRequestCancel, lastRequestTemplate := m.getLastRequest()
 
-			if !m.certSatisfiesTemplate() && !reflect.DeepEqual(lastRequestTemplate, m.getTemplate()) {
+			if !m.certSatisfiesTemplate(logger) && !reflect.DeepEqual(lastRequestTemplate, m.getTemplate()) {
 				// if the template is different, queue up an interrupt of the rotation deadline loop.
 				// if we've requested a CSR that matches the new template by the time the interrupt is handled, the interrupt is disregarded.
 				if lastRequestCancel != nil {
@@ -306,14 +493,20 @@ func (m *manager) Start() {
 				}
 				select {
 				case templateChanged <- struct{}{}:
-				case <-m.stopCh:
+				case <-ctx.Done():
 				}
 			}
-		}, time.Second, m.stopCh)
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			wait.UntilWithContext(m.ctx, template, time.Second)
+		}()
 	}
 }
 
 func getCurrentCertificateOrBootstrap(
+	logger klog.Logger,
 	store Store,
 	bootstrapCertificatePEM []byte,
 	bootstrapKeyPEM []byte) (cert *tls.Certificate, shouldRotate bool, errResult error) {
@@ -344,31 +537,32 @@ func getCurrentCertificateOrBootstrap(
 
 	certs, err := x509.ParseCertificates(bootstrapCert.Certificate[0])
 	if err != nil {
-		return nil, false, fmt.Errorf("unable to parse certificate data: %v", err)
+		return nil, false, fmt.Errorf("unable to parse certificate data: %w", err)
+	}
+	if len(certs) < 1 {
+		return nil, false, fmt.Errorf("no cert data found")
 	}
 	bootstrapCert.Leaf = certs[0]
 
 	if _, err := store.Update(bootstrapCertificatePEM, bootstrapKeyPEM); err != nil {
-		utilruntime.HandleError(fmt.Errorf("Unable to set the cert/key pair to the bootstrap certificate: %v", err))
-	} else {
-		klog.V(4).Infof("Updated the store to contain the initial bootstrap certificate")
+		utilruntime.HandleErrorWithLogger(logger, err, "Unable to set the cert/key pair to the bootstrap certificate")
 	}
 
 	return &bootstrapCert, true, nil
 }
 
-func (m *manager) getClient() (certificatesclient.CertificateSigningRequestInterface, error) {
+func (m *manager) getClientset() (clientset.Interface, error) {
 	current := m.Current()
 	m.clientAccessLock.Lock()
 	defer m.clientAccessLock.Unlock()
-	return m.clientFn(current)
+	return m.clientsetFn(current)
 }
 
 // RotateCerts is exposed for testing only and is not a part of the public interface.
 // Returns true if it changed the cert, false otherwise. Error is only returned in
 // exceptional cases.
 func (m *manager) RotateCerts() (bool, error) {
-	return m.rotateCerts()
+	return m.rotateCerts(m.ctx)
 }
 
 // rotateCerts attempts to request a client cert from the server, wait a reasonable
@@ -377,31 +571,46 @@ func (m *manager) RotateCerts() (bool, error) {
 // This method also keeps track of "server health" by interpreting the responses it gets
 // from the server on the various calls it makes.
 // TODO: return errors, have callers handle and log them correctly
-func (m *manager) rotateCerts() (bool, error) {
-	klog.V(2).Infof("Rotating certificates")
+func (m *manager) rotateCerts(ctx context.Context) (bool, error) {
+	logger := klog.FromContext(ctx)
+	logger.V(2).Info("Rotating certificates")
 
 	template, csrPEM, keyPEM, privateKey, err := m.generateCSR()
 	if err != nil {
-		utilruntime.HandleError(fmt.Errorf("Unable to generate a certificate signing request: %v", err))
+		utilruntime.HandleErrorWithContext(ctx, err, "Unable to generate a certificate signing request")
+		if m.certificateRenewFailure != nil {
+			m.certificateRenewFailure.Inc()
+		}
 		return false, nil
 	}
 
 	// request the client each time
-	client, err := m.getClient()
+	clientSet, err := m.getClientset()
 	if err != nil {
-		utilruntime.HandleError(fmt.Errorf("Unable to load a client to request certificates: %v", err))
+		utilruntime.HandleErrorWithContext(ctx, err, "Unable to load a client to request certificates")
+		if m.certificateRenewFailure != nil {
+			m.certificateRenewFailure.Inc()
+		}
 		return false, nil
 	}
 
+	getUsages := m.getUsages
+	if m.getUsages == nil {
+		getUsages = DefaultKubeletClientGetUsages
+	}
+	usages := getUsages(privateKey)
 	// Call the Certificate Signing Request API to get a certificate for the
-	// new private key.
-	req, err := csr.RequestCertificate(client, csrPEM, "", m.usages, privateKey)
+	// new private key
+	reqName, reqUID, err := csr.RequestCertificateWithContext(ctx, clientSet, csrPEM, "", m.signerName, m.requestedCertificateLifetime, usages, privateKey)
 	if err != nil {
-		utilruntime.HandleError(fmt.Errorf("Failed while requesting a signed certificate from the master: %v", err))
+		utilruntime.HandleErrorWithContext(ctx, err, "Failed while requesting a signed certificate from the control plane")
+		if m.certificateRenewFailure != nil {
+			m.certificateRenewFailure.Inc()
+		}
 		return false, m.updateServerError(err)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), certificateWaitTimeout)
+	ctx, cancel := context.WithTimeout(ctx, certificateWaitTimeout)
 	defer cancel()
 
 	// Once we've successfully submitted a CSR for this template, record that we did so
@@ -409,19 +618,28 @@ func (m *manager) rotateCerts() (bool, error) {
 
 	// Wait for the certificate to be signed. This interface and internal timout
 	// is a remainder after the old design using raw watch wrapped with backoff.
-	crtPEM, err := csr.WaitForCertificate(ctx, client, req)
+	crtPEM, err := csr.WaitForCertificate(ctx, clientSet, reqName, reqUID)
 	if err != nil {
-		utilruntime.HandleError(fmt.Errorf("certificate request was not signed: %v", err))
+		utilruntime.HandleErrorWithContext(ctx, err, "Certificate request was not signed")
+		if m.certificateRenewFailure != nil {
+			m.certificateRenewFailure.Inc()
+		}
 		return false, nil
 	}
 
 	cert, err := m.certStore.Update(crtPEM, keyPEM)
 	if err != nil {
-		utilruntime.HandleError(fmt.Errorf("Unable to store the new cert/key pair: %v", err))
+		utilruntime.HandleErrorWithContext(ctx, err, "Unable to store the new cert/key pair")
+		if m.certificateRenewFailure != nil {
+			m.certificateRenewFailure.Inc()
+		}
 		return false, nil
 	}
 
-	m.updateCached(cert)
+	if old := m.updateCached(cert); old != nil && m.certificateRotation != nil {
+		m.certificateRotation.Observe(m.now().Sub(old.Leaf.NotBefore).Seconds())
+	}
+
 	return true, nil
 }
 
@@ -432,14 +650,14 @@ func (m *manager) rotateCerts() (bool, error) {
 // the template will not trigger a renewal.
 //
 // Requires certAccessLock to be locked.
-func (m *manager) certSatisfiesTemplateLocked() bool {
+func (m *manager) certSatisfiesTemplateLocked(logger klog.Logger) bool {
 	if m.cert == nil {
 		return false
 	}
 
 	if template := m.getTemplate(); template != nil {
 		if template.Subject.CommonName != m.cert.Leaf.Subject.CommonName {
-			klog.V(2).Infof("Current certificate CN (%s) does not match requested CN (%s)", m.cert.Leaf.Subject.CommonName, template.Subject.CommonName)
+			logger.V(2).Info("Current certificate CN does not match requested CN", "currentName", m.cert.Leaf.Subject.CommonName, "requestedName", template.Subject.CommonName)
 			return false
 		}
 
@@ -447,7 +665,7 @@ func (m *manager) certSatisfiesTemplateLocked() bool {
 		desiredDNSNames := sets.NewString(template.DNSNames...)
 		missingDNSNames := desiredDNSNames.Difference(currentDNSNames)
 		if len(missingDNSNames) > 0 {
-			klog.V(2).Infof("Current certificate is missing requested DNS names %v", missingDNSNames.List())
+			logger.V(2).Info("Current certificate is missing requested DNS names", "dnsNames", missingDNSNames.List())
 			return false
 		}
 
@@ -461,7 +679,7 @@ func (m *manager) certSatisfiesTemplateLocked() bool {
 		}
 		missingIPs := desiredIPs.Difference(currentIPs)
 		if len(missingIPs) > 0 {
-			klog.V(2).Infof("Current certificate is missing requested IP addresses %v", missingIPs.List())
+			logger.V(2).Info("Current certificate is missing requested IP addresses", "IPs", missingIPs.List())
 			return false
 		}
 
@@ -469,7 +687,7 @@ func (m *manager) certSatisfiesTemplateLocked() bool {
 		desiredOrgs := sets.NewString(template.Subject.Organization...)
 		missingOrgs := desiredOrgs.Difference(currentOrgs)
 		if len(missingOrgs) > 0 {
-			klog.V(2).Infof("Current certificate is missing requested orgs %v", missingOrgs.List())
+			logger.V(2).Info("Current certificate is missing requested orgs", "orgs", missingOrgs.List())
 			return false
 		}
 	}
@@ -477,37 +695,34 @@ func (m *manager) certSatisfiesTemplateLocked() bool {
 	return true
 }
 
-func (m *manager) certSatisfiesTemplate() bool {
+func (m *manager) certSatisfiesTemplate(logger klog.Logger) bool {
 	m.certAccessLock.RLock()
 	defer m.certAccessLock.RUnlock()
-	return m.certSatisfiesTemplateLocked()
+	return m.certSatisfiesTemplateLocked(logger)
 }
 
 // nextRotationDeadline returns a value for the threshold at which the
 // current certificate should be rotated, 80%+/-10% of the expiration of the
 // certificate.
-func (m *manager) nextRotationDeadline() time.Time {
+func (m *manager) nextRotationDeadline(logger klog.Logger) time.Time {
 	// forceRotation is not protected by locks
 	if m.forceRotation {
 		m.forceRotation = false
-		return time.Now()
+		return m.now()
 	}
 
 	m.certAccessLock.RLock()
 	defer m.certAccessLock.RUnlock()
 
-	if !m.certSatisfiesTemplateLocked() {
-		return time.Now()
+	if !m.certSatisfiesTemplateLocked(logger) {
+		return m.now()
 	}
 
 	notAfter := m.cert.Leaf.NotAfter
 	totalDuration := float64(notAfter.Sub(m.cert.Leaf.NotBefore))
 	deadline := m.cert.Leaf.NotBefore.Add(jitteryDuration(totalDuration))
 
-	klog.V(2).Infof("Certificate expiration is %v, rotation deadline is %v", notAfter, deadline)
-	if m.certificateExpiration != nil {
-		m.certificateExpiration.Set(float64(notAfter.Unix()))
-	}
+	logger.V(2).Info("Certificate rotation deadline determined", "expiration", notAfter, "deadline", deadline)
 	return deadline
 }
 
@@ -523,13 +738,15 @@ var jitteryDuration = func(totalDuration float64) time.Duration {
 	return wait.Jitter(time.Duration(totalDuration), 0.2) - time.Duration(totalDuration*0.3)
 }
 
-// updateCached sets the most recent retrieved cert. It also sets the server
-// as assumed healthy.
-func (m *manager) updateCached(cert *tls.Certificate) {
+// updateCached sets the most recent retrieved cert and returns the old cert.
+// It also sets the server as assumed healthy.
+func (m *manager) updateCached(cert *tls.Certificate) *tls.Certificate {
 	m.certAccessLock.Lock()
 	defer m.certAccessLock.Unlock()
 	m.serverHealth = true
+	old := m.cert
 	m.cert = cert
+	return old
 }
 
 // updateServerError takes an error returned by the server and infers
@@ -540,41 +757,51 @@ func (m *manager) updateServerError(err error) error {
 	m.certAccessLock.Lock()
 	defer m.certAccessLock.Unlock()
 	switch {
-	case errors.IsUnauthorized(err):
+	case apierrors.IsUnauthorized(err):
 		// SSL terminating proxies may report this error instead of the master
 		m.serverHealth = true
-	case errors.IsUnexpectedServerError(err):
+	case apierrors.IsUnexpectedServerError(err):
 		// generally indicates a proxy or other load balancer problem, rather than a problem coming
 		// from the master
 		m.serverHealth = false
 	default:
 		// Identify known errors that could be expected for a cert request that
 		// indicate everything is working normally
-		m.serverHealth = errors.IsNotFound(err) || errors.IsForbidden(err)
+		m.serverHealth = apierrors.IsNotFound(err) || apierrors.IsForbidden(err)
 	}
 	return nil
 }
 
+var generateKeyFunc = generateKeyFuncImpl
+
+func generateKeyFuncImpl() (crypto.Signer, error) {
+	return ecdsa.GenerateKey(elliptic.P256(), cryptorand.Reader)
+}
+
 func (m *manager) generateCSR() (template *x509.CertificateRequest, csrPEM []byte, keyPEM []byte, key interface{}, err error) {
+	generateKey := m.generateKey
+	if generateKey == nil {
+		generateKey = generateKeyFunc
+	}
 	// Generate a new private key.
-	privateKey, err := ecdsa.GenerateKey(elliptic.P256(), cryptorand.Reader)
+	privateKey, err := generateKey()
 	if err != nil {
-		return nil, nil, nil, nil, fmt.Errorf("unable to generate a new private key: %v", err)
+		return nil, nil, nil, nil, fmt.Errorf("unable to generate a new private key: %w", err)
 	}
-	der, err := x509.MarshalECPrivateKey(privateKey)
+	if err = validateKeyStrength(privateKey); err != nil {
+		return nil, nil, nil, nil, fmt.Errorf("the new key is insecure: %w", err)
+	}
+	keyPEM, err = keyutil.MarshalPrivateKeyToPEM(privateKey)
 	if err != nil {
-		return nil, nil, nil, nil, fmt.Errorf("unable to marshal the new key to DER: %v", err)
+		return nil, nil, nil, nil, fmt.Errorf("unable to marshal the new key to PEM: %w", err)
 	}
-
-	keyPEM = pem.EncodeToMemory(&pem.Block{Type: keyutil.ECPrivateKeyBlockType, Bytes: der})
-
 	template = m.getTemplate()
 	if template == nil {
-		return nil, nil, nil, nil, fmt.Errorf("unable to create a csr, no template available")
+		return nil, nil, nil, nil, errors.New("unable to create a csr, no template available")
 	}
 	csrPEM, err = cert.MakeCSRFromTemplate(privateKey, template)
 	if err != nil {
-		return nil, nil, nil, nil, fmt.Errorf("unable to create a csr from the private key: %v", err)
+		return nil, nil, nil, nil, fmt.Errorf("unable to create a csr from the private key: %w", err)
 	}
 	return template, csrPEM, keyPEM, privateKey, nil
 }
@@ -590,4 +817,36 @@ func (m *manager) setLastRequest(cancel context.CancelFunc, r *x509.CertificateR
 	defer m.lastRequestLock.Unlock()
 	m.lastRequestCancel = cancel
 	m.lastRequest = r
+}
+
+func hasKeyUsage(usages []certificates.KeyUsage, usage certificates.KeyUsage) bool {
+	for _, u := range usages {
+		if u == usage {
+			return true
+		}
+	}
+	return false
+}
+
+// validateKeyStrength checks that the key is strong enough to be used for a certificate.
+// For RSA the minimum bits must be 2048, for ECDSA the minimum curve size must be 256 bits.
+// ML-DSA keys have no minimum requirement.
+func validateKeyStrength(key crypto.Signer) error {
+	const (
+		minRSAKeyBits   = 2048
+		minECDSAKeyBits = 256
+	)
+	switch k := key.(type) {
+	case *rsa.PrivateKey:
+		if bits := k.N.BitLen(); bits < minRSAKeyBits {
+			return fmt.Errorf("RSA key size %d bits is below the minimum of %d",
+				bits, minRSAKeyBits)
+		}
+	case *ecdsa.PrivateKey:
+		if bits := k.Curve.Params().BitSize; bits < minECDSAKeyBits {
+			return fmt.Errorf("ECDSA key curve %s (%d bits) is below the minimum of %d",
+				k.Curve.Params().Name, bits, minECDSAKeyBits)
+		}
+	}
+	return nil
 }

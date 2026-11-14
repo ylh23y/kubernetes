@@ -13,10 +13,12 @@
 # limitations under the License.
 
 SRCS=agnhost
+OS ?= linux
 ARCH ?= amd64
 TARGET ?= $(CURDIR)
-GOLANG_VERSION ?= latest
 SRC_DIR = $(notdir $(shell pwd))
+VERSION = $(shell cat VERSION)
+LD_FLAGS = -X 'main.Version=$(VERSION)'
 export
 
 bin:

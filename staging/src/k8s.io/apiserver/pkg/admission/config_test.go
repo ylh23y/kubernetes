@@ -17,25 +17,28 @@ limitations under the License.
 package admission
 
 import (
-	"io/ioutil"
+	"io"
 	"os"
 	"reflect"
 	"testing"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/json"
 	"k8s.io/apiserver/pkg/apis/apiserver"
+	apiserverapiv1 "k8s.io/apiserver/pkg/apis/apiserver/v1"
 	apiserverapiv1alpha1 "k8s.io/apiserver/pkg/apis/apiserver/v1alpha1"
 )
 
 func TestReadAdmissionConfiguration(t *testing.T) {
 	// create a place holder file to hold per test config
-	configFile, err := ioutil.TempFile("", "admission-plugin-config")
+	configFile, err := os.CreateTemp("", "admission-plugin-config")
 	if err != nil {
 		t.Fatalf("unexpected err: %v", err)
 	}
+	defer os.Remove(configFile.Name())
 	if err = configFile.Close(); err != nil {
 		t.Fatalf("unexpected err: %v", err)
 	}
@@ -50,7 +53,28 @@ func TestReadAdmissionConfiguration(t *testing.T) {
 		ConfigBody              string
 		ExpectedAdmissionConfig *apiserver.AdmissionConfiguration
 		PluginNames             []string
+		ExpectedError           string
 	}{
+		"duplicate field configuration error": {
+			ConfigBody: `{
+"apiVersion": "apiserver.k8s.io/v1alpha1",
+"kind": "AdmissionConfiguration",
+"plugins": [
+  {"name": "ImagePolicyWebhook-duplicate", "name": "ImagePolicyWebhook", "path": "image-policy-webhook.json"},
+  {"name": "ResourceQuota"}
+]}`,
+			ExpectedError: "strict decoding error: duplicate field",
+		},
+		"unknown field configuration error": {
+			ConfigBody: `{
+"apiVersion": "apiserver.k8s.io/v1alpha1",
+"kind": "AdmissionConfiguration",
+"plugins": [
+  {"foo": "bar", "name": "ImagePolicyWebhook", "path": "image-policy-webhook.json"},
+  {"name": "ResourceQuota"}
+]}`,
+			ExpectedError: "strict decoding error: unknown field",
+		},
 		"v1alpha1 configuration - path fixup": {
 			ConfigBody: `{
 "apiVersion": "apiserver.k8s.io/v1alpha1",
@@ -75,6 +99,48 @@ func TestReadAdmissionConfiguration(t *testing.T) {
 		"v1alpha1 configuration - abspath": {
 			ConfigBody: `{
 "apiVersion": "apiserver.k8s.io/v1alpha1",
+"kind": "AdmissionConfiguration",
+"plugins": [
+  {"name": "ImagePolicyWebhook", "path": "/tmp/image-policy-webhook.json"},
+  {"name": "ResourceQuota"}
+]}`,
+			ExpectedAdmissionConfig: &apiserver.AdmissionConfiguration{
+				Plugins: []apiserver.AdmissionPluginConfiguration{
+					{
+						Name: "ImagePolicyWebhook",
+						Path: "/tmp/image-policy-webhook.json",
+					},
+					{
+						Name: "ResourceQuota",
+					},
+				},
+			},
+			PluginNames: []string{},
+		},
+		"v1 configuration - path fixup": {
+			ConfigBody: `{
+"apiVersion": "apiserver.config.k8s.io/v1",
+"kind": "AdmissionConfiguration",
+"plugins": [
+  {"name": "ImagePolicyWebhook", "path": "image-policy-webhook.json"},
+  {"name": "ResourceQuota"}
+]}`,
+			ExpectedAdmissionConfig: &apiserver.AdmissionConfiguration{
+				Plugins: []apiserver.AdmissionPluginConfiguration{
+					{
+						Name: "ImagePolicyWebhook",
+						Path: imagePolicyWebhookFile,
+					},
+					{
+						Name: "ResourceQuota",
+					},
+				},
+			},
+			PluginNames: []string{},
+		},
+		"v1 configuration - abspath": {
+			ConfigBody: `{
+"apiVersion": "apiserver.config.k8s.io/v1",
 "kind": "AdmissionConfiguration",
 "plugins": [
   {"name": "ImagePolicyWebhook", "path": "/tmp/image-policy-webhook.json"},
@@ -141,27 +207,35 @@ func TestReadAdmissionConfiguration(t *testing.T) {
 	scheme := runtime.NewScheme()
 	require.NoError(t, apiserver.AddToScheme(scheme))
 	require.NoError(t, apiserverapiv1alpha1.AddToScheme(scheme))
+	require.NoError(t, apiserverapiv1.AddToScheme(scheme))
 
 	for testName, testCase := range testCases {
-		if err = ioutil.WriteFile(configFileName, []byte(testCase.ConfigBody), 0644); err != nil {
+		if err = os.WriteFile(configFileName, []byte(testCase.ConfigBody), 0644); err != nil {
 			t.Fatalf("unexpected err writing temp file: %v", err)
 		}
 		config, err := ReadAdmissionConfiguration(testCase.PluginNames, configFileName, scheme)
-		if err != nil {
+		if testCase.ExpectedError != "" {
+			if err != nil {
+				assert.Contains(t, err.Error(), testCase.ExpectedError)
+			} else {
+				t.Fatalf("expected error %q but received none", testCase.ExpectedError)
+			}
+		} else if err != nil {
 			t.Fatalf("unexpected err: %v", err)
+		} else if !reflect.DeepEqual(config.(configProvider).config, testCase.ExpectedAdmissionConfig) {
+			t.Fatalf("%s: Expected:\n\t%#v\nGot:\n\t%#v", testName, testCase.ExpectedAdmissionConfig, config.(configProvider).config)
 		}
-		if !reflect.DeepEqual(config.(configProvider).config, testCase.ExpectedAdmissionConfig) {
-			t.Errorf("%s: Expected:\n\t%#v\nGot:\n\t%#v", testName, testCase.ExpectedAdmissionConfig, config.(configProvider).config)
-		}
+
 	}
 }
 
 func TestEmbeddedConfiguration(t *testing.T) {
 	// create a place holder file to hold per test config
-	configFile, err := ioutil.TempFile("", "admission-plugin-config")
+	configFile, err := os.CreateTemp("", "admission-plugin-config")
 	if err != nil {
 		t.Fatalf("unexpected err: %v", err)
 	}
+	defer os.Remove(configFile.Name())
 	if err = configFile.Close(); err != nil {
 		t.Fatalf("unexpected err: %v", err)
 	}
@@ -171,7 +245,7 @@ func TestEmbeddedConfiguration(t *testing.T) {
 		ConfigBody     string
 		ExpectedConfig string
 	}{
-		"versioned configuration": {
+		"v1alpha1 versioned configuration": {
 			ConfigBody: `{
 				"apiVersion": "apiserver.k8s.io/v1alpha1",
 				"kind": "AdmissionConfiguration",
@@ -191,9 +265,45 @@ func TestEmbeddedConfiguration(t *testing.T) {
 			  "foo": "bar"
 			}`,
 		},
-		"legacy configuration": {
+		"v1alpha1 legacy configuration": {
 			ConfigBody: `{
 				"apiVersion": "apiserver.k8s.io/v1alpha1",
+				"kind": "AdmissionConfiguration",
+				"plugins": [
+				  {
+					"name": "Foo",
+					"configuration": {
+					  "foo": "bar"
+					}
+				  }
+				]}`,
+			ExpectedConfig: `{
+			  "foo": "bar"
+			}`,
+		},
+		"v1 versioned configuration": {
+			ConfigBody: `{
+				"apiVersion": "apiserver.config.k8s.io/v1",
+				"kind": "AdmissionConfiguration",
+				"plugins": [
+				  {
+					"name": "Foo",
+					"configuration": {
+					  "apiVersion": "foo.admission.k8s.io/v1alpha1",
+					  "kind": "Configuration",
+					  "foo": "bar"
+					}
+				  }
+				]}`,
+			ExpectedConfig: `{
+			  "apiVersion": "foo.admission.k8s.io/v1alpha1",
+			  "kind": "Configuration",
+			  "foo": "bar"
+			}`,
+		},
+		"v1 legacy configuration": {
+			ConfigBody: `{
+				"apiVersion": "apiserver.config.k8s.io/v1",
 				"kind": "AdmissionConfiguration",
 				"plugins": [
 				  {
@@ -213,8 +323,9 @@ func TestEmbeddedConfiguration(t *testing.T) {
 		scheme := runtime.NewScheme()
 		require.NoError(t, apiserver.AddToScheme(scheme))
 		require.NoError(t, apiserverapiv1alpha1.AddToScheme(scheme))
+		require.NoError(t, apiserverapiv1.AddToScheme(scheme))
 
-		if err = ioutil.WriteFile(configFileName, []byte(test.ConfigBody), 0644); err != nil {
+		if err = os.WriteFile(configFileName, []byte(test.ConfigBody), 0644); err != nil {
 			t.Errorf("[%s] unexpected err writing temp file: %v", desc, err)
 			continue
 		}
@@ -228,7 +339,7 @@ func TestEmbeddedConfiguration(t *testing.T) {
 			t.Errorf("[%s] Failed to get Foo config: %v", desc, err)
 			continue
 		}
-		bs, err := ioutil.ReadAll(r)
+		bs, err := io.ReadAll(r)
 		if err != nil {
 			t.Errorf("[%s] Failed to read Foo config data: %v", desc, err)
 			continue

@@ -17,21 +17,22 @@ limitations under the License.
 package storage
 
 import (
-	"k8s.io/api/core/v1"
+	"context"
+
+	v1 "k8s.io/api/core/v1"
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/kubernetes/test/e2e/framework"
-	e2elog "k8s.io/kubernetes/test/e2e/framework/log"
-	"k8s.io/kubernetes/test/e2e/framework/volume"
-
-	"github.com/onsi/ginkgo"
+	e2epod "k8s.io/kubernetes/test/e2e/framework/pod"
+	e2eoutput "k8s.io/kubernetes/test/e2e/framework/pod/output"
+	e2epv "k8s.io/kubernetes/test/e2e/framework/pv"
 	"k8s.io/kubernetes/test/e2e/upgrades"
+
+	"github.com/onsi/ginkgo/v2"
 )
 
 // PersistentVolumeUpgradeTest test that a pv is available before and after a cluster upgrade.
 type PersistentVolumeUpgradeTest struct {
-	pvSource *v1.PersistentVolumeSource
-	pv       *v1.PersistentVolume
-	pvc      *v1.PersistentVolumeClaim
+	pvc *v1.PersistentVolumeClaim
 }
 
 // Name returns the tracking name of the test.
@@ -44,60 +45,45 @@ const (
 	pvReadCmd  string = "cat " + pvTestFile
 )
 
-func (t *PersistentVolumeUpgradeTest) deleteGCEVolume(pvSource *v1.PersistentVolumeSource) error {
-	return framework.DeletePDWithRetry(pvSource.GCEPersistentDisk.PDName)
-}
-
 // Setup creates a pv and then verifies that a pod can consume it.  The pod writes data to the volume.
-func (t *PersistentVolumeUpgradeTest) Setup(f *framework.Framework) {
+func (t *PersistentVolumeUpgradeTest) Setup(ctx context.Context, f *framework.Framework) {
 
 	var err error
-	// TODO: generalize this to other providers
-	framework.SkipUnlessProviderIs("gce", "gke")
+	// At the moment, the user of this test limits execution to GCE.
 
 	ns := f.Namespace.Name
 
-	ginkgo.By("Initializing PV source")
-	t.pvSource, _ = volume.CreateGCEVolume()
-	pvConfig := framework.PersistentVolumeConfig{
-		NamePrefix: "pv-upgrade",
-		PVSource:   *t.pvSource,
-		Prebind:    nil,
+	ginkgo.By("Creating a PVC")
+	pvcConfig := e2epv.PersistentVolumeClaimConfig{
+		StorageClassName: nil,
 	}
-	emptyStorageClass := ""
-	pvcConfig := framework.PersistentVolumeClaimConfig{StorageClassName: &emptyStorageClass}
-
-	ginkgo.By("Creating the PV and PVC")
-	t.pv, t.pvc, err = framework.CreatePVPVC(f.ClientSet, pvConfig, pvcConfig, ns, true)
+	t.pvc = e2epv.MakePersistentVolumeClaim(pvcConfig, ns)
+	t.pvc, err = e2epv.CreatePVC(ctx, f.ClientSet, ns, t.pvc)
 	framework.ExpectNoError(err)
-	framework.ExpectNoError(framework.WaitOnPVandPVC(f.ClientSet, ns, t.pv, t.pvc))
 
 	ginkgo.By("Consuming the PV before upgrade")
-	t.testPod(f, pvWriteCmd+";"+pvReadCmd)
+	t.testPod(ctx, f, pvWriteCmd+";"+pvReadCmd)
 }
 
 // Test waits for the upgrade to complete, and then verifies that a pod can still consume the pv
 // and that the volume data persists.
-func (t *PersistentVolumeUpgradeTest) Test(f *framework.Framework, done <-chan struct{}, upgrade upgrades.UpgradeType) {
+func (t *PersistentVolumeUpgradeTest) Test(ctx context.Context, f *framework.Framework, done <-chan struct{}, upgrade upgrades.UpgradeType) {
 	<-done
 	ginkgo.By("Consuming the PV after upgrade")
-	t.testPod(f, pvReadCmd)
+	t.testPod(ctx, f, pvReadCmd)
 }
 
 // Teardown cleans up any remaining resources.
-func (t *PersistentVolumeUpgradeTest) Teardown(f *framework.Framework) {
-	errs := framework.PVPVCCleanup(f.ClientSet, f.Namespace.Name, t.pv, t.pvc)
-	if err := t.deleteGCEVolume(t.pvSource); err != nil {
-		errs = append(errs, err)
-	}
+func (t *PersistentVolumeUpgradeTest) Teardown(ctx context.Context, f *framework.Framework) {
+	errs := e2epv.PVPVCCleanup(ctx, f.ClientSet, f.Namespace.Name, nil, t.pvc)
 	if len(errs) > 0 {
-		e2elog.Failf("Failed to delete 1 or more PVs/PVCs and/or the GCE volume. Errors: %v", utilerrors.NewAggregate(errs))
+		framework.Failf("Failed to delete 1 or more PVs/PVCs. Errors: %v", utilerrors.NewAggregate(errs))
 	}
 }
 
 // testPod creates a pod that consumes a pv and prints it out. The output is then verified.
-func (t *PersistentVolumeUpgradeTest) testPod(f *framework.Framework, cmd string) {
-	pod := framework.MakePod(f.Namespace.Name, nil, []*v1.PersistentVolumeClaim{t.pvc}, false, cmd)
+func (t *PersistentVolumeUpgradeTest) testPod(ctx context.Context, f *framework.Framework, cmd string) {
+	pod := e2epod.MakePod(f.Namespace.Name, nil, []*v1.PersistentVolumeClaim{t.pvc}, f.NamespacePodSecurityLevel, cmd)
 	expectedOutput := []string{pvTestData}
-	f.TestContainerOutput("pod consumes pv", pod, 0, expectedOutput)
+	e2eoutput.TestContainerOutput(ctx, f, "pod consumes pv", pod, 0, expectedOutput)
 }

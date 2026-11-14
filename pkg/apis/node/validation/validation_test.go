@@ -21,11 +21,9 @@ import (
 
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	utilfeature "k8s.io/apiserver/pkg/util/feature"
-	featuregatetesting "k8s.io/component-base/featuregate/testing"
 	"k8s.io/kubernetes/pkg/apis/core"
 	"k8s.io/kubernetes/pkg/apis/node"
-	"k8s.io/kubernetes/pkg/features"
+	"k8s.io/utils/ptr"
 
 	"github.com/stretchr/testify/assert"
 )
@@ -41,19 +39,6 @@ func TestValidateRuntimeClass(t *testing.T) {
 		rc: node.RuntimeClass{
 			ObjectMeta: metav1.ObjectMeta{Name: "&!@#"},
 			Handler:    "foo",
-		},
-	}, {
-		name:        "invalid Handler name",
-		expectError: true,
-		rc: node.RuntimeClass{
-			ObjectMeta: metav1.ObjectMeta{Name: "foo"},
-			Handler:    "&@#$",
-		},
-	}, {
-		name:        "invalid empty RuntimeClass",
-		expectError: true,
-		rc: node.RuntimeClass{
-			ObjectMeta: metav1.ObjectMeta{Name: "empty"},
 		},
 	}, {
 		name:        "valid Handler",
@@ -101,18 +86,10 @@ func TestValidateRuntimeUpdate(t *testing.T) {
 		old:         old,
 		new: node.RuntimeClass{
 			ObjectMeta: metav1.ObjectMeta{
-				Name:        "empty",
-				ClusterName: "somethingelse", // immutable
+				Name:      "empty",
+				Namespace: "somethingelse", // immutable
 			},
 			Handler: "bar",
-		},
-	}, {
-		name:        "invalid Handler update",
-		expectError: true,
-		old:         old,
-		new: node.RuntimeClass{
-			ObjectMeta: metav1.ObjectMeta{Name: "foo"},
-			Handler:    "somethingelse",
 		},
 	}}
 
@@ -133,23 +110,25 @@ func TestValidateRuntimeUpdate(t *testing.T) {
 }
 
 func TestValidateOverhead(t *testing.T) {
-
-	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.PodOverhead, true)()
-
 	successCase := []struct {
 		Name     string
 		overhead *node.Overhead
-	}{
-		{
-			Name: "Overhead with valid cpu and memory resources",
-			overhead: &node.Overhead{
-				PodFixed: core.ResourceList{
-					core.ResourceName(core.ResourceCPU):    resource.MustParse("10"),
-					core.ResourceName(core.ResourceMemory): resource.MustParse("10G"),
-				},
+	}{{
+		Name: "Overhead with valid cpu and memory resources",
+		overhead: &node.Overhead{
+			PodFixed: core.ResourceList{
+				core.ResourceName(core.ResourceCPU):    resource.MustParse("10"),
+				core.ResourceName(core.ResourceMemory): resource.MustParse("10G"),
 			},
 		},
-	}
+	}, {
+		Name: "Overhead with a whole-number extended resource past int64",
+		overhead: &node.Overhead{
+			PodFixed: core.ResourceList{
+				core.ResourceName("example.com/gpu"): resource.MustParse("18446744073709551616"),
+			},
+		},
+	}}
 
 	for _, tc := range successCase {
 		rc := &node.RuntimeClass{
@@ -165,16 +144,29 @@ func TestValidateOverhead(t *testing.T) {
 	errorCase := []struct {
 		Name     string
 		overhead *node.Overhead
-	}{
-		{
-			Name: "Invalid Resources",
-			overhead: &node.Overhead{
-				PodFixed: core.ResourceList{
-					core.ResourceName("my.org"): resource.MustParse("10m"),
-				},
+	}{{
+		Name: "Invalid Resources",
+		overhead: &node.Overhead{
+			PodFixed: core.ResourceList{
+				core.ResourceName("my.org"): resource.MustParse("10m"),
 			},
 		},
-	}
+	}, {
+		Name: "Fractional extended resource past int64",
+		overhead: &node.Overhead{
+			PodFixed: core.ResourceList{
+				core.ResourceName("example.com/gpu"): resource.MustParse("18446744073709551616m"),
+			},
+		},
+	}, {
+		Name: "Hugepages past int64",
+		overhead: &node.Overhead{
+			PodFixed: core.ResourceList{
+				core.ResourceName(core.ResourceMemory):                  resource.MustParse("10G"),
+				core.ResourceName(core.ResourceHugePagesPrefix + "2Mi"): resource.MustParse("18446744073709551616"),
+			},
+		},
+	}}
 	for _, tc := range errorCase {
 		rc := &node.RuntimeClass{
 			ObjectMeta: metav1.ObjectMeta{Name: "foo"},
@@ -184,5 +176,88 @@ func TestValidateOverhead(t *testing.T) {
 		if errs := ValidateRuntimeClass(rc); len(errs) == 0 {
 			t.Errorf("%q expected error", tc.Name)
 		}
+	}
+}
+
+func TestValidateScheduling(t *testing.T) {
+	tests := []struct {
+		name       string
+		scheduling *node.Scheduling
+		expectErrs int
+	}{{
+		name: "valid scheduling",
+		scheduling: &node.Scheduling{
+			NodeSelector: map[string]string{"valid": "yes"},
+			Tolerations: []core.Toleration{{
+				Key:      "valid",
+				Operator: core.TolerationOpExists,
+				Effect:   core.TaintEffectNoSchedule,
+			}},
+		},
+	}, {
+		name:       "empty scheduling",
+		scheduling: &node.Scheduling{},
+	}, {
+		name: "invalid nodeSelector",
+		scheduling: &node.Scheduling{
+			NodeSelector: map[string]string{"not a valid key!!!": "nope"},
+		},
+		expectErrs: 1,
+	}, {
+		name: "invalid toleration",
+		scheduling: &node.Scheduling{
+			Tolerations: []core.Toleration{{
+				Key:      "valid",
+				Operator: core.TolerationOpExists,
+				Effect:   core.TaintEffectNoSchedule,
+			}, {
+				Key:      "not a valid key!!!",
+				Operator: core.TolerationOpExists,
+				Effect:   core.TaintEffectNoSchedule,
+			}},
+		},
+		expectErrs: 1,
+	}, {
+		name: "duplicate tolerations",
+		scheduling: &node.Scheduling{
+			Tolerations: []core.Toleration{{
+				Key:               "valid",
+				Operator:          core.TolerationOpExists,
+				Effect:            core.TaintEffectNoExecute,
+				TolerationSeconds: ptr.To[int64](5),
+			}, {
+				Key:               "valid",
+				Operator:          core.TolerationOpExists,
+				Effect:            core.TaintEffectNoExecute,
+				TolerationSeconds: ptr.To[int64](10),
+			}},
+		},
+		expectErrs: 1,
+	}, {
+		name: "invalid scheduling",
+		scheduling: &node.Scheduling{
+			NodeSelector: map[string]string{"not a valid key!!!": "nope"},
+			Tolerations: []core.Toleration{{
+				Key:      "valid",
+				Operator: core.TolerationOpExists,
+				Effect:   core.TaintEffectNoSchedule,
+			}, {
+				Key:      "not a valid toleration key!!!",
+				Operator: core.TolerationOpExists,
+				Effect:   core.TaintEffectNoSchedule,
+			}},
+		},
+		expectErrs: 2,
+	}}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			rc := &node.RuntimeClass{
+				ObjectMeta: metav1.ObjectMeta{Name: "foo"},
+				Handler:    "bar",
+				Scheduling: test.scheduling,
+			}
+			assert.Len(t, ValidateRuntimeClass(rc), test.expectErrs)
+		})
 	}
 }

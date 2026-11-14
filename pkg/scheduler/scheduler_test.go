@@ -17,1015 +17,1594 @@ limitations under the License.
 package scheduler
 
 import (
+	"context"
 	"errors"
 	"fmt"
-	"io/ioutil"
-	"os"
-	"path"
-	"reflect"
+	"slices"
+	"sort"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
-	"k8s.io/api/core/v1"
-	"k8s.io/api/events/v1beta1"
-	"k8s.io/apimachinery/pkg/api/resource"
+	"github.com/google/go-cmp/cmp"
+	"github.com/onsi/gomega"
+	"github.com/stretchr/testify/require"
+
+	v1 "k8s.io/api/core/v1"
+	eventsv1 "k8s.io/api/events/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/apimachinery/pkg/util/diff"
 	"k8s.io/apimachinery/pkg/util/sets"
-	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/apiserver/pkg/util/feature"
+	clientfeatures "k8s.io/client-go/features"
+	clientfeaturestesting "k8s.io/client-go/features/testing"
 	"k8s.io/client-go/informers"
-	clientsetfake "k8s.io/client-go/kubernetes/fake"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/kubernetes/fake"
 	"k8s.io/client-go/kubernetes/scheme"
-	clientcache "k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/events"
-	volumescheduling "k8s.io/kubernetes/pkg/controller/volume/scheduling"
-	"k8s.io/kubernetes/pkg/scheduler/algorithm"
-	"k8s.io/kubernetes/pkg/scheduler/algorithm/predicates"
-	"k8s.io/kubernetes/pkg/scheduler/algorithm/priorities"
-	schedulerapi "k8s.io/kubernetes/pkg/scheduler/api"
-	kubeschedulerconfig "k8s.io/kubernetes/pkg/scheduler/apis/config"
-	"k8s.io/kubernetes/pkg/scheduler/core"
-	"k8s.io/kubernetes/pkg/scheduler/factory"
-	framework "k8s.io/kubernetes/pkg/scheduler/framework/v1alpha1"
-	internalcache "k8s.io/kubernetes/pkg/scheduler/internal/cache"
-	fakecache "k8s.io/kubernetes/pkg/scheduler/internal/cache/fake"
-	internalqueue "k8s.io/kubernetes/pkg/scheduler/internal/queue"
-	schedulernodeinfo "k8s.io/kubernetes/pkg/scheduler/nodeinfo"
-	"k8s.io/kubernetes/pkg/scheduler/volumebinder"
+	featuregatetesting "k8s.io/component-base/featuregate/testing"
+	"k8s.io/component-base/metrics/legacyregistry"
+	fifometrics "k8s.io/component-base/metrics/prometheus/clientgo/fifo"
+	"k8s.io/component-base/metrics/testutil"
+	"k8s.io/klog/v2"
+	"k8s.io/klog/v2/ktesting"
+	utiltesting "k8s.io/ktesting"
+	fwk "k8s.io/kube-scheduler/framework"
+	"k8s.io/kubernetes/pkg/features"
+	schedulerapi "k8s.io/kubernetes/pkg/scheduler/apis/config"
+	"k8s.io/kubernetes/pkg/scheduler/apis/config/testing/defaults"
+	apicache "k8s.io/kubernetes/pkg/scheduler/backend/api_cache"
+	apidispatcher "k8s.io/kubernetes/pkg/scheduler/backend/api_dispatcher"
+	internalcache "k8s.io/kubernetes/pkg/scheduler/backend/cache"
+	internalqueue "k8s.io/kubernetes/pkg/scheduler/backend/queue"
+	"k8s.io/kubernetes/pkg/scheduler/framework"
+	apicalls "k8s.io/kubernetes/pkg/scheduler/framework/api_calls"
+	"k8s.io/kubernetes/pkg/scheduler/framework/plugins"
+	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/defaultbinder"
+	plfeature "k8s.io/kubernetes/pkg/scheduler/framework/plugins/feature"
+	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/names"
+	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/queuesort"
+	"k8s.io/kubernetes/pkg/scheduler/framework/preemption"
+	frameworkruntime "k8s.io/kubernetes/pkg/scheduler/framework/runtime"
+	"k8s.io/kubernetes/pkg/scheduler/metrics"
+	"k8s.io/kubernetes/pkg/scheduler/profile"
+	st "k8s.io/kubernetes/pkg/scheduler/testing"
+	tf "k8s.io/kubernetes/pkg/scheduler/testing/framework"
+	testingclock "k8s.io/utils/clock/testing"
+	"k8s.io/utils/ptr"
 )
 
-// EmptyFramework is an empty framework used in tests.
-// Note: If the test runs in goroutine, please don't use this variable to avoid a race condition.
-var EmptyFramework, _ = framework.NewFramework(EmptyPluginRegistry, nil, EmptyPluginConfig)
-
-// EmptyPluginConfig is an empty plugin config used in tests.
-var EmptyPluginConfig = []kubeschedulerconfig.PluginConfig{}
-
-type fakeBinder struct {
-	b func(binding *v1.Binding) error
-}
-
-func (fb fakeBinder) Bind(binding *v1.Binding) error { return fb.b(binding) }
-
-type fakePodConditionUpdater struct{}
-
-func (fc fakePodConditionUpdater) Update(pod *v1.Pod, podCondition *v1.PodCondition) error {
-	return nil
-}
-
-type fakePodPreemptor struct{}
-
-func (fp fakePodPreemptor) GetUpdatedPod(pod *v1.Pod) (*v1.Pod, error) {
-	return pod, nil
-}
-
-func (fp fakePodPreemptor) DeletePod(pod *v1.Pod) error {
-	return nil
-}
-
-func (fp fakePodPreemptor) SetNominatedNodeName(pod *v1.Pod, nomNodeName string) error {
-	return nil
-}
-
-func (fp fakePodPreemptor) RemoveNominatedNodeName(pod *v1.Pod) error {
-	return nil
-}
-
-func podWithID(id, desiredHost string) *v1.Pod {
-	return &v1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:     id,
-			UID:      types.UID(id),
-			SelfLink: fmt.Sprintf("/api/v1/%s/%s", string(v1.ResourcePods), id),
-		},
-		Spec: v1.PodSpec{
-			NodeName: desiredHost,
-		},
-	}
-}
-
-func deletingPod(id string) *v1.Pod {
-	deletionTimestamp := metav1.Now()
-	return &v1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:              id,
-			UID:               types.UID(id),
-			DeletionTimestamp: &deletionTimestamp,
-			SelfLink:          fmt.Sprintf("/api/v1/%s/%s", string(v1.ResourcePods), id),
-		},
-		Spec: v1.PodSpec{
-			NodeName: "",
-		},
-	}
-}
-
-func podWithPort(id, desiredHost string, port int) *v1.Pod {
-	pod := podWithID(id, desiredHost)
-	pod.Spec.Containers = []v1.Container{
-		{Name: "ctr", Ports: []v1.ContainerPort{{HostPort: int32(port)}}},
-	}
-	return pod
-}
-
-func podWithResources(id, desiredHost string, limits v1.ResourceList, requests v1.ResourceList) *v1.Pod {
-	pod := podWithID(id, desiredHost)
-	pod.Spec.Containers = []v1.Container{
-		{Name: "ctr", Resources: v1.ResourceRequirements{Limits: limits, Requests: requests}},
-	}
-	return pod
-}
-
-func PredicateOne(pod *v1.Pod, meta predicates.PredicateMetadata, nodeInfo *schedulernodeinfo.NodeInfo) (bool, []predicates.PredicateFailureReason, error) {
-	return true, nil, nil
-}
-
-func PriorityOne(pod *v1.Pod, nodeNameToInfo map[string]*schedulernodeinfo.NodeInfo, nodes []*v1.Node) (schedulerapi.HostPriorityList, error) {
-	return []schedulerapi.HostPriority{}, nil
-}
-
-type mockScheduler struct {
-	result core.ScheduleResult
-	err    error
-}
-
-func (es mockScheduler) Schedule(pod *v1.Pod, ml algorithm.NodeLister, pc *framework.PluginContext) (core.ScheduleResult, error) {
-	return es.result, es.err
-}
-
-func (es mockScheduler) Predicates() map[string]predicates.FitPredicate {
-	return nil
-}
-func (es mockScheduler) Prioritizers() []priorities.PriorityConfig {
-	return nil
-}
-
-func (es mockScheduler) Preempt(pod *v1.Pod, nodeLister algorithm.NodeLister, scheduleErr error) (*v1.Node, []*v1.Pod, []*v1.Pod, error) {
-	return nil, nil, nil, nil
+func init() {
+	metrics.Register()
 }
 
 func TestSchedulerCreation(t *testing.T) {
-	client := clientsetfake.NewSimpleClientset()
-	informerFactory := informers.NewSharedInformerFactory(client, 0)
-
-	testSource := "testProvider"
-	eventBroadcaster := events.NewBroadcaster(&events.EventSinkImpl{Interface: client.EventsV1beta1().Events("")})
-
-	defaultBindTimeout := int64(30)
-	factory.RegisterFitPredicate("PredicateOne", PredicateOne)
-	factory.RegisterPriorityFunction("PriorityOne", PriorityOne, 1)
-	factory.RegisterAlgorithmProvider(testSource, sets.NewString("PredicateOne"), sets.NewString("PriorityOne"))
-
-	stopCh := make(chan struct{})
-	defer close(stopCh)
-	_, err := New(client,
-		informerFactory.Core().V1().Nodes(),
-		factory.NewPodInformer(client, 0),
-		informerFactory.Core().V1().PersistentVolumes(),
-		informerFactory.Core().V1().PersistentVolumeClaims(),
-		informerFactory.Core().V1().ReplicationControllers(),
-		informerFactory.Apps().V1().ReplicaSets(),
-		informerFactory.Apps().V1().StatefulSets(),
-		informerFactory.Core().V1().Services(),
-		informerFactory.Policy().V1beta1().PodDisruptionBudgets(),
-		informerFactory.Storage().V1().StorageClasses(),
-		informerFactory.Storage().V1beta1().CSINodes(),
-		eventBroadcaster.NewRecorder(scheme.Scheme, "scheduler"),
-		kubeschedulerconfig.SchedulerAlgorithmSource{Provider: &testSource},
-		stopCh,
-		EmptyPluginRegistry,
-		nil,
-		EmptyPluginConfig,
-		WithBindTimeoutSeconds(defaultBindTimeout))
-
-	if err != nil {
-		t.Fatalf("Failed to create scheduler: %v", err)
+	invalidRegistry := map[string]frameworkruntime.PluginFactory{
+		defaultbinder.Name: defaultbinder.New,
 	}
-}
-
-func TestScheduler(t *testing.T) {
-	testNode := v1.Node{ObjectMeta: metav1.ObjectMeta{Name: "machine1", UID: types.UID("machine1")}}
-	client := clientsetfake.NewSimpleClientset(&testNode)
-	eventBroadcaster := events.NewBroadcaster(&events.EventSinkImpl{Interface: client.EventsV1beta1().Events("")})
-	errS := errors.New("scheduler")
-	errB := errors.New("binder")
-
-	table := []struct {
-		name             string
-		injectBindError  error
-		sendPod          *v1.Pod
-		algo             core.ScheduleAlgorithm
-		expectErrorPod   *v1.Pod
-		expectForgetPod  *v1.Pod
-		expectAssumedPod *v1.Pod
-		expectError      error
-		expectBind       *v1.Binding
-		eventReason      string
+	validRegistry := map[string]frameworkruntime.PluginFactory{
+		"Foo": defaultbinder.New,
+	}
+	cases := []struct {
+		name                            string
+		isSchedulerAsyncAPICallsEnabled bool
+		opts                            []Option
+		wantErr                         string
+		wantProfiles                    []string
+		wantExtenders                   []string
+		wantNodeInfoSnapshot            *internalcache.Snapshot
+		wantAPIDispatcher               bool
 	}{
 		{
-			name:             "bind assumed pod scheduled",
-			sendPod:          podWithID("foo", ""),
-			algo:             mockScheduler{core.ScheduleResult{SuggestedHost: testNode.Name, EvaluatedNodes: 1, FeasibleNodes: 1}, nil},
-			expectBind:       &v1.Binding{ObjectMeta: metav1.ObjectMeta{Name: "foo", UID: types.UID("foo")}, Target: v1.ObjectReference{Kind: "Node", Name: testNode.Name}},
-			expectAssumedPod: podWithID("foo", testNode.Name),
-			eventReason:      "Scheduled",
+			name: "valid out-of-tree registry",
+			opts: []Option{
+				WithFrameworkOutOfTreeRegistry(validRegistry),
+				WithProfiles(
+					schedulerapi.KubeSchedulerProfile{
+						SchedulerName: "default-scheduler",
+						Plugins: &schedulerapi.Plugins{
+							QueueSort: schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: "PrioritySort"}}},
+							Bind:      schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: "DefaultBinder"}}},
+						},
+					},
+				)},
+			wantProfiles: []string{"default-scheduler"},
 		},
 		{
-			name:           "error pod failed scheduling",
-			sendPod:        podWithID("foo", ""),
-			algo:           mockScheduler{core.ScheduleResult{SuggestedHost: testNode.Name, EvaluatedNodes: 1, FeasibleNodes: 1}, errS},
-			expectError:    errS,
-			expectErrorPod: podWithID("foo", ""),
-			eventReason:    "FailedScheduling",
+			name: "repeated plugin name in out-of-tree plugin",
+			opts: []Option{
+				WithFrameworkOutOfTreeRegistry(invalidRegistry),
+				WithProfiles(
+					schedulerapi.KubeSchedulerProfile{
+						SchedulerName: "default-scheduler",
+						Plugins: &schedulerapi.Plugins{
+							QueueSort: schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: "PrioritySort"}}},
+							Bind:      schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: "DefaultBinder"}}},
+						},
+					},
+				)},
+			wantProfiles: []string{"default-scheduler"},
+			wantErr:      "a plugin named DefaultBinder already exists",
 		},
 		{
-			name:             "error bind forget pod failed scheduling",
-			sendPod:          podWithID("foo", ""),
-			algo:             mockScheduler{core.ScheduleResult{SuggestedHost: testNode.Name, EvaluatedNodes: 1, FeasibleNodes: 1}, nil},
-			expectBind:       &v1.Binding{ObjectMeta: metav1.ObjectMeta{Name: "foo", UID: types.UID("foo")}, Target: v1.ObjectReference{Kind: "Node", Name: testNode.Name}},
-			expectAssumedPod: podWithID("foo", testNode.Name),
-			injectBindError:  errB,
-			expectError:      errB,
-			expectErrorPod:   podWithID("foo", testNode.Name),
-			expectForgetPod:  podWithID("foo", testNode.Name),
-			eventReason:      "FailedScheduling",
-		}, {
-			sendPod:     deletingPod("foo"),
-			algo:        mockScheduler{core.ScheduleResult{}, nil},
-			eventReason: "FailedScheduling",
-		},
-	}
-
-	stop := make(chan struct{})
-	defer close(stop)
-	informerFactory := informers.NewSharedInformerFactory(client, 0)
-
-	informerFactory.Start(stop)
-	informerFactory.WaitForCacheSync(stop)
-
-	for _, item := range table {
-		t.Run(item.name, func(t *testing.T) {
-			var gotError error
-			var gotPod *v1.Pod
-			var gotForgetPod *v1.Pod
-			var gotAssumedPod *v1.Pod
-			var gotBinding *v1.Binding
-			sCache := &fakecache.Cache{
-				ForgetFunc: func(pod *v1.Pod) {
-					gotForgetPod = pod
-				},
-				AssumeFunc: func(pod *v1.Pod) {
-					gotAssumedPod = pod
-				},
-			}
-
-			s := NewFromConfig(&factory.Config{
-				SchedulerCache: sCache,
-				NodeLister:     sCache,
-				Algorithm:      item.algo,
-				GetBinder: func(pod *v1.Pod) factory.Binder {
-					return fakeBinder{func(b *v1.Binding) error {
-						gotBinding = b
-						return item.injectBindError
-					}}
-				},
-				PodConditionUpdater: fakePodConditionUpdater{},
-				Error: func(p *v1.Pod, err error) {
-					gotPod = p
-					gotError = err
-				},
-				NextPod: func() *v1.Pod {
-					return item.sendPod
-				},
-				Framework:    EmptyFramework,
-				Recorder:     eventBroadcaster.NewRecorder(scheme.Scheme, "scheduler"),
-				VolumeBinder: volumebinder.NewFakeVolumeBinder(&volumescheduling.FakeVolumeBinderConfig{AllBound: true}),
-			})
-			called := make(chan struct{})
-			stopFunc := eventBroadcaster.StartEventWatcher(func(obj runtime.Object) {
-				e, _ := obj.(*v1beta1.Event)
-				if e, a := item.eventReason, e.Reason; e != a {
-					t.Errorf("expected %v, got %v", e, a)
-				}
-				close(called)
-			})
-			s.scheduleOne()
-			<-called
-			if e, a := item.expectAssumedPod, gotAssumedPod; !reflect.DeepEqual(e, a) {
-				t.Errorf("assumed pod: wanted %v, got %v", e, a)
-			}
-			if e, a := item.expectErrorPod, gotPod; !reflect.DeepEqual(e, a) {
-				t.Errorf("error pod: wanted %v, got %v", e, a)
-			}
-			if e, a := item.expectForgetPod, gotForgetPod; !reflect.DeepEqual(e, a) {
-				t.Errorf("forget pod: wanted %v, got %v", e, a)
-			}
-			if e, a := item.expectError, gotError; !reflect.DeepEqual(e, a) {
-				t.Errorf("error: wanted %v, got %v", e, a)
-			}
-			if e, a := item.expectBind, gotBinding; !reflect.DeepEqual(e, a) {
-				t.Errorf("error: %s", diff.ObjectDiff(e, a))
-			}
-			stopFunc()
-		})
-	}
-}
-
-func TestSchedulerNoPhantomPodAfterExpire(t *testing.T) {
-	stop := make(chan struct{})
-	defer close(stop)
-	queuedPodStore := clientcache.NewFIFO(clientcache.MetaNamespaceKeyFunc)
-	scache := internalcache.New(100*time.Millisecond, stop)
-	pod := podWithPort("pod.Name", "", 8080)
-	node := v1.Node{ObjectMeta: metav1.ObjectMeta{Name: "machine1", UID: types.UID("machine1")}}
-	scache.AddNode(&node)
-	client := clientsetfake.NewSimpleClientset(&node)
-	informerFactory := informers.NewSharedInformerFactory(client, 0)
-	predicateMap := map[string]predicates.FitPredicate{"PodFitsHostPorts": predicates.PodFitsHostPorts}
-	scheduler, bindingChan, _ := setupTestSchedulerWithOnePodOnNode(t, queuedPodStore, scache, informerFactory, stop, predicateMap, pod, &node)
-
-	waitPodExpireChan := make(chan struct{})
-	timeout := make(chan struct{})
-	go func() {
-		for {
-			select {
-			case <-timeout:
-				return
-			default:
-			}
-			pods, err := scache.List(labels.Everything())
-			if err != nil {
-				t.Fatalf("cache.List failed: %v", err)
-			}
-			if len(pods) == 0 {
-				close(waitPodExpireChan)
-				return
-			}
-			time.Sleep(100 * time.Millisecond)
-		}
-	}()
-	// waiting for the assumed pod to expire
-	select {
-	case <-waitPodExpireChan:
-	case <-time.After(wait.ForeverTestTimeout):
-		close(timeout)
-		t.Fatalf("timeout timeout in waiting pod expire after %v", wait.ForeverTestTimeout)
-	}
-
-	// We use conflicted pod ports to incur fit predicate failure if first pod not removed.
-	secondPod := podWithPort("bar", "", 8080)
-	queuedPodStore.Add(secondPod)
-	scheduler.scheduleOne()
-	select {
-	case b := <-bindingChan:
-		expectBinding := &v1.Binding{
-			ObjectMeta: metav1.ObjectMeta{Name: "bar", UID: types.UID("bar")},
-			Target:     v1.ObjectReference{Kind: "Node", Name: node.Name},
-		}
-		if !reflect.DeepEqual(expectBinding, b) {
-			t.Errorf("binding want=%v, get=%v", expectBinding, b)
-		}
-	case <-time.After(wait.ForeverTestTimeout):
-		t.Fatalf("timeout in binding after %v", wait.ForeverTestTimeout)
-	}
-}
-
-func TestSchedulerNoPhantomPodAfterDelete(t *testing.T) {
-	stop := make(chan struct{})
-	defer close(stop)
-	queuedPodStore := clientcache.NewFIFO(clientcache.MetaNamespaceKeyFunc)
-	scache := internalcache.New(10*time.Minute, stop)
-	firstPod := podWithPort("pod.Name", "", 8080)
-	node := v1.Node{ObjectMeta: metav1.ObjectMeta{Name: "machine1", UID: types.UID("machine1")}}
-	scache.AddNode(&node)
-	client := clientsetfake.NewSimpleClientset(&node)
-	informerFactory := informers.NewSharedInformerFactory(client, 0)
-	predicateMap := map[string]predicates.FitPredicate{"PodFitsHostPorts": predicates.PodFitsHostPorts}
-	scheduler, bindingChan, errChan := setupTestSchedulerWithOnePodOnNode(t, queuedPodStore, scache, informerFactory, stop, predicateMap, firstPod, &node)
-
-	// We use conflicted pod ports to incur fit predicate failure.
-	secondPod := podWithPort("bar", "", 8080)
-	queuedPodStore.Add(secondPod)
-	// queuedPodStore: [bar:8080]
-	// cache: [(assumed)foo:8080]
-
-	scheduler.scheduleOne()
-	select {
-	case err := <-errChan:
-		expectErr := &core.FitError{
-			Pod:              secondPod,
-			NumAllNodes:      1,
-			FailedPredicates: core.FailedPredicateMap{node.Name: []predicates.PredicateFailureReason{predicates.ErrPodNotFitsHostPorts}},
-		}
-		if !reflect.DeepEqual(expectErr, err) {
-			t.Errorf("err want=%v, get=%v", expectErr, err)
-		}
-	case <-time.After(wait.ForeverTestTimeout):
-		t.Fatalf("timeout in fitting after %v", wait.ForeverTestTimeout)
-	}
-
-	// We mimic the workflow of cache behavior when a pod is removed by user.
-	// Note: if the schedulernodeinfo timeout would be super short, the first pod would expire
-	// and would be removed itself (without any explicit actions on schedulernodeinfo). Even in that case,
-	// explicitly AddPod will as well correct the behavior.
-	firstPod.Spec.NodeName = node.Name
-	if err := scache.AddPod(firstPod); err != nil {
-		t.Fatalf("err: %v", err)
-	}
-	if err := scache.RemovePod(firstPod); err != nil {
-		t.Fatalf("err: %v", err)
-	}
-
-	queuedPodStore.Add(secondPod)
-	scheduler.scheduleOne()
-	select {
-	case b := <-bindingChan:
-		expectBinding := &v1.Binding{
-			ObjectMeta: metav1.ObjectMeta{Name: "bar", UID: types.UID("bar")},
-			Target:     v1.ObjectReference{Kind: "Node", Name: node.Name},
-		}
-		if !reflect.DeepEqual(expectBinding, b) {
-			t.Errorf("binding want=%v, get=%v", expectBinding, b)
-		}
-	case <-time.After(wait.ForeverTestTimeout):
-		t.Fatalf("timeout in binding after %v", wait.ForeverTestTimeout)
-	}
-}
-
-// Scheduler should preserve predicate constraint even if binding was longer
-// than cache ttl
-func TestSchedulerErrorWithLongBinding(t *testing.T) {
-	stop := make(chan struct{})
-	defer close(stop)
-
-	firstPod := podWithPort("foo", "", 8080)
-	conflictPod := podWithPort("bar", "", 8080)
-	pods := map[string]*v1.Pod{firstPod.Name: firstPod, conflictPod.Name: conflictPod}
-	for _, test := range []struct {
-		name            string
-		Expected        map[string]bool
-		CacheTTL        time.Duration
-		BindingDuration time.Duration
-	}{
-		{
-			name:            "long cache ttl",
-			Expected:        map[string]bool{firstPod.Name: true},
-			CacheTTL:        100 * time.Millisecond,
-			BindingDuration: 300 * time.Millisecond,
+			name: "multiple profiles",
+			opts: []Option{
+				WithProfiles(
+					schedulerapi.KubeSchedulerProfile{
+						SchedulerName: "foo",
+						Plugins: &schedulerapi.Plugins{
+							QueueSort: schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: "PrioritySort"}}},
+							Bind:      schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: "DefaultBinder"}}},
+						},
+					},
+					schedulerapi.KubeSchedulerProfile{
+						SchedulerName: "bar",
+						Plugins: &schedulerapi.Plugins{
+							QueueSort: schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: "PrioritySort"}}},
+							Bind:      schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: "DefaultBinder"}}},
+						},
+					},
+				)},
+			wantProfiles: []string{"bar", "foo"},
 		},
 		{
-			name:            "short cache ttl",
-			Expected:        map[string]bool{firstPod.Name: true},
-			CacheTTL:        10 * time.Second,
-			BindingDuration: 300 * time.Millisecond,
+			name: "Repeated profiles",
+			opts: []Option{
+				WithProfiles(
+					schedulerapi.KubeSchedulerProfile{
+						SchedulerName: "foo",
+						Plugins: &schedulerapi.Plugins{
+							QueueSort: schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: "PrioritySort"}}},
+							Bind:      schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: "DefaultBinder"}}},
+						},
+					},
+					schedulerapi.KubeSchedulerProfile{
+						SchedulerName: "bar",
+						Plugins: &schedulerapi.Plugins{
+							QueueSort: schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: "PrioritySort"}}},
+							Bind:      schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: "DefaultBinder"}}},
+						},
+					},
+					schedulerapi.KubeSchedulerProfile{
+						SchedulerName: "foo",
+						Plugins: &schedulerapi.Plugins{
+							QueueSort: schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: "PrioritySort"}}},
+							Bind:      schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: "DefaultBinder"}}},
+						},
+					},
+				)},
+			wantErr: "duplicate profile with scheduler name \"foo\"",
 		},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			queuedPodStore := clientcache.NewFIFO(clientcache.MetaNamespaceKeyFunc)
-			scache := internalcache.New(test.CacheTTL, stop)
+		{
+			name: "With extenders",
+			opts: []Option{
+				WithProfiles(
+					schedulerapi.KubeSchedulerProfile{
+						SchedulerName: "default-scheduler",
+						Plugins: &schedulerapi.Plugins{
+							QueueSort: schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: "PrioritySort"}}},
+							Bind:      schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: "DefaultBinder"}}},
+						},
+					},
+				),
+				WithExtenders(
+					schedulerapi.Extender{
+						URLPrefix: "http://extender.kube-system/",
+					},
+				),
+			},
+			wantProfiles:  []string{"default-scheduler"},
+			wantExtenders: []string{"http://extender.kube-system/"},
+		},
+		{
+			name:                            "With SchedulerAsyncAPICalls enabled",
+			isSchedulerAsyncAPICallsEnabled: true,
+			opts: []Option{
+				WithProfiles(
+					schedulerapi.KubeSchedulerProfile{
+						SchedulerName: "default-scheduler",
+						Plugins: &schedulerapi.Plugins{
+							QueueSort: schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: "PrioritySort"}}},
+							Bind:      schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: "DefaultBinder"}}},
+						},
+					},
+				),
+			},
+			wantProfiles:      []string{"default-scheduler"},
+			wantAPIDispatcher: true,
+		},
+	}
 
-			node := v1.Node{ObjectMeta: metav1.ObjectMeta{Name: "machine1", UID: types.UID("machine1")}}
-			scache.AddNode(&node)
-
-			client := clientsetfake.NewSimpleClientset(&node)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			featuregatetesting.SetFeatureGateDuringTest(t, feature.DefaultFeatureGate, features.SchedulerAsyncAPICalls, tc.isSchedulerAsyncAPICallsEnabled)
+			client := fake.NewClientset()
 			informerFactory := informers.NewSharedInformerFactory(client, 0)
-			predicateMap := map[string]predicates.FitPredicate{"PodFitsHostPorts": predicates.PodFitsHostPorts}
 
-			scheduler, bindingChan := setupTestSchedulerLongBindingWithRetry(
-				queuedPodStore, scache, informerFactory, predicateMap, stop, test.BindingDuration)
+			eventBroadcaster := events.NewBroadcaster(&events.EventSinkImpl{Interface: client.EventsV1()})
 
-			informerFactory.Start(stop)
-			informerFactory.WaitForCacheSync(stop)
+			_, ctx := ktesting.NewTestContext(t)
+			ctx, cancel := context.WithCancel(ctx)
+			defer cancel()
+			s, err := New(
+				ctx,
+				client,
+				informerFactory,
+				nil,
+				profile.NewRecorderFactory(eventBroadcaster),
+				tc.opts...,
+			)
 
-			scheduler.Run()
-			queuedPodStore.Add(firstPod)
-			queuedPodStore.Add(conflictPod)
-
-			resultBindings := map[string]bool{}
-			waitChan := time.After(5 * time.Second)
-			for finished := false; !finished; {
-				select {
-				case b := <-bindingChan:
-					resultBindings[b.Name] = true
-					p := pods[b.Name]
-					p.Spec.NodeName = b.Target.Name
-					scache.AddPod(p)
-				case <-waitChan:
-					finished = true
+			// Errors
+			if len(tc.wantErr) != 0 {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Errorf("got error %q, want %q", err, tc.wantErr)
 				}
+				return
 			}
-			if !reflect.DeepEqual(resultBindings, test.Expected) {
-				t.Errorf("Result binding are not equal to expected. %v != %v", resultBindings, test.Expected)
+			if err != nil {
+				t.Fatalf("Failed to create scheduler: %v", err)
+			}
+
+			if gotAPIDispatcher := s.APIDispatcher != nil; tc.wantAPIDispatcher != gotAPIDispatcher {
+				t.Errorf("Unexpected APIDispatcher state, want: %v, got: %v", tc.wantAPIDispatcher, gotAPIDispatcher)
+			}
+
+			// Profiles
+			profiles := make([]string, 0, len(s.Profiles))
+			for name := range s.Profiles {
+				profiles = append(profiles, name)
+			}
+			sort.Strings(profiles)
+			if diff := cmp.Diff(tc.wantProfiles, profiles); diff != "" {
+				t.Errorf("unexpected profiles (-want, +got):\n%s", diff)
+			}
+
+			// Extenders
+			if len(tc.wantExtenders) != 0 {
+				for _, p := range s.Profiles {
+					extenders := make([]string, 0, len(p.Extenders()))
+					for _, e := range p.Extenders() {
+						extenders = append(extenders, e.Name())
+					}
+					if diff := cmp.Diff(tc.wantExtenders, extenders); diff != "" {
+						t.Errorf("unexpected extenders (-want, +got):\n%s", diff)
+					}
+				}
 			}
 		})
 	}
 }
 
-// queuedPodStore: pods queued before processing.
-// cache: scheduler cache that might contain assumed pods.
-func setupTestSchedulerWithOnePodOnNode(t *testing.T, queuedPodStore *clientcache.FIFO, scache internalcache.Cache,
-	informerFactory informers.SharedInformerFactory, stop chan struct{}, predicateMap map[string]predicates.FitPredicate, pod *v1.Pod, node *v1.Node) (*Scheduler, chan *v1.Binding, chan error) {
-
-	scheduler, bindingChan, errChan := setupTestScheduler(queuedPodStore, scache, informerFactory, predicateMap, nil)
-
-	informerFactory.Start(stop)
-	informerFactory.WaitForCacheSync(stop)
-
-	queuedPodStore.Add(pod)
-	// queuedPodStore: [foo:8080]
-	// cache: []
-
-	scheduler.scheduleOne()
-	// queuedPodStore: []
-	// cache: [(assumed)foo:8080]
-
-	select {
-	case b := <-bindingChan:
-		expectBinding := &v1.Binding{
-			ObjectMeta: metav1.ObjectMeta{Name: pod.Name, UID: types.UID(pod.Name)},
-			Target:     v1.ObjectReference{Kind: "Node", Name: node.Name},
-		}
-		if !reflect.DeepEqual(expectBinding, b) {
-			t.Errorf("binding want=%v, get=%v", expectBinding, b)
-		}
-	case <-time.After(wait.ForeverTestTimeout):
-		t.Fatalf("timeout after %v", wait.ForeverTestTimeout)
+func TestWithFrameworkOutOfTreeRegistryCloned(t *testing.T) {
+	registry := frameworkruntime.Registry{
+		"Foo": defaultbinder.New,
 	}
-	return scheduler, bindingChan, errChan
-}
+	opt := WithFrameworkOutOfTreeRegistry(registry)
+	registry["Bar"] = defaultbinder.New
+	delete(registry, "Foo")
 
-func TestSchedulerFailedSchedulingReasons(t *testing.T) {
-	stop := make(chan struct{})
-	defer close(stop)
-	queuedPodStore := clientcache.NewFIFO(clientcache.MetaNamespaceKeyFunc)
-	scache := internalcache.New(10*time.Minute, stop)
+	opts := &schedulerOptions{}
+	opt(opts)
 
-	// Design the baseline for the pods, and we will make nodes that dont fit it later.
-	var cpu = int64(4)
-	var mem = int64(500)
-	podWithTooBigResourceRequests := podWithResources("bar", "", v1.ResourceList{
-		v1.ResourceCPU:    *(resource.NewQuantity(cpu, resource.DecimalSI)),
-		v1.ResourceMemory: *(resource.NewQuantity(mem, resource.DecimalSI)),
-	}, v1.ResourceList{
-		v1.ResourceCPU:    *(resource.NewQuantity(cpu, resource.DecimalSI)),
-		v1.ResourceMemory: *(resource.NewQuantity(mem, resource.DecimalSI)),
-	})
-
-	// create several nodes which cannot schedule the above pod
-	var nodes []*v1.Node
-	var objects []runtime.Object
-	for i := 0; i < 100; i++ {
-		uid := fmt.Sprintf("machine%v", i)
-		node := v1.Node{
-			ObjectMeta: metav1.ObjectMeta{Name: uid, UID: types.UID(uid)},
-			Status: v1.NodeStatus{
-				Capacity: v1.ResourceList{
-					v1.ResourceCPU:    *(resource.NewQuantity(cpu/2, resource.DecimalSI)),
-					v1.ResourceMemory: *(resource.NewQuantity(mem/5, resource.DecimalSI)),
-					v1.ResourcePods:   *(resource.NewQuantity(10, resource.DecimalSI)),
-				},
-				Allocatable: v1.ResourceList{
-					v1.ResourceCPU:    *(resource.NewQuantity(cpu/2, resource.DecimalSI)),
-					v1.ResourceMemory: *(resource.NewQuantity(mem/5, resource.DecimalSI)),
-					v1.ResourcePods:   *(resource.NewQuantity(10, resource.DecimalSI)),
-				}},
-		}
-		scache.AddNode(&node)
-		nodes = append(nodes, &node)
-		objects = append(objects, &node)
-	}
-	client := clientsetfake.NewSimpleClientset(objects...)
-	informerFactory := informers.NewSharedInformerFactory(client, 0)
-	predicateMap := map[string]predicates.FitPredicate{
-		"PodFitsResources": predicates.PodFitsResources,
-	}
-
-	// Create expected failure reasons for all the nodes.  Hopefully they will get rolled up into a non-spammy summary.
-	failedPredicatesMap := core.FailedPredicateMap{}
-	for _, node := range nodes {
-		failedPredicatesMap[node.Name] = []predicates.PredicateFailureReason{
-			predicates.NewInsufficientResourceError(v1.ResourceCPU, 4000, 0, 2000),
-			predicates.NewInsufficientResourceError(v1.ResourceMemory, 500, 0, 100),
-		}
-	}
-	scheduler, _, errChan := setupTestScheduler(queuedPodStore, scache, informerFactory, predicateMap, nil)
-
-	informerFactory.Start(stop)
-	informerFactory.WaitForCacheSync(stop)
-
-	queuedPodStore.Add(podWithTooBigResourceRequests)
-	scheduler.scheduleOne()
-	select {
-	case err := <-errChan:
-		expectErr := &core.FitError{
-			Pod:              podWithTooBigResourceRequests,
-			NumAllNodes:      len(nodes),
-			FailedPredicates: failedPredicatesMap,
-		}
-		if len(fmt.Sprint(expectErr)) > 150 {
-			t.Errorf("message is too spammy ! %v ", len(fmt.Sprint(expectErr)))
-		}
-		if !reflect.DeepEqual(expectErr, err) {
-			t.Errorf("\n err \nWANT=%+v,\nGOT=%+v", expectErr, err)
-		}
-	case <-time.After(wait.ForeverTestTimeout):
-		t.Fatalf("timeout after %v", wait.ForeverTestTimeout)
+	if diff := cmp.Diff(sets.New("Foo"), sets.KeySet(opts.frameworkOutOfTreeRegistry)); diff != "" {
+		t.Errorf("unexpected out-of-tree registry plugins (-want, +got):\n%s", diff)
 	}
 }
 
-// queuedPodStore: pods queued before processing.
-// scache: scheduler cache that might contain assumed pods.
-func setupTestScheduler(queuedPodStore *clientcache.FIFO, scache internalcache.Cache, informerFactory informers.SharedInformerFactory, predicateMap map[string]predicates.FitPredicate, recorder events.EventRecorder) (*Scheduler, chan *v1.Binding, chan error) {
-	algo := core.NewGenericScheduler(
-		scache,
-		internalqueue.NewSchedulingQueue(nil, nil),
-		predicateMap,
-		predicates.EmptyPredicateMetadataProducer,
-		[]priorities.PriorityConfig{},
-		priorities.EmptyPriorityMetadataProducer,
-		EmptyFramework,
-		[]algorithm.SchedulerExtender{},
-		nil,
-		informerFactory.Core().V1().PersistentVolumeClaims().Lister(),
-		informerFactory.Policy().V1beta1().PodDisruptionBudgets().Lister(),
-		false,
-		false,
-		schedulerapi.DefaultPercentageOfNodesToScore,
-		false,
-	)
-	bindingChan := make(chan *v1.Binding, 1)
-	errChan := make(chan error, 1)
+func TestFailureHandler(t *testing.T) {
+	metrics.Register()
+	testPod := st.MakePod().Name("test-pod").Namespace(v1.NamespaceDefault).Obj()
+	testPodUpdated := testPod.DeepCopy()
+	testPodUpdated.Labels = map[string]string{"foo": ""}
 
-	config := &factory.Config{
-		SchedulerCache: scache,
-		NodeLister:     scache,
-		Algorithm:      algo,
-		GetBinder: func(pod *v1.Pod) factory.Binder {
-			return fakeBinder{func(b *v1.Binding) error {
-				bindingChan <- b
-				return nil
-			}}
-		},
-		NextPod: func() *v1.Pod {
-			return clientcache.Pop(queuedPodStore).(*v1.Pod)
-		},
-		Error: func(p *v1.Pod, err error) {
-			errChan <- err
-		},
-		Recorder:            &events.FakeRecorder{},
-		PodConditionUpdater: fakePodConditionUpdater{},
-		PodPreemptor:        fakePodPreemptor{},
-		Framework:           EmptyFramework,
-		VolumeBinder:        volumebinder.NewFakeVolumeBinder(&volumescheduling.FakeVolumeBinderConfig{AllBound: true}),
-	}
-
-	if recorder != nil {
-		config.Recorder = recorder
-	}
-
-	sched := NewFromConfig(config)
-
-	return sched, bindingChan, errChan
-}
-
-func setupTestSchedulerLongBindingWithRetry(queuedPodStore *clientcache.FIFO, scache internalcache.Cache, informerFactory informers.SharedInformerFactory, predicateMap map[string]predicates.FitPredicate, stop chan struct{}, bindingTime time.Duration) (*Scheduler, chan *v1.Binding) {
-	framework, _ := framework.NewFramework(EmptyPluginRegistry, nil, []kubeschedulerconfig.PluginConfig{})
-	algo := core.NewGenericScheduler(
-		scache,
-		internalqueue.NewSchedulingQueue(nil, nil),
-		predicateMap,
-		predicates.EmptyPredicateMetadataProducer,
-		[]priorities.PriorityConfig{},
-		priorities.EmptyPriorityMetadataProducer,
-		framework,
-		[]algorithm.SchedulerExtender{},
-		nil,
-		informerFactory.Core().V1().PersistentVolumeClaims().Lister(),
-		informerFactory.Policy().V1beta1().PodDisruptionBudgets().Lister(),
-		false,
-		false,
-		schedulerapi.DefaultPercentageOfNodesToScore,
-		false,
-	)
-	bindingChan := make(chan *v1.Binding, 2)
-
-	sched := NewFromConfig(&factory.Config{
-		SchedulerCache: scache,
-		NodeLister:     scache,
-		Algorithm:      algo,
-		GetBinder: func(pod *v1.Pod) factory.Binder {
-			return fakeBinder{func(b *v1.Binding) error {
-				time.Sleep(bindingTime)
-				bindingChan <- b
-				return nil
-			}}
-		},
-		WaitForCacheSync: func() bool {
-			return true
-		},
-		NextPod: func() *v1.Pod {
-			return clientcache.Pop(queuedPodStore).(*v1.Pod)
-		},
-		Error: func(p *v1.Pod, err error) {
-			queuedPodStore.AddIfNotPresent(p)
-		},
-		Recorder:            &events.FakeRecorder{},
-		PodConditionUpdater: fakePodConditionUpdater{},
-		PodPreemptor:        fakePodPreemptor{},
-		StopEverything:      stop,
-		Framework:           framework,
-		VolumeBinder:        volumebinder.NewFakeVolumeBinder(&volumescheduling.FakeVolumeBinderConfig{AllBound: true}),
-	})
-
-	return sched, bindingChan
-}
-
-func setupTestSchedulerWithVolumeBinding(fakeVolumeBinder *volumebinder.VolumeBinder, stop <-chan struct{}, broadcaster events.EventBroadcaster) (*Scheduler, chan *v1.Binding, chan error) {
-	testNode := v1.Node{ObjectMeta: metav1.ObjectMeta{Name: "machine1", UID: types.UID("machine1")}}
-	queuedPodStore := clientcache.NewFIFO(clientcache.MetaNamespaceKeyFunc)
-	pod := podWithID("foo", "")
-	pod.Namespace = "foo-ns"
-	pod.Spec.Volumes = append(pod.Spec.Volumes, v1.Volume{Name: "testVol",
-		VolumeSource: v1.VolumeSource{PersistentVolumeClaim: &v1.PersistentVolumeClaimVolumeSource{ClaimName: "testPVC"}}})
-	queuedPodStore.Add(pod)
-	scache := internalcache.New(10*time.Minute, stop)
-	scache.AddNode(&testNode)
-	testPVC := v1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: "testPVC", Namespace: pod.Namespace, UID: types.UID("testPVC")}}
-	client := clientsetfake.NewSimpleClientset(&testNode, &testPVC)
-	informerFactory := informers.NewSharedInformerFactory(client, 0)
-
-	predicateMap := map[string]predicates.FitPredicate{
-		predicates.CheckVolumeBindingPred: predicates.NewVolumeBindingPredicate(fakeVolumeBinder),
-	}
-
-	recorder := broadcaster.NewRecorder(scheme.Scheme, "scheduler")
-	s, bindingChan, errChan := setupTestScheduler(queuedPodStore, scache, informerFactory, predicateMap, recorder)
-	informerFactory.Start(stop)
-	informerFactory.WaitForCacheSync(stop)
-	s.config.VolumeBinder = fakeVolumeBinder
-	return s, bindingChan, errChan
-}
-
-// This is a workaround because golint complains that errors cannot
-// end with punctuation.  However, the real predicate error message does
-// end with a period.
-func makePredicateError(failReason string) error {
-	s := fmt.Sprintf("0/1 nodes are available: %v.", failReason)
-	return fmt.Errorf(s)
-}
-
-func TestSchedulerWithVolumeBinding(t *testing.T) {
-	findErr := fmt.Errorf("find err")
-	assumeErr := fmt.Errorf("assume err")
-	bindErr := fmt.Errorf("bind err")
-	client := clientsetfake.NewSimpleClientset()
-
-	eventBroadcaster := events.NewBroadcaster(&events.EventSinkImpl{Interface: client.EventsV1beta1().Events("")})
-
-	// This can be small because we wait for pod to finish scheduling first
-	chanTimeout := 2 * time.Second
-
-	table := []struct {
-		name               string
-		expectError        error
-		expectPodBind      *v1.Binding
-		expectAssumeCalled bool
-		expectBindCalled   bool
-		eventReason        string
-		volumeBinderConfig *volumescheduling.FakeVolumeBinderConfig
+	tests := []struct {
+		name                       string
+		podUpdatedDuringScheduling bool // pod is updated during a scheduling cycle
+		podDeletedDuringScheduling bool // pod is deleted during a scheduling cycle
+		expect                     *v1.Pod
 	}{
 		{
-			name: "all bound",
-			volumeBinderConfig: &volumescheduling.FakeVolumeBinderConfig{
-				AllBound:             true,
-				FindUnboundSatsified: true,
-				FindBoundSatsified:   true,
-			},
-			expectAssumeCalled: true,
-			expectPodBind:      &v1.Binding{ObjectMeta: metav1.ObjectMeta{Name: "foo", Namespace: "foo-ns", UID: types.UID("foo")}, Target: v1.ObjectReference{Kind: "Node", Name: "machine1"}},
-			eventReason:        "Scheduled",
+			name:                       "pod is updated during a scheduling cycle",
+			podUpdatedDuringScheduling: true,
+			expect:                     testPodUpdated,
 		},
 		{
-			name: "bound/invalid pv affinity",
-			volumeBinderConfig: &volumescheduling.FakeVolumeBinderConfig{
-				AllBound:             true,
-				FindUnboundSatsified: true,
-				FindBoundSatsified:   false,
-			},
-			eventReason: "FailedScheduling",
-			expectError: makePredicateError("1 node(s) had volume node affinity conflict"),
+			name:   "pod is not updated during a scheduling cycle",
+			expect: testPod,
 		},
 		{
-			name: "unbound/no matches",
-			volumeBinderConfig: &volumescheduling.FakeVolumeBinderConfig{
-				FindUnboundSatsified: false,
-				FindBoundSatsified:   true,
-			},
-			eventReason: "FailedScheduling",
-			expectError: makePredicateError("1 node(s) didn't find available persistent volumes to bind"),
-		},
-		{
-			name: "bound and unbound unsatisfied",
-			volumeBinderConfig: &volumescheduling.FakeVolumeBinderConfig{
-				FindUnboundSatsified: false,
-				FindBoundSatsified:   false,
-			},
-			eventReason: "FailedScheduling",
-			expectError: makePredicateError("1 node(s) didn't find available persistent volumes to bind, 1 node(s) had volume node affinity conflict"),
-		},
-		{
-			name: "unbound/found matches/bind succeeds",
-			volumeBinderConfig: &volumescheduling.FakeVolumeBinderConfig{
-				FindUnboundSatsified: true,
-				FindBoundSatsified:   true,
-			},
-			expectAssumeCalled: true,
-			expectBindCalled:   true,
-			expectPodBind:      &v1.Binding{ObjectMeta: metav1.ObjectMeta{Name: "foo", Namespace: "foo-ns", UID: types.UID("foo")}, Target: v1.ObjectReference{Kind: "Node", Name: "machine1"}},
-			eventReason:        "Scheduled",
-		},
-		{
-			name: "predicate error",
-			volumeBinderConfig: &volumescheduling.FakeVolumeBinderConfig{
-				FindErr: findErr,
-			},
-			eventReason: "FailedScheduling",
-			expectError: findErr,
-		},
-		{
-			name: "assume error",
-			volumeBinderConfig: &volumescheduling.FakeVolumeBinderConfig{
-				FindUnboundSatsified: true,
-				FindBoundSatsified:   true,
-				AssumeErr:            assumeErr,
-			},
-			expectAssumeCalled: true,
-			eventReason:        "FailedScheduling",
-			expectError:        assumeErr,
-		},
-		{
-			name: "bind error",
-			volumeBinderConfig: &volumescheduling.FakeVolumeBinderConfig{
-				FindUnboundSatsified: true,
-				FindBoundSatsified:   true,
-				BindErr:              bindErr,
-			},
-			expectAssumeCalled: true,
-			expectBindCalled:   true,
-			eventReason:        "FailedScheduling",
-			expectError:        bindErr,
+			name:                       "pod is deleted during a scheduling cycle",
+			podDeletedDuringScheduling: true,
+			expect:                     nil,
 		},
 	}
 
-	for _, item := range table {
-		t.Run(item.name, func(t *testing.T) {
-			stop := make(chan struct{})
-			fakeVolumeBinder := volumebinder.NewFakeVolumeBinder(item.volumeBinderConfig)
-			internalBinder, ok := fakeVolumeBinder.Binder.(*volumescheduling.FakeVolumeBinder)
-			if !ok {
-				t.Fatalf("Failed to get fake volume binder")
-			}
-			s, bindingChan, errChan := setupTestSchedulerWithVolumeBinding(fakeVolumeBinder, stop, eventBroadcaster)
-			eventChan := make(chan struct{})
-			stopFunc := eventBroadcaster.StartEventWatcher(func(obj runtime.Object) {
-				e, _ := obj.(*v1beta1.Event)
-				if e, a := item.eventReason, e.Reason; e != a {
-					t.Errorf("expected %v, got %v", e, a)
+	for _, asyncAPICallsEnabled := range []bool{true, false} {
+		for _, tt := range tests {
+			t.Run(fmt.Sprintf("%s (Async API calls enabled: %v)", tt.name, asyncAPICallsEnabled), func(t *testing.T) {
+				logger, ctx := ktesting.NewTestContext(t)
+				ctx, cancel := context.WithCancel(ctx)
+				defer cancel()
+
+				client := fake.NewClientset(&v1.PodList{Items: []v1.Pod{*testPod}})
+				informerFactory := informers.NewSharedInformerFactory(client, 0)
+				podInformer := informerFactory.Core().V1().Pods()
+				// Need to add/update/delete testPod to the store.
+				if err := podInformer.Informer().GetStore().Add(testPod); err != nil {
+					t.Fatal(err)
 				}
-				close(eventChan)
+
+				var apiDispatcher *apidispatcher.APIDispatcher
+				if asyncAPICallsEnabled {
+					apiDispatcher = apidispatcher.New(client, 16, apicalls.Relevances)
+					apiDispatcher.Run(logger)
+					defer apiDispatcher.Close()
+				}
+
+				recorder := metrics.NewMetricsAsyncRecorder(3, 20*time.Microsecond, ctx.Done())
+				queue := internalqueue.NewPriorityQueue(nil, informerFactory, internalqueue.WithClock(testingclock.NewFakeClock(time.Now())), internalqueue.WithMetricsRecorder(recorder), internalqueue.WithAPIDispatcher(apiDispatcher))
+				schedulerCache := internalcache.New(ctx, apiDispatcher, false, false)
+
+				queue.Add(ctx, testPod)
+
+				if _, err := queue.Pop(logger); err != nil {
+					t.Fatalf("Pop failed: %v", err)
+				}
+
+				if tt.podUpdatedDuringScheduling {
+					if err := podInformer.Informer().GetStore().Update(testPodUpdated); err != nil {
+						t.Fatal(err)
+					}
+					queue.Update(ctx, testPod, testPodUpdated)
+				}
+				if tt.podDeletedDuringScheduling {
+					if err := podInformer.Informer().GetStore().Delete(testPod); err != nil {
+						t.Fatal(err)
+					}
+					queue.Delete(logger, testPod)
+				}
+
+				s, schedFramework, err := initScheduler(ctx, schedulerCache, queue, apiDispatcher, client, informerFactory)
+				if err != nil {
+					t.Fatal(err)
+				}
+
+				testPodInfo := &framework.QueuedPodInfo{PodInfo: mustNewPodInfo(t, testPod)}
+				s.FailureHandler(ctx, schedFramework, testPodInfo, fwk.NewStatus(fwk.Unschedulable), nil, time.Now())
+
+				var got *v1.Pod
+				if tt.podUpdatedDuringScheduling {
+					pInfo, ok := queue.GetPod(ctx, testPod.Name, testPod.Namespace, testPod.Spec.SchedulingGroup)
+					if !ok {
+						t.Fatalf("Failed to get pod %s/%s from queue", testPod.Namespace, testPod.Name)
+					}
+					got = pInfo.Pod
+				} else {
+					got = getPodFromPriorityQueue(queue, testPod)
+				}
+
+				if diff := cmp.Diff(tt.expect, got); diff != "" {
+					t.Errorf("Unexpected pod (-want, +got): %s", diff)
+				}
 			})
-			s.scheduleOne()
-			// Wait for pod to succeed or fail scheduling
-			select {
-			case <-eventChan:
-			case <-time.After(wait.ForeverTestTimeout):
-				t.Fatalf("scheduling timeout after %v", wait.ForeverTestTimeout)
-			}
-			stopFunc()
-			// Wait for scheduling to return an error
-			select {
-			case err := <-errChan:
-				if item.expectError == nil || !reflect.DeepEqual(item.expectError.Error(), err.Error()) {
-					t.Errorf("err \nWANT=%+v,\nGOT=%+v", item.expectError, err)
-				}
-			case <-time.After(chanTimeout):
-				if item.expectError != nil {
-					t.Errorf("did not receive error after %v", chanTimeout)
-				}
+		}
+	}
+}
+
+func TestFailureHandler_PodAlreadyBound(t *testing.T) {
+	for _, asyncAPICallsEnabled := range []bool{true, false} {
+		t.Run(fmt.Sprintf("Async API calls enabled: %v", asyncAPICallsEnabled), func(t *testing.T) {
+			logger, ctx := ktesting.NewTestContext(t)
+			ctx, cancel := context.WithCancel(ctx)
+			defer cancel()
+
+			nodeFoo := v1.Node{ObjectMeta: metav1.ObjectMeta{Name: "foo"}}
+			testPod := st.MakePod().Name("test-pod").Namespace(v1.NamespaceDefault).Node("foo").Obj()
+
+			client := fake.NewClientset(&v1.PodList{Items: []v1.Pod{*testPod}}, &v1.NodeList{Items: []v1.Node{nodeFoo}})
+			informerFactory := informers.NewSharedInformerFactory(client, 0)
+			podInformer := informerFactory.Core().V1().Pods()
+			// Need to add testPod to the store.
+			if err := podInformer.Informer().GetStore().Add(testPod); err != nil {
+				t.Fatal(err)
 			}
 
-			// Wait for pod to succeed binding
-			select {
-			case b := <-bindingChan:
-				if !reflect.DeepEqual(item.expectPodBind, b) {
-					t.Errorf("err \nWANT=%+v,\nGOT=%+v", item.expectPodBind, b)
-				}
-			case <-time.After(chanTimeout):
-				if item.expectPodBind != nil {
-					t.Errorf("did not receive pod binding after %v", chanTimeout)
-				}
+			var apiDispatcher *apidispatcher.APIDispatcher
+			if asyncAPICallsEnabled {
+				apiDispatcher = apidispatcher.New(client, 16, apicalls.Relevances)
+				apiDispatcher.Run(logger)
+				defer apiDispatcher.Close()
 			}
 
-			if item.expectAssumeCalled != internalBinder.AssumeCalled {
-				t.Errorf("expectedAssumeCall %v", item.expectAssumeCalled)
+			queue := internalqueue.NewPriorityQueue(nil, informerFactory, internalqueue.WithClock(testingclock.NewFakeClock(time.Now())), internalqueue.WithAPIDispatcher(apiDispatcher))
+			schedulerCache := internalcache.New(ctx, apiDispatcher, false, false)
+
+			// Add node to schedulerCache no matter it's deleted in API server or not.
+			schedulerCache.AddNode(logger, &nodeFoo)
+
+			s, schedFramework, err := initScheduler(ctx, schedulerCache, queue, apiDispatcher, client, informerFactory)
+			if err != nil {
+				t.Fatal(err)
 			}
 
-			if item.expectBindCalled != internalBinder.BindCalled {
-				t.Errorf("expectedBindCall %v", item.expectBindCalled)
-			}
+			testPodInfo := &framework.QueuedPodInfo{PodInfo: mustNewPodInfo(t, testPod)}
+			s.FailureHandler(ctx, schedFramework, testPodInfo, fwk.NewStatus(fwk.Unschedulable).WithError(fmt.Errorf("binding rejected: timeout")), nil, time.Now())
 
-			close(stop)
+			pod := getPodFromPriorityQueue(queue, testPod)
+			if pod != nil {
+				t.Fatalf("Unexpected pod: %v should not be in PriorityQueue when the NodeName of pod is not empty", pod.Name)
+			}
 		})
 	}
 }
 
-func TestInitPolicyFromFile(t *testing.T) {
-	dir, err := ioutil.TempDir(os.TempDir(), "policy")
-	if err != nil {
-		t.Errorf("unexpected error: %v", err)
-	}
-	defer os.RemoveAll(dir)
-
-	for i, test := range []struct {
-		policy               string
-		expectedPredicates   sets.String
-		expectedPrioritizers sets.String
+// TestWithPercentageOfNodesToScore tests scheduler's PercentageOfNodesToScore is set correctly.
+func TestWithPercentageOfNodesToScore(t *testing.T) {
+	tests := []struct {
+		name                           string
+		percentageOfNodesToScoreConfig *int32
+		wantedPercentageOfNodesToScore int32
 	}{
-		// Test json format policy file
 		{
-			policy: `{
-				"kind" : "Policy",
-				"apiVersion" : "v1",
-				"predicates" : [
-					{"name" : "PredicateOne"},
-					{"name" : "PredicateTwo"}
-				],
-				"priorities" : [
-					{"name" : "PriorityOne", "weight" : 1},
-					{"name" : "PriorityTwo", "weight" : 5}
-				]
-			}`,
-			expectedPredicates: sets.NewString(
-				"PredicateOne",
-				"PredicateTwo",
-			),
-			expectedPrioritizers: sets.NewString(
-				"PriorityOne",
-				"PriorityTwo",
-			),
+			name:                           "percentageOfNodesScore is nil",
+			percentageOfNodesToScoreConfig: nil,
+			wantedPercentageOfNodesToScore: schedulerapi.DefaultPercentageOfNodesToScore,
 		},
-		// Test yaml format policy file
 		{
-			policy: `apiVersion: v1
-kind: Policy
-predicates:
-- name: PredicateOne
-- name: PredicateTwo
-priorities:
-- name: PriorityOne
-  weight: 1
-- name: PriorityTwo
-  weight: 5
-`,
-			expectedPredicates: sets.NewString(
-				"PredicateOne",
-				"PredicateTwo",
-			),
-			expectedPrioritizers: sets.NewString(
-				"PriorityOne",
-				"PriorityTwo",
-			),
+			name:                           "percentageOfNodesScore is not nil",
+			percentageOfNodesToScoreConfig: ptr.To[int32](10),
+			wantedPercentageOfNodesToScore: 10,
 		},
-	} {
-		file := fmt.Sprintf("scheduler-policy-config-file-%d", i)
-		fullPath := path.Join(dir, file)
+	}
 
-		if err := ioutil.WriteFile(fullPath, []byte(test.policy), 0644); err != nil {
-			t.Fatalf("Failed writing a policy config file: %v", err)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client := fake.NewClientset()
+			informerFactory := informers.NewSharedInformerFactory(client, 0)
+			eventBroadcaster := events.NewBroadcaster(&events.EventSinkImpl{Interface: client.EventsV1()})
+			_, ctx := ktesting.NewTestContext(t)
+			ctx, cancel := context.WithCancel(ctx)
+			defer cancel()
+			sched, err := New(
+				ctx,
+				client,
+				informerFactory,
+				nil,
+				profile.NewRecorderFactory(eventBroadcaster),
+				WithPercentageOfNodesToScore(tt.percentageOfNodesToScoreConfig),
+			)
+			if err != nil {
+				t.Fatalf("Failed to create scheduler: %v", err)
+			}
+			if sched.algorithm.percentageOfNodesToScore != tt.wantedPercentageOfNodesToScore {
+				t.Errorf("scheduler.percentageOfNodesToScore = %v, want %v", sched.algorithm.percentageOfNodesToScore, tt.wantedPercentageOfNodesToScore)
+			}
+		})
+	}
+}
+
+// TestWithPercentageOfPlacementsToScore tests scheduler's PercentageOfPlacementsToScore is set correctly.
+func TestWithPercentageOfPlacementsToScore(t *testing.T) {
+	tests := []struct {
+		name                                string
+		percentageOfPlacementsToScoreConfig *int32
+		wantedPercentageOfPlacementsToScore int32
+	}{
+		{
+			name:                                "percentageOfPlacementsScore is nil",
+			percentageOfPlacementsToScoreConfig: nil,
+			wantedPercentageOfPlacementsToScore: schedulerapi.DefaultPercentageOfPlacementsToScore,
+		},
+		{
+			name:                                "percentageOfPlacementsScore is not nil",
+			percentageOfPlacementsToScoreConfig: ptr.To[int32](10),
+			wantedPercentageOfPlacementsToScore: 10,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client := fake.NewClientset()
+			informerFactory := informers.NewSharedInformerFactory(client, 0)
+			eventBroadcaster := events.NewBroadcaster(&events.EventSinkImpl{Interface: client.EventsV1()})
+			_, ctx := ktesting.NewTestContext(t)
+			ctx, cancel := context.WithCancel(ctx)
+			defer cancel()
+			sched, err := New(
+				ctx,
+				client,
+				informerFactory,
+				nil,
+				profile.NewRecorderFactory(eventBroadcaster),
+				WithPercentageOfPlacementsToScore(tt.percentageOfPlacementsToScoreConfig),
+			)
+			if err != nil {
+				t.Fatalf("Failed to create scheduler: %v", err)
+			}
+			if sched.podGroupAlgorithm.percentageOfPlacementsToScore != tt.wantedPercentageOfPlacementsToScore {
+				t.Errorf("scheduler.podGroupAlgorithm.percentageOfPlacementsToScore = %v, want %v", sched.podGroupAlgorithm.percentageOfPlacementsToScore, tt.wantedPercentageOfPlacementsToScore)
+			}
+		})
+	}
+}
+
+// getPodFromPriorityQueue is the function used in the TestDefaultErrorFunc test to get
+// the specific pod from the given priority queue. It returns the found pod in the priority queue.
+func getPodFromPriorityQueue(queue *internalqueue.PriorityQueue, pod *v1.Pod) *v1.Pod {
+	podList, _ := queue.PendingPods()
+	if len(podList) == 0 {
+		return nil
+	}
+
+	queryPodKey, err := cache.MetaNamespaceKeyFunc(pod)
+	if err != nil {
+		return nil
+	}
+
+	for _, foundPod := range podList {
+		foundPodKey, err := cache.MetaNamespaceKeyFunc(foundPod)
+		if err != nil {
+			return nil
 		}
 
-		policy := &schedulerapi.Policy{}
+		if foundPodKey == queryPodKey {
+			return foundPod
+		}
+	}
 
-		if err := initPolicyFromFile(fullPath, policy); err != nil {
-			t.Fatalf("Failed writing a policy config file: %v", err)
-		}
+	return nil
+}
 
-		// Verify that the policy is initialized correctly.
-		schedPredicates := sets.NewString()
-		for _, p := range policy.Predicates {
-			schedPredicates.Insert(p.Name)
+func initScheduler(ctx context.Context, cache internalcache.Cache, queue internalqueue.SchedulingQueue, apiDispatcher *apidispatcher.APIDispatcher,
+	client kubernetes.Interface, informerFactory informers.SharedInformerFactory) (*Scheduler, framework.Framework, error) {
+	logger := klog.FromContext(ctx)
+	registerPluginFuncs := []tf.RegisterPluginFunc{
+		tf.RegisterQueueSortPlugin(queuesort.Name, queuesort.New),
+		tf.RegisterBindPlugin(defaultbinder.Name, defaultbinder.New),
+	}
+	eventBroadcaster := events.NewBroadcaster(&events.EventSinkImpl{Interface: client.EventsV1()})
+	waitingPods := frameworkruntime.NewWaitingPodsMap()
+	fwk, err := tf.NewFramework(ctx,
+		registerPluginFuncs,
+		testSchedulerName,
+		frameworkruntime.WithClientSet(client),
+		frameworkruntime.WithAPIDispatcher(apiDispatcher),
+		frameworkruntime.WithInformerFactory(informerFactory),
+		frameworkruntime.WithEventRecorder(eventBroadcaster.NewRecorder(scheme.Scheme, testSchedulerName)),
+		frameworkruntime.WithWaitingPods(waitingPods),
+	)
+	if err != nil {
+		return nil, nil, err
+	}
+	if apiDispatcher != nil {
+		fwk.SetAPICacher(apicache.New(queue, cache))
+	}
+
+	s := &Scheduler{
+		Cache:            cache,
+		nodeInfoSnapshot: internalcache.NewEmptySnapshot(),
+		client:           client,
+		StopEverything:   ctx.Done(),
+		SchedulingQueue:  queue,
+		APIDispatcher:    apiDispatcher,
+		Profiles:         profile.Map{testSchedulerName: fwk},
+		logger:           logger,
+	}
+	if err := s.initAlgorithm(); err != nil {
+		return nil, nil, err
+	}
+	s.applyDefaultHandlers()
+
+	return s, fwk, nil
+}
+
+func TestInitPluginsWithIndexers(t *testing.T) {
+	tests := []struct {
+		name string
+		// the plugin registration ordering must not matter, being map traversal random
+		entrypoints map[string]frameworkruntime.PluginFactory
+		wantErr     string
+	}{
+		{
+			name: "register indexer, no conflicts",
+			entrypoints: map[string]frameworkruntime.PluginFactory{
+				"AddIndexer": func(ctx context.Context, obj runtime.Object, handle fwk.Handle) (fwk.Plugin, error) {
+					podInformer := handle.SharedInformerFactory().Core().V1().Pods()
+					err := podInformer.Informer().AddIndexers(cache.Indexers{
+						"nodeName": indexByPodSpecNodeName,
+					})
+					return &TestPlugin{name: "AddIndexer"}, err
+				},
+			},
+		},
+		{
+			name: "register the same indexer name multiple times, conflict",
+			// order of registration doesn't matter
+			entrypoints: map[string]frameworkruntime.PluginFactory{
+				"AddIndexer1": func(ctx context.Context, obj runtime.Object, handle fwk.Handle) (fwk.Plugin, error) {
+					podInformer := handle.SharedInformerFactory().Core().V1().Pods()
+					err := podInformer.Informer().AddIndexers(cache.Indexers{
+						"nodeName": indexByPodSpecNodeName,
+					})
+					return &TestPlugin{name: "AddIndexer1"}, err
+				},
+				"AddIndexer2": func(ctx context.Context, obj runtime.Object, handle fwk.Handle) (fwk.Plugin, error) {
+					podInformer := handle.SharedInformerFactory().Core().V1().Pods()
+					err := podInformer.Informer().AddIndexers(cache.Indexers{
+						"nodeName": indexByPodAnnotationNodeName,
+					})
+					return &TestPlugin{name: "AddIndexer1"}, err
+				},
+			},
+			wantErr: "indexer conflict",
+		},
+		{
+			name: "register the same indexer body with different names, no conflicts",
+			// order of registration doesn't matter
+			entrypoints: map[string]frameworkruntime.PluginFactory{
+				"AddIndexer1": func(ctx context.Context, obj runtime.Object, handle fwk.Handle) (fwk.Plugin, error) {
+					podInformer := handle.SharedInformerFactory().Core().V1().Pods()
+					err := podInformer.Informer().AddIndexers(cache.Indexers{
+						"nodeName1": indexByPodSpecNodeName,
+					})
+					return &TestPlugin{name: "AddIndexer1"}, err
+				},
+				"AddIndexer2": func(ctx context.Context, obj runtime.Object, handle fwk.Handle) (fwk.Plugin, error) {
+					podInformer := handle.SharedInformerFactory().Core().V1().Pods()
+					err := podInformer.Informer().AddIndexers(cache.Indexers{
+						"nodeName2": indexByPodAnnotationNodeName,
+					})
+					return &TestPlugin{name: "AddIndexer2"}, err
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fakeInformerFactory := NewInformerFactory(&fake.Clientset{}, 0*time.Second, nil)
+
+			var registerPluginFuncs []tf.RegisterPluginFunc
+			for name, entrypoint := range tt.entrypoints {
+				registerPluginFuncs = append(registerPluginFuncs,
+					// anything supported by TestPlugin is fine
+					tf.RegisterFilterPlugin(name, entrypoint),
+				)
+			}
+			// we always need this
+			registerPluginFuncs = append(registerPluginFuncs,
+				tf.RegisterQueueSortPlugin(queuesort.Name, queuesort.New),
+				tf.RegisterBindPlugin(defaultbinder.Name, defaultbinder.New),
+			)
+			_, ctx := ktesting.NewTestContext(t)
+			ctx, cancel := context.WithCancel(ctx)
+			defer cancel()
+			_, err := tf.NewFramework(ctx, registerPluginFuncs, "test", frameworkruntime.WithInformerFactory(fakeInformerFactory))
+
+			if len(tt.wantErr) > 0 {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+					t.Errorf("got error %q, want %q", err, tt.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Failed to create scheduler: %v", err)
+			}
+		})
+	}
+}
+
+func indexByPodSpecNodeName(obj interface{}) ([]string, error) {
+	pod, ok := obj.(*v1.Pod)
+	if !ok {
+		return []string{}, nil
+	}
+	if len(pod.Spec.NodeName) == 0 {
+		return []string{}, nil
+	}
+	return []string{pod.Spec.NodeName}, nil
+}
+
+func indexByPodAnnotationNodeName(obj interface{}) ([]string, error) {
+	pod, ok := obj.(*v1.Pod)
+	if !ok {
+		return []string{}, nil
+	}
+	if len(pod.Annotations) == 0 {
+		return []string{}, nil
+	}
+	nodeName, ok := pod.Annotations["node-name"]
+	if !ok {
+		return []string{}, nil
+	}
+	return []string{nodeName}, nil
+}
+
+const (
+	filterWithoutEnqueueExtensions = "filterWithoutEnqueueExtensions"
+	fakeNode                       = "fakeNode"
+	fakePod                        = "fakePod"
+	emptyEventsToRegister          = "emptyEventsToRegister"
+	errorEventsToRegister          = "errorEventsToRegister"
+	queueSort                      = "no-op-queue-sort-plugin"
+	fakeBind                       = "bind-plugin"
+	emptyEventExtensions           = "emptyEventExtensions"
+	fakePermit                     = "fakePermit"
+	fakeAssignedPod                = "fakeAssignedPodPlugin"
+)
+
+func Test_buildQueueingHintMap(t *testing.T) {
+	tests := []struct {
+		name    string
+		plugins []fwk.Plugin
+		want    map[fwk.ClusterEvent][]*internalqueue.QueueingHintFunction
+		wantErr error
+	}{
+		{
+			name:    "filter without EnqueueExtensions plugin",
+			plugins: []fwk.Plugin{&filterWithoutEnqueueExtensionsPlugin{}},
+			want: map[fwk.ClusterEvent][]*internalqueue.QueueingHintFunction{
+				{Resource: fwk.AssignedPod, ActionType: fwk.All}: {
+					{PluginName: filterWithoutEnqueueExtensions, QueueingHintFn: defaultQueueingHintFn},
+				},
+				{Resource: fwk.UnscheduledPod, ActionType: fwk.All}: {
+					{PluginName: filterWithoutEnqueueExtensions, QueueingHintFn: defaultQueueingHintFn},
+				},
+				{Resource: fwk.TargetPod, ActionType: fwk.All}: {
+					{PluginName: filterWithoutEnqueueExtensions, QueueingHintFn: defaultQueueingHintFn},
+				},
+				{Resource: fwk.Node, ActionType: fwk.All}: {
+					{PluginName: filterWithoutEnqueueExtensions, QueueingHintFn: defaultQueueingHintFn},
+				},
+				{Resource: fwk.CSINode, ActionType: fwk.All}: {
+					{PluginName: filterWithoutEnqueueExtensions, QueueingHintFn: defaultQueueingHintFn},
+				},
+				{Resource: fwk.CSIDriver, ActionType: fwk.All}: {
+					{PluginName: filterWithoutEnqueueExtensions, QueueingHintFn: defaultQueueingHintFn},
+				},
+				{Resource: fwk.CSIStorageCapacity, ActionType: fwk.All}: {
+					{PluginName: filterWithoutEnqueueExtensions, QueueingHintFn: defaultQueueingHintFn},
+				},
+				{Resource: fwk.PersistentVolume, ActionType: fwk.All}: {
+					{PluginName: filterWithoutEnqueueExtensions, QueueingHintFn: defaultQueueingHintFn},
+				},
+				{Resource: fwk.StorageClass, ActionType: fwk.All}: {
+					{PluginName: filterWithoutEnqueueExtensions, QueueingHintFn: defaultQueueingHintFn},
+				},
+				{Resource: fwk.PersistentVolumeClaim, ActionType: fwk.All}: {
+					{PluginName: filterWithoutEnqueueExtensions, QueueingHintFn: defaultQueueingHintFn},
+				},
+				{Resource: fwk.ResourceClaim, ActionType: fwk.All}: {
+					{PluginName: filterWithoutEnqueueExtensions, QueueingHintFn: defaultQueueingHintFn},
+				},
+				{Resource: fwk.DeviceClass, ActionType: fwk.All}: {
+					{PluginName: filterWithoutEnqueueExtensions, QueueingHintFn: defaultQueueingHintFn},
+				},
+				{Resource: fwk.PodGroup, ActionType: fwk.All}: {
+					{PluginName: filterWithoutEnqueueExtensions, QueueingHintFn: defaultQueueingHintFn},
+				},
+			},
+		},
+		{
+			name:    "node and pod plugin",
+			plugins: []fwk.Plugin{&fakeNodePlugin{}, &fakePodPlugin{}},
+			want: map[fwk.ClusterEvent][]*internalqueue.QueueingHintFunction{
+				{Resource: fwk.AssignedPod, ActionType: fwk.Add}: {
+					{PluginName: fakePod, QueueingHintFn: fakePodPluginQueueingFn},
+				},
+				{Resource: fwk.UnscheduledPod, ActionType: fwk.Add}: {
+					{PluginName: fakePod, QueueingHintFn: fakePodPluginQueueingFn},
+				},
+				{Resource: fwk.TargetPod, ActionType: fwk.Add}: {
+					{PluginName: fakePod, QueueingHintFn: fakePodPluginQueueingFn},
+				},
+				{Resource: fwk.Node, ActionType: fwk.Add}: {
+					{PluginName: fakeNode, QueueingHintFn: fakeNodePluginQueueingFn},
+				},
+				{Resource: fwk.Node, ActionType: fwk.UpdateNodeTaint}: {
+					{PluginName: fakeNode, QueueingHintFn: defaultQueueingHintFn}, // When Node/Add is registered, Node/UpdateNodeTaint is automatically registered.
+				},
+			},
+		},
+		{
+			name:    "register plugin with empty event",
+			plugins: []fwk.Plugin{&emptyEventPlugin{}},
+			want:    map[fwk.ClusterEvent][]*internalqueue.QueueingHintFunction{},
+		},
+		{
+			name:    "register plugins including emptyEventPlugin",
+			plugins: []fwk.Plugin{&emptyEventPlugin{}, &fakeNodePlugin{}},
+			want: map[fwk.ClusterEvent][]*internalqueue.QueueingHintFunction{
+				{Resource: fwk.AssignedPod, ActionType: fwk.Add}: {
+					{PluginName: fakePod, QueueingHintFn: fakePodPluginQueueingFn},
+				},
+				{Resource: fwk.UnscheduledPod, ActionType: fwk.Add}: {
+					{PluginName: fakePod, QueueingHintFn: fakePodPluginQueueingFn},
+				},
+				{Resource: fwk.TargetPod, ActionType: fwk.Add}: {
+					{PluginName: fakePod, QueueingHintFn: fakePodPluginQueueingFn},
+				},
+				{Resource: fwk.Node, ActionType: fwk.Add}: {
+					{PluginName: fakeNode, QueueingHintFn: fakeNodePluginQueueingFn},
+				},
+				{Resource: fwk.Node, ActionType: fwk.UpdateNodeTaint}: {
+					{PluginName: fakeNode, QueueingHintFn: defaultQueueingHintFn}, // When Node/Add is registered, Node/UpdateNodeTaint is automatically registered.
+				},
+			},
+		},
+		{
+			name:    "one EventsToRegister returns an error",
+			plugins: []fwk.Plugin{&errorEventsToRegisterPlugin{}},
+			want:    map[fwk.ClusterEvent][]*internalqueue.QueueingHintFunction{},
+			wantErr: errors.New("mock error"),
+		},
+		{
+			name:    "plugin registering to a specific pod resource 'AssignedPod'",
+			plugins: []fwk.Plugin{&fakeAssignedPodPlugin{}},
+			want: map[fwk.ClusterEvent][]*internalqueue.QueueingHintFunction{
+				{Resource: fwk.AssignedPod, ActionType: fwk.Update}: {
+					{PluginName: fakeAssignedPod, QueueingHintFn: fakeAssignedPodPluginQueueingFn},
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			logger, ctx := ktesting.NewTestContext(t)
+			ctx, cancel := context.WithCancel(ctx)
+			defer cancel()
+			registry := frameworkruntime.Registry{}
+			cfgPls := &schedulerapi.Plugins{}
+			plugins := append(tt.plugins, &fakebindPlugin{}, &fakeQueueSortPlugin{})
+			for _, pl := range plugins {
+				if err := registry.Register(pl.Name(), func(_ context.Context, _ runtime.Object, _ fwk.Handle) (fwk.Plugin, error) {
+					return pl, nil
+				}); err != nil {
+					t.Fatalf("fail to register filter plugin (%s)", pl.Name())
+				}
+				cfgPls.MultiPoint.Enabled = append(cfgPls.MultiPoint.Enabled, schedulerapi.Plugin{Name: pl.Name()})
+			}
+
+			profile := schedulerapi.KubeSchedulerProfile{Plugins: cfgPls}
+			fwk, err := newFramework(ctx, registry, profile)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			exts := fwk.EnqueueExtensions()
+			// need to sort to make the test result stable.
+			sort.Slice(exts, func(i, j int) bool {
+				return exts[i].Name() < exts[j].Name()
+			})
+
+			got, err := buildQueueingHintMap(ctx, exts)
+			if err != nil {
+				if tt.wantErr != nil && tt.wantErr.Error() != err.Error() {
+					t.Fatalf("unexpected error from buildQueueingHintMap: expected: %v, actual: %v", tt.wantErr, err)
+				}
+
+				if tt.wantErr == nil {
+					t.Fatalf("unexpected error from buildQueueingHintMap: %v", err)
+				}
+			}
+
+			for e, fns := range got {
+				wantfns, ok := tt.want[e]
+				if !ok {
+					t.Errorf("got unexpected event %v", e)
+					continue
+				}
+				if len(fns) != len(wantfns) {
+					t.Errorf("got %v queueing hint functions, want %v", len(fns), len(wantfns))
+					continue
+				}
+				for i, fn := range fns {
+					if fn.PluginName != wantfns[i].PluginName {
+						t.Errorf("got plugin name %v, want %v", fn.PluginName, wantfns[i].PluginName)
+						continue
+					}
+					got, gotErr := fn.QueueingHintFn(logger, nil, nil, nil)
+					want, wantErr := wantfns[i].QueueingHintFn(logger, nil, nil, nil)
+					if got != want || gotErr != wantErr {
+						t.Errorf("got queueing hint function (%v) returning (%v, %v), expect it to return (%v, %v)", fn.PluginName, got, gotErr, want, wantErr)
+						continue
+					}
+				}
+			}
+		})
+	}
+}
+
+// Test_UnionedGVKs tests UnionedGVKs worked with buildQueueingHintMap.
+// It verifies that a given set of plugins is correctly registered for a specific set of cluster events.
+func Test_UnionedGVKs(t *testing.T) {
+	tests := []struct {
+		name                  string
+		plugins               schedulerapi.PluginSet
+		want                  map[fwk.EventResource]fwk.ActionType
+		enableGenericWorkload bool
+	}{
+		{
+			name: "filter without EnqueueExtensions plugin",
+			plugins: schedulerapi.PluginSet{
+				Enabled: []schedulerapi.Plugin{
+					{Name: filterWithoutEnqueueExtensions},
+					{Name: queueSort},
+					{Name: fakeBind},
+				},
+				Disabled: []schedulerapi.Plugin{{Name: "*"}}, // disable default plugins
+			},
+			want: map[fwk.EventResource]fwk.ActionType{
+				fwk.AssignedPod:           fwk.All,
+				fwk.UnscheduledPod:        fwk.All,
+				fwk.TargetPod:             fwk.All,
+				fwk.Node:                  fwk.All,
+				fwk.CSINode:               fwk.All,
+				fwk.CSIDriver:             fwk.All,
+				fwk.CSIStorageCapacity:    fwk.All,
+				fwk.PersistentVolume:      fwk.All,
+				fwk.PersistentVolumeClaim: fwk.All,
+				fwk.StorageClass:          fwk.All,
+				fwk.ResourceClaim:         fwk.All,
+				fwk.DeviceClass:           fwk.All,
+			},
+		},
+		{
+			name: "filter without EnqueueExtensions plugin (GenericWorkload enabled)",
+			plugins: schedulerapi.PluginSet{
+				Enabled: []schedulerapi.Plugin{
+					{Name: filterWithoutEnqueueExtensions},
+					{Name: queueSort},
+					{Name: fakeBind},
+				},
+				Disabled: []schedulerapi.Plugin{{Name: "*"}}, // disable default plugins
+			},
+			want: map[fwk.EventResource]fwk.ActionType{
+				fwk.AssignedPod:           fwk.All,
+				fwk.UnscheduledPod:        fwk.All,
+				fwk.TargetPod:             fwk.All,
+				fwk.Node:                  fwk.All,
+				fwk.CSINode:               fwk.All,
+				fwk.CSIDriver:             fwk.All,
+				fwk.CSIStorageCapacity:    fwk.All,
+				fwk.PersistentVolume:      fwk.All,
+				fwk.PersistentVolumeClaim: fwk.All,
+				fwk.StorageClass:          fwk.All,
+				fwk.ResourceClaim:         fwk.All,
+				fwk.DeviceClass:           fwk.All,
+				fwk.PodGroup:              fwk.All,
+			},
+			enableGenericWorkload: true,
+		},
+		{
+			name: "node plugin",
+			plugins: schedulerapi.PluginSet{
+				Enabled: []schedulerapi.Plugin{
+					{Name: fakeNode},
+					{Name: queueSort},
+					{Name: fakeBind},
+				},
+				Disabled: []schedulerapi.Plugin{{Name: "*"}}, // disable default plugins
+			},
+			want: map[fwk.EventResource]fwk.ActionType{
+				fwk.Node: fwk.Add,
+			},
+		},
+		{
+			name: "pod plugin",
+			plugins: schedulerapi.PluginSet{
+				Enabled: []schedulerapi.Plugin{
+					{Name: fakePod},
+					{Name: queueSort},
+					{Name: fakeBind},
+				},
+				Disabled: []schedulerapi.Plugin{{Name: "*"}}, // disable default plugins
+			},
+			want: map[fwk.EventResource]fwk.ActionType{
+				fwk.AssignedPod:    fwk.Add,
+				fwk.UnscheduledPod: fwk.Add,
+				fwk.TargetPod:      fwk.Add,
+			},
+		},
+		{
+			name: "node and pod plugin",
+			plugins: schedulerapi.PluginSet{
+				Enabled: []schedulerapi.Plugin{
+					{Name: fakePod},
+					{Name: fakeNode},
+					{Name: queueSort},
+					{Name: fakeBind},
+				},
+				Disabled: []schedulerapi.Plugin{{Name: "*"}}, // disable default plugins
+			},
+			want: map[fwk.EventResource]fwk.ActionType{
+				fwk.AssignedPod:    fwk.Add,
+				fwk.UnscheduledPod: fwk.Add,
+				fwk.TargetPod:      fwk.Add,
+				fwk.Node:           fwk.Add,
+			},
+		},
+		{
+			name: "empty EventsToRegister plugin",
+			plugins: schedulerapi.PluginSet{
+				Enabled: []schedulerapi.Plugin{
+					{Name: emptyEventsToRegister},
+					{Name: queueSort},
+					{Name: fakeBind},
+				},
+				Disabled: []schedulerapi.Plugin{{Name: "*"}}, // disable default plugins
+			},
+			want: map[fwk.EventResource]fwk.ActionType{},
+		},
+		{
+			name:    "plugins with default profile",
+			plugins: defaults.PluginsV1.MultiPoint,
+			want: map[fwk.EventResource]fwk.ActionType{
+				// NodeDeclaredFeatures adds fwk.Update
+				fwk.AssignedPod: fwk.Add | fwk.UpdatePodLabel | fwk.UpdatePodScaleDown | fwk.Delete,
+				fwk.TargetPod:   fwk.UpdatePodGeneratedResourceClaim | fwk.UpdatePodToleration | fwk.UpdatePodSchedulingGatesEliminated | fwk.Update,
+				// NodeDeclaredFeatures adds fwk.UpdateNodeDeclaredFeature; DeferredPodScheduling adds fwk.UpdateNodePreemptionPolicy
+				fwk.Node:                  fwk.Add | fwk.UpdateNodeAllocatable | fwk.UpdateNodeLabel | fwk.UpdateNodeTaint | fwk.Delete | fwk.UpdateNodeDeclaredFeature | fwk.UpdateNodePreemptionPolicy,
+				fwk.CSINode:               fwk.All - fwk.Delete,
+				fwk.CSIDriver:             fwk.Update,
+				fwk.CSIStorageCapacity:    fwk.All - fwk.Delete,
+				fwk.PersistentVolume:      fwk.All - fwk.Delete,
+				fwk.PersistentVolumeClaim: fwk.All - fwk.Delete,
+				fwk.StorageClass:          fwk.All - fwk.Delete,
+				fwk.VolumeAttachment:      fwk.Delete,
+				fwk.DeviceClass:           fwk.All - fwk.Delete,
+				fwk.ResourceClaim:         fwk.All,
+				fwk.ResourceSlice:         fwk.All - fwk.Delete,
+			},
+		},
+		{
+			name: "plugin registering to a specific pod resource 'AssignedPod'",
+			plugins: schedulerapi.PluginSet{
+				Enabled: []schedulerapi.Plugin{
+					{Name: fakeAssignedPod},
+					{Name: queueSort},
+					{Name: fakeBind},
+				},
+				Disabled: []schedulerapi.Plugin{{Name: "*"}}, // disable default plugins
+			},
+			want: map[fwk.EventResource]fwk.ActionType{
+				fwk.AssignedPod: fwk.Update,
+			},
+		},
+		{
+			name:    "plugins with default profile and GangScheduling",
+			plugins: schedulerapi.PluginSet{Enabled: append(defaults.PluginsV1.MultiPoint.Enabled, schedulerapi.Plugin{Name: names.GangScheduling})},
+			want: map[fwk.EventResource]fwk.ActionType{
+				fwk.AssignedPod:           fwk.Add | fwk.UpdatePodLabel | fwk.UpdatePodScaleDown | fwk.Delete,
+				fwk.TargetPod:             fwk.UpdatePodLabel | fwk.UpdatePodGeneratedResourceClaim | fwk.UpdatePodScaleDown | fwk.UpdatePodToleration | fwk.UpdatePodSchedulingGatesEliminated | fwk.Update,
+				fwk.UnscheduledPod:        fwk.Add,
+				fwk.Node:                  fwk.Add | fwk.UpdateNodeAllocatable | fwk.UpdateNodeLabel | fwk.UpdateNodeTaint | fwk.Delete | fwk.UpdateNodeDeclaredFeature | fwk.UpdateNodePreemptionPolicy,
+				fwk.CSINode:               fwk.All - fwk.Delete,
+				fwk.CSIDriver:             fwk.Update,
+				fwk.CSIStorageCapacity:    fwk.All - fwk.Delete,
+				fwk.PersistentVolume:      fwk.All - fwk.Delete,
+				fwk.PersistentVolumeClaim: fwk.All - fwk.Delete,
+				fwk.StorageClass:          fwk.All - fwk.Delete,
+				fwk.VolumeAttachment:      fwk.Delete,
+				fwk.DeviceClass:           fwk.All - fwk.Delete,
+				fwk.ResourceClaim:         fwk.All,
+				fwk.ResourceSlice:         fwk.All - fwk.Delete,
+				fwk.PodGroup:              fwk.Add | fwk.Update,
+			},
+			enableGenericWorkload: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pluginConfig := defaults.PluginConfigsV1
+
+			featuregatetesting.SetFeatureGatesDuringTest(t, feature.DefaultFeatureGate, featuregatetesting.FeatureOverrides{
+				features.GenericWorkload: tt.enableGenericWorkload,
+			})
+
+			_, ctx := ktesting.NewTestContext(t)
+			ctx, cancel := context.WithCancel(ctx)
+			defer cancel()
+			registry := plugins.NewInTreeRegistry()
+
+			cfgPls := &schedulerapi.Plugins{MultiPoint: tt.plugins}
+			plugins := []fwk.Plugin{&fakeNodePlugin{}, &fakePodPlugin{}, &fakeAssignedPodPlugin{}, &filterWithoutEnqueueExtensionsPlugin{}, &emptyEventsToRegisterPlugin{}, &fakeQueueSortPlugin{}, &fakebindPlugin{}}
+			for _, pl := range plugins {
+				if err := registry.Register(pl.Name(), func(_ context.Context, _ runtime.Object, _ fwk.Handle) (fwk.Plugin, error) {
+					return pl, nil
+				}); err != nil {
+					t.Fatalf("fail to register filter plugin (%s)", pl.Name())
+				}
+			}
+
+			profile := schedulerapi.KubeSchedulerProfile{Plugins: cfgPls, PluginConfig: pluginConfig}
+			fwk, err := newFramework(ctx, registry, profile)
+			if err != nil {
+				t.Fatal(err)
+			}
+			queueingHintMap, err := buildQueueingHintMap(ctx, fwk.EnqueueExtensions())
+			if err != nil {
+				t.Fatal(err)
+			}
+			queueingHintsPerProfile := internalqueue.QueueingHintMapPerProfile{
+				"default": queueingHintMap,
+			}
+			got := unionedGVKs(queueingHintsPerProfile)
+
+			if diff := cmp.Diff(tt.want, got); diff != "" {
+				t.Errorf("Unexpected eventToPlugin map (-want,+got):%s", diff)
+			}
+		})
+	}
+}
+
+func newFramework(ctx context.Context, r frameworkruntime.Registry, profile schedulerapi.KubeSchedulerProfile) (framework.Framework, error) {
+	snapshot := internalcache.NewSnapshot(nil, nil)
+	return frameworkruntime.NewFramework(ctx, r, &profile,
+		frameworkruntime.WithSnapshotSharedLister(snapshot),
+		frameworkruntime.WithMutableSnapshotLister(snapshot),
+		frameworkruntime.WithInformerFactory(informers.NewSharedInformerFactory(fake.NewClientset(), 0)),
+		frameworkruntime.WithPodGroupManager(internalcache.New(ctx, nil, false, false /* CompositePodGroup */)),
+		frameworkruntime.WithPreemptionManager(func(fh fwk.Handle) fwk.PreemptionManager {
+			return preemption.NewPreemptionManager(fh, plfeature.Features{})
+		}),
+	)
+}
+
+func TestFrameworkHandler_IterateOverWaitingPods(t *testing.T) {
+	const (
+		testSchedulerProfile1 = "test-scheduler-profile-1"
+		testSchedulerProfile2 = "test-scheduler-profile-2"
+		testSchedulerProfile3 = "test-scheduler-profile-3"
+	)
+
+	nodes := []runtime.Object{
+		st.MakeNode().Name("node1").UID("node1").Obj(),
+		st.MakeNode().Name("node2").UID("node2").Obj(),
+		st.MakeNode().Name("node3").UID("node3").Obj(),
+	}
+
+	cases := []struct {
+		name                        string
+		profiles                    []schedulerapi.KubeSchedulerProfile
+		waitSchedulingPods          []*v1.Pod
+		expectPodNamesInWaitingPods []string
+	}{
+		{
+			name: "pods with same profile are waiting on permit stage",
+			profiles: []schedulerapi.KubeSchedulerProfile{
+				{
+					SchedulerName: testSchedulerProfile1,
+					Plugins: &schedulerapi.Plugins{
+						QueueSort: schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: "PrioritySort"}}},
+						Permit:    schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: fakePermit}}},
+						Bind:      schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: "DefaultBinder"}}},
+					},
+				},
+			},
+			waitSchedulingPods: []*v1.Pod{
+				st.MakePod().Name("pod1").UID("pod1").SchedulerName(testSchedulerProfile1).Obj(),
+				st.MakePod().Name("pod2").UID("pod2").SchedulerName(testSchedulerProfile1).Obj(),
+				st.MakePod().Name("pod3").UID("pod3").SchedulerName(testSchedulerProfile1).Obj(),
+			},
+			expectPodNamesInWaitingPods: []string{"pod1", "pod2", "pod3"},
+		},
+		{
+			name: "pods with different profiles are waiting on permit stage",
+			profiles: []schedulerapi.KubeSchedulerProfile{
+				{
+					SchedulerName: testSchedulerProfile1,
+					Plugins: &schedulerapi.Plugins{
+						QueueSort: schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: "PrioritySort"}}},
+						Permit:    schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: fakePermit}}},
+						Bind:      schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: "DefaultBinder"}}},
+					},
+				},
+				{
+					SchedulerName: testSchedulerProfile2,
+					Plugins: &schedulerapi.Plugins{
+						QueueSort: schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: "PrioritySort"}}},
+						Permit:    schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: fakePermit}}},
+						Bind:      schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: "DefaultBinder"}}},
+					},
+				},
+				{
+					SchedulerName: testSchedulerProfile3,
+					Plugins: &schedulerapi.Plugins{
+						QueueSort: schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: "PrioritySort"}}},
+						Permit:    schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: fakePermit}}},
+						Bind:      schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: "DefaultBinder"}}},
+					},
+				},
+			},
+			waitSchedulingPods: []*v1.Pod{
+				st.MakePod().Name("pod1").UID("pod1").SchedulerName(testSchedulerProfile1).Obj(),
+				st.MakePod().Name("pod2").UID("pod2").SchedulerName(testSchedulerProfile1).Obj(),
+				st.MakePod().Name("pod3").UID("pod3").SchedulerName(testSchedulerProfile2).Obj(),
+				st.MakePod().Name("pod4").UID("pod4").SchedulerName(testSchedulerProfile3).Obj(),
+			},
+			expectPodNamesInWaitingPods: []string{"pod1", "pod2", "pod3", "pod4"},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Set up scheduler for the 3 nodes.
+			objs := append([]runtime.Object{&v1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ""}}}, nodes...)
+			fakeClient := fake.NewClientset(objs...)
+			informerFactory := informers.NewSharedInformerFactory(fakeClient, 0)
+			eventBroadcaster := events.NewBroadcaster(&events.EventSinkImpl{Interface: fakeClient.EventsV1()})
+			defer eventBroadcaster.Shutdown()
+
+			eventRecorder := eventBroadcaster.NewRecorder(scheme.Scheme, fakePermit)
+
+			outOfTreeRegistry := frameworkruntime.Registry{
+				fakePermit: newFakePermitPlugin(eventRecorder),
+			}
+
+			tCtx := utiltesting.Init(t)
+
+			scheduler, err := New(
+				tCtx,
+				fakeClient,
+				informerFactory,
+				nil,
+				profile.NewRecorderFactory(eventBroadcaster),
+				WithProfiles(tc.profiles...),
+				WithFrameworkOutOfTreeRegistry(outOfTreeRegistry),
+			)
+
+			if err != nil {
+				t.Fatalf("Failed to create scheduler: %v", err)
+			}
+
+			var wg sync.WaitGroup
+			waitSchedulingPodNumber := len(tc.waitSchedulingPods)
+			wg.Add(waitSchedulingPodNumber)
+			stopFn, err := eventBroadcaster.StartEventWatcher(func(obj runtime.Object) {
+				e, ok := obj.(*eventsv1.Event)
+				if !ok || (e.Reason != podWaitingReason) {
+					return
+				}
+				wg.Done()
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer stopFn()
+
+			// Run scheduler.
+			informerFactory.StartWithContext(tCtx)
+			informerFactory.WaitForCacheSyncWithContext(tCtx)
+			go scheduler.Run(tCtx)
+
+			// Send pods to be scheduled.
+			for _, p := range tc.waitSchedulingPods {
+				_, err = fakeClient.CoreV1().Pods("").Create(tCtx, p, metav1.CreateOptions{})
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			// Wait all pods in waitSchedulingPods to be scheduled.
+			wg.Wait()
+
+			tCtx.Eventually(func(utiltesting.TContext) sets.Set[string] {
+				// Ensure that all waitingPods in scheduler can be obtained from any profiles.
+				actualPodNamesInWaitingPods := sets.New[string]()
+				for _, schedFramework := range scheduler.Profiles {
+					schedFramework.IterateOverWaitingPods(func(pod fwk.WaitingPod) {
+						actualPodNamesInWaitingPods.Insert(pod.GetPod().Name)
+					})
+				}
+				return actualPodNamesInWaitingPods
+			}).WithTimeout(permitTimeout).Should(gomega.Equal(sets.New(tc.expectPodNamesInWaitingPods...)), "unexpected waitingPods in scheduler profile")
+		})
+	}
+}
+
+var _ fwk.QueueSortPlugin = &fakeQueueSortPlugin{}
+
+// fakeQueueSortPlugin is a no-op implementation for QueueSort extension point.
+type fakeQueueSortPlugin struct{}
+
+func (pl *fakeQueueSortPlugin) Name() string {
+	return queueSort
+}
+
+func (pl *fakeQueueSortPlugin) Less(_, _ fwk.QueuedEntityInfo) bool {
+	return false
+}
+
+var _ fwk.BindPlugin = &fakebindPlugin{}
+
+// fakebindPlugin is a no-op implementation for Bind extension point.
+type fakebindPlugin struct{}
+
+func (t *fakebindPlugin) Name() string {
+	return fakeBind
+}
+
+func (t *fakebindPlugin) Bind(ctx context.Context, state fwk.CycleState, p *v1.Pod, nodeName string) *fwk.Status {
+	return nil
+}
+
+// filterWithoutEnqueueExtensionsPlugin implements Filter, but doesn't implement EnqueueExtensions.
+type filterWithoutEnqueueExtensionsPlugin struct{}
+
+func (*filterWithoutEnqueueExtensionsPlugin) Name() string { return filterWithoutEnqueueExtensions }
+
+func (*filterWithoutEnqueueExtensionsPlugin) Filter(_ context.Context, _ fwk.CycleState, _ *v1.Pod, _ fwk.NodeInfo) *fwk.Status {
+	return nil
+}
+
+var hintFromFakeNode = fwk.QueueingHint(100)
+
+type fakeNodePlugin struct{}
+
+var fakeNodePluginQueueingFn = func(_ klog.Logger, _ *v1.Pod, _, _ interface{}) (fwk.QueueingHint, error) {
+	return hintFromFakeNode, nil
+}
+
+func (*fakeNodePlugin) Name() string { return fakeNode }
+
+func (*fakeNodePlugin) Filter(_ context.Context, _ fwk.CycleState, _ *v1.Pod, _ fwk.NodeInfo) *fwk.Status {
+	return nil
+}
+
+func (pl *fakeNodePlugin) EventsToRegister(_ context.Context) ([]fwk.ClusterEventWithHint, error) {
+	return []fwk.ClusterEventWithHint{
+		{Event: fwk.ClusterEvent{Resource: fwk.Node, ActionType: fwk.Add}, QueueingHintFn: fakeNodePluginQueueingFn},
+	}, nil
+}
+
+var hintFromFakePod = fwk.QueueingHint(101)
+
+type fakePodPlugin struct{}
+
+var fakePodPluginQueueingFn = func(_ klog.Logger, _ *v1.Pod, _, _ interface{}) (fwk.QueueingHint, error) {
+	return hintFromFakePod, nil
+}
+
+func (*fakePodPlugin) Name() string { return fakePod }
+
+func (*fakePodPlugin) Filter(_ context.Context, _ fwk.CycleState, _ *v1.Pod, _ fwk.NodeInfo) *fwk.Status {
+	return nil
+}
+
+func (pl *fakePodPlugin) EventsToRegister(_ context.Context) ([]fwk.ClusterEventWithHint, error) {
+	return []fwk.ClusterEventWithHint{
+		{Event: fwk.ClusterEvent{Resource: fwk.Pod, ActionType: fwk.Add}, QueueingHintFn: fakePodPluginQueueingFn},
+	}, nil
+}
+
+var hintFromFakeAssignedPod = fwk.QueueingHint(102)
+
+type fakeAssignedPodPlugin struct{}
+
+var fakeAssignedPodPluginQueueingFn = func(_ klog.Logger, _ *v1.Pod, _, _ interface{}) (fwk.QueueingHint, error) {
+	return hintFromFakeAssignedPod, nil
+}
+
+func (*fakeAssignedPodPlugin) Name() string { return fakeAssignedPod }
+
+func (*fakeAssignedPodPlugin) Filter(_ context.Context, _ fwk.CycleState, _ *v1.Pod, _ fwk.NodeInfo) *fwk.Status {
+	return nil
+}
+
+func (pl *fakeAssignedPodPlugin) EventsToRegister(_ context.Context) ([]fwk.ClusterEventWithHint, error) {
+	return []fwk.ClusterEventWithHint{
+		{Event: fwk.ClusterEvent{Resource: fwk.AssignedPod, ActionType: fwk.Update}, QueueingHintFn: fakeAssignedPodPluginQueueingFn},
+	}, nil
+}
+
+type emptyEventPlugin struct{}
+
+func (*emptyEventPlugin) Name() string { return emptyEventExtensions }
+
+func (*emptyEventPlugin) Filter(_ context.Context, _ fwk.CycleState, _ *v1.Pod, _ fwk.NodeInfo) *fwk.Status {
+	return nil
+}
+
+func (pl *emptyEventPlugin) EventsToRegister(_ context.Context) ([]fwk.ClusterEventWithHint, error) {
+	return nil, nil
+}
+
+// errorEventsToRegisterPlugin is a mock plugin that returns an error for EventsToRegister method
+type errorEventsToRegisterPlugin struct{}
+
+func (*errorEventsToRegisterPlugin) Name() string { return errorEventsToRegister }
+
+func (*errorEventsToRegisterPlugin) Filter(_ context.Context, _ fwk.CycleState, _ *v1.Pod, _ fwk.NodeInfo) *fwk.Status {
+	return nil
+}
+
+func (*errorEventsToRegisterPlugin) EventsToRegister(_ context.Context) ([]fwk.ClusterEventWithHint, error) {
+	return nil, errors.New("mock error")
+}
+
+// emptyEventsToRegisterPlugin implement interface fwk.EnqueueExtensions, but returns nil from EventsToRegister.
+// This can simulate a plugin registered at scheduler setup, but does nothing
+// due to some disabled feature gate.
+type emptyEventsToRegisterPlugin struct{}
+
+func (*emptyEventsToRegisterPlugin) Name() string { return emptyEventsToRegister }
+
+func (*emptyEventsToRegisterPlugin) Filter(_ context.Context, _ fwk.CycleState, _ *v1.Pod, _ fwk.NodeInfo) *fwk.Status {
+	return nil
+}
+
+func (*emptyEventsToRegisterPlugin) EventsToRegister(_ context.Context) ([]fwk.ClusterEventWithHint, error) {
+	return nil, nil
+}
+
+// fakePermitPlugin only implements PermitPlugin interface.
+type fakePermitPlugin struct {
+	eventRecorder events.EventRecorderLogger
+}
+
+func newFakePermitPlugin(eventRecorder events.EventRecorderLogger) frameworkruntime.PluginFactory {
+	return func(ctx context.Context, configuration runtime.Object, f fwk.Handle) (fwk.Plugin, error) {
+		pl := &fakePermitPlugin{
+			eventRecorder: eventRecorder,
 		}
-		schedPrioritizers := sets.NewString()
-		for _, p := range policy.Priorities {
-			schedPrioritizers.Insert(p.Name)
+		return pl, nil
+	}
+}
+
+func (f fakePermitPlugin) Name() string {
+	return fakePermit
+}
+
+const (
+	podWaitingReason = "podWaiting"
+	permitTimeout    = 10 * time.Second
+)
+
+func (f fakePermitPlugin) Permit(ctx context.Context, state fwk.CycleState, p *v1.Pod, nodeName string) (*fwk.Status, time.Duration) {
+	defer func() {
+		// Send event with podWaiting reason to broadcast this pod is already waiting in the permit stage.
+		f.eventRecorder.WithLogger(klog.FromContext(ctx)).Eventf(p, nil, v1.EventTypeWarning, podWaitingReason, "", "")
+	}()
+
+	return fwk.NewStatus(fwk.Wait), permitTimeout
+}
+
+var _ fwk.PermitPlugin = &fakePermitPlugin{}
+
+func TestNewInformerFactoryTrim(t *testing.T) {
+	// The transform only runs with ManagedFieldsOptOutClient disabled.
+	clientfeaturestesting.SetFeatureDuringTest(t, clientfeatures.ManagedFieldsOptOutClient, false)
+	cs := fake.NewClientset()
+
+	pd := &v1.Pod{ObjectMeta: metav1.ObjectMeta{
+		Name:      "test",
+		Namespace: "default",
+		ManagedFields: []metav1.ManagedFieldsEntry{
+			{
+				Manager:    "update",
+				Operation:  metav1.ManagedFieldsOperationApply,
+				APIVersion: "apps/v1",
+			},
+		},
+	}}
+	require.NoError(t, cs.Tracker().Add(pd))
+
+	informerFactory := NewInformerFactory(cs, 0, nil)
+	lister := informerFactory.Core().V1().Pods().Lister()
+
+	tCtx := utiltesting.Init(t)
+	informerFactory.StartWithContext(tCtx)
+	tCtx.ExpectNoError(informerFactory.WaitForCacheSyncWithContext(tCtx).AsError())
+
+	p, err := lister.Pods("default").Get("test")
+	require.NoError(t, err)
+	require.Empty(t, p.GetManagedFields(), "expected managedFields to be trimmed by the transform")
+}
+
+func TestNewInformerFactoryMetrics(t *testing.T) {
+	cache.ResetInformerNamesForTesting()
+	fifometrics.Register()
+
+	informerName, err := cache.NewInformerName("kube-scheduler")
+	require.NoError(t, err)
+	defer informerName.Release()
+
+	cs := fake.NewClientset()
+	informerFactory := NewInformerFactory(cs, 0, informerName)
+	// The pod informer is built by the scheduler itself rather than by the factory,
+	// so make sure it carries the identity too.
+	informerFactory.Core().V1().Pods().Informer()
+	informerFactory.Core().V1().Nodes().Informer()
+
+	tCtx := utiltesting.Init(t)
+	informerFactory.StartWithContext(tCtx)
+	tCtx.ExpectNoError(informerFactory.WaitForCacheSyncWithContext(tCtx).AsError())
+
+	want := `
+# HELP informer_queued_items [ALPHA] Number of items currently queued in the FIFO.
+# TYPE informer_queued_items gauge
+informer_queued_items{group="",name="kube-scheduler",resource="nodes",version="v1"} 0
+informer_queued_items{group="",name="kube-scheduler",resource="pods",version="v1"} 0
+`
+	if err := testutil.GatherAndCompare(legacyregistry.DefaultGatherer, strings.NewReader(want), "informer_queued_items"); err != nil {
+		t.Error(err)
+	}
+}
+
+func TestDeferredResizeQueueingByProfile(t *testing.T) {
+	newProfile := func(name string, plugins ...schedulerapi.Plugin) schedulerapi.KubeSchedulerProfile {
+		return schedulerapi.KubeSchedulerProfile{
+			SchedulerName: name,
+			Plugins: &schedulerapi.Plugins{
+				QueueSort: schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: names.PrioritySort}}},
+				Filter:    schedulerapi.PluginSet{Enabled: plugins},
+				Bind:      schedulerapi.PluginSet{Enabled: slices.Concat(plugins, []schedulerapi.Plugin{{Name: names.DefaultBinder}})},
+			},
 		}
-		if !schedPredicates.Equal(test.expectedPredicates) {
-			t.Errorf("Expected predicates %v, got %v", test.expectedPredicates, schedPredicates)
-		}
-		if !schedPrioritizers.Equal(test.expectedPrioritizers) {
-			t.Errorf("Expected priority functions %v, got %v", test.expectedPrioritizers, schedPrioritizers)
-		}
+	}
+	filterOnly := newProfile("deferred-pod-scheduling-filter-only")
+	filterOnly.Plugins.Filter.Enabled = []schedulerapi.Plugin{{Name: names.DeferredPodScheduling}}
+	bindOnly := newProfile("deferred-pod-scheduling-bind-only")
+	bindOnly.Plugins.Bind.Enabled = []schedulerapi.Plugin{{Name: names.DeferredPodScheduling}, {Name: names.DefaultBinder}}
+
+	tests := []struct {
+		profile       string
+		expectInQueue bool
+	}{
+		{profile: "with-deferred-pod-scheduling", expectInQueue: true},
+		{profile: "without-deferred-pod-scheduling", expectInQueue: false},
+		{profile: "deferred-pod-scheduling-filter-only", expectInQueue: false},
+		{profile: "deferred-pod-scheduling-bind-only", expectInQueue: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.profile, func(t *testing.T) {
+			featuregatetesting.SetFeatureGateDuringTest(t, feature.DefaultFeatureGate, features.InPlacePodVerticalScalingSchedulerPreemption, true)
+			_, ctx := ktesting.NewTestContext(t)
+			ctx, cancel := context.WithCancel(ctx)
+			defer cancel()
+
+			client := fake.NewClientset()
+			sched, err := New(ctx, client, informers.NewSharedInformerFactory(client, 0), nil,
+				profile.NewRecorderFactory(events.NewBroadcaster(&events.EventSinkImpl{Interface: client.EventsV1()})),
+				WithProfiles(
+					newProfile("with-deferred-pod-scheduling", schedulerapi.Plugin{Name: names.DeferredPodScheduling}),
+					newProfile("without-deferred-pod-scheduling"),
+					filterOnly,
+					bindOnly,
+				),
+			)
+			if err != nil {
+				t.Fatalf("Failed to create scheduler: %v", err)
+			}
+
+			pod := st.MakePod().Name("pod1").Namespace("ns1").UID("pod1").Node("node1").SchedulerName(tt.profile).Obj()
+			deferredPod := st.MakePod().Name("pod1").Namespace("ns1").UID("pod1").Node("node1").SchedulerName(tt.profile).
+				Condition(v1.PodResizePending, v1.ConditionTrue, v1.PodReasonDeferred).Obj()
+			resizedPod := st.MakePod().Name("pod1").Namespace("ns1").UID("pod1").Node("node1").SchedulerName(tt.profile).
+				Condition(v1.PodResizePending, v1.ConditionTrue, v1.PodReasonDeferred).Req(map[v1.ResourceName]string{v1.ResourceCPU: "2"}).Obj()
+			checkQueue := func(step string) {
+				t.Helper()
+				if _, inQueue := sched.SchedulingQueue.GetPod(ctx, pod.Name, pod.Namespace, nil); inQueue != tt.expectInQueue {
+					t.Errorf("%s: got inQueue=%v, want inQueue=%v", step, inQueue, tt.expectInQueue)
+				}
+			}
+
+			sched.addPod(deferredPod)
+			checkQueue("add with deferred resize")
+			// The queue adds a pod it doesn't hold on Update, so an unqueued deferred pod must not get there.
+			sched.updatePod(deferredPod, resizedPod)
+			checkQueue("resize while deferred")
+			sched.deletePod(resizedPod)
+
+			sched.addPod(pod)
+			sched.updatePod(pod, deferredPod)
+			checkQueue("transition to deferred resize")
+		})
 	}
 }

@@ -27,49 +27,6 @@ import (
 	"k8s.io/apimachinery/pkg/util/sets"
 )
 
-// PodRequestsAndLimits returns a dictionary of all defined resources summed up for all
-// containers of the pod.
-func PodRequestsAndLimits(pod *corev1.Pod) (reqs, limits corev1.ResourceList) {
-	reqs, limits = corev1.ResourceList{}, corev1.ResourceList{}
-	for _, container := range pod.Spec.Containers {
-		addResourceList(reqs, container.Resources.Requests)
-		addResourceList(limits, container.Resources.Limits)
-	}
-	// init containers define the minimum of any resource
-	for _, container := range pod.Spec.InitContainers {
-		maxResourceList(reqs, container.Resources.Requests)
-		maxResourceList(limits, container.Resources.Limits)
-	}
-	return
-}
-
-// addResourceList adds the resources in newList to list
-func addResourceList(list, new corev1.ResourceList) {
-	for name, quantity := range new {
-		if value, ok := list[name]; !ok {
-			list[name] = *quantity.Copy()
-		} else {
-			value.Add(quantity)
-			list[name] = value
-		}
-	}
-}
-
-// maxResourceList sets list to the greater of list/newList for every resource
-// either list
-func maxResourceList(list, new corev1.ResourceList) {
-	for name, quantity := range new {
-		if value, ok := list[name]; !ok {
-			list[name] = *quantity.Copy()
-			continue
-		} else {
-			if quantity.Cmp(value) > 0 {
-				list[name] = *quantity.Copy()
-			}
-		}
-	}
-}
-
 // ExtractContainerResourceValue extracts the value of a resource
 // in an already known container
 func ExtractContainerResourceValue(fs *corev1.ResourceFieldSelector, container *corev1.Container) (string, error) {
@@ -94,7 +51,20 @@ func ExtractContainerResourceValue(fs *corev1.ResourceFieldSelector, container *
 	case "requests.ephemeral-storage":
 		return convertResourceEphemeralStorageToString(container.Resources.Requests.StorageEphemeral(), divisor)
 	}
-
+	// handle extended standard resources with dynamic names
+	// example: requests.hugepages-<pageSize> or limits.hugepages-<pageSize>
+	if strings.HasPrefix(fs.Resource, "requests.") {
+		resourceName := corev1.ResourceName(strings.TrimPrefix(fs.Resource, "requests."))
+		if IsHugePageResourceName(resourceName) {
+			return convertResourceHugePagesToString(container.Resources.Requests.Name(resourceName, resource.BinarySI), divisor)
+		}
+	}
+	if strings.HasPrefix(fs.Resource, "limits.") {
+		resourceName := corev1.ResourceName(strings.TrimPrefix(fs.Resource, "limits."))
+		if IsHugePageResourceName(resourceName) {
+			return convertResourceHugePagesToString(container.Resources.Limits.Name(resourceName, resource.BinarySI), divisor)
+		}
+	}
 	return "", fmt.Errorf("Unsupported container resource : %v", fs.Resource)
 }
 
@@ -112,6 +82,13 @@ func convertResourceMemoryToString(memory *resource.Quantity, divisor resource.Q
 	return strconv.FormatInt(m, 10), nil
 }
 
+// convertResourceHugePagesToString converts hugepages value to the format of divisor and returns
+// ceiling of the value.
+func convertResourceHugePagesToString(hugePages *resource.Quantity, divisor resource.Quantity) (string, error) {
+	m := int64(math.Ceil(float64(hugePages.Value()) / float64(divisor.Value())))
+	return strconv.FormatInt(m, 10), nil
+}
+
 // convertResourceEphemeralStorageToString converts ephemeral storage value to the format of divisor and returns
 // ceiling of the value.
 func convertResourceEphemeralStorageToString(ephemeralStorage *resource.Quantity, divisor resource.Quantity) (string, error) {
@@ -119,7 +96,7 @@ func convertResourceEphemeralStorageToString(ephemeralStorage *resource.Quantity
 	return strconv.FormatInt(m, 10), nil
 }
 
-var standardContainerResources = sets.NewString(
+var standardContainerResources = sets.New(
 	string(corev1.ResourceCPU),
 	string(corev1.ResourceMemory),
 	string(corev1.ResourceEphemeralStorage),

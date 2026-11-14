@@ -23,28 +23,53 @@ import (
 func TestPolicyBestEffortCanAdmitPodResult(t *testing.T) {
 	tcases := []struct {
 		name     string
-		admit    bool
+		hint     TopologyHint
 		expected bool
 	}{
 		{
-			name:     "Affinity is set to false in topology hints",
-			admit:    false,
+			name:     "Preferred is set to false in topology hints",
+			hint:     TopologyHint{NUMANodeAffinity: nil, Preferred: false},
 			expected: true,
 		},
 		{
-			name:     "Affinity is set to true in topology hints",
-			admit:    true,
+			name:     "Preferred is set to true in topology hints",
+			hint:     TopologyHint{NUMANodeAffinity: nil, Preferred: true},
 			expected: true,
 		},
 	}
 
 	for _, tc := range tcases {
-		policy := NewBestEffortPolicy()
-		admit := tc.admit
-		result := policy.CanAdmitPodResult(admit)
+		numaInfo := commonNUMAInfoTwoNodes()
+		policy := &bestEffortPolicy{numaInfo: numaInfo}
+		result := policy.canAdmitPodResult(&tc.hint)
 
-		if result.Admit != tc.expected {
-			t.Errorf("Expected Admit field in result to be %t, got %t", tc.expected, result.Admit)
+		if result != tc.expected {
+			t.Errorf("Expected result to be %t, got %t", tc.expected, result)
 		}
 	}
+}
+
+func TestPolicyBestEffortMerge(t *testing.T) {
+	numaInfo := commonNUMAInfoFourNodes()
+	policy := &bestEffortPolicy{numaInfo: numaInfo}
+
+	tcases := commonPolicyMergeTestCases(numaInfo.Nodes)
+	tcases = append(tcases, policy.mergeTestCases(numaInfo.Nodes)...)
+	tcases = append(tcases, policy.mergeTestCasesNoPolicies(numaInfo.Nodes)...)
+
+	testPolicyMerge(policy, tcases, t)
+}
+
+func TestPolicyBestEffortMergeClosestNUMA(t *testing.T) {
+	numaInfo := commonNUMAInfoEightNodes()
+	opts := PolicyOptions{
+		PreferClosestNUMA: true,
+	}
+	policy := &bestEffortPolicy{numaInfo: numaInfo, opts: opts}
+
+	tcases := commonPolicyMergeTestCases(numaInfo.Nodes)
+	tcases = append(tcases, policy.mergeTestCases(numaInfo.Nodes)...)
+	tcases = append(tcases, policy.mergeTestCasesClosestNUMA(numaInfo.Nodes)...)
+
+	testPolicyMerge(policy, tcases, t)
 }

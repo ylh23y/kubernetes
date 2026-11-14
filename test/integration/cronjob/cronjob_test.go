@@ -17,61 +17,65 @@ limitations under the License.
 package cronjob
 
 import (
+	"context"
 	"fmt"
-	"net/http/httptest"
 	"testing"
 	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
-	batchv1beta1 "k8s.io/api/batch/v1beta1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/informers"
 	clientset "k8s.io/client-go/kubernetes"
-	clientbatchv1beta1 "k8s.io/client-go/kubernetes/typed/batch/v1beta1"
+	clientbatchv1 "k8s.io/client-go/kubernetes/typed/batch/v1"
 	restclient "k8s.io/client-go/rest"
+	"k8s.io/ktesting"
+	kubeapiservertesting "k8s.io/kubernetes/cmd/kube-apiserver/app/testing"
 	"k8s.io/kubernetes/pkg/controller/cronjob"
 	"k8s.io/kubernetes/pkg/controller/job"
 	"k8s.io/kubernetes/test/integration/framework"
 )
 
-func setup(t *testing.T) (*httptest.Server, framework.CloseFunc, *cronjob.Controller, *job.JobController, informers.SharedInformerFactory, clientset.Interface, restclient.Config) {
-	masterConfig := framework.NewIntegrationTestMasterConfig()
-	_, server, closeFn := framework.RunAMaster(masterConfig)
+func setup(ctx context.Context, t *testing.T) (kubeapiservertesting.TearDownFunc, *cronjob.ControllerV2, *job.Controller, informers.SharedInformerFactory, clientset.Interface) {
+	// Disable ServiceAccount admission plugin as we don't have serviceaccount controller running.
+	server := kubeapiservertesting.StartTestServerOrDie(t, nil, framework.DefaultTestServerFlags(), framework.SharedEtcd())
 
-	config := restclient.Config{Host: server.URL}
-	clientSet, err := clientset.NewForConfig(&config)
+	config := restclient.CopyConfig(server.ClientConfig)
+	clientSet, err := clientset.NewForConfig(config)
 	if err != nil {
 		t.Fatalf("Error creating clientset: %v", err)
 	}
 	resyncPeriod := 12 * time.Hour
-	informerSet := informers.NewSharedInformerFactory(clientset.NewForConfigOrDie(restclient.AddUserAgent(&config, "cronjob-informers")), resyncPeriod)
-	cjc, err := cronjob.NewController(clientSet)
+	informerSet := informers.NewSharedInformerFactory(clientset.NewForConfigOrDie(restclient.AddUserAgent(config, "cronjob-informers")), resyncPeriod)
+	cjc, err := cronjob.NewControllerV2(ctx, informerSet.Batch().V1().Jobs(), informerSet.Batch().V1().CronJobs(), clientSet)
 	if err != nil {
 		t.Fatalf("Error creating CronJob controller: %v", err)
 	}
-	jc := job.NewJobController(informerSet.Core().V1().Pods(), informerSet.Batch().V1().Jobs(), clientSet)
+	jc, err := job.NewController(ctx, clientSet, informerSet.Core().V1().Pods(), informerSet.Batch().V1().Jobs(), nil, nil)
+	if err != nil {
+		t.Fatalf("Error creating Job controller: %v", err)
+	}
 
-	return server, closeFn, cjc, jc, informerSet, clientSet, config
+	return server.TearDownFn, cjc, jc, informerSet, clientSet
 }
 
-func newCronJob(name, namespace, schedule string) *batchv1beta1.CronJob {
+func newCronJob(name, namespace, schedule string) *batchv1.CronJob {
 	zero64 := int64(0)
 	zero32 := int32(0)
-	return &batchv1beta1.CronJob{
+	return &batchv1.CronJob{
 		TypeMeta: metav1.TypeMeta{
 			Kind:       "CronJob",
-			APIVersion: "batch/v1beta1",
+			APIVersion: "batch/v1",
 		},
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace: namespace,
 			Name:      name,
 		},
-		Spec: batchv1beta1.CronJobSpec{
+		Spec: batchv1.CronJobSpec{
 			Schedule:                   schedule,
 			SuccessfulJobsHistoryLimit: &zero32,
-			JobTemplate: batchv1beta1.JobTemplateSpec{
+			JobTemplate: batchv1.JobTemplateSpec{
 				Spec: batchv1.JobSpec{
 					Template: corev1.PodTemplateSpec{
 						Spec: corev1.PodSpec{
@@ -86,9 +90,9 @@ func newCronJob(name, namespace, schedule string) *batchv1beta1.CronJob {
 	}
 }
 
-func cleanupCronJobs(t *testing.T, cjClient clientbatchv1beta1.CronJobInterface, name string) {
+func cleanupCronJobs(t *testing.T, cjClient clientbatchv1.CronJobInterface, name string) {
 	deletePropagation := metav1.DeletePropagationForeground
-	err := cjClient.Delete(name, &metav1.DeleteOptions{PropagationPolicy: &deletePropagation})
+	err := cjClient.Delete(context.TODO(), name, metav1.DeleteOptions{PropagationPolicy: &deletePropagation})
 	if err != nil {
 		t.Errorf("Failed to delete CronJob: %v", err)
 	}
@@ -96,7 +100,7 @@ func cleanupCronJobs(t *testing.T, cjClient clientbatchv1beta1.CronJobInterface,
 
 func validateJobAndPod(t *testing.T, clientSet clientset.Interface, namespace string) {
 	if err := wait.PollImmediate(1*time.Second, 120*time.Second, func() (bool, error) {
-		jobs, err := clientSet.BatchV1().Jobs(namespace).List(metav1.ListOptions{})
+		jobs, err := clientSet.BatchV1().Jobs(namespace).List(context.TODO(), metav1.ListOptions{})
 		if err != nil {
 			t.Fatalf("Failed to list jobs: %v", err)
 		}
@@ -117,7 +121,7 @@ func validateJobAndPod(t *testing.T, clientSet clientset.Interface, namespace st
 			}
 		}
 
-		pods, err := clientSet.CoreV1().Pods(namespace).List(metav1.ListOptions{})
+		pods, err := clientSet.CoreV1().Pods(namespace).List(context.TODO(), metav1.ListOptions{})
 		if err != nil {
 			t.Fatalf("Failed to list pods: %v", err)
 		}
@@ -144,25 +148,24 @@ func validateJobAndPod(t *testing.T, clientSet clientset.Interface, namespace st
 }
 
 func TestCronJobLaunchesPodAndCleansUp(t *testing.T) {
-	server, closeFn, cjc, jc, informerSet, clientSet, _ := setup(t)
-	defer closeFn()
+	tCtx := ktesting.Init(t)
+
+	closeFn, cjc, jc, informerSet, clientSet := setup(tCtx, t)
+	tCtx.Cleanup(closeFn)
 
 	cronJobName := "foo"
 	namespaceName := "simple-cronjob-test"
 
-	ns := framework.CreateTestingNamespace(namespaceName, server, t)
-	defer framework.DeleteTestingNamespace(ns, server, t)
+	ns := framework.CreateNamespaceOrDie(clientSet, namespaceName, t)
+	defer framework.DeleteNamespaceOrDie(clientSet, ns, t)
 
-	cjClient := clientSet.BatchV1beta1().CronJobs(ns.Name)
+	cjClient := clientSet.BatchV1().CronJobs(ns.Name)
 
-	stopCh := make(chan struct{})
-	defer close(stopCh)
+	informerSet.Start(tCtx.Done())
+	go cjc.Run(tCtx, 1)
+	go jc.Run(tCtx, 1)
 
-	informerSet.Start(stopCh)
-	go cjc.Run(stopCh)
-	go jc.Run(1, stopCh)
-
-	_, err := cjClient.Create(newCronJob(cronJobName, ns.Name, "* * * * ?"))
+	_, err := cjClient.Create(tCtx, newCronJob(cronJobName, ns.Name, "* * * * ?"), metav1.CreateOptions{})
 	if err != nil {
 		t.Fatalf("Failed to create CronJob: %v", err)
 	}

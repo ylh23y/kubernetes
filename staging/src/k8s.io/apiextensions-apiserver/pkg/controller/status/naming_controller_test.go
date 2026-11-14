@@ -22,24 +22,29 @@ import (
 	"testing"
 	"time"
 
-	"k8s.io/apiextensions-apiserver/pkg/apis/apiextensions"
-	listers "k8s.io/apiextensions-apiserver/pkg/client/listers/apiextensions/internalversion"
+	apiextensionsv1 "k8s.io/apiextensions-api/pkg/apis/apiextensions/v1"
+	"k8s.io/apiextensions-api/pkg/client/clientset/clientset/fake"
+	listers "k8s.io/apiextensions-api/pkg/client/listers/apiextensions/v1"
+	apiextensionshelpers "k8s.io/apiextensions-apiserver/pkg/apihelpers"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/util/workqueue"
+	"k8s.io/klog/v2/ktesting"
 )
 
 type crdBuilder struct {
-	curr apiextensions.CustomResourceDefinition
+	curr apiextensionsv1.CustomResourceDefinition
 }
 
 func newCRD(name string) *crdBuilder {
 	tokens := strings.SplitN(name, ".", 2)
 	return &crdBuilder{
-		curr: apiextensions.CustomResourceDefinition{
+		curr: apiextensionsv1.CustomResourceDefinition{
 			ObjectMeta: metav1.ObjectMeta{Name: name},
-			Spec: apiextensions.CustomResourceDefinitionSpec{
+			Spec: apiextensionsv1.CustomResourceDefinitionSpec{
 				Group: tokens[1],
-				Names: apiextensions.CustomResourceDefinitionNames{
+				Names: apiextensionsv1.CustomResourceDefinitionNames{
 					Plural: tokens[0],
 				},
 			},
@@ -67,14 +72,14 @@ func (b *crdBuilder) StatusNames(plural, singular, kind, listKind string, shortN
 	return b
 }
 
-func (b *crdBuilder) Condition(c apiextensions.CustomResourceDefinitionCondition) *crdBuilder {
+func (b *crdBuilder) Condition(c apiextensionsv1.CustomResourceDefinitionCondition) *crdBuilder {
 	b.curr.Status.Conditions = append(b.curr.Status.Conditions, c)
 
 	return b
 }
 
-func names(plural, singular, kind, listKind string, shortNames ...string) apiextensions.CustomResourceDefinitionNames {
-	ret := apiextensions.CustomResourceDefinitionNames{
+func names(plural, singular, kind, listKind string, shortNames ...string) apiextensionsv1.CustomResourceDefinitionNames {
+	ret := apiextensionsv1.CustomResourceDefinitionNames{
 		Plural:     plural,
 		Singular:   singular,
 		Kind:       kind,
@@ -84,42 +89,42 @@ func names(plural, singular, kind, listKind string, shortNames ...string) apiext
 	return ret
 }
 
-func (b *crdBuilder) NewOrDie() *apiextensions.CustomResourceDefinition {
+func (b *crdBuilder) NewOrDie() *apiextensionsv1.CustomResourceDefinition {
 	return &b.curr
 }
 
-var acceptedCondition = apiextensions.CustomResourceDefinitionCondition{
-	Type:    apiextensions.NamesAccepted,
-	Status:  apiextensions.ConditionTrue,
+var acceptedCondition = apiextensionsv1.CustomResourceDefinitionCondition{
+	Type:    apiextensionsv1.NamesAccepted,
+	Status:  apiextensionsv1.ConditionTrue,
 	Reason:  "NoConflicts",
 	Message: "no conflicts found",
 }
 
-var notAcceptedCondition = apiextensions.CustomResourceDefinitionCondition{
-	Type:    apiextensions.NamesAccepted,
-	Status:  apiextensions.ConditionFalse,
+var notAcceptedCondition = apiextensionsv1.CustomResourceDefinitionCondition{
+	Type:    apiextensionsv1.NamesAccepted,
+	Status:  apiextensionsv1.ConditionFalse,
 	Reason:  "NotAccepted",
 	Message: "not all names are accepted",
 }
 
-var installingCondition = apiextensions.CustomResourceDefinitionCondition{
-	Type:    apiextensions.Established,
-	Status:  apiextensions.ConditionFalse,
+var installingCondition = apiextensionsv1.CustomResourceDefinitionCondition{
+	Type:    apiextensionsv1.Established,
+	Status:  apiextensionsv1.ConditionFalse,
 	Reason:  "Installing",
 	Message: "the initial names have been accepted",
 }
 
-var notEstablishedCondition = apiextensions.CustomResourceDefinitionCondition{
-	Type:    apiextensions.Established,
-	Status:  apiextensions.ConditionFalse,
+var notEstablishedCondition = apiextensionsv1.CustomResourceDefinitionCondition{
+	Type:    apiextensionsv1.Established,
+	Status:  apiextensionsv1.ConditionFalse,
 	Reason:  "NotAccepted",
 	Message: "not all names are accepted",
 }
 
-func nameConflictCondition(reason, message string) apiextensions.CustomResourceDefinitionCondition {
-	return apiextensions.CustomResourceDefinitionCondition{
-		Type:    apiextensions.NamesAccepted,
-		Status:  apiextensions.ConditionFalse,
+func nameConflictCondition(reason, message string) apiextensionsv1.CustomResourceDefinitionCondition {
+	return apiextensionsv1.CustomResourceDefinitionCondition{
+		Type:    apiextensionsv1.NamesAccepted,
+		Status:  apiextensionsv1.ConditionFalse,
 		Reason:  reason,
 		Message: message,
 	}
@@ -129,17 +134,17 @@ func TestSync(t *testing.T) {
 	tests := []struct {
 		name string
 
-		in                            *apiextensions.CustomResourceDefinition
-		existing                      []*apiextensions.CustomResourceDefinition
-		expectedNames                 apiextensions.CustomResourceDefinitionNames
-		expectedNameConflictCondition apiextensions.CustomResourceDefinitionCondition
-		expectedEstablishedCondition  apiextensions.CustomResourceDefinitionCondition
+		in                            *apiextensionsv1.CustomResourceDefinition
+		existing                      []*apiextensionsv1.CustomResourceDefinition
+		expectedNames                 apiextensionsv1.CustomResourceDefinitionNames
+		expectedNameConflictCondition apiextensionsv1.CustomResourceDefinitionCondition
+		expectedEstablishedCondition  apiextensionsv1.CustomResourceDefinitionCondition
 	}{
 		{
 			name:     "first resource",
 			in:       newCRD("alfa.bravo.com").NewOrDie(),
-			existing: []*apiextensions.CustomResourceDefinition{},
-			expectedNames: apiextensions.CustomResourceDefinitionNames{
+			existing: []*apiextensionsv1.CustomResourceDefinition{},
+			expectedNames: apiextensionsv1.CustomResourceDefinitionNames{
 				Plural: "alfa",
 			},
 			expectedNameConflictCondition: acceptedCondition,
@@ -148,7 +153,7 @@ func TestSync(t *testing.T) {
 		{
 			name: "different groups",
 			in:   newCRD("alfa.bravo.com").SpecNames("alfa", "delta-singular", "echo-kind", "foxtrot-listkind", "golf-shortname-1", "hotel-shortname-2").NewOrDie(),
-			existing: []*apiextensions.CustomResourceDefinition{
+			existing: []*apiextensionsv1.CustomResourceDefinition{
 				newCRD("alfa.charlie.com").StatusNames("alfa", "delta-singular", "echo-kind", "foxtrot-listkind", "golf-shortname-1", "hotel-shortname-2").NewOrDie(),
 			},
 			expectedNames:                 names("alfa", "delta-singular", "echo-kind", "foxtrot-listkind", "golf-shortname-1", "hotel-shortname-2"),
@@ -158,7 +163,7 @@ func TestSync(t *testing.T) {
 		{
 			name: "conflict plural to singular",
 			in:   newCRD("alfa.bravo.com").SpecNames("alfa", "delta-singular", "echo-kind", "foxtrot-listkind", "golf-shortname-1", "hotel-shortname-2").NewOrDie(),
-			existing: []*apiextensions.CustomResourceDefinition{
+			existing: []*apiextensionsv1.CustomResourceDefinition{
 				newCRD("india.bravo.com").StatusNames("india", "alfa", "", "").NewOrDie(),
 			},
 			expectedNames:                 names("", "delta-singular", "echo-kind", "foxtrot-listkind", "golf-shortname-1", "hotel-shortname-2"),
@@ -168,7 +173,7 @@ func TestSync(t *testing.T) {
 		{
 			name: "conflict singular to shortName",
 			in:   newCRD("alfa.bravo.com").SpecNames("alfa", "delta-singular", "echo-kind", "foxtrot-listkind", "golf-shortname-1", "hotel-shortname-2").NewOrDie(),
-			existing: []*apiextensions.CustomResourceDefinition{
+			existing: []*apiextensionsv1.CustomResourceDefinition{
 				newCRD("india.bravo.com").StatusNames("india", "indias", "", "", "delta-singular").NewOrDie(),
 			},
 			expectedNames:                 names("alfa", "", "echo-kind", "foxtrot-listkind", "golf-shortname-1", "hotel-shortname-2"),
@@ -178,7 +183,7 @@ func TestSync(t *testing.T) {
 		{
 			name: "conflict on shortName to shortName",
 			in:   newCRD("alfa.bravo.com").SpecNames("alfa", "delta-singular", "echo-kind", "foxtrot-listkind", "golf-shortname-1", "hotel-shortname-2").NewOrDie(),
-			existing: []*apiextensions.CustomResourceDefinition{
+			existing: []*apiextensionsv1.CustomResourceDefinition{
 				newCRD("india.bravo.com").StatusNames("india", "indias", "", "", "hotel-shortname-2").NewOrDie(),
 			},
 			expectedNames:                 names("alfa", "delta-singular", "echo-kind", "foxtrot-listkind"),
@@ -188,7 +193,7 @@ func TestSync(t *testing.T) {
 		{
 			name: "conflict on kind to listkind",
 			in:   newCRD("alfa.bravo.com").SpecNames("alfa", "delta-singular", "echo-kind", "foxtrot-listkind", "golf-shortname-1", "hotel-shortname-2").NewOrDie(),
-			existing: []*apiextensions.CustomResourceDefinition{
+			existing: []*apiextensionsv1.CustomResourceDefinition{
 				newCRD("india.bravo.com").StatusNames("india", "indias", "", "echo-kind").NewOrDie(),
 			},
 			expectedNames:                 names("alfa", "delta-singular", "", "foxtrot-listkind", "golf-shortname-1", "hotel-shortname-2"),
@@ -198,7 +203,7 @@ func TestSync(t *testing.T) {
 		{
 			name: "conflict on listkind to kind",
 			in:   newCRD("alfa.bravo.com").SpecNames("alfa", "delta-singular", "echo-kind", "foxtrot-listkind", "golf-shortname-1", "hotel-shortname-2").NewOrDie(),
-			existing: []*apiextensions.CustomResourceDefinition{
+			existing: []*apiextensionsv1.CustomResourceDefinition{
 				newCRD("india.bravo.com").StatusNames("india", "indias", "foxtrot-listkind", "").NewOrDie(),
 			},
 			expectedNames:                 names("alfa", "delta-singular", "echo-kind", "", "golf-shortname-1", "hotel-shortname-2"),
@@ -208,7 +213,7 @@ func TestSync(t *testing.T) {
 		{
 			name: "no conflict on resource and kind",
 			in:   newCRD("alfa.bravo.com").SpecNames("alfa", "delta-singular", "echo-kind", "foxtrot-listkind", "golf-shortname-1", "hotel-shortname-2").NewOrDie(),
-			existing: []*apiextensions.CustomResourceDefinition{
+			existing: []*apiextensionsv1.CustomResourceDefinition{
 				newCRD("india.bravo.com").StatusNames("india", "echo-kind", "", "").NewOrDie(),
 			},
 			expectedNames:                 names("alfa", "delta-singular", "echo-kind", "foxtrot-listkind", "golf-shortname-1", "hotel-shortname-2"),
@@ -221,7 +226,7 @@ func TestSync(t *testing.T) {
 				SpecNames("alfa", "delta-singular", "echo-kind", "foxtrot-listkind", "golf-shortname-1", "hotel-shortname-2").
 				StatusNames("zulu", "yankee-singular", "xray-kind", "whiskey-listkind", "victor-shortname-1", "uniform-shortname-2").
 				NewOrDie(),
-			existing: []*apiextensions.CustomResourceDefinition{
+			existing: []*apiextensionsv1.CustomResourceDefinition{
 				newCRD("india.bravo.com").StatusNames("india", "indias", "foxtrot-listkind", "", "delta-singular").NewOrDie(),
 			},
 			expectedNames:                 names("alfa", "yankee-singular", "echo-kind", "whiskey-listkind", "golf-shortname-1", "hotel-shortname-2"),
@@ -234,7 +239,7 @@ func TestSync(t *testing.T) {
 				SpecNames("alfa", "delta-singular", "echo-kind", "foxtrot-listkind", "golf-shortname-1", "hotel-shortname-2").
 				StatusNames("zulu", "yankee-singular", "xray-kind", "whiskey-listkind", "victor-shortname-1", "uniform-shortname-2").
 				NewOrDie(),
-			existing: []*apiextensions.CustomResourceDefinition{
+			existing: []*apiextensionsv1.CustomResourceDefinition{
 				newCRD("india.bravo.com").StatusNames("india", "indias", "foxtrot-listkind", "", "delta-singular", "golf-shortname-1").NewOrDie(),
 			},
 			expectedNames:                 names("alfa", "yankee-singular", "echo-kind", "whiskey-listkind", "victor-shortname-1", "uniform-shortname-2"),
@@ -247,7 +252,7 @@ func TestSync(t *testing.T) {
 				SpecNames("alfa", "delta-singular", "echo-kind", "foxtrot-listkind", "golf-shortname-1", "hotel-shortname-2").
 				StatusNames("alfa", "delta-singular", "echo-kind", "foxtrot-listkind", "golf-shortname-1", "hotel-shortname-2").
 				NewOrDie(),
-			existing: []*apiextensions.CustomResourceDefinition{
+			existing: []*apiextensionsv1.CustomResourceDefinition{
 				newCRD("alfa.bravo.com").
 					SpecNames("alfa", "delta-singular", "echo-kind", "foxtrot-listkind", "golf-shortname-1", "hotel-shortname-2").
 					StatusNames("alfa", "delta-singular", "echo-kind", "foxtrot-listkind", "golf-shortname-1", "hotel-shortname-2").
@@ -263,7 +268,7 @@ func TestSync(t *testing.T) {
 				SpecNames("alfa", "delta-singular", "echo-kind", "foxtrot-listkind", "golf-shortname-1").
 				StatusNames("alfa", "delta-singular", "echo-kind", "foxtrot-listkind", "golf-shortname-1", "hotel-shortname-2").
 				NewOrDie(),
-			existing: []*apiextensions.CustomResourceDefinition{
+			existing: []*apiextensionsv1.CustomResourceDefinition{
 				newCRD("alfa.bravo.com").
 					SpecNames("alfa", "delta-singular", "echo-kind", "foxtrot-listkind", "golf-shortname-1", "hotel-shortname-2").
 					StatusNames("alfa", "delta-singular", "echo-kind", "foxtrot-listkind", "golf-shortname-1", "hotel-shortname-2").
@@ -276,8 +281,8 @@ func TestSync(t *testing.T) {
 		{
 			name:     "installing before with true condition",
 			in:       newCRD("alfa.bravo.com").Condition(acceptedCondition).NewOrDie(),
-			existing: []*apiextensions.CustomResourceDefinition{},
-			expectedNames: apiextensions.CustomResourceDefinitionNames{
+			existing: []*apiextensionsv1.CustomResourceDefinition{},
+			expectedNames: apiextensionsv1.CustomResourceDefinitionNames{
 				Plural: "alfa",
 			},
 			expectedNameConflictCondition: acceptedCondition,
@@ -286,8 +291,8 @@ func TestSync(t *testing.T) {
 		{
 			name:     "not installing before with false condition",
 			in:       newCRD("alfa.bravo.com").Condition(notAcceptedCondition).NewOrDie(),
-			existing: []*apiextensions.CustomResourceDefinition{},
-			expectedNames: apiextensions.CustomResourceDefinitionNames{
+			existing: []*apiextensionsv1.CustomResourceDefinition{},
+			expectedNames: apiextensionsv1.CustomResourceDefinitionNames{
 				Plural: "alfa",
 			},
 			expectedNameConflictCondition: acceptedCondition,
@@ -298,7 +303,7 @@ func TestSync(t *testing.T) {
 			in: newCRD("alfa.bravo.com").SpecNames("alfa", "delta-singular", "echo-kind", "foxtrot-listkind", "golf-shortname-1", "hotel-shortname-2").
 				Condition(acceptedCondition).
 				NewOrDie(),
-			existing: []*apiextensions.CustomResourceDefinition{
+			existing: []*apiextensionsv1.CustomResourceDefinition{
 				newCRD("india.bravo.com").StatusNames("india", "alfa", "", "").NewOrDie(),
 			},
 			expectedNames:                 names("", "delta-singular", "echo-kind", "foxtrot-listkind", "golf-shortname-1", "hotel-shortname-2"),
@@ -310,7 +315,7 @@ func TestSync(t *testing.T) {
 			in: newCRD("alfa.bravo.com").SpecNames("alfa", "delta-singular", "echo-kind", "foxtrot-listkind", "golf-shortname-1", "hotel-shortname-2").
 				Condition(notAcceptedCondition).
 				NewOrDie(),
-			existing: []*apiextensions.CustomResourceDefinition{
+			existing: []*apiextensionsv1.CustomResourceDefinition{
 				newCRD("india.bravo.com").StatusNames("india", "alfa", "", "").NewOrDie(),
 			},
 			expectedNames:                 names("", "delta-singular", "echo-kind", "foxtrot-listkind", "golf-shortname-1", "hotel-shortname-2"),
@@ -320,25 +325,125 @@ func TestSync(t *testing.T) {
 	}
 
 	for _, tc := range tests {
-		crdIndexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc})
-		for _, obj := range tc.existing {
-			crdIndexer.Add(obj)
-		}
+		t.Run(tc.name, func(t *testing.T) {
+			logger, _ := ktesting.NewTestContext(t)
+			crdIndexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc})
+			for _, obj := range tc.existing {
+				if err := crdIndexer.Add(obj); err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+			}
 
-		c := NamingConditionController{
-			crdLister:        listers.NewCustomResourceDefinitionLister(crdIndexer),
-			crdMutationCache: cache.NewIntegerResourceVersionMutationCache(crdIndexer, crdIndexer, 60*time.Second, false),
-		}
-		actualNames, actualNameConflictCondition, establishedCondition := c.calculateNamesAndConditions(tc.in)
+			c := NamingConditionController{
+				crdLister:        listers.NewCustomResourceDefinitionLister(crdIndexer),
+				crdMutationCache: cache.NewIntegerResourceVersionMutationCache(logger, crdIndexer, crdIndexer, 60*time.Second, false),
+			}
+			actualNames, actualNameConflictCondition, establishedCondition := c.calculateNamesAndConditions(tc.in)
 
-		if e, a := tc.expectedNames, actualNames; !reflect.DeepEqual(e, a) {
-			t.Errorf("%v expected %v, got %#v", tc.name, e, a)
-		}
-		if e, a := tc.expectedNameConflictCondition, actualNameConflictCondition; !apiextensions.IsCRDConditionEquivalent(&e, &a) {
-			t.Errorf("%v expected %v, got %v", tc.name, e, a)
-		}
-		if e, a := tc.expectedEstablishedCondition, establishedCondition; !apiextensions.IsCRDConditionEquivalent(&e, &a) {
-			t.Errorf("%v expected %v, got %v", tc.name, e, a)
-		}
+			if e, a := tc.expectedNames, actualNames; !reflect.DeepEqual(e, a) {
+				t.Errorf("expected %v, got %#v", e, a)
+			}
+			if e, a := tc.expectedNameConflictCondition, actualNameConflictCondition; !apiextensionshelpers.IsCRDConditionEquivalent(&e, &a) {
+				t.Errorf("expected %v, got %v", e, a)
+			}
+			if e, a := tc.expectedEstablishedCondition, establishedCondition; !apiextensionshelpers.IsCRDConditionEquivalent(&e, &a) {
+				t.Errorf("expected %v, got %v", e, a)
+			}
+		})
+	}
+}
+
+func TestSyncReevaluatesNamesAccepted(t *testing.T) {
+	establishedCondition := apiextensionsv1.CustomResourceDefinitionCondition{
+		Type:   apiextensionsv1.Established,
+		Status: apiextensionsv1.ConditionTrue,
+		Reason: "InitialNamesAccepted",
+	}
+
+	tests := []struct {
+		name     string
+		in       *apiextensionsv1.CustomResourceDefinition
+		existing []*apiextensionsv1.CustomResourceDefinition
+
+		expectUpdate                  bool
+		expectedNameConflictCondition apiextensionsv1.CustomResourceDefinitionCondition
+		expectedEstablishedCondition  apiextensionsv1.CustomResourceDefinitionCondition
+	}{
+		{
+			name: "conflicting shortName removed from spec",
+			in: newCRD("alfa.bravo.com").SpecNames("alfa", "delta-singular", "echo-kind", "foxtrot-listkind").
+				StatusNames("alfa", "delta-singular", "echo-kind", "foxtrot-listkind").
+				Condition(nameConflictCondition("ShortNamesConflict", `"golf-shortname" is already in use`)).
+				Condition(notEstablishedCondition).
+				NewOrDie(),
+			existing: []*apiextensionsv1.CustomResourceDefinition{
+				newCRD("india.bravo.com").StatusNames("india", "", "", "", "golf-shortname").NewOrDie(),
+			},
+			expectUpdate:                  true,
+			expectedNameConflictCondition: acceptedCondition,
+			expectedEstablishedCondition:  installingCondition,
+		},
+		{
+			name: "names already accepted",
+			in: newCRD("alfa.bravo.com").SpecNames("alfa", "delta-singular", "echo-kind", "foxtrot-listkind").
+				StatusNames("alfa", "delta-singular", "echo-kind", "foxtrot-listkind").
+				Condition(acceptedCondition).
+				Condition(establishedCondition).
+				NewOrDie(),
+			expectUpdate:                  false,
+			expectedNameConflictCondition: acceptedCondition,
+			expectedEstablishedCondition:  establishedCondition,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			logger, ctx := ktesting.NewTestContext(t)
+			crdIndexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc})
+			objs := []runtime.Object{tc.in}
+			if err := crdIndexer.Add(tc.in); err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			for _, obj := range tc.existing {
+				if err := crdIndexer.Add(obj); err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				objs = append(objs, obj)
+			}
+			client := fake.NewClientset(objs...)
+
+			c := NamingConditionController{
+				crdClient:        client.ApiextensionsV1(),
+				crdLister:        listers.NewCustomResourceDefinitionLister(crdIndexer),
+				crdMutationCache: cache.NewIntegerResourceVersionMutationCache(logger, crdIndexer, crdIndexer, 60*time.Second, false),
+				queue:            workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[string]()),
+			}
+			defer c.queue.ShutDown()
+
+			if err := c.sync(ctx, tc.in.Name); err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+
+			updated := false
+			for _, action := range client.Actions() {
+				if action.Matches("update", "customresourcedefinitions") && action.GetSubresource() == "status" {
+					updated = true
+				}
+			}
+			if updated != tc.expectUpdate {
+				t.Errorf("expected status update %v, got %v", tc.expectUpdate, updated)
+			}
+
+			actual, err := client.ApiextensionsV1().CustomResourceDefinitions().Get(ctx, tc.in.Name, metav1.GetOptions{})
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if e, a := tc.expectedNameConflictCondition, apiextensionshelpers.FindCRDCondition(actual, apiextensionsv1.NamesAccepted); a == nil || !apiextensionshelpers.IsCRDConditionEquivalent(&e, a) {
+				t.Errorf("expected %v, got %v", e, a)
+			}
+			if e, a := tc.expectedEstablishedCondition, apiextensionshelpers.FindCRDCondition(actual, apiextensionsv1.Established); a == nil || !apiextensionshelpers.IsCRDConditionEquivalent(&e, a) {
+				t.Errorf("expected %v, got %v", e, a)
+			}
+		})
 	}
 }

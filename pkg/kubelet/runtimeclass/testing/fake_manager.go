@@ -17,10 +17,11 @@ limitations under the License.
 package testing
 
 import (
-	nodev1beta1 "k8s.io/api/node/v1beta1"
+	nodev1 "k8s.io/api/node/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
+	"k8s.io/ktesting"
 	"k8s.io/kubernetes/pkg/kubelet/runtimeclass"
 )
 
@@ -45,20 +46,21 @@ func NewPopulatedClient() clientset.Interface {
 
 // StartManagerSync starts the manager, and waits for the informer cache to sync.
 // Returns a function to stop the manager, which should be called with a defer:
-//     defer StartManagerSync(t, m)()
-func StartManagerSync(m *runtimeclass.Manager) func() {
-	stopCh := make(chan struct{})
-	m.Start(stopCh)
-	m.WaitForCacheSync(stopCh)
+//
+//	defer StartManagerSync(tCtx, m)()
+func StartManagerSync(tCtx ktesting.TContext, m *runtimeclass.Manager) func() {
+	tCtx = tCtx.WithCancel()
+	m.Start(tCtx)
+	m.WaitForCacheSync(tCtx)
 	return func() {
-		close(stopCh)
+		tCtx.Cancel("stopping manager")
 	}
 }
 
 // NewRuntimeClass is a helper to generate a RuntimeClass resource with
 // the given name & handler.
-func NewRuntimeClass(name, handler string) *nodev1beta1.RuntimeClass {
-	return &nodev1beta1.RuntimeClass{
+func NewRuntimeClass(name, handler string) *nodev1.RuntimeClass {
+	return &nodev1.RuntimeClass{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: name,
 		},

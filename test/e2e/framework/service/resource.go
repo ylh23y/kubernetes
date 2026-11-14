@@ -17,17 +17,16 @@ limitations under the License.
 package service
 
 import (
-	"fmt"
+	"context"
 	"time"
 
 	v1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/errors"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	clientset "k8s.io/client-go/kubernetes"
 	restclient "k8s.io/client-go/rest"
 	"k8s.io/kubernetes/test/e2e/framework"
-	e2elog "k8s.io/kubernetes/test/e2e/framework/log"
-	imageutils "k8s.io/kubernetes/test/utils/image"
+	e2enode "k8s.io/kubernetes/test/e2e/framework/node"
 )
 
 // GetServicesProxyRequest returns a request for a service proxy.
@@ -62,20 +61,20 @@ func CreateServiceSpec(serviceName, externalName string, isHeadless bool, select
 // UpdateService fetches a service, calls the update function on it,
 // and then attempts to send the updated service. It retries up to 2
 // times in the face of timeouts and conflicts.
-func UpdateService(c clientset.Interface, namespace, serviceName string, update func(*v1.Service)) (*v1.Service, error) {
+func UpdateService(ctx context.Context, c clientset.Interface, namespace, serviceName string, update func(*v1.Service)) (*v1.Service, error) {
 	var service *v1.Service
 	var err error
-	for i := 0; i < 3; i++ {
-		service, err = c.CoreV1().Services(namespace).Get(serviceName, metav1.GetOptions{})
+	for range 3 {
+		service, err = c.CoreV1().Services(namespace).Get(ctx, serviceName, metav1.GetOptions{})
 		if err != nil {
 			return service, err
 		}
 
 		update(service)
 
-		service, err = c.CoreV1().Services(namespace).Update(service)
+		service, err = c.CoreV1().Services(namespace).Update(ctx, service, metav1.UpdateOptions{})
 
-		if !errors.IsConflict(err) && !errors.IsServerTimeout(err) {
+		if !apierrors.IsConflict(err) && !apierrors.IsServerTimeout(err) {
 			return service, err
 		}
 	}
@@ -83,8 +82,8 @@ func UpdateService(c clientset.Interface, namespace, serviceName string, update 
 }
 
 // CleanupServiceResources cleans up service Type=LoadBalancer resources.
-func CleanupServiceResources(c clientset.Interface, loadBalancerName, region, zone string) {
-	framework.TestContext.CloudConfig.Provider.CleanupServiceResources(c, loadBalancerName, region, zone)
+func CleanupServiceResources(ctx context.Context, c clientset.Interface, loadBalancerName, region, zone string) {
+	framework.TestContext.CloudConfig.Provider.CleanupServiceResources(ctx, c, loadBalancerName, region, zone)
 }
 
 // GetIngressPoint returns a host on which ingress serves.
@@ -96,80 +95,22 @@ func GetIngressPoint(ing *v1.LoadBalancerIngress) string {
 	return host
 }
 
-// EnableAndDisableInternalLB returns two functions for enabling and disabling the internal load balancer
-// setting for the supported cloud providers (currently GCE/GKE and Azure) and empty functions for others.
-func EnableAndDisableInternalLB() (enable func(svc *v1.Service), disable func(svc *v1.Service)) {
-	return framework.TestContext.CloudConfig.Provider.EnableAndDisableInternalLB()
-}
-
-// DescribeSvc logs the output of kubectl describe svc for the given namespace
-func DescribeSvc(ns string) {
-	e2elog.Logf("\nOutput of kubectl describe svc:\n")
-	desc, _ := framework.RunKubectl(
-		"describe", "svc", fmt.Sprintf("--namespace=%v", ns))
-	e2elog.Logf(desc)
-}
-
-// newNetexecPodSpec returns the pod spec of netexec pod
-func newNetexecPodSpec(podName string, httpPort, udpPort int32, hostNetwork bool) *v1.Pod {
-	pod := &v1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: podName,
-		},
-		Spec: v1.PodSpec{
-			Containers: []v1.Container{
-				{
-					Name:  "netexec",
-					Image: framework.NetexecImageName,
-					Args: []string{
-						"netexec",
-						fmt.Sprintf("--http-port=%d", httpPort),
-						fmt.Sprintf("--udp-port=%d", udpPort),
-					},
-					Ports: []v1.ContainerPort{
-						{
-							Name:          "http",
-							ContainerPort: httpPort,
-						},
-						{
-							Name:          "udp",
-							ContainerPort: udpPort,
-						},
-					},
-				},
-			},
-			HostNetwork: hostNetwork,
-		},
-	}
-	return pod
-}
-
-// newEchoServerPodSpec returns the pod spec of echo server pod
-func newEchoServerPodSpec(podName string) *v1.Pod {
-	port := 8080
-	pod := &v1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: podName,
-		},
-		Spec: v1.PodSpec{
-			Containers: []v1.Container{
-				{
-					Name:  "echoserver",
-					Image: imageutils.GetE2EImage(imageutils.Agnhost),
-					Args:  []string{"netexec", fmt.Sprintf("--http-port=%d", port)},
-					Ports: []v1.ContainerPort{{ContainerPort: int32(port)}},
-				},
-			},
-			RestartPolicy: v1.RestartPolicyNever,
-		},
-	}
-	return pod
-}
-
 // GetServiceLoadBalancerCreationTimeout returns a timeout value for creating a load balancer of a service.
-func GetServiceLoadBalancerCreationTimeout(cs clientset.Interface) time.Duration {
-	if nodes := framework.GetReadySchedulableNodesOrDie(cs); len(nodes.Items) > LargeClusterMinNodesNumber {
-		return LoadBalancerCreateTimeoutLarge
+func GetServiceLoadBalancerCreationTimeout(ctx context.Context, cs clientset.Interface) time.Duration {
+	nodes, err := e2enode.GetReadySchedulableNodes(ctx, cs)
+	framework.ExpectNoError(err)
+	if len(nodes.Items) > LargeClusterMinNodesNumber {
+		return loadBalancerCreateTimeoutLarge
 	}
-	return LoadBalancerCreateTimeoutDefault
+	return loadBalancerCreateTimeoutDefault
+}
+
+// GetServiceLoadBalancerPropagationTimeout returns a timeout value for propagating a load balancer of a service.
+func GetServiceLoadBalancerPropagationTimeout(ctx context.Context, cs clientset.Interface) time.Duration {
+	nodes, err := e2enode.GetReadySchedulableNodes(ctx, cs)
+	framework.ExpectNoError(err)
+	if len(nodes.Items) > LargeClusterMinNodesNumber {
+		return loadBalancerPropagationTimeoutLarge
+	}
+	return loadBalancerPropagationTimeoutDefault
 }

@@ -28,26 +28,22 @@ import (
 	"k8s.io/kubernetes/pkg/registry/core/event"
 )
 
+// REST implements a RESTStorage for events.
 type REST struct {
 	*genericregistry.Store
 }
 
 // NewREST returns a RESTStorage object that will work against events.
-func NewREST(optsGetter generic.RESTOptionsGetter, ttl uint64) *REST {
-	resource := api.Resource("events")
-	opts, err := optsGetter.GetRESTOptions(resource)
-	if err != nil {
-		panic(err) // TODO: Propagate error up
-	}
-
+func NewREST(optsGetter generic.RESTOptionsGetter, ttl uint64) (*REST, error) {
 	store := &genericregistry.Store{
 		NewFunc:       func() runtime.Object { return &api.Event{} },
 		NewListFunc:   func() runtime.Object { return &api.EventList{} },
-		PredicateFunc: event.MatchEvent,
+		PredicateFunc: event.Matcher,
 		TTLFunc: func(runtime.Object, uint64, bool) (uint64, error) {
 			return ttl, nil
 		},
-		DefaultQualifiedResource: resource,
+		DefaultQualifiedResource:  api.Resource("events"),
+		SingularQualifiedResource: api.Resource("event"),
 
 		CreateStrategy: event.Strategy,
 		UpdateStrategy: event.Strategy,
@@ -55,11 +51,11 @@ func NewREST(optsGetter generic.RESTOptionsGetter, ttl uint64) *REST {
 
 		TableConvertor: printerstorage.TableConvertor{TableGenerator: printers.NewTableGenerator().With(printersinternal.AddHandlers)},
 	}
-	options := &generic.StoreOptions{RESTOptions: opts, AttrFunc: event.GetAttrs} // Pass in opts to use UndecoratedStorage
+	options := &generic.StoreOptions{RESTOptions: optsGetter, AttrFunc: event.GetAttrs}
 	if err := store.CompleteWithOptions(options); err != nil {
-		panic(err) // TODO: Propagate error up
+		return nil, err
 	}
-	return &REST{store}
+	return &REST{store}, nil
 }
 
 // Implement ShortNamesProvider

@@ -17,487 +17,548 @@ limitations under the License.
 package storage
 
 import (
+	"context"
 	"fmt"
+	"strings"
 	"time"
 
-	"github.com/onsi/ginkgo"
+	"github.com/onsi/ginkgo/v2"
 	"github.com/onsi/gomega"
-	"github.com/prometheus/common/model"
 
 	v1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
 	clientset "k8s.io/client-go/kubernetes"
+	"k8s.io/component-base/metrics/testutil"
+	"k8s.io/component-helpers/storage/ephemeral"
+	"k8s.io/kubernetes/pkg/features"
 	kubeletmetrics "k8s.io/kubernetes/pkg/kubelet/metrics"
+	"k8s.io/kubernetes/test/e2e/feature"
 	"k8s.io/kubernetes/test/e2e/framework"
-	e2elog "k8s.io/kubernetes/test/e2e/framework/log"
-	"k8s.io/kubernetes/test/e2e/framework/metrics"
+	e2emetrics "k8s.io/kubernetes/test/e2e/framework/metrics"
 	e2epod "k8s.io/kubernetes/test/e2e/framework/pod"
+	e2epv "k8s.io/kubernetes/test/e2e/framework/pv"
+	e2eskipper "k8s.io/kubernetes/test/e2e/framework/skipper"
+	"k8s.io/kubernetes/test/e2e/storage/drivers"
+	storageframework "k8s.io/kubernetes/test/e2e/storage/framework"
 	"k8s.io/kubernetes/test/e2e/storage/testsuites"
 	"k8s.io/kubernetes/test/e2e/storage/utils"
+	admissionapi "k8s.io/pod-security-admission/api"
+	"k8s.io/utils/ptr"
 )
 
-// This test needs to run in serial because other tests could interfere
-// with metrics being tested here.
-var _ = utils.SIGDescribe("[Serial] Volume metrics", func() {
+func createPod(ctx context.Context, c clientset.Interface, pod *v1.Pod) *v1.Pod {
+	ns := pod.Namespace
+	pod, err := c.CoreV1().Pods(ns).Create(ctx, pod, metav1.CreateOptions{})
+	framework.ExpectNoError(err)
+
+	ginkgo.DeferCleanup(func(ctx context.Context) {
+		framework.Logf("Deleting pod %q/%q", pod.Namespace, pod.Name)
+		framework.ExpectNoError(e2epod.DeletePodWithWait(ctx, c, pod))
+	})
+	return pod
+}
+
+func createPVC(ctx context.Context, c clientset.Interface, pvc *v1.PersistentVolumeClaim) *v1.PersistentVolumeClaim {
+	pvc, err := c.CoreV1().PersistentVolumeClaims(pvc.Namespace).Create(ctx, pvc, metav1.CreateOptions{})
+	framework.ExpectNoError(err)
+	gomega.Expect(pvc).ToNot(gomega.BeNil())
+
+	ginkgo.DeferCleanup(func(ctx context.Context) {
+		newPvc, err := c.CoreV1().PersistentVolumeClaims(pvc.Namespace).Get(ctx, pvc.Name, metav1.GetOptions{})
+		if err != nil {
+			framework.Failf("Failed to get pvc %s/%s: %v", pvc.Namespace, pvc.Name, err)
+		} else {
+			framework.ExpectNoError(e2epv.DeletePersistentVolumeClaim(ctx, c, newPvc.Name, newPvc.Namespace))
+			if newPvc.Spec.VolumeName != "" {
+				err = e2epv.WaitForPersistentVolumeDeleted(ctx, c, newPvc.Spec.VolumeName, 5*time.Second, 5*time.Minute)
+				framework.ExpectNoError(err, "Persistent Volume %v not deleted by dynamic provisioner", newPvc.Spec.VolumeName)
+			}
+		}
+	})
+	return pvc
+}
+
+// These tests can run in parallel because each one provisions its volumes
+// through a dedicated CSI driver instance (unique provisioner name) in its own
+// namespace, so the metrics being verified are isolated from other tests.
+var _ = utils.SIGDescribe("Volume metrics", func() {
 	var (
 		c              clientset.Interface
 		ns             string
 		pvc            *v1.PersistentVolumeClaim
-		metricsGrabber *metrics.Grabber
-		invalidSc      *storagev1.StorageClass
-		defaultScName  string
+		pvcBlock       *v1.PersistentVolumeClaim
+		metricsGrabber *e2emetrics.Grabber
+		sc             *storagev1.StorageClass
+		err            error
 	)
-	f := framework.NewDefaultFramework("pv")
+	f := framework.NewDefaultFramework("volume-metrics")
+	f.NamespacePodSecurityLevel = admissionapi.LevelPrivileged
+	driver := drivers.InitHostPathCSIDriver()
 
-	ginkgo.BeforeEach(func() {
+	ginkgo.BeforeEach(func(ctx context.Context) {
 		c = f.ClientSet
 		ns = f.Namespace.Name
 		var err error
-		framework.SkipUnlessProviderIs("gce", "gke", "aws")
-		defaultScName, err = framework.GetDefaultStorageClassName(c)
-		if err != nil {
-			e2elog.Failf(err.Error())
-		}
+
+		cfg := driver.PrepareTest(ctx, f)
+		sc = driver.(storageframework.DynamicPVTestDriver).GetDynamicProvisionStorageClass(ctx, cfg, "")
+		sc = testsuites.SetupStorageClass(ctx, f.ClientSet, sc)
+
 		test := testsuites.StorageClassTest{
 			Name:      "default",
+			Timeouts:  f.Timeouts,
 			ClaimSize: "2Gi",
 		}
 
-		pvc = framework.MakePersistentVolumeClaim(framework.PersistentVolumeClaimConfig{
-			ClaimSize:  test.ClaimSize,
-			VolumeMode: &test.VolumeMode,
+		pvc = e2epv.MakePersistentVolumeClaim(e2epv.PersistentVolumeClaimConfig{
+			StorageClassName: &sc.Name,
+			ClaimSize:        test.ClaimSize,
+			VolumeMode:       ptr.To(v1.PersistentVolumeFilesystem),
 		}, ns)
 
-		metricsGrabber, err = metrics.NewMetricsGrabber(c, nil, true, false, true, false, false)
+		pvcBlock = e2epv.MakePersistentVolumeClaim(e2epv.PersistentVolumeClaimConfig{
+			StorageClassName: &sc.Name,
+			ClaimSize:        test.ClaimSize,
+			VolumeMode:       ptr.To(v1.PersistentVolumeBlock),
+		}, ns)
+
+		metricsGrabber, err = e2emetrics.NewMetricsGrabber(ctx, c, f.ClientConfig(), true, false, true, false, false, false)
 
 		if err != nil {
-			e2elog.Failf("Error creating metrics grabber : %v", err)
+			framework.Failf("Error creating metrics grabber : %v", err)
 		}
 	})
 
-	ginkgo.AfterEach(func() {
-		newPvc, err := c.CoreV1().PersistentVolumeClaims(pvc.Namespace).Get(pvc.Name, metav1.GetOptions{})
-		if err != nil {
-			e2elog.Logf("Failed to get pvc %s/%s: %v", pvc.Namespace, pvc.Name, err)
-		} else {
-			framework.DeletePersistentVolumeClaim(c, newPvc.Name, newPvc.Namespace)
-			if newPvc.Spec.VolumeName != "" {
-				err = framework.WaitForPersistentVolumeDeleted(c, newPvc.Spec.VolumeName, 5*time.Second, 5*time.Minute)
-				framework.ExpectNoError(err, "Persistent Volume %v not deleted by dynamic provisioner", newPvc.Spec.VolumeName)
-			}
+	provisioning := func(ctx context.Context, ephemeral bool) {
+		if !metricsGrabber.HasControlPlanePods() {
+			e2eskipper.Skipf("Environment does not support getting controller-manager metrics - skipping")
 		}
 
-		if invalidSc != nil {
-			err := c.StorageV1().StorageClasses().Delete(invalidSc.Name, nil)
-			framework.ExpectNoError(err, "Error deleting storageclass %v: %v", invalidSc.Name, err)
-			invalidSc = nil
-		}
-	})
+		pluginName := sc.Provisioner
 
-	ginkgo.It("should create prometheus metrics for volume provisioning and attach/detach", func() {
-		var err error
-
-		if !metricsGrabber.HasRegisteredMaster() {
-			framework.Skipf("Environment does not support getting controller-manager metrics - skipping")
-		}
-
-		controllerMetrics, err := metricsGrabber.GrabFromControllerManager()
+		controllerMetrics, err := metricsGrabber.GrabFromControllerManager(ctx)
 
 		framework.ExpectNoError(err, "Error getting c-m metrics : %v", err)
 
-		storageOpMetrics := getControllerStorageMetrics(controllerMetrics)
+		storageOpMetrics := getControllerStorageMetrics(controllerMetrics, pluginName)
 
-		pvc, err = c.CoreV1().PersistentVolumeClaims(pvc.Namespace).Create(pvc)
-		framework.ExpectNoError(err)
-		framework.ExpectNotEqual(pvc, nil)
+		if !ephemeral {
+			pvc = createPVC(ctx, c, pvc)
+		}
 
-		claims := []*v1.PersistentVolumeClaim{pvc}
-
-		pod := framework.MakePod(ns, nil, claims, false, "")
-		pod, err = c.CoreV1().Pods(ns).Create(pod)
+		pod := makePod(f, pvc, ephemeral)
+		pod, err = c.CoreV1().Pods(ns).Create(ctx, pod, metav1.CreateOptions{})
 		framework.ExpectNoError(err)
 
-		err = e2epod.WaitForPodRunningInNamespace(c, pod)
-		framework.ExpectNoError(e2epod.WaitForPodRunningInNamespace(c, pod), "Error starting pod %s", pod.Name)
+		err = e2epod.WaitTimeoutForPodRunningInNamespace(ctx, c, pod.Name, pod.Namespace, f.Timeouts.PodStart)
+		framework.ExpectNoError(err, "Error starting pod %s", pod.Name)
 
-		e2elog.Logf("Deleting pod %q/%q", pod.Namespace, pod.Name)
-		framework.ExpectNoError(framework.DeletePodWithWait(f, c, pod))
+		framework.ExpectNoError(e2epod.DeletePodWithWait(ctx, c, pod))
 
-		updatedStorageMetrics := waitForDetachAndGrabMetrics(storageOpMetrics, metricsGrabber)
+		updatedStorageMetrics := waitForDetachAndGrabMetrics(ctx, storageOpMetrics, metricsGrabber, pluginName)
 
-		framework.ExpectNotEqual(len(updatedStorageMetrics.latencyMetrics), 0, "Error fetching c-m updated storage metrics")
-		framework.ExpectNotEqual(len(updatedStorageMetrics.statusMetrics), 0, "Error fetching c-m updated storage metrics")
+		gomega.Expect(updatedStorageMetrics.latencyMetrics).ToNot(gomega.BeEmpty(), "Error fetching c-m updated storage metrics")
+		gomega.Expect(updatedStorageMetrics.statusMetrics).ToNot(gomega.BeEmpty(), "Error fetching c-m updated storage metrics")
 
-		volumeOperations := []string{"volume_provision", "volume_detach", "volume_attach"}
+		volumeOperations := []string{"volume_detach", "volume_attach"}
 
 		for _, volumeOp := range volumeOperations {
 			verifyMetricCount(storageOpMetrics, updatedStorageMetrics, volumeOp, false)
 		}
-	})
+	}
 
-	ginkgo.It("should create prometheus metrics for volume provisioning errors [Slow]", func() {
-		var err error
-
-		if !metricsGrabber.HasRegisteredMaster() {
-			framework.Skipf("Environment does not support getting controller-manager metrics - skipping")
+	filesystemMode := func(ctx context.Context, isEphemeral bool) {
+		if !isEphemeral {
+			pvc = createPVC(ctx, c, pvc)
 		}
 
-		controllerMetrics, err := metricsGrabber.GrabFromControllerManager()
+		pod := makePod(f, pvc, isEphemeral)
+		pod = createPod(ctx, c, pod)
 
-		framework.ExpectNoError(err, "Error getting c-m metrics : %v", err)
+		err = e2epod.WaitTimeoutForPodRunningInNamespace(ctx, c, pod.Name, pod.Namespace, f.Timeouts.PodStart)
+		framework.ExpectNoError(err, "Error starting pod %s", pod.Name)
 
-		storageOpMetrics := getControllerStorageMetrics(controllerMetrics)
+		pod, err = c.CoreV1().Pods(ns).Get(ctx, pod.Name, metav1.GetOptions{})
+		framework.ExpectNoError(err)
 
-		ginkgo.By("Creating an invalid storageclass")
-		defaultClass, err := c.StorageV1().StorageClasses().Get(defaultScName, metav1.GetOptions{})
-		framework.ExpectNoError(err, "Error getting default storageclass: %v", err)
-
-		invalidSc = &storagev1.StorageClass{
-			ObjectMeta: metav1.ObjectMeta{
-				Name: fmt.Sprintf("fail-metrics-invalid-sc-%s", pvc.Namespace),
-			},
-			Provisioner: defaultClass.Provisioner,
-			Parameters: map[string]string{
-				"invalidparam": "invalidvalue",
-			},
+		pvcName := pvc.Name
+		if isEphemeral {
+			pvcName = ephemeral.VolumeClaimName(pod, &pod.Spec.Volumes[0])
 		}
-		_, err = c.StorageV1().StorageClasses().Create(invalidSc)
-		framework.ExpectNoError(err, "Error creating new storageclass: %v", err)
-
-		pvc.Spec.StorageClassName = &invalidSc.Name
-		pvc, err = c.CoreV1().PersistentVolumeClaims(pvc.Namespace).Create(pvc)
-		framework.ExpectNoError(err, "failed to create PVC %s/%s", pvc.Namespace, pvc.Name)
-		framework.ExpectNotEqual(pvc, nil)
-
-		claims := []*v1.PersistentVolumeClaim{pvc}
-
-		ginkgo.By("Creating a pod and expecting it to fail")
-		pod := framework.MakePod(ns, nil, claims, false, "")
-		pod, err = c.CoreV1().Pods(ns).Create(pod)
-		framework.ExpectNoError(err, "failed to create Pod %s/%s", pod.Namespace, pod.Name)
-
-		err = e2epod.WaitTimeoutForPodRunningInNamespace(c, pod.Name, pod.Namespace, framework.PodStartShortTimeout)
-		framework.ExpectError(err)
-
-		e2elog.Logf("Deleting pod %q/%q", pod.Namespace, pod.Name)
-		framework.ExpectNoError(framework.DeletePodWithWait(f, c, pod))
-
-		ginkgo.By("Checking failure metrics")
-		updatedControllerMetrics, err := metricsGrabber.GrabFromControllerManager()
-		framework.ExpectNoError(err, "failed to get controller manager metrics")
-		updatedStorageMetrics := getControllerStorageMetrics(updatedControllerMetrics)
-
-		framework.ExpectNotEqual(len(updatedStorageMetrics.statusMetrics), 0, "Error fetching c-m updated storage metrics")
-		verifyMetricCount(storageOpMetrics, updatedStorageMetrics, "volume_provision", true)
-	})
-
-	ginkgo.It("should create volume metrics with the correct PVC ref", func() {
-		var err error
-		pvc, err = c.CoreV1().PersistentVolumeClaims(pvc.Namespace).Create(pvc)
-		framework.ExpectNoError(err)
-		framework.ExpectNotEqual(pvc, nil)
-
-		claims := []*v1.PersistentVolumeClaim{pvc}
-		pod := framework.MakePod(ns, nil, claims, false, "")
-		pod, err = c.CoreV1().Pods(ns).Create(pod)
-		framework.ExpectNoError(err)
-
-		err = e2epod.WaitForPodRunningInNamespace(c, pod)
-		framework.ExpectNoError(e2epod.WaitForPodRunningInNamespace(c, pod), "Error starting pod ", pod.Name)
-
-		pod, err = c.CoreV1().Pods(ns).Get(pod.Name, metav1.GetOptions{})
-		framework.ExpectNoError(err)
+		pvcNamespace := pod.Namespace
 
 		// Verify volume stat metrics were collected for the referenced PVC
 		volumeStatKeys := []string{
 			kubeletmetrics.VolumeStatsUsedBytesKey,
 			kubeletmetrics.VolumeStatsCapacityBytesKey,
 			kubeletmetrics.VolumeStatsAvailableBytesKey,
-			kubeletmetrics.VolumeStatsUsedBytesKey,
+			kubeletmetrics.VolumeStatsInodesKey,
 			kubeletmetrics.VolumeStatsInodesFreeKey,
 			kubeletmetrics.VolumeStatsInodesUsedKey,
 		}
+		key := volumeStatKeys[0]
+		kubeletKeyName := fmt.Sprintf("%s_%s", kubeletmetrics.KubeletSubsystem, key)
 		// Poll kubelet metrics waiting for the volume to be picked up
 		// by the volume stats collector
-		var kubeMetrics metrics.KubeletMetrics
-		waitErr := wait.Poll(30*time.Second, 5*time.Minute, func() (bool, error) {
-			e2elog.Logf("Grabbing Kubelet metrics")
+		var kubeMetrics e2emetrics.KubeletMetrics
+		waitErr := wait.PollUntilContextTimeout(ctx, 30*time.Second, 5*time.Minute, false, func(ctx context.Context) (bool, error) {
+			framework.Logf("Grabbing Kubelet metrics")
 			// Grab kubelet metrics from the node the pod was scheduled on
 			var err error
-			kubeMetrics, err = metricsGrabber.GrabFromKubelet(pod.Spec.NodeName)
+			kubeMetrics, err = metricsGrabber.GrabFromKubelet(ctx, pod.Spec.NodeName)
 			if err != nil {
-				e2elog.Logf("Error fetching kubelet metrics")
+				framework.Logf("Error fetching kubelet metrics")
 				return false, err
 			}
-			key := volumeStatKeys[0]
-			kubeletKeyName := fmt.Sprintf("%s_%s", kubeletmetrics.KubeletSubsystem, key)
-			if !findVolumeStatMetric(kubeletKeyName, pvc.Namespace, pvc.Name, kubeMetrics) {
+			if !findVolumeStatMetric(kubeletKeyName, pvcNamespace, pvcName, kubeMetrics) {
 				return false, nil
 			}
 			return true, nil
 		})
-		framework.ExpectNoError(waitErr, "Error finding volume metrics : %v", waitErr)
+		framework.ExpectNoError(waitErr, "Unable to find metric %s for PVC %s/%s", kubeletKeyName, pvcNamespace, pvcName)
 
 		for _, key := range volumeStatKeys {
 			kubeletKeyName := fmt.Sprintf("%s_%s", kubeletmetrics.KubeletSubsystem, key)
-			found := findVolumeStatMetric(kubeletKeyName, pvc.Namespace, pvc.Name, kubeMetrics)
-			gomega.Expect(found).To(gomega.BeTrue(), "PVC %s, Namespace %s not found for %s", pvc.Name, pvc.Namespace, kubeletKeyName)
+			found := findVolumeStatMetric(kubeletKeyName, pvcNamespace, pvcName, kubeMetrics)
+			if !found {
+				framework.Failf("PVC %s, Namespace %s not found for %s", pvcName, pvcNamespace, kubeletKeyName)
+			}
+		}
+	}
+
+	blockmode := func(ctx context.Context, isEphemeral bool) {
+		if !isEphemeral {
+			pvcBlock = createPVC(ctx, c, pvcBlock)
 		}
 
-		e2elog.Logf("Deleting pod %q/%q", pod.Namespace, pod.Name)
-		framework.ExpectNoError(framework.DeletePodWithWait(f, c, pod))
-	})
+		pod := makePod(f, pvcBlock, isEphemeral)
+		pod.Spec.Containers[0].VolumeDevices = []v1.VolumeDevice{{
+			Name:       pod.Spec.Volumes[0].Name,
+			DevicePath: "/mnt/" + pod.Spec.Volumes[0].Name,
+		}}
+		pod.Spec.Containers[0].VolumeMounts = nil
+		pod = createPod(ctx, c, pod)
 
-	ginkgo.It("should create metrics for total time taken in volume operations in P/V Controller", func() {
-		var err error
-		pvc, err = c.CoreV1().PersistentVolumeClaims(pvc.Namespace).Create(pvc)
-		framework.ExpectNoError(err)
-		framework.ExpectNotEqual(pvc, nil)
+		err = e2epod.WaitTimeoutForPodRunningInNamespace(ctx, c, pod.Name, pod.Namespace, f.Timeouts.PodStart)
+		framework.ExpectNoError(err, "Error starting pod %s", pod.Name)
 
-		claims := []*v1.PersistentVolumeClaim{pvc}
-		pod := framework.MakePod(ns, nil, claims, false, "")
-		pod, err = c.CoreV1().Pods(ns).Create(pod)
-		framework.ExpectNoError(err)
-
-		err = e2epod.WaitForPodRunningInNamespace(c, pod)
-		framework.ExpectNoError(e2epod.WaitForPodRunningInNamespace(c, pod), "Error starting pod ", pod.Name)
-
-		pod, err = c.CoreV1().Pods(ns).Get(pod.Name, metav1.GetOptions{})
+		pod, err = c.CoreV1().Pods(ns).Get(ctx, pod.Name, metav1.GetOptions{})
 		framework.ExpectNoError(err)
 
-		controllerMetrics, err := metricsGrabber.GrabFromControllerManager()
+		// Verify volume stat metrics were collected for the referenced PVC
+		volumeStatKeys := []string{
+			// BlockMode PVCs only support capacity (for now)
+			kubeletmetrics.VolumeStatsCapacityBytesKey,
+		}
+		key := volumeStatKeys[0]
+		kubeletKeyName := fmt.Sprintf("%s_%s", kubeletmetrics.KubeletSubsystem, key)
+		pvcName := pvcBlock.Name
+		pvcNamespace := pvcBlock.Namespace
+		if isEphemeral {
+			pvcName = ephemeral.VolumeClaimName(pod, &pod.Spec.Volumes[0])
+			pvcNamespace = pod.Namespace
+		}
+		// Poll kubelet metrics waiting for the volume to be picked up
+		// by the volume stats collector
+		var kubeMetrics e2emetrics.KubeletMetrics
+		waitErr := wait.PollUntilContextTimeout(ctx, 30*time.Second, 5*time.Minute, false, func(ctx context.Context) (bool, error) {
+			framework.Logf("Grabbing Kubelet metrics")
+			// Grab kubelet metrics from the node the pod was scheduled on
+			var err error
+			kubeMetrics, err = metricsGrabber.GrabFromKubelet(ctx, pod.Spec.NodeName)
+			if err != nil {
+				framework.Logf("Error fetching kubelet metrics")
+				return false, err
+			}
+			if !findVolumeStatMetric(kubeletKeyName, pvcNamespace, pvcName, kubeMetrics) {
+				return false, nil
+			}
+			return true, nil
+		})
+		framework.ExpectNoError(waitErr, "Unable to find metric %s for PVC %s/%s", kubeletKeyName, pvcNamespace, pvcName)
+
+		for _, key := range volumeStatKeys {
+			kubeletKeyName := fmt.Sprintf("%s_%s", kubeletmetrics.KubeletSubsystem, key)
+			found := findVolumeStatMetric(kubeletKeyName, pvcNamespace, pvcName, kubeMetrics)
+			if !found {
+				framework.Failf("PVC %s, Namespace %s not found for %s", pvcName, pvcNamespace, kubeletKeyName)
+			}
+		}
+	}
+
+	totalTime := func(ctx context.Context, isEphemeral bool) {
+		if !isEphemeral {
+			pvc = createPVC(ctx, c, pvc)
+		}
+
+		pod := makePod(f, pvc, isEphemeral)
+		pod = createPod(ctx, c, pod)
+
+		err = e2epod.WaitTimeoutForPodRunningInNamespace(ctx, c, pod.Name, pod.Namespace, f.Timeouts.PodStart)
+		framework.ExpectNoError(err, "Error starting pod %s", pod.Name)
+
+		controllerMetrics, err := metricsGrabber.GrabFromControllerManager(ctx)
 		if err != nil {
-			framework.Skipf("Could not get controller-manager metrics - skipping")
+			e2eskipper.Skipf("Could not get controller-manager metrics - skipping")
 		}
 
 		metricKey := "volume_operation_total_seconds_count"
-		dimensions := []string{"operation_name", "plugin_name"}
-		valid := hasValidMetrics(metrics.Metrics(controllerMetrics), metricKey, dimensions...)
-		gomega.Expect(valid).To(gomega.BeTrue(), "Invalid metric in P/V Controller metrics: %q", metricKey)
+		verifyMetric(metricKey, map[testutil.LabelName]testutil.LabelValue{
+			"operation_name": "provision",
+			"plugin_name":    testutil.LabelValue(sc.Provisioner),
+		}, testutil.Metrics(controllerMetrics))
+	}
 
-		e2elog.Logf("Deleting pod %q/%q", pod.Namespace, pod.Name)
-		framework.ExpectNoError(framework.DeletePodWithWait(f, c, pod))
-	})
+	volumeManager := func(ctx context.Context, isEphemeral bool) {
+		if !isEphemeral {
+			pvc = createPVC(ctx, c, pvc)
+		}
 
-	ginkgo.It("should create volume metrics in Volume Manager", func() {
-		var err error
-		pvc, err = c.CoreV1().PersistentVolumeClaims(pvc.Namespace).Create(pvc)
-		framework.ExpectNoError(err)
-		framework.ExpectNotEqual(pvc, nil)
+		pod := makePod(f, pvc, isEphemeral)
+		pod = createPod(ctx, c, pod)
 
-		claims := []*v1.PersistentVolumeClaim{pvc}
-		pod := framework.MakePod(ns, nil, claims, false, "")
-		pod, err = c.CoreV1().Pods(ns).Create(pod)
-		framework.ExpectNoError(err)
+		err = e2epod.WaitTimeoutForPodRunningInNamespace(ctx, c, pod.Name, pod.Namespace, f.Timeouts.PodStart)
+		framework.ExpectNoError(err, "Error starting pod %s", pod.Name)
 
-		err = e2epod.WaitForPodRunningInNamespace(c, pod)
-		framework.ExpectNoError(e2epod.WaitForPodRunningInNamespace(c, pod), "Error starting pod ", pod.Name)
-
-		pod, err = c.CoreV1().Pods(ns).Get(pod.Name, metav1.GetOptions{})
+		pod, err = c.CoreV1().Pods(ns).Get(ctx, pod.Name, metav1.GetOptions{})
 		framework.ExpectNoError(err)
 
-		kubeMetrics, err := metricsGrabber.GrabFromKubelet(pod.Spec.NodeName)
+		kubeMetrics, err := metricsGrabber.GrabFromKubelet(ctx, pod.Spec.NodeName)
 		framework.ExpectNoError(err)
 
 		// Metrics should have dimensions plugin_name and state available
 		totalVolumesKey := "volume_manager_total_volumes"
-		dimensions := []string{"state", "plugin_name"}
-		valid := hasValidMetrics(metrics.Metrics(kubeMetrics), totalVolumesKey, dimensions...)
-		gomega.Expect(valid).To(gomega.BeTrue(), "Invalid metric in Volume Manager metrics: %q", totalVolumesKey)
+		verifyMetric(totalVolumesKey, map[testutil.LabelName]testutil.LabelValue{
+			"state":       "actual_state_of_world",
+			"plugin_name": testutil.LabelValue("kubernetes.io/csi:" + sc.Provisioner),
+		}, testutil.Metrics(kubeMetrics))
+	}
 
-		e2elog.Logf("Deleting pod %q/%q", pod.Namespace, pod.Name)
-		framework.ExpectNoError(framework.DeletePodWithWait(f, c, pod))
-	})
+	adController := func(ctx context.Context, isEphemeral bool) {
+		if !isEphemeral {
+			pvc = createPVC(ctx, c, pvc)
+		}
 
-	ginkgo.It("should create metrics for total number of volumes in A/D Controller", func() {
-		var err error
-		pvc, err = c.CoreV1().PersistentVolumeClaims(pvc.Namespace).Create(pvc)
-		framework.ExpectNoError(err)
-		framework.ExpectNotEqual(pvc, nil)
-
-		claims := []*v1.PersistentVolumeClaim{pvc}
-		pod := framework.MakePod(ns, nil, claims, false, "")
+		pod := makePod(f, pvc, isEphemeral)
 
 		// Get metrics
-		controllerMetrics, err := metricsGrabber.GrabFromControllerManager()
+		controllerMetrics, err := metricsGrabber.GrabFromControllerManager(ctx)
 		if err != nil {
-			framework.Skipf("Could not get controller-manager metrics - skipping")
+			e2eskipper.Skipf("Could not get controller-manager metrics - skipping")
 		}
 
 		// Create pod
-		pod, err = c.CoreV1().Pods(ns).Create(pod)
-		framework.ExpectNoError(err)
-		err = e2epod.WaitForPodRunningInNamespace(c, pod)
-		framework.ExpectNoError(e2epod.WaitForPodRunningInNamespace(c, pod), "Error starting pod ", pod.Name)
-		pod, err = c.CoreV1().Pods(ns).Get(pod.Name, metav1.GetOptions{})
-		framework.ExpectNoError(err)
+		pod = createPod(ctx, c, pod)
+
+		err = e2epod.WaitTimeoutForPodRunningInNamespace(ctx, c, pod.Name, pod.Namespace, f.Timeouts.PodStart)
+		framework.ExpectNoError(err, "Error starting pod %s", pod.Name)
 
 		// Get updated metrics
-		updatedControllerMetrics, err := metricsGrabber.GrabFromControllerManager()
+		updatedControllerMetrics, err := metricsGrabber.GrabFromControllerManager(ctx)
 		if err != nil {
-			framework.Skipf("Could not get controller-manager metrics - skipping")
+			e2eskipper.Skipf("Could not get controller-manager metrics - skipping")
 		}
 
-		// Forced detach metric should be present
-		forceDetachKey := "attachdetach_controller_forced_detaches"
-		_, ok := updatedControllerMetrics[forceDetachKey]
-		gomega.Expect(ok).To(gomega.BeTrue(), "Key %q not found in A/D Controller metrics", forceDetachKey)
-
-		// Wait and validate
+		// Validate
 		totalVolumesKey := "attachdetach_controller_total_volumes"
 		states := []string{"actual_state_of_world", "desired_state_of_world"}
-		dimensions := []string{"state", "plugin_name"}
-		waitForADControllerStatesMetrics(metricsGrabber, totalVolumesKey, dimensions, states)
+		pluginName := "kubernetes.io/csi:" + sc.Provisioner
 
-		// Total number of volumes in both ActualStateofWorld and DesiredStateOfWorld
-		// states should be higher or equal than it used to be
-		oldStates := getStatesMetrics(totalVolumesKey, metrics.Metrics(controllerMetrics))
-		updatedStates := getStatesMetrics(totalVolumesKey, metrics.Metrics(updatedControllerMetrics))
+		// A single grab is enough here:
+		// informer -> A/D controller DSW -> ASW -> Node status.volumesAttached -> Pod running
+		// We already waited for pod running, and the metric is collected from DSW/ASW at scrape time.
+		//
+		// Each test has a unique CSI driver name, so we assert exactly 1 more.
+		oldStates := getStatesMetrics(totalVolumesKey, testutil.Metrics(controllerMetrics), pluginName)
+		updatedStates := getStatesMetrics(totalVolumesKey, testutil.Metrics(updatedControllerMetrics), pluginName)
 		for _, stateName := range states {
-			if _, ok := oldStates[stateName]; !ok {
-				continue
-			}
-			for pluginName, numVolumes := range updatedStates[stateName] {
-				oldNumVolumes := oldStates[stateName][pluginName]
-				gomega.Expect(numVolumes).To(gomega.BeNumerically(">=", oldNumVolumes),
-					"Wrong number of volumes in state %q, plugin %q: wanted >=%d, got %d",
-					stateName, pluginName, oldNumVolumes, numVolumes)
-			}
+			gomega.Expect(updatedStates[stateName]).To(gomega.Equal(oldStates[stateName]+1), func() string {
+				return fmt.Sprintf("wrong %q volume count for plugin %q: before pod=%d, after pod running=%d, want before+1\nraw %s samples: %v",
+					stateName, pluginName, oldStates[stateName], updatedStates[stateName],
+					totalVolumesKey, testutil.Metrics(updatedControllerMetrics)[totalVolumesKey])
+			})
 		}
+	}
 
-		e2elog.Logf("Deleting pod %q/%q", pod.Namespace, pod.Name)
-		framework.ExpectNoError(framework.DeletePodWithWait(f, c, pod))
+	testAll := func(isEphemeral bool) {
+		ginkgo.It("should create prometheus metrics for volume provisioning and attach/detach", func(ctx context.Context) {
+			provisioning(ctx, isEphemeral)
+		})
+		ginkgo.It("should create volume metrics with the correct FilesystemMode PVC ref", func(ctx context.Context) {
+			filesystemMode(ctx, isEphemeral)
+		})
+		ginkgo.It("should create volume metrics with the correct BlockMode PVC ref", func(ctx context.Context) {
+			blockmode(ctx, isEphemeral)
+		})
+		ginkgo.It("should create metrics for total time taken in volume operations in P/V Controller", func(ctx context.Context) {
+			totalTime(ctx, isEphemeral)
+		})
+		ginkgo.It("should create volume metrics in Volume Manager", func(ctx context.Context) {
+			volumeManager(ctx, isEphemeral)
+		})
+		ginkgo.It("should create metrics for total number of volumes in A/D Controller", func(ctx context.Context) {
+			adController(ctx, isEphemeral)
+		})
+	}
+
+	ginkgo.Context("PVC", func() {
+		testAll(false)
+	})
+
+	ginkgo.Context("Ephemeral", func() {
+		testAll(true)
 	})
 
 	// Test for pv controller metrics, concretely: bound/unbound pv/pvc count.
 	ginkgo.Describe("PVController", func() {
 		const (
-			classKey     = "storage_class"
-			namespaceKey = "namespace"
+			namespaceKey            = "namespace"
+			pluginNameKey           = "plugin_name"
+			volumeModeKey           = "volume_mode"
+			storageClassKey         = "storage_class"
+			volumeAttributeClassKey = "volume_attributes_class"
 
+			totalPVKey    = "pv_collector_total_pv_count"
 			boundPVKey    = "pv_collector_bound_pv_count"
 			unboundPVKey  = "pv_collector_unbound_pv_count"
 			boundPVCKey   = "pv_collector_bound_pvc_count"
 			unboundPVCKey = "pv_collector_unbound_pvc_count"
 		)
 
+		type mvs struct {
+			boundPV, unboundPV, boundPVC, unboundPVC int64
+		}
+
 		var (
 			pv  *v1.PersistentVolume
 			pvc *v1.PersistentVolumeClaim
 
-			className = "bound-unbound-count-test-sc"
-			pvConfig  = framework.PersistentVolumeConfig{
+			storageClassName          string
+			pvConfig                  e2epv.PersistentVolumeConfig
+			volumeAttributesClassName string
+			pvcConfig                 e2epv.PersistentVolumeClaimConfig
+		)
+
+		// validator polls the pv controller metrics until the bound/unbound
+		// pv/pvc counts for this test's storage class and namespace match the
+		// expected values.
+		validator := func(ctx context.Context, metric mvs) {
+			gomega.Eventually(ctx, func(ctx context.Context) mvs {
+				controllerMetrics, err := metricsGrabber.GrabFromControllerManager(ctx)
+				framework.ExpectNoError(err, "Error getting c-m metricValues: %v", err)
+				ms := testutil.Metrics(controllerMetrics)
+				return mvs{
+					boundPV:    testutil.GetMetricValuesForLabel(ms, boundPVKey, storageClassKey)[storageClassName],
+					unboundPV:  testutil.GetMetricValuesForLabel(ms, unboundPVKey, storageClassKey)[storageClassName],
+					boundPVC:   testutil.GetMetricValuesForLabel(ms, boundPVCKey, namespaceKey)[ns],
+					unboundPVC: testutil.GetMetricValuesForLabel(ms, unboundPVCKey, namespaceKey)[ns],
+				}
+			}).WithPolling(2 * time.Second).WithTimeout(1 * time.Minute).Should(gomega.Equal(metric))
+		}
+
+		ginkgo.BeforeEach(func(ctx context.Context) {
+			storageClassName = "bound-unbound-count-test-sc-" + f.UniqueName
+			pvConfig = e2epv.PersistentVolumeConfig{
 				PVSource: v1.PersistentVolumeSource{
 					HostPath: &v1.HostPathVolumeSource{Path: "/data"},
 				},
 				NamePrefix:       "pv-test-",
-				StorageClassName: className,
+				StorageClassName: storageClassName,
 			}
-			pvcConfig = framework.PersistentVolumeClaimConfig{StorageClassName: &className}
+			// TODO: Insert volumeAttributesClassName into pvcConfig when "VolumeAttributesClass" is GA
+			volumeAttributesClassName = "bound-unbound-count-test-vac-" + f.UniqueName
+			pvcConfig = e2epv.PersistentVolumeClaimConfig{StorageClassName: &storageClassName}
 
-			metrics = []struct {
-				name      string
-				dimension string
-			}{
-				{boundPVKey, classKey},
-				{unboundPVKey, classKey},
-				{boundPVCKey, namespaceKey},
-				{unboundPVCKey, namespaceKey},
+			if !metricsGrabber.HasControlPlanePods() {
+				e2eskipper.Skipf("Environment does not support getting controller-manager metrics - skipping")
 			}
 
-			// Original metric values before we create any PV/PVCs. The length should be 4,
-			// and the elements should be bound pv count, unbound pv count, bound pvc count,
-			// unbound pvc count in turn.
-			// We use these values to calculate relative increment of each test.
-			originMetricValues []map[string]int64
-		)
+			pv = e2epv.MakePersistentVolume(pvConfig)
+			pvc = e2epv.MakePersistentVolumeClaim(pvcConfig, ns)
+		})
 
-		// validator used to validate each metric's values, the length of metricValues
-		// should be 4, and the elements should be bound pv count, unbound pv count, bound
-		// pvc count, unbound pvc count in turn.
-		validator := func(metricValues []map[string]int64) {
-			framework.ExpectEqual(len(metricValues), 4, "Wrong metric size: %d", len(metricValues))
-
-			controllerMetrics, err := metricsGrabber.GrabFromControllerManager()
-			framework.ExpectNoError(err, "Error getting c-m metricValues: %v", err)
-
-			for i, metric := range metrics {
-				expectValues := metricValues[i]
-				if expectValues == nil {
-					expectValues = make(map[string]int64)
-				}
-				// We using relative increment value instead of absolute value to reduce unexpected flakes.
-				// Concretely, we expect the difference of the updated values and original values for each
-				// test suit are equal to expectValues.
-				actualValues := calculateRelativeValues(originMetricValues[i],
-					getPVControllerMetrics(controllerMetrics, metric.name, metric.dimension))
-				framework.ExpectEqual(actualValues, expectValues, "Wrong pv controller metric %s(%s): wanted %v, got %v",
-					metric.name, metric.dimension, expectValues, actualValues)
+		ginkgo.AfterEach(func(ctx context.Context) {
+			if err := e2epv.DeletePersistentVolume(ctx, c, pv.Name); err != nil {
+				framework.Failf("Error deleting pv: %v", err)
 			}
-		}
-
-		ginkgo.BeforeEach(func() {
-			if !metricsGrabber.HasRegisteredMaster() {
-				framework.Skipf("Environment does not support getting controller-manager metrics - skipping")
-			}
-
-			pv = framework.MakePersistentVolume(pvConfig)
-			pvc = framework.MakePersistentVolumeClaim(pvcConfig, ns)
-
-			// Initializes all original metric values.
-			controllerMetrics, err := metricsGrabber.GrabFromControllerManager()
-			framework.ExpectNoError(err, "Error getting c-m metricValues: %v", err)
-			for _, metric := range metrics {
-				originMetricValues = append(originMetricValues,
-					getPVControllerMetrics(controllerMetrics, metric.name, metric.dimension))
+			if err := e2epv.DeletePersistentVolumeClaim(ctx, c, pvc.Name, pvc.Namespace); err != nil {
+				framework.Failf("Error deleting pvc: %v", err)
 			}
 		})
 
-		ginkgo.AfterEach(func() {
-			if err := framework.DeletePersistentVolume(c, pv.Name); err != nil {
-				e2elog.Failf("Error deleting pv: %v", err)
-			}
-			if err := framework.DeletePersistentVolumeClaim(c, pvc.Name, pvc.Namespace); err != nil {
-				e2elog.Failf("Error deleting pvc: %v", err)
-			}
-
-			// Clear original metric values.
-			originMetricValues = nil
-		})
-
-		ginkgo.It("should create none metrics for pvc controller before creating any PV or PVC", func() {
-			validator([]map[string]int64{nil, nil, nil, nil})
+		ginkgo.It("should create none metrics for pvc controller before creating any PV or PVC", func(ctx context.Context) {
+			validator(ctx, mvs{0, 0, 0, 0})
 		})
 
 		ginkgo.It("should create unbound pv count metrics for pvc controller after creating pv only",
-			func() {
+			func(ctx context.Context) {
 				var err error
-				pv, err = framework.CreatePV(c, pv)
+				pv, err = e2epv.CreatePV(ctx, c, f.Timeouts, pv)
 				framework.ExpectNoError(err, "Error creating pv: %v", err)
-				waitForPVControllerSync(metricsGrabber, unboundPVKey, classKey)
-				validator([]map[string]int64{nil, {className: 1}, nil, nil})
+				validator(ctx, mvs{0, 1, 0, 0})
 			})
 
 		ginkgo.It("should create unbound pvc count metrics for pvc controller after creating pvc only",
-			func() {
+			func(ctx context.Context) {
 				var err error
-				pvc, err = framework.CreatePVC(c, ns, pvc)
+				pvc, err = e2epv.CreatePVC(ctx, c, ns, pvc)
 				framework.ExpectNoError(err, "Error creating pvc: %v", err)
-				waitForPVControllerSync(metricsGrabber, unboundPVCKey, namespaceKey)
-				validator([]map[string]int64{nil, nil, nil, {ns: 1}})
+				validator(ctx, mvs{0, 0, 0, 1})
 			})
 
 		ginkgo.It("should create bound pv/pvc count metrics for pvc controller after creating both pv and pvc",
-			func() {
+			func(ctx context.Context) {
 				var err error
-				pv, pvc, err = framework.CreatePVPVC(c, pvConfig, pvcConfig, ns, true)
+				pv, pvc, err = e2epv.CreatePVPVC(ctx, c, f.Timeouts, pvConfig, pvcConfig, ns, true)
 				framework.ExpectNoError(err, "Error creating pv pvc: %v", err)
-				waitForPVControllerSync(metricsGrabber, boundPVKey, classKey)
-				waitForPVControllerSync(metricsGrabber, boundPVCKey, namespaceKey)
-				validator([]map[string]int64{{className: 1}, nil, {ns: 1}, nil})
+				validator(ctx, mvs{1, 0, 1, 0})
+			})
 
+		// TODO: Merge with bound/unbound tests when "VolumeAttributesClass" feature is enabled by default.
+		f.It("should create unbound pvc count metrics for pvc controller with volume attributes class dimension after creating pvc only", framework.WithFeatureGate(features.VolumeAttributesClass), feature.VolumeAttributesClass, func(ctx context.Context) {
+			var err error
+			dimensions := []string{namespaceKey, storageClassKey, volumeAttributeClassKey}
+			pvcConfigWithVAC := pvcConfig
+			pvcConfigWithVAC.VolumeAttributesClassName = &volumeAttributesClassName
+			pvcWithVAC := e2epv.MakePersistentVolumeClaim(pvcConfigWithVAC, ns)
+			pvc, err = e2epv.CreatePVC(ctx, c, ns, pvcWithVAC)
+			framework.ExpectNoError(err, "Error creating pvc: %v", err)
+			waitForPVControllerSync(ctx, metricsGrabber, unboundPVCKey, volumeAttributeClassKey)
+			controllerMetrics, err := metricsGrabber.GrabFromControllerManager(ctx)
+			framework.ExpectNoError(err, "Error getting c-m metricValues: %v", err)
+			err = testutil.ValidateMetrics(testutil.Metrics(controllerMetrics), unboundPVCKey, dimensions...)
+			framework.ExpectNoError(err, "Invalid metric in Controller Manager metrics: %q", unboundPVCKey)
+		})
+
+		// TODO: Merge with bound/unbound tests when "VolumeAttributesClass" feature is enabled by default
+		f.It("should create bound pv/pvc count metrics for pvc controller with volume attributes class dimension after creating both pv and pvc", framework.WithFeatureGate(features.VolumeAttributesClass), feature.VolumeAttributesClass, func(ctx context.Context) {
+			var err error
+			dimensions := []string{namespaceKey, storageClassKey, volumeAttributeClassKey}
+			pvcConfigWithVAC := pvcConfig
+			pvcConfigWithVAC.VolumeAttributesClassName = &volumeAttributesClassName
+			pv, pvc, err = e2epv.CreatePVPVC(ctx, c, f.Timeouts, pvConfig, pvcConfigWithVAC, ns, true)
+			framework.ExpectNoError(err, "Error creating pv pvc: %v", err)
+			waitForPVControllerSync(ctx, metricsGrabber, boundPVKey, storageClassKey)
+			waitForPVControllerSync(ctx, metricsGrabber, boundPVCKey, volumeAttributeClassKey)
+			controllerMetrics, err := metricsGrabber.GrabFromControllerManager(ctx)
+			framework.ExpectNoError(err, "Error getting c-m metricValues: %v", err)
+			err = testutil.ValidateMetrics(testutil.Metrics(controllerMetrics), boundPVCKey, dimensions...)
+			framework.ExpectNoError(err, "Invalid metric in Controller Manager metrics: %q", boundPVCKey)
+		})
+
+		ginkgo.It("should create total pv count metrics for with plugin and volume mode labels after creating pv",
+			func(ctx context.Context) {
+				var err error
+				dimensions := []string{pluginNameKey, volumeModeKey}
+				pv, err = e2epv.CreatePV(ctx, c, f.Timeouts, pv)
+				framework.ExpectNoError(err, "Error creating pv: %v", err)
+				waitForPVControllerSync(ctx, metricsGrabber, totalPVKey, pluginNameKey)
+				controllerMetrics, err := metricsGrabber.GrabFromControllerManager(ctx)
+				framework.ExpectNoError(err, "Error getting c-m metricValues: %v", err)
+				err = testutil.ValidateMetrics(testutil.Metrics(controllerMetrics), totalPVKey, dimensions...)
+				framework.ExpectNoError(err, "Invalid metric in Controller Manager metrics: %q", totalPVKey)
 			})
 	})
 })
@@ -520,7 +581,7 @@ func newStorageControllerMetrics() *storageControllerMetrics {
 	}
 }
 
-func waitForDetachAndGrabMetrics(oldMetrics *storageControllerMetrics, metricsGrabber *metrics.Grabber) *storageControllerMetrics {
+func waitForDetachAndGrabMetrics(ctx context.Context, oldMetrics *storageControllerMetrics, metricsGrabber *e2emetrics.Grabber, pluginName string) *storageControllerMetrics {
 	backoff := wait.Backoff{
 		Duration: 10 * time.Second,
 		Factor:   1.2,
@@ -533,19 +594,20 @@ func waitForDetachAndGrabMetrics(oldMetrics *storageControllerMetrics, metricsGr
 		oldDetachCount = 0
 	}
 
-	verifyMetricFunc := func() (bool, error) {
-		updatedMetrics, err := metricsGrabber.GrabFromControllerManager()
+	verifyMetricFunc := func(ctx context.Context) (bool, error) {
+		updatedMetrics, err := metricsGrabber.GrabFromControllerManager(ctx)
 
 		if err != nil {
-			e2elog.Logf("Error fetching controller-manager metrics")
+			framework.Logf("Error fetching controller-manager metrics")
 			return false, err
 		}
 
-		updatedStorageMetrics = getControllerStorageMetrics(updatedMetrics)
+		updatedStorageMetrics = getControllerStorageMetrics(updatedMetrics, pluginName)
 		newDetachCount, ok := updatedStorageMetrics.latencyMetrics["volume_detach"]
 
 		// if detach metrics are not yet there, we need to retry
 		if !ok {
+			framework.Logf("Detach metrics not found yet")
 			return false, nil
 		}
 
@@ -554,11 +616,12 @@ func waitForDetachAndGrabMetrics(oldMetrics *storageControllerMetrics, metricsGr
 		if oldDetachCount >= newDetachCount {
 			return false, nil
 		}
+
 		return true, nil
 	}
 
-	waitErr := wait.ExponentialBackoff(backoff, verifyMetricFunc)
-	framework.ExpectNoError(waitErr, "Timeout error fetching storage c-m metrics : %v", waitErr)
+	waitErr := wait.ExponentialBackoffWithContext(ctx, backoff, verifyMetricFunc)
+	framework.ExpectNoError(waitErr, "Unable to get updated metrics for plugin %s", pluginName)
 	return updatedStorageMetrics
 }
 
@@ -580,10 +643,14 @@ func verifyMetricCount(oldMetrics, newMetrics *storageControllerMetrics, metricN
 
 	newLatencyCount, ok := newMetrics.latencyMetrics[metricName]
 	if !expectFailure {
-		gomega.Expect(ok).To(gomega.BeTrue(), "Error getting updated latency metrics for %s", metricName)
+		if !ok {
+			framework.Failf("Error getting updated latency metrics for %s", metricName)
+		}
 	}
 	newStatusCounts, ok := newMetrics.statusMetrics[metricName]
-	gomega.Expect(ok).To(gomega.BeTrue(), "Error getting updated status metrics for %s", metricName)
+	if !ok {
+		framework.Failf("Error getting updated status metrics for %s", metricName)
+	}
 
 	newStatusCount := int64(0)
 	if expectFailure {
@@ -601,23 +668,27 @@ func verifyMetricCount(oldMetrics, newMetrics *storageControllerMetrics, metricN
 	gomega.Expect(newStatusCount).To(gomega.BeNumerically(">", oldStatusCount), "New status count %d should be more than old count %d for action %s", newStatusCount, oldStatusCount, metricName)
 }
 
-func getControllerStorageMetrics(ms metrics.ControllerManagerMetrics) *storageControllerMetrics {
+func getControllerStorageMetrics(ms e2emetrics.ControllerManagerMetrics, pluginName string) *storageControllerMetrics {
 	result := newStorageControllerMetrics()
 
 	for method, samples := range ms {
 		switch method {
-
+		// from the base metric name "storage_operation_duration_seconds"
 		case "storage_operation_duration_seconds_count":
 			for _, sample := range samples {
 				count := int64(sample.Value)
 				operation := string(sample.Metric["operation_name"])
-				result.latencyMetrics[operation] = count
-			}
-		case "storage_operation_status_count":
-			for _, sample := range samples {
-				count := int64(sample.Value)
-				operation := string(sample.Metric["operation_name"])
+				// if the volumes were provisioned with a CSI Driver
+				// the metric operation name will be prefixed with
+				// "kubernetes.io/csi:"
+				metricPluginName := string(sample.Metric["volume_plugin"])
 				status := string(sample.Metric["status"])
+				if !strings.Contains(metricPluginName, pluginName) {
+					// the metric volume plugin field doesn't match
+					// the default storageClass.Provisioner field
+					continue
+				}
+
 				statusCounts := result.statusMetrics[operation]
 				switch status {
 				case "success":
@@ -628,148 +699,100 @@ func getControllerStorageMetrics(ms metrics.ControllerManagerMetrics) *storageCo
 					statusCounts.otherCount = count
 				}
 				result.statusMetrics[operation] = statusCounts
+				result.latencyMetrics[operation] = count
 			}
-
 		}
 	}
 	return result
+}
+
+func findMetric(metricKeyName string, labels map[testutil.LabelName]testutil.LabelValue, metrics testutil.Metrics) bool {
+	found := false
+	errCount := 0
+	if samples, ok := metrics[metricKeyName]; ok {
+	samples:
+		for _, sample := range samples {
+			for k, v := range labels {
+				got, ok := sample.Metric[k]
+				if !ok {
+					framework.Logf("sample %v missing key %s", sample, k)
+					errCount++
+					continue samples
+				} else if got != v {
+					continue samples
+				}
+			}
+			found = true
+			framework.Logf("Found expected sample: %v", sample)
+			break
+		}
+	}
+	gomega.Expect(errCount).To(gomega.Equal(0), "Found invalid samples")
+	return found
+}
+
+func verifyMetric(metricKeyName string, labels map[testutil.LabelName]testutil.LabelValue, metrics testutil.Metrics) {
+	ginkgo.GinkgoHelper()
+	found := findMetric(metricKeyName, labels, metrics)
+	gomega.Expect(found).To(gomega.BeTrueBecause("Failed to find metric %s with labels %v. Got %v", metricKeyName, labels, metrics[metricKeyName]))
 }
 
 // Finds the sample in the specified metric from `KubeletMetrics` tagged with
 // the specified namespace and pvc name
-func findVolumeStatMetric(metricKeyName string, namespace string, pvcName string, kubeletMetrics metrics.KubeletMetrics) bool {
-	found := false
-	errCount := 0
-	e2elog.Logf("Looking for sample in metric `%s` tagged with namespace `%s`, PVC `%s`", metricKeyName, namespace, pvcName)
-	if samples, ok := kubeletMetrics[metricKeyName]; ok {
-		for _, sample := range samples {
-			e2elog.Logf("Found sample %s", sample.String())
-			samplePVC, ok := sample.Metric["persistentvolumeclaim"]
-			if !ok {
-				e2elog.Logf("Error getting pvc for metric %s, sample %s", metricKeyName, sample.String())
-				errCount++
-			}
-			sampleNS, ok := sample.Metric["namespace"]
-			if !ok {
-				e2elog.Logf("Error getting namespace for metric %s, sample %s", metricKeyName, sample.String())
-				errCount++
-			}
-
-			if string(samplePVC) == pvcName && string(sampleNS) == namespace {
-				found = true
-				break
-			}
-		}
-	}
-	framework.ExpectEqual(errCount, 0, "Found invalid samples")
-	return found
+func findVolumeStatMetric(metricKeyName string, namespace string, pvcName string, kubeletMetrics e2emetrics.KubeletMetrics) bool {
+	framework.Logf("Looking for sample in metric `%s` tagged with namespace `%s`, PVC `%s`", metricKeyName, namespace, pvcName)
+	return findMetric(metricKeyName, map[testutil.LabelName]testutil.LabelValue{
+		"namespace":             testutil.LabelValue(namespace),
+		"persistentvolumeclaim": testutil.LabelValue(pvcName),
+	}, testutil.Metrics(kubeletMetrics))
 }
 
 // Wait for the count of a pv controller's metric specified by metricName and dimension bigger than zero.
-func waitForPVControllerSync(metricsGrabber *metrics.Grabber, metricName, dimension string) {
+func waitForPVControllerSync(ctx context.Context, metricsGrabber *e2emetrics.Grabber, metricName, dimension string) {
 	backoff := wait.Backoff{
-		Duration: 10 * time.Second,
+		Duration: 1 * time.Second,
 		Factor:   1.2,
 		Steps:    21,
 	}
-	verifyMetricFunc := func() (bool, error) {
-		updatedMetrics, err := metricsGrabber.GrabFromControllerManager()
+	verifyMetricFunc := func(ctx context.Context) (bool, error) {
+		updatedMetrics, err := metricsGrabber.GrabFromControllerManager(ctx)
 		if err != nil {
-			e2elog.Logf("Error fetching controller-manager metrics")
+			framework.Logf("Error fetching controller-manager metrics")
 			return false, err
 		}
-		return len(getPVControllerMetrics(updatedMetrics, metricName, dimension)) > 0, nil
+		return len(testutil.GetMetricValuesForLabel(testutil.Metrics(updatedMetrics), metricName, dimension)) > 0, nil
 	}
-	waitErr := wait.ExponentialBackoff(backoff, verifyMetricFunc)
-	framework.ExpectNoError(waitErr,
-		"Timeout error fetching pv controller metrics : %v", waitErr)
+	waitErr := wait.ExponentialBackoffWithContext(ctx, backoff, verifyMetricFunc)
+	framework.ExpectNoError(waitErr, "Unable to get pv controller metrics")
 }
 
-func getPVControllerMetrics(ms metrics.ControllerManagerMetrics, metricName, dimension string) map[string]int64 {
-	result := make(map[string]int64)
-	for method, samples := range ms {
-		if method != metricName {
+func getStatesMetrics(metricKey string, givenMetrics testutil.Metrics, pluginName string) map[string]int64 {
+	states := make(map[string]int64)
+	for _, sample := range givenMetrics[metricKey] {
+		if string(sample.Metric["plugin_name"]) != pluginName {
 			continue
 		}
-		for _, sample := range samples {
-			count := int64(sample.Value)
-			dimensionName := string(sample.Metric[model.LabelName(dimension)])
-			result[dimensionName] = count
-		}
-	}
-	return result
-}
-
-func calculateRelativeValues(originValues, updatedValues map[string]int64) map[string]int64 {
-	relativeValues := make(map[string]int64)
-	for key, value := range updatedValues {
-		relativeValue := value - originValues[key]
-		if relativeValue != 0 {
-			relativeValues[key] = relativeValue
-		}
-	}
-	for key, value := range originValues {
-		if _, exist := updatedValues[key]; !exist && value > 0 {
-			relativeValues[key] = -value
-		}
-	}
-	return relativeValues
-}
-
-func hasValidMetrics(metrics metrics.Metrics, metricKey string, dimensions ...string) bool {
-	var errCount int
-	e2elog.Logf("Looking for sample in metric %q", metricKey)
-	samples, ok := metrics[metricKey]
-	if !ok {
-		e2elog.Logf("Key %q was not found in metrics", metricKey)
-		return false
-	}
-	for _, sample := range samples {
-		e2elog.Logf("Found sample %q", sample.String())
-		for _, d := range dimensions {
-			if _, ok := sample.Metric[model.LabelName(d)]; !ok {
-				e2elog.Logf("Error getting dimension %q for metric %q, sample %q", d, metricKey, sample.String())
-				errCount++
-			}
-		}
-	}
-	return errCount == 0
-}
-
-func getStatesMetrics(metricKey string, givenMetrics metrics.Metrics) map[string]map[string]int64 {
-	states := make(map[string]map[string]int64)
-	for _, sample := range givenMetrics[metricKey] {
-		e2elog.Logf("Found sample %q", sample.String())
+		framework.Logf("Found sample %q", sample.String())
 		state := string(sample.Metric["state"])
-		pluginName := string(sample.Metric["plugin_name"])
-		states[state] = map[string]int64{pluginName: int64(sample.Value)}
+		states[state] = int64(sample.Value)
 	}
 	return states
 }
 
-func waitForADControllerStatesMetrics(metricsGrabber *metrics.Grabber, metricName string, dimensions []string, stateNames []string) {
-	backoff := wait.Backoff{
-		Duration: 10 * time.Second,
-		Factor:   1.2,
-		Steps:    21,
+// makePod creates a pod which either references the PVC or creates it via a
+// generic ephemeral volume claim template.
+func makePod(f *framework.Framework, pvc *v1.PersistentVolumeClaim, isEphemeral bool) *v1.Pod {
+	claims := []*v1.PersistentVolumeClaim{pvc}
+	pod := e2epod.MakePod(f.Namespace.Name, nil, claims, f.NamespacePodSecurityLevel, "")
+	if isEphemeral {
+		volSrc := pod.Spec.Volumes[0]
+		volSrc.PersistentVolumeClaim = nil
+		volSrc.Ephemeral = &v1.EphemeralVolumeSource{
+			VolumeClaimTemplate: &v1.PersistentVolumeClaimTemplate{
+				Spec: pvc.Spec,
+			},
+		}
+		pod.Spec.Volumes[0] = volSrc
 	}
-	verifyMetricFunc := func() (bool, error) {
-		updatedMetrics, err := metricsGrabber.GrabFromControllerManager()
-		if err != nil {
-			framework.Skipf("Could not get controller-manager metrics - skipping")
-			return false, err
-		}
-		if !hasValidMetrics(metrics.Metrics(updatedMetrics), metricName, dimensions...) {
-			return false, fmt.Errorf("could not get valid metrics for %q", metricName)
-		}
-		states := getStatesMetrics(metricName, metrics.Metrics(updatedMetrics))
-		for _, name := range stateNames {
-			if _, ok := states[name]; !ok {
-				return false, fmt.Errorf("could not get state %q from A/D Controller metrics", name)
-			}
-		}
-		return true, nil
-	}
-	waitErr := wait.ExponentialBackoff(backoff, verifyMetricFunc)
-	framework.ExpectNoError(waitErr, "Timeout error fetching A/D controller metrics : %v", waitErr)
+	return pod
 }

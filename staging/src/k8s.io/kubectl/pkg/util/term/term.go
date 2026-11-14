@@ -17,10 +17,13 @@ limitations under the License.
 package term
 
 import (
+	"errors"
 	"io"
 	"os"
 
-	"github.com/docker/docker/pkg/term"
+	"k8s.io/cli-runtime/pkg/printers"
+
+	"github.com/moby/term"
 
 	"k8s.io/kubectl/pkg/util/interrupt"
 )
@@ -55,19 +58,13 @@ type TTY struct {
 // IsTerminalIn returns true if t.In is a terminal. Does not check /dev/tty
 // even if TryDev is set.
 func (t TTY) IsTerminalIn() bool {
-	return IsTerminal(t.In)
+	return printers.IsTerminal(t.In)
 }
 
 // IsTerminalOut returns true if t.Out is a terminal. Does not check /dev/tty
 // even if TryDev is set.
 func (t TTY) IsTerminalOut() bool {
-	return IsTerminal(t.Out)
-}
-
-// IsTerminal returns whether the passed object is a terminal or not
-func IsTerminal(i interface{}) bool {
-	_, terminal := term.GetFdInfo(i)
-	return terminal
+	return printers.IsTerminal(t.Out)
 }
 
 // Safe invokes the provided function and will attempt to ensure that when the
@@ -107,4 +104,28 @@ func (t TTY) Safe(fn SafeFunc) error {
 
 		term.RestoreTerminal(inFd, state)
 	}).Run(fn)
+}
+
+type detachableReader struct {
+	escapeProxy io.Reader
+}
+
+func NewDetachableReader(r io.Reader, detachKeys string) (io.Reader, error) {
+	detachKeyBytes, err := term.ToBytes(detachKeys)
+	if err != nil {
+		return nil, err
+	}
+	return &detachableReader{
+		escapeProxy: term.NewEscapeProxy(r, detachKeyBytes),
+	}, nil
+}
+
+func (r *detachableReader) Read(p []byte) (n int, err error) {
+	n, err = r.escapeProxy.Read(p)
+	if errors.Is(err, term.EscapeError{}) {
+		// EscapeError is expected when the user types the detach key sequence, so we should not treat it as an error.
+		// Instead, we return io.EOF so that the attach session will end gracefully.
+		err = io.EOF
+	}
+	return n, err
 }

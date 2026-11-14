@@ -1,4 +1,4 @@
-// +build windows
+//go:build windows
 
 /*
 Copyright 2018 The Kubernetes Authors.
@@ -19,74 +19,98 @@ limitations under the License.
 package util
 
 import (
+	"fmt"
+	"reflect"
+	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"k8s.io/cri-client/pkg/util"
 )
 
-func TestParseEndpoint(t *testing.T) {
+func TestNormalizePath(t *testing.T) {
 	tests := []struct {
-		endpoint         string
-		expectError      bool
-		expectedProtocol string
-		expectedAddr     string
+		originalpath   string
+		normalizedPath string
 	}{
 		{
-			endpoint:         "unix:///tmp/s1.sock",
-			expectedProtocol: "unix",
-			expectError:      true,
+			originalpath:   "\\path\\to\\file",
+			normalizedPath: "c:\\path\\to\\file",
 		},
 		{
-			endpoint:         "tcp://localhost:15880",
-			expectedProtocol: "tcp",
-			expectedAddr:     "localhost:15880",
+			originalpath:   "/path/to/file",
+			normalizedPath: "c:\\path\\to\\file",
 		},
 		{
-			endpoint:         "npipe://./pipe/mypipe",
-			expectedProtocol: "npipe",
-			expectedAddr:     "//./pipe/mypipe",
+			originalpath:   "/path/to/dir/",
+			normalizedPath: "c:\\path\\to\\dir\\",
 		},
 		{
-			endpoint:         "npipe:////./pipe/mypipe2",
-			expectedProtocol: "npipe",
-			expectedAddr:     "//./pipe/mypipe2",
+			originalpath:   "\\path\\to\\dir\\",
+			normalizedPath: "c:\\path\\to\\dir\\",
 		},
 		{
-			endpoint:         "npipe:/pipe/mypipe3",
-			expectedProtocol: "npipe",
-			expectedAddr:     "//./pipe/mypipe3",
+			originalpath:   "/file",
+			normalizedPath: "c:\\file",
 		},
 		{
-			endpoint:         "npipe:\\\\.\\pipe\\mypipe4",
-			expectedProtocol: "npipe",
-			expectedAddr:     "//./pipe/mypipe4",
+			originalpath:   "\\file",
+			normalizedPath: "c:\\file",
 		},
 		{
-			endpoint:         "npipe:\\pipe\\mypipe5",
-			expectedProtocol: "npipe",
-			expectedAddr:     "//./pipe/mypipe5",
-		},
-		{
-			endpoint:         "tcp1://abc",
-			expectedProtocol: "tcp1",
-			expectError:      true,
-		},
-		{
-			endpoint:    "a b c",
-			expectError: true,
+			originalpath:   "fileonly",
+			normalizedPath: "fileonly",
 		},
 	}
 
 	for _, test := range tests {
-		protocol, addr, err := parseEndpoint(test.endpoint)
-		assert.Equal(t, test.expectedProtocol, protocol)
+		assert.Equal(t, test.normalizedPath, NormalizePath(test.originalpath))
+	}
+}
+
+func TestLocalEndpoint(t *testing.T) {
+	tests := []struct {
+		path             string
+		file             string
+		expectError      bool
+		expectedFullPath string
+	}{
+		{
+			path:             "/var/lib/kubelet/pod-resources",
+			file:             "kube.sock", // this is not the default, but it's not relevant here
+			expectError:      false,
+			expectedFullPath: `npipe://\\.\pipe\kubelet-pod-resources`,
+		},
+	}
+	for _, test := range tests {
+		fullPath, err := LocalEndpoint(test.path, test.file)
 		if test.expectError {
-			assert.NotNil(t, err, "Expect error during parsing %q", test.endpoint)
+			assert.NotNil(t, err, "expected error")
 			continue
 		}
-		require.Nil(t, err, "Expect no error during parsing %q", test.endpoint)
-		assert.Equal(t, test.expectedAddr, addr)
+		assert.Nil(t, err, "expected no error")
+		assert.Equal(t, test.expectedFullPath, fullPath)
 	}
+}
 
+func TestLocalEndpointRoundTrip(t *testing.T) {
+	functionPointer := reflect.ValueOf(util.GetAddressAndDialer).Pointer()
+	functionName := runtime.FuncForPC(functionPointer).Name()
+	expectedDialerName := fmt.Sprintf("%s.npipeDial", functionName[:strings.LastIndex(functionName, ".")])
+	expectedAddress := "//./pipe/kubelet-pod-resources"
+
+	fullPath, err := LocalEndpoint(`pod-resources`, "kubelet")
+	require.NoErrorf(t, err, "Failed to create the local endpoint path")
+
+	address, dialer, err := util.GetAddressAndDialer(fullPath)
+	require.NoErrorf(t, err, "Failed to parse the endpoint path and get back address and dialer (path=%q)", fullPath)
+
+	dialerPointer := reflect.ValueOf(dialer).Pointer()
+	actualDialerName := runtime.FuncForPC(dialerPointer).Name()
+
+	assert.Equal(t, expectedDialerName, actualDialerName)
+	assert.Equal(t, expectedAddress, address)
 }

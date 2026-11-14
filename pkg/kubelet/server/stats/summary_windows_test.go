@@ -1,4 +1,4 @@
-// +build windows
+//go:build windows
 
 /*
 Copyright 2018 The Kubernetes Authors.
@@ -22,18 +22,19 @@ import (
 	"testing"
 	"time"
 
-	fuzz "github.com/google/gofuzz"
 	"github.com/stretchr/testify/assert"
+	"sigs.k8s.io/randfill"
 
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	statsapi "k8s.io/kubernetes/pkg/kubelet/apis/stats/v1alpha1"
+	statsapi "k8s.io/kubelet/pkg/apis/stats/v1alpha1"
 	"k8s.io/kubernetes/pkg/kubelet/cm"
 	statstest "k8s.io/kubernetes/pkg/kubelet/server/stats/testing"
 )
 
 func TestSummaryProvider(t *testing.T) {
 	var (
+		ctx            = t.Context()
 		podStats       = []statsapi.PodStats{*getPodStats()}
 		imageFsStats   = getFsStats()
 		rootFsStats    = getFsStats()
@@ -51,51 +52,57 @@ func TestSummaryProvider(t *testing.T) {
 
 	assert := assert.New(t)
 
-	mockStatsProvider := new(statstest.StatsProvider)
-	mockStatsProvider.
-		On("GetNode").Return(node, nil).
-		On("GetNodeConfig").Return(nodeConfig).
-		On("GetPodCgroupRoot").Return(cgroupRoot).
-		On("ListPodStats").Return(podStats, nil).
-		On("ListPodStatsAndUpdateCPUNanoCoreUsage").Return(podStats, nil).
-		On("ImageFsStats").Return(imageFsStats, nil).
-		On("RootFsStats").Return(rootFsStats, nil).
-		On("RlimitStats").Return(nil, nil).
-		On("GetCgroupStats", "/", true).Return(cgroupStatsMap["/"].cs, cgroupStatsMap["/"].ns, nil)
+	mockStatsProvider := statstest.NewMockProvider(t)
+	mockStatsProvider.EXPECT().GetNode(ctx).Return(node, nil).Maybe()
+	mockStatsProvider.EXPECT().GetNodeConfig().Return(nodeConfig).Maybe()
+	mockStatsProvider.EXPECT().GetPodCgroupRoot().Return(cgroupRoot).Maybe()
+	mockStatsProvider.EXPECT().ListPodStats(ctx).Return(podStats, nil).Maybe()
+	mockStatsProvider.EXPECT().ListPodStatsAndUpdateCPUNanoCoreUsage(ctx).Return(podStats, nil).Maybe()
+	mockStatsProvider.EXPECT().ImageFsStats(ctx).Return(imageFsStats, imageFsStats, nil).Maybe()
+	mockStatsProvider.EXPECT().RootFsStats().Return(rootFsStats, nil).Maybe()
+	mockStatsProvider.EXPECT().RlimitStats().Return(nil, nil).Maybe()
+	mockStatsProvider.EXPECT().GetCgroupStats(ctx, "/", true).Return(cgroupStatsMap["/"].cs, cgroupStatsMap["/"].ns, nil).Maybe()
 
-	provider := NewSummaryProvider(mockStatsProvider)
-	summary, err := provider.Get(true)
+	kubeletCreationTime := metav1.Now()
+	systemBootTime := metav1.Now()
+	provider := summaryProviderImpl{kubeletCreationTime: kubeletCreationTime, systemBootTime: systemBootTime, provider: mockStatsProvider}
+	summary, err := provider.Get(ctx, true)
 	assert.NoError(err)
 
-	assert.Equal(summary.Node.NodeName, "test-node")
-	assert.Equal(summary.Node.StartTime, cgroupStatsMap["/"].cs.StartTime)
-	assert.Equal(summary.Node.CPU, cgroupStatsMap["/"].cs.CPU)
-	assert.Equal(summary.Node.Memory, cgroupStatsMap["/"].cs.Memory)
-	assert.Equal(summary.Node.Network, cgroupStatsMap["/"].ns)
-	assert.Equal(summary.Node.Fs, rootFsStats)
-	assert.Equal(summary.Node.Runtime, &statsapi.RuntimeStats{ImageFs: imageFsStats})
+	assert.Equal("test-node", summary.Node.NodeName)
+	assert.Equal(systemBootTime, summary.Node.StartTime)
+	assert.Equal(cgroupStatsMap["/"].cs.CPU, summary.Node.CPU)
+	assert.Equal(cgroupStatsMap["/"].cs.Memory, summary.Node.Memory)
+	assert.Equal(cgroupStatsMap["/"].ns, summary.Node.Network)
+	assert.Equal(rootFsStats, summary.Node.Fs)
+	assert.Equal(&statsapi.RuntimeStats{ContainerFs: imageFsStats, ImageFs: imageFsStats}, summary.Node.Runtime)
 
-	assert.Equal(len(summary.Node.SystemContainers), 1)
-	assert.Equal(summary.Node.SystemContainers[0].Name, "pods")
-	assert.Equal(summary.Node.SystemContainers[0].CPU.UsageCoreNanoSeconds, podStats[0].CPU.UsageCoreNanoSeconds)
-	assert.Equal(summary.Node.SystemContainers[0].CPU.UsageNanoCores, podStats[0].CPU.UsageNanoCores)
-	assert.Equal(summary.Node.SystemContainers[0].Memory.WorkingSetBytes, podStats[0].Memory.WorkingSetBytes)
-	assert.Equal(summary.Node.SystemContainers[0].Memory.UsageBytes, podStats[0].Memory.UsageBytes)
-	assert.Equal(summary.Node.SystemContainers[0].Memory.AvailableBytes, podStats[0].Memory.AvailableBytes)
+	assert.NoError(err)
+	assert.Len(summary.Node.SystemContainers, 2)
+	assert.Equal("pods", summary.Node.SystemContainers[0].Name)
+	assert.Equal(podStats[0].CPU.UsageCoreNanoSeconds, summary.Node.SystemContainers[0].CPU.UsageCoreNanoSeconds)
+	assert.Equal(podStats[0].CPU.UsageNanoCores, summary.Node.SystemContainers[0].CPU.UsageNanoCores)
+	assert.Equal(podStats[0].Memory.WorkingSetBytes, summary.Node.SystemContainers[0].Memory.WorkingSetBytes)
+	assert.Equal(podStats[0].Memory.UsageBytes, summary.Node.SystemContainers[0].Memory.UsageBytes)
+	assert.Equal(podStats[0].Memory.AvailableBytes, summary.Node.SystemContainers[0].Memory.AvailableBytes)
+	assert.Equal(statsapi.SystemContainerWindowsGlobalCommitMemory, summary.Node.SystemContainers[1].Name)
+	assert.NotEqual(nil, summary.Node.SystemContainers[1].Memory)
+	assert.NotEqual(nil, summary.Node.SystemContainers[1].Memory.AvailableBytes)
+	assert.NotEqual(nil, summary.Node.SystemContainers[1].Memory.UsageBytes)
 	assert.Equal(summary.Pods, podStats)
 }
 
 func getFsStats() *statsapi.FsStats {
-	f := fuzz.New().NilChance(0)
+	f := randfill.New().NilChance(0)
 	v := &statsapi.FsStats{}
-	f.Fuzz(v)
+	f.Fill(v)
 	return v
 }
 
 func getContainerStats() *statsapi.ContainerStats {
-	f := fuzz.New().NilChance(0)
+	f := randfill.New().NilChance(0)
 	v := &statsapi.ContainerStats{}
-	f.Fuzz(v)
+	f.Fill(v)
 	return v
 }
 

@@ -18,6 +18,14 @@ set -o errexit
 set -o nounset
 set -o pipefail
 
+# A CRD object is stored before its API is served. Creating an instance in that
+# window fails discovery, and errexit then skips the deletes below the create.
+# Later test-cmd cases share this apiserver, so a leaked CRD (singular name
+# "foo", for example) fails unrelated assertions.
+wait_for_crd_established() {
+  kubectl wait --for=condition=Established=true --timeout=30s "crd/${1}"
+}
+
 run_RESTMapper_evaluation_tests() {
   set -o nounset
   set -o errexit
@@ -27,7 +35,7 @@ run_RESTMapper_evaluation_tests() {
 
   RESTMAPPER_ERROR_FILE="${KUBE_TEMP}/restmapper-error"
 
-  ### Non-existent resource type should give a recognizeable error
+  ### Non-existent resource type should give a recognizable error
   # Pre-condition: None
   # Command
   kubectl get "${kube_flags[@]:?}" unknownresourcetype 2>"${RESTMAPPER_ERROR_FILE}" || true
@@ -48,6 +56,12 @@ run_assert_short_name_tests() {
   set -o nounset
   set -o errexit
 
+  cleanup_assert_short_name_tests() {
+    kubectl delete examples/test-crd-example --ignore-not-found=true --timeout=30s || true
+    kubectl delete customresourcedefinition examples.test.com --ignore-not-found=true --timeout=60s || true
+  }
+  trap cleanup_assert_short_name_tests EXIT
+
   create_and_use_new_namespace
   kube::log::status "Testing assert short name"
 
@@ -55,7 +69,158 @@ run_assert_short_name_tests() {
   output_message=$(kubectl get --raw=/api/v1)
 
   ## test if a short name is exported during discovery
-  kube::test::if_has_string "${output_message}" '{"name":"configmaps","singularName":"","namespaced":true,"kind":"ConfigMap","verbs":\["create","delete","deletecollection","get","list","patch","update","watch"\],"shortNames":\["cm"\],"storageVersionHash":'
+  kube::test::if_has_string "${output_message}" '{"name":"configmaps","singularName":"configmap","namespaced":true,"kind":"ConfigMap","verbs":\["create","delete","deletecollection","get","list","patch","update","watch"\],"shortNames":\["cm"\],"storageVersionHash":'
+
+  # check that there is no pod with the name test-crd-example
+  output_message=$(kubectl get pod)
+  kube::test::if_has_not_string "${output_message}" "test-crd-example"
+
+    kubectl create -f - << __EOF__
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: examples.test.com
+spec:
+  group: test.com
+  scope: Namespaced
+  versions:
+    - name: v1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              properties:
+                test:
+                  type: string
+  names:
+    plural: examples
+    singular: example
+    shortNames:
+      - pod
+    kind: Example
+__EOF__
+
+  # Test that we can list this new custom resource
+  kube::test::wait_object_assert customresourcedefinitions "{{range.items}}{{if eq ${id_field:?} \"examples.test.com\"}}{{$id_field}}:{{end}}{{end}}" 'examples.test.com:'
+  wait_for_crd_established examples.test.com
+
+  kubectl create -f - << __EOF__
+apiVersion: test.com/v1
+kind: Example
+metadata:
+  name: test-crd-example
+spec:
+  test: test
+__EOF__
+
+  # Test that we can list this new custom resource
+  kube::test::wait_object_assert examples "{{range.items}}{{${id_field:?}}}:{{end}}" 'test-crd-example:'
+
+  output_message=$(kubectl get examples)
+  kube::test::if_has_string "${output_message}" "test-crd-example"
+
+  # test that get pod returns v1/pod instead crd
+  output_message=$(kubectl get pod)
+  kube::test::if_has_not_string "${output_message}" "test-crd-example"
+
+  # invalidate cache and assure that still correct resource is shown
+  kubectl api-resources
+
+  # retest the above cases after invalidating cache
+  output_message=$(kubectl get examples)
+  kube::test::if_has_string "${output_message}" "test-crd-example"
+
+  output_message=$(kubectl get pod)
+  kube::test::if_has_not_string "${output_message}" "test-crd-example"
+
+  cleanup_assert_short_name_tests
+  trap - EXIT
+
+  set +o nounset
+  set +o errexit
+}
+
+run_assert_singular_name_tests() {
+  set -o nounset
+  set -o errexit
+
+  cleanup_assert_singular_name_tests() {
+    kubectl delete examples/test-crd-example --ignore-not-found=true --timeout=30s || true
+    kubectl delete customresourcedefinition examples.test.com --ignore-not-found=true --timeout=60s || true
+  }
+  trap cleanup_assert_singular_name_tests EXIT
+
+  create_and_use_new_namespace
+  kube::log::status "Testing assert singular name"
+
+  # check that there is no pod with the name test-crd-example
+  output_message=$(kubectl get pod)
+  kube::test::if_has_not_string "${output_message}" "test-crd-example"
+
+  kubectl create -f - << __EOF__
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: examples.test.com
+spec:
+  group: test.com
+  scope: Namespaced
+  versions:
+    - name: v1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              properties:
+                test:
+                  type: string
+  names:
+    plural: examples
+    singular: pod
+    kind: Example
+__EOF__
+
+  # Test that we can list this new custom resource
+  kube::test::wait_object_assert customresourcedefinitions "{{range.items}}{{if eq ${id_field:?} \"examples.test.com\"}}{{$id_field}}:{{end}}{{end}}" 'examples.test.com:'
+  wait_for_crd_established examples.test.com
+
+  kubectl create -f - << __EOF__
+apiVersion: test.com/v1
+kind: Example
+metadata:
+  name: test-crd-example
+spec:
+  test: test
+__EOF__
+
+  # Test that we can list this new custom resource
+  kube::test::wait_object_assert examples "{{range.items}}{{$id_field}}:{{end}}" 'test-crd-example:'
+
+  output_message=$(kubectl get examples)
+  kube::test::if_has_string "${output_message}" "test-crd-example"
+
+  output_message=$(kubectl get pod)
+  kube::test::if_has_not_string "${output_message}" "test-crd-example"
+
+  # invalidate cache and assure that still correct resource is shown
+  kubectl api-resources
+
+  output_message=$(kubectl get examples)
+  kube::test::if_has_string "${output_message}" "test-crd-example"
+
+  output_message=$(kubectl get pod)
+  kube::test::if_has_not_string "${output_message}" "test-crd-example"
+
+  cleanup_assert_singular_name_tests
+  trap - EXIT
 
   set +o nounset
   set +o errexit
@@ -82,15 +247,53 @@ run_resource_aliasing_tests() {
   kubectl create -f test/e2e/testing-manifests/statefulset/cassandra/controller.yaml "${kube_flags[@]}"
   kubectl create -f test/e2e/testing-manifests/statefulset/cassandra/service.yaml "${kube_flags[@]}"
 
-  object="all -l'app=cassandra'"
+  object="all -l app=cassandra"
   request="{{range.items}}{{range .metadata.labels}}{{.}}:{{end}}{{end}}"
 
   # all 4 cassandra's might not be in the request immediately...
-  kube::test::get_object_assert "$object" "$request" 'cassandra:cassandra:cassandra:cassandra:' || \
-  kube::test::get_object_assert "$object" "$request" 'cassandra:cassandra:cassandra:' || \
-  kube::test::get_object_assert "$object" "$request" 'cassandra:cassandra:'
+  # :? suffix is for possible service.kubernetes.io/headless
+  # label with "" value
+  kube::test::get_object_assert "$object" "$request" '(cassandra:){2}(cassandra:(cassandra::?)?)?'
 
   kubectl delete all -l app=cassandra "${kube_flags[@]}"
+
+  set +o nounset
+  set +o errexit
+}
+
+run_crd_deletion_recreation_tests() {
+  set -o nounset
+  set -o errexit
+
+  cleanup_crd_deletion_recreation_tests() {
+    kubectl delete -f hack/testdata/CRD/example-crd-1-cluster-scoped-resource.yaml --ignore-not-found=true --timeout=30s || true
+    kubectl delete -f hack/testdata/CRD/example-crd-1-namespaced-resource.yaml --ignore-not-found=true --timeout=30s || true
+    kubectl delete customresourcedefinition examples.test.com --ignore-not-found=true --timeout=60s || true
+  }
+  trap cleanup_crd_deletion_recreation_tests EXIT
+
+  create_and_use_new_namespace
+  kube::log::status "Testing resource creation, deletion, and re-creation"
+
+  output_message=$(kubectl apply -f hack/testdata/CRD/example-crd-1-cluster-scoped.yaml)
+  kube::test::if_has_string "${output_message}" 'created'
+  wait_for_crd_established examples.test.com
+  output_message=$(kubectl apply -f hack/testdata/CRD/example-crd-1-cluster-scoped-resource.yaml)
+  kube::test::if_has_string "${output_message}" 'created'
+  output_message=$(kubectl delete -f hack/testdata/CRD/example-crd-1-cluster-scoped.yaml)
+  kube::test::if_has_string "${output_message}" 'deleted'
+  # Invalidate local cache because cluster scoped CRD in cache is stale.
+  # Invalidation of cache may take up to 6 hours and we are manually
+  # invalidate cache and expect that scope changed CRD should be created without problem.
+  kubectl api-resources
+  output_message=$(kubectl apply -f hack/testdata/CRD/example-crd-1-namespaced.yaml)
+  kube::test::if_has_string "${output_message}" 'created'
+  wait_for_crd_established examples.test.com
+  output_message=$(kubectl apply -f hack/testdata/CRD/example-crd-1-namespaced-resource.yaml)
+  kube::test::if_has_string "${output_message}" 'created'
+
+  cleanup_crd_deletion_recreation_tests
+  trap - EXIT
 
   set +o nounset
   set +o errexit
@@ -120,10 +323,215 @@ run_swagger_tests() {
 
   # Verify schema
   file="${KUBE_TEMP}/schema.json"
-  curl -s "http://127.0.0.1:${API_PORT}/openapi/v2" > "${file}"
+  curl -kfsS -H 'Authorization: Bearer admin-token' "https://127.0.0.1:${SECURE_API_PORT}/openapi/v2" > "${file}"
   grep -q "list of returned" "${file}"
   grep -q "List of services" "${file}"
   grep -q "Watch for changes to the described resources" "${file}"
+
+  set +o nounset
+  set +o errexit
+}
+
+run_ambiguous_shortname_tests() {
+  set -o nounset
+  set -o errexit
+
+  cleanup_ambiguous_shortname_tests() {
+    kubectl delete foos/test-crd-foo --ignore-not-found=true --timeout=30s || true
+    kubectl delete customresourcedefinition foos.bar.com --ignore-not-found=true --timeout=60s || true
+    kubectl delete customresourcedefinition examples.test.com --ignore-not-found=true --timeout=60s || true
+  }
+  trap cleanup_ambiguous_shortname_tests EXIT
+
+  create_and_use_new_namespace
+  kube::log::status "Testing ambiguous short name"
+
+  kubectl create -f - << __EOF__
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: foos.bar.com
+spec:
+  group: bar.com
+  scope: Namespaced
+  versions:
+    - name: v1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              properties:
+                test:
+                  type: string
+  names:
+    plural: foos
+    singular: foo
+    shortNames:
+      - exmp
+    kind: Foo
+    categories:
+      - all
+__EOF__
+
+  # Test that we can list this new custom resource
+  kube::test::wait_object_assert customresourcedefinitions "{{range.items}}{{if eq ${id_field:?} \"foos.bar.com\"}}{{$id_field}}:{{end}}{{end}}" 'foos.bar.com:'
+  wait_for_crd_established foos.bar.com
+
+  kubectl create -f - << __EOF__
+apiVersion: bar.com/v1
+kind: Foo
+metadata:
+  name: test-crd-foo
+spec:
+  test: test
+__EOF__
+
+  # Test that we can list this new custom resource
+  kube::test::wait_object_assert foos "{{range.items}}{{$id_field}}:{{end}}" 'test-crd-foo:'
+
+  output_message=$(kubectl get exmp)
+  kube::test::if_has_string "${output_message}" "test-crd-foo"
+
+  kubectl create -f - << __EOF__
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: examples.test.com
+spec:
+  group: test.com
+  scope: Namespaced
+  versions:
+    - name: v1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              properties:
+                test:
+                  type: string
+  names:
+    plural: examples
+    singular: example
+    shortNames:
+      - exmp
+    kind: Example
+__EOF__
+
+  # Test that we can list this new custom resource
+  kube::test::wait_object_assert customresourcedefinitions "{{range.items}}{{if eq ${id_field:?} \"examples.test.com\"}}{{$id_field}}:{{end}}{{end}}" 'examples.test.com:'
+  wait_for_crd_established examples.test.com
+
+  output_message=$(kubectl  get examples 2>&1 "${kube_flags[@]}")
+  kube::test::if_has_string "${output_message}" 'No resources found'
+
+  output_message=$(kubectl get exmp 2>&1)
+  kube::test::if_has_string "${output_message}" "test-crd-foo"
+  kube::test::if_has_string "${output_message}" "short name \"exmp\" could also match lower priority resource examples.test.com"
+
+  cleanup_ambiguous_shortname_tests
+  trap - EXIT
+
+  set +o nounset
+  set +o errexit
+}
+
+run_explain_crd_with_additional_properties_tests() {
+  set -o nounset
+  set -o errexit
+
+  cleanup_explain_crd_tests() {
+    kubectl delete customresourcedefinition mock-resources.test.com --ignore-not-found=true --timeout=60s || true
+  }
+  trap cleanup_explain_crd_tests EXIT
+
+  create_and_use_new_namespace
+  kube::log::status "Testing explain with custom CRD that uses additionalProperties as non boolean field"
+
+  kubectl create -f - << __EOF__
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: mock-resources.test.com
+spec:
+  group: test.com
+  scope: Namespaced
+  names:
+    plural: mock-resources
+    singular: mock-resource
+    kind: MockResource
+    listKind: MockResources
+  versions:
+    - name: v1
+      storage: true
+      served: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              properties:
+                test:
+                  type: object
+                  additionalProperties:
+                    type: array
+                    items:
+                      type: string
+              additionalProperties: true
+__EOF__
+
+  kube::test::wait_object_assert customresourcedefinitions "{{range.items}}{{if eq ${id_field:?} \"mock-resources.test.com\"}}{{$id_field}}:{{end}}{{end}}" 'mock-resources.test.com:'
+  wait_for_crd_established mock-resources.test.com
+
+  retries=0
+  max_retries=5
+
+  # First try would get non zero exit code so we disable immediate exit here
+  set +o errexit
+
+  # Loop until `kubectl explain` returns a zero exit code or maximum retries reached
+  until output_message=$(kubectl explain mock-resource) > /dev/null || [ $retries -eq $max_retries ]; do
+    kube::log::status "Retrying kubectl explain..."
+    ((retries++))
+    sleep 1
+  done
+
+  set -o errexit
+
+  output_message=$(kubectl explain mock-resource --recursive --max-depth=1)
+  kube::test::if_has_string "${output_message}" 'spec'
+  kube::test::if_has_not_string "${output_message}" 'annotations'
+
+  output_message=$(kubectl explain mock-resource --recursive --max-depth=2)
+  kube::test::if_has_string "${output_message}" 'annotations'
+  kube::test::if_has_not_string "${output_message}" 'subresource'
+
+  output_message=$(kubectl explain mock-resource --recursive)
+  kube::test::if_has_string "${output_message}" 'subresource'
+  kube::test::if_has_string "${output_message}" 'map\[string\]\[\]string'
+
+  output_message=$(kubectl explain mock-resource --recursive --max-depth=1 -o plaintext-openapiv2)
+  kube::test::if_has_string "${output_message}" 'spec'
+  kube::test::if_has_not_string "${output_message}" 'annotations'
+
+  output_message=$(kubectl explain mock-resource --recursive --max-depth=2 -o plaintext-openapiv2)
+  kube::test::if_has_string "${output_message}" 'annotations'
+  kube::test::if_has_not_string "${output_message}" 'subresource'
+
+  output_message=$(kubectl explain mock-resource --recursive -o plaintext-openapiv2)
+  kube::test::if_has_string "${output_message}" 'subresource'
+  kube::test::if_has_string "${output_message}" 'map\[string\]\[\]string'
+
+  cleanup_explain_crd_tests
+  trap - EXIT
 
   set +o nounset
   set +o errexit

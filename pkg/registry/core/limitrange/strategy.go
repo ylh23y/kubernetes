@@ -22,6 +22,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/uuid"
 	"k8s.io/apimachinery/pkg/util/validation/field"
+	"k8s.io/apiserver/pkg/registry/rest"
 	"k8s.io/apiserver/pkg/storage/names"
 	"k8s.io/kubernetes/pkg/api/legacyscheme"
 	api "k8s.io/kubernetes/pkg/apis/core"
@@ -29,13 +30,13 @@ import (
 )
 
 type limitrangeStrategy struct {
-	runtime.ObjectTyper
+	rest.DeclarativeValidation
 	names.NameGenerator
 }
 
 // Strategy is the default logic that applies when creating and updating
 // LimitRange objects via the REST API.
-var Strategy = limitrangeStrategy{legacyscheme.Scheme, names.SimpleNameGenerator}
+var Strategy = limitrangeStrategy{rest.DeclarativeValidation{Scheme: legacyscheme.Scheme}, names.SimpleNameGenerator}
 
 func (limitrangeStrategy) NamespaceScoped() bool {
 	return true
@@ -56,11 +57,16 @@ func (limitrangeStrategy) Validate(ctx context.Context, obj runtime.Object) fiel
 	return validation.ValidateLimitRange(limitRange)
 }
 
+// WarningsOnCreate returns warnings for the creation of the given object.
+func (limitrangeStrategy) WarningsOnCreate(ctx context.Context, obj runtime.Object) []string {
+	return nil
+}
+
 // Canonicalize normalizes the object after validation.
 func (limitrangeStrategy) Canonicalize(obj runtime.Object) {
 }
 
-func (limitrangeStrategy) AllowCreateOnUpdate() bool {
+func (limitrangeStrategy) AllowCreateOnUpdate(ctx context.Context) bool {
 	return true
 }
 
@@ -69,13 +75,11 @@ func (limitrangeStrategy) ValidateUpdate(ctx context.Context, obj, old runtime.O
 	return validation.ValidateLimitRange(limitRange)
 }
 
-func (limitrangeStrategy) AllowUnconditionalUpdate() bool {
-	return true
+// WarningsOnUpdate returns warnings for the given update.
+func (limitrangeStrategy) WarningsOnUpdate(ctx context.Context, obj, old runtime.Object) []string {
+	return nil
 }
 
-func (limitrangeStrategy) Export(context.Context, runtime.Object, bool) error {
-	// Copied from OpenShift exporter
-	// TODO: this needs to be fixed
-	//  limitrange.Strategy.PrepareForCreate(ctx, obj)
-	return nil
+func (limitrangeStrategy) AllowUnconditionalUpdate(ctx context.Context) bool {
+	return true
 }

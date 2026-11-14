@@ -17,6 +17,7 @@ limitations under the License.
 package pluginwatcher
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net"
@@ -24,11 +25,10 @@ import (
 	"sync"
 	"time"
 
-	"golang.org/x/net/context"
 	"google.golang.org/grpc"
-	"k8s.io/klog"
+	"k8s.io/klog/v2"
 
-	registerapi "k8s.io/kubernetes/pkg/kubelet/apis/pluginregistration/v1"
+	registerapi "k8s.io/kubelet/pkg/apis/pluginregistration/v1"
 	"k8s.io/kubernetes/pkg/kubelet/pluginmanager/cache"
 	v1beta1 "k8s.io/kubernetes/pkg/kubelet/pluginmanager/pluginwatcher/example_plugin_apis/v1beta1"
 	v1beta2 "k8s.io/kubernetes/pkg/kubelet/pluginmanager/pluginwatcher/example_plugin_apis/v1beta2"
@@ -43,14 +43,18 @@ type examplePlugin struct {
 	pluginName         string
 	pluginType         string
 	versions           []string
+
+	registerapi.UnsafeRegistrationServer
 }
 
 type pluginServiceV1Beta1 struct {
 	server *examplePlugin
+	v1beta1.UnsafeExampleServer
 }
 
 func (s *pluginServiceV1Beta1) GetExampleInfo(ctx context.Context, rqt *v1beta1.ExampleRequest) (*v1beta1.ExampleResponse, error) {
-	klog.Infof("GetExampleInfo v1beta1field: %s", rqt.V1Beta1Field)
+	logger := klog.FromContext(ctx)
+	logger.Info("GetExampleInfo v1beta1field", "field", rqt.V1Beta1Field)
 	return &v1beta1.ExampleResponse{}, nil
 }
 
@@ -60,10 +64,12 @@ func (s *pluginServiceV1Beta1) RegisterService() {
 
 type pluginServiceV1Beta2 struct {
 	server *examplePlugin
+	v1beta2.UnsafeExampleServer
 }
 
 func (s *pluginServiceV1Beta2) GetExampleInfo(ctx context.Context, rqt *v1beta2.ExampleRequest) (*v1beta2.ExampleResponse, error) {
-	klog.Infof("GetExampleInfo v1beta2_field: %s", rqt.V1Beta2Field)
+	logger := klog.FromContext(ctx)
+	logger.Info("GetExampleInfo v1beta2_field", "field", rqt.V1Beta2Field)
 	return &v1beta2.ExampleResponse{}, nil
 }
 
@@ -88,10 +94,9 @@ func NewTestExamplePlugin(pluginName string, pluginType string, endpoint string,
 }
 
 // GetPluginInfo returns a PluginInfo object
-func GetPluginInfo(plugin *examplePlugin, foundInDeprecatedDir bool) cache.PluginInfo {
+func GetPluginInfo(plugin *examplePlugin) cache.PluginInfo {
 	return cache.PluginInfo{
-		SocketPath:           plugin.endpoint,
-		FoundInDeprecatedDir: foundInDeprecatedDir,
+		SocketPath: plugin.endpoint,
 	}
 }
 
@@ -106,7 +111,8 @@ func (e *examplePlugin) GetInfo(ctx context.Context, req *registerapi.InfoReques
 }
 
 func (e *examplePlugin) NotifyRegistrationStatus(ctx context.Context, status *registerapi.RegistrationStatus) (*registerapi.RegistrationStatusResponse, error) {
-	klog.Errorf("Registration is: %v\n", status)
+	logger := klog.FromContext(ctx)
+	logger.Info("Notify registration status", "status", status)
 
 	if e.registrationStatus != nil {
 		e.registrationStatus <- *status
@@ -116,14 +122,15 @@ func (e *examplePlugin) NotifyRegistrationStatus(ctx context.Context, status *re
 }
 
 // Serve starts a pluginwatcher server and one or more of the plugin services
-func (e *examplePlugin) Serve(services ...string) error {
-	klog.Infof("starting example server at: %s\n", e.endpoint)
+func (e *examplePlugin) Serve(ctx context.Context, services ...string) error {
+	logger := klog.FromContext(ctx)
+	logger.Info("Starting example server", "endpoint", e.endpoint)
 	lis, err := net.Listen("unix", e.endpoint)
 	if err != nil {
 		return err
 	}
 
-	klog.Infof("example server started at: %s\n", e.endpoint)
+	logger.Info("Example server started", "endpoint", e.endpoint)
 	e.grpcServer = grpc.NewServer()
 
 	// Registers kubelet plugin watcher api.
@@ -134,13 +141,11 @@ func (e *examplePlugin) Serve(services ...string) error {
 		case "v1beta1":
 			v1beta1 := &pluginServiceV1Beta1{server: e}
 			v1beta1.RegisterService()
-			break
 		case "v1beta2":
 			v1beta2 := &pluginServiceV1Beta2{server: e}
 			v1beta2.RegisterService()
-			break
 		default:
-			return fmt.Errorf("Unsupported service: '%s'", service)
+			return fmt.Errorf("unsupported service: '%s'", service)
 		}
 	}
 
@@ -150,15 +155,16 @@ func (e *examplePlugin) Serve(services ...string) error {
 		defer e.wg.Done()
 		// Blocking call to accept incoming connections.
 		if err := e.grpcServer.Serve(lis); err != nil {
-			klog.Errorf("example server stopped serving: %v", err)
+			logger.Error(err, "Example server stopped serving")
 		}
 	}()
 
 	return nil
 }
 
-func (e *examplePlugin) Stop() error {
-	klog.Infof("Stopping example server at: %s\n", e.endpoint)
+func (e *examplePlugin) Stop(ctx context.Context) error {
+	logger := klog.FromContext(ctx)
+	logger.Info("Stopping example server", "endpoint", e.endpoint)
 
 	e.grpcServer.Stop()
 	c := make(chan struct{})
@@ -171,7 +177,7 @@ func (e *examplePlugin) Stop() error {
 	case <-c:
 		break
 	case <-time.After(time.Second):
-		return errors.New("Timed out on waiting for stop completion")
+		return errors.New("timed out on waiting for stop completion")
 	}
 
 	if err := os.Remove(e.endpoint); err != nil && !os.IsNotExist(err) {

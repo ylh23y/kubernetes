@@ -1,3 +1,5 @@
+//go:build linux
+
 /*
 Copyright 2018 The Kubernetes Authors.
 
@@ -17,14 +19,18 @@ limitations under the License.
 package eviction
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
 	"k8s.io/apimachinery/pkg/api/resource"
-	statsapi "k8s.io/kubernetes/pkg/kubelet/apis/stats/v1alpha1"
+	klogtesting "k8s.io/klog/v2/ktesting"
+	"k8s.io/ktesting"
+	statsapi "k8s.io/kubelet/pkg/apis/stats/v1alpha1"
 	evictionapi "k8s.io/kubernetes/pkg/kubelet/eviction/api"
 )
 
@@ -58,8 +64,8 @@ func nodeSummary(available, workingSet, usage resource.Quantity, allocatable boo
 	}
 }
 
-func newTestMemoryThresholdNotifier(threshold evictionapi.Threshold, factory NotifierFactory, handler func(string)) *memoryThresholdNotifier {
-	return &memoryThresholdNotifier{
+func newTestMemoryThresholdNotifier(threshold evictionapi.Threshold, factory NotifierFactory, handler func(string)) *linuxMemoryThresholdNotifier {
+	return &linuxMemoryThresholdNotifier{
 		threshold:  threshold,
 		cgroupPath: testCgroupPath,
 		events:     make(chan struct{}),
@@ -131,27 +137,81 @@ func TestUpdateThreshold(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.description, func(t *testing.T) {
-			notifierFactory := &MockNotifierFactory{}
-			notifier := &MockCgroupNotifier{}
+			logger, tCtx := klogtesting.NewTestContext(t)
+			notifierFactory := NewMockNotifierFactory(t)
+			notifier := NewMockCgroupNotifier(t)
+
 			m := newTestMemoryThresholdNotifier(tc.evictionThreshold, notifierFactory, nil)
-			notifierFactory.On("NewCgroupNotifier", testCgroupPath, memoryUsageAttribute, tc.expectedThreshold.Value()).Return(notifier, tc.updateThresholdErr)
-			var events chan<- struct{}
-			events = m.events
-			notifier.On("Start", events).Return()
-			err := m.UpdateThreshold(nodeSummary(tc.available, tc.workingSet, tc.usage, isAllocatableEvictionThreshold(tc.evictionThreshold)))
+			notifierFactory.EXPECT().NewCgroupNotifier(logger, testCgroupPath, memoryUsageAttribute, tc.expectedThreshold.Value()).Return(notifier, tc.updateThresholdErr).Times(1)
+			var events chan<- struct{} = m.events
+
+			// Use a WaitGroup to ensure the goroutine completes before test ends
+			var wg sync.WaitGroup
+			wg.Add(1)
+			notifier.EXPECT().Start(tCtx, events).Run(func(ctx context.Context, eventCh chan<- struct{}) {
+				defer wg.Done()
+				// Mock implementation completes immediately
+			}).Maybe()
+
+			err := m.UpdateThreshold(tCtx, nodeSummary(tc.available, tc.workingSet, tc.usage, isAllocatableEvictionThreshold(tc.evictionThreshold)))
+
+			// Wait for the goroutine started by UpdateThreshold to complete
+			if err == nil {
+				wg.Wait()
+			}
+
 			if err != nil && !tc.expectErr {
 				t.Errorf("Unexpected error updating threshold: %v", err)
 			} else if err == nil && tc.expectErr {
 				t.Errorf("Expected error updating threshold, but got nil")
 			}
-			if !tc.expectErr {
-				notifierFactory.AssertNumberOfCalls(t, "NewCgroupNotifier", 1)
+		})
+	}
+}
+
+func TestUpdateThresholdWithInvalidSummary(t *testing.T) {
+	testCases := []struct {
+		description                  string
+		summary                      *statsapi.Summary
+		allocatableEvictionThreshold bool
+	}{
+		{
+			description: "incomplete summary",
+			summary: &statsapi.Summary{
+				Node: statsapi.NodeStats{
+					Memory: &statsapi.MemoryStats{},
+				},
+			},
+		},
+		{
+			description:                  "system container not found in metrics",
+			allocatableEvictionThreshold: true,
+			summary: &statsapi.Summary{
+				Node: statsapi.NodeStats{
+					SystemContainers: []statsapi.ContainerStats{
+						{
+							Name: "invalid",
+						},
+					},
+					Memory: &statsapi.MemoryStats{},
+				},
+			},
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.description, func(t *testing.T) {
+			tCtx := ktesting.Init(t)
+			m := newTestMemoryThresholdNotifier(evictionapi.Threshold{}, nil, nil)
+			if tc.allocatableEvictionThreshold {
+				m.threshold.Signal = evictionapi.SignalAllocatableMemoryAvailable
 			}
+			assert.Error(t, m.UpdateThreshold(tCtx, tc.summary))
 		})
 	}
 }
 
 func TestStart(t *testing.T) {
+	logger, tCtx := klogtesting.NewTestContext(t)
 	noResources := resource.MustParse("0")
 	threshold := evictionapi.Threshold{
 		Signal:   evictionapi.SignalMemoryAvailable,
@@ -160,31 +220,30 @@ func TestStart(t *testing.T) {
 			Quantity: &noResources,
 		},
 	}
-	notifier := &MockCgroupNotifier{}
-	notifierFactory := &MockNotifierFactory{}
+	notifierFactory := NewMockNotifierFactory(t)
+	notifier := NewMockCgroupNotifier(t)
 
 	var wg sync.WaitGroup
 	wg.Add(4)
 	m := newTestMemoryThresholdNotifier(threshold, notifierFactory, func(string) {
 		wg.Done()
 	})
-	notifierFactory.On("NewCgroupNotifier", testCgroupPath, memoryUsageAttribute, int64(0)).Return(notifier, nil)
-	var events chan<- struct{}
-	events = m.events
-	notifier.On("Start", events).Return()
-	notifier.On("Stop").Return()
+	notifierFactory.EXPECT().NewCgroupNotifier(logger, testCgroupPath, memoryUsageAttribute, int64(0)).Return(notifier, nil).Times(1)
 
-	err := m.UpdateThreshold(nodeSummary(noResources, noResources, noResources, isAllocatableEvictionThreshold(threshold)))
+	var events chan<- struct{} = m.events
+	notifier.EXPECT().Start(tCtx, events).Run(func(ctx context.Context, events chan<- struct{}) {
+		for i := 0; i < 4; i++ {
+			events <- struct{}{}
+		}
+	})
+
+	err := m.UpdateThreshold(tCtx, nodeSummary(noResources, noResources, noResources, isAllocatableEvictionThreshold(threshold)))
 	if err != nil {
 		t.Errorf("Unexpected error updating threshold: %v", err)
 	}
-	notifierFactory.AssertNumberOfCalls(t, "NewCgroupNotifier", 1)
 
-	go m.Start()
+	go m.Start(tCtx)
 
-	for i := 0; i < 4; i++ {
-		m.events <- struct{}{}
-	}
 	wg.Wait()
 }
 
@@ -249,7 +308,7 @@ func TestThresholdDescription(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.description, func(t *testing.T) {
-			m := &memoryThresholdNotifier{
+			m := &linuxMemoryThresholdNotifier{
 				notifier:   &MockCgroupNotifier{},
 				threshold:  tc.evictionThreshold,
 				cgroupPath: testCgroupPath,

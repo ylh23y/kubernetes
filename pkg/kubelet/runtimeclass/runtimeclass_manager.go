@@ -17,18 +17,19 @@ limitations under the License.
 package runtimeclass
 
 import (
+	"context"
 	"fmt"
 
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/client-go/informers"
 	clientset "k8s.io/client-go/kubernetes"
-	nodev1beta1 "k8s.io/client-go/listers/node/v1beta1"
+	nodev1 "k8s.io/client-go/listers/node/v1"
 )
 
 // Manager caches RuntimeClass API objects, and provides accessors to the Kubelet.
 type Manager struct {
 	informerFactory informers.SharedInformerFactory
-	lister          nodev1beta1.RuntimeClassLister
+	lister          nodev1.RuntimeClassLister
 }
 
 // NewManager returns a new RuntimeClass Manager. Run must be called before the manager can be used.
@@ -36,7 +37,7 @@ func NewManager(client clientset.Interface) *Manager {
 	const resyncPeriod = 0
 
 	factory := informers.NewSharedInformerFactory(client, resyncPeriod)
-	lister := factory.Node().V1beta1().RuntimeClasses().Lister()
+	lister := factory.Node().V1().RuntimeClasses().Lister()
 
 	return &Manager{
 		informerFactory: factory,
@@ -45,14 +46,14 @@ func NewManager(client clientset.Interface) *Manager {
 }
 
 // Start starts syncing the RuntimeClass cache with the apiserver.
-func (m *Manager) Start(stopCh <-chan struct{}) {
-	m.informerFactory.Start(stopCh)
+func (m *Manager) Start(ctx context.Context) {
+	m.informerFactory.StartWithContext(ctx)
 }
 
 // WaitForCacheSync exposes the WaitForCacheSync method on the informer factory for testing
 // purposes.
-func (m *Manager) WaitForCacheSync(stopCh <-chan struct{}) {
-	m.informerFactory.WaitForCacheSync(stopCh)
+func (m *Manager) WaitForCacheSync(ctx context.Context) {
+	m.informerFactory.WaitForCacheSyncWithContext(ctx)
 }
 
 // LookupRuntimeHandler returns the RuntimeHandler string associated with the given RuntimeClass
@@ -71,7 +72,7 @@ func (m *Manager) LookupRuntimeHandler(runtimeClassName *string) (string, error)
 		if errors.IsNotFound(err) {
 			return "", err
 		}
-		return "", fmt.Errorf("Failed to lookup RuntimeClass %s: %v", name, err)
+		return "", fmt.Errorf("failed to lookup RuntimeClass %s: %v", name, err)
 	}
 
 	return rc.Handler, nil

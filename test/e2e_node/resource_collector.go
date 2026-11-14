@@ -1,4 +1,4 @@
-// +build linux
+//go:build linux
 
 /*
 Copyright 2015 The Kubernetes Authors.
@@ -16,45 +16,38 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package e2e_node
+package e2enode
 
 import (
 	"bytes"
+	"context"
+	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"log"
-	"os"
+	"net/http"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"text/tabwriter"
 	"time"
 
-	cadvisorclient "github.com/google/cadvisor/client/v2"
-	cadvisorapiv2 "github.com/google/cadvisor/info/v2"
-	"github.com/opencontainers/runc/libcontainer/cgroups"
-	"k8s.io/api/core/v1"
+	"github.com/opencontainers/cgroups"
+	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/labels"
-	"k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/uuid"
 	"k8s.io/apimachinery/pkg/util/wait"
-	kubeletstatsv1alpha1 "k8s.io/kubernetes/pkg/kubelet/apis/stats/v1alpha1"
-	"k8s.io/kubernetes/pkg/util/procfs"
+	kubeletstatsv1alpha1 "k8s.io/kubelet/pkg/apis/stats/v1alpha1"
 	"k8s.io/kubernetes/test/e2e/framework"
 	e2ekubelet "k8s.io/kubernetes/test/e2e/framework/kubelet"
-	e2elog "k8s.io/kubernetes/test/e2e/framework/log"
 	e2epod "k8s.io/kubernetes/test/e2e/framework/pod"
 	"k8s.io/kubernetes/test/e2e_node/perftype"
 
-	"github.com/onsi/ginkgo"
-	"github.com/onsi/gomega"
+	"github.com/onsi/ginkgo/v2"
 )
 
 const (
 	// resource monitoring
-	cadvisorImageName = "google/cadvisor:latest"
+	cadvisorImageName = "gcr.io/cadvisor/cadvisor:v0.47.2"
 	cadvisorPodName   = "cadvisor"
 	cadvisorPort      = 8090
 	// housekeeping interval of Cadvisor (second)
@@ -65,14 +58,54 @@ var (
 	systemContainers map[string]string
 )
 
+// ResourceCollector is a collector object which collects
+// resource usage periodically from Cadvisor.
 type ResourceCollector struct {
-	client  *cadvisorclient.Client
-	request *cadvisorapiv2.RequestOptions
-
 	pollingInterval time.Duration
 	buffers         map[string][]*e2ekubelet.ContainerResourceUsage
 	lock            sync.RWMutex
 	stopCh          chan struct{}
+}
+
+// cadvisorContainerInfo / cadvisorContainerStats are the minimal subset of the
+// standalone cAdvisor pod's v2 /api/v2.1/stats response that this collector
+// reads. Decoding into these local types keeps test/e2e_node free of both the
+// cAdvisor Go client and its v2 API types -- it talks to the pod over HTTP+JSON.
+type cadvisorContainerInfo struct {
+	Stats []*cadvisorContainerStats `json:"stats"`
+}
+
+type cadvisorContainerStats struct {
+	Timestamp time.Time `json:"timestamp"`
+	CPU       struct {
+		Usage struct {
+			Total uint64 `json:"total"`
+		} `json:"usage"`
+	} `json:"cpu"`
+	Memory struct {
+		Usage      uint64 `json:"usage"`
+		WorkingSet uint64 `json:"working_set"`
+		RSS        uint64 `json:"rss"`
+	} `json:"memory"`
+}
+
+// cadvisorStats fetches the latest stats sample for a container from the
+// standalone cAdvisor pod's v2 REST API (replacing the cAdvisor v2 Go client).
+func cadvisorStats(name string) (map[string]*cadvisorContainerInfo, error) {
+	u := fmt.Sprintf("http://localhost:%d/api/v2.1/stats%s?count=1&type=name&recursive=false", cadvisorPort, name)
+	resp, err := http.Get(u)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("cadvisor stats for %q: HTTP %d", name, resp.StatusCode)
+	}
+	out := map[string]*cadvisorContainerInfo{}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 // NewResourceCollector creates a resource collector object which collects
@@ -91,30 +124,29 @@ func (r *ResourceCollector) Start() {
 	// Get the cgroup container names for kubelet and runtime
 	kubeletContainer, err1 := getContainerNameForProcess(kubeletProcessName, "")
 	runtimeContainer, err2 := getContainerNameForProcess(framework.TestContext.ContainerRuntimeProcessName, framework.TestContext.ContainerRuntimePidFile)
-	if err1 == nil && err2 == nil {
+	if err1 == nil && err2 == nil && kubeletContainer != "" && runtimeContainer != "" {
 		systemContainers = map[string]string{
 			kubeletstatsv1alpha1.SystemContainerKubelet: kubeletContainer,
 			kubeletstatsv1alpha1.SystemContainerRuntime: runtimeContainer,
 		}
 	} else {
-		e2elog.Failf("Failed to get runtime container name in test-e2e-node resource collector.")
+		framework.Failf("Failed to get runtime container name in test-e2e-node resource collector.")
 	}
 
-	wait.Poll(1*time.Second, 1*time.Minute, func() (bool, error) {
-		var err error
-		r.client, err = cadvisorclient.NewClient(fmt.Sprintf("http://localhost:%d/", cadvisorPort))
-		if err == nil {
-			return true, nil
+	// Wait for the standalone cAdvisor pod's v2 REST API to be reachable.
+	err := wait.PollUntilContextTimeout(context.Background(), 1*time.Second, 1*time.Minute, false, func(context.Context) (bool, error) {
+		resp, err := http.Get(fmt.Sprintf("http://localhost:%d/api/v2.1/machine", cadvisorPort))
+		if err != nil {
+			return false, nil
 		}
-		return false, err
+		_ = resp.Body.Close()
+		return resp.StatusCode == http.StatusOK, nil
 	})
+	framework.ExpectNoError(err, "cadvisor not ready")
 
-	gomega.Expect(r.client).NotTo(gomega.BeNil(), "cadvisor client not ready")
-
-	r.request = &cadvisorapiv2.RequestOptions{IdType: "name", Count: 1, Recursive: false}
 	r.stopCh = make(chan struct{})
 
-	oldStatsMap := make(map[string]*cadvisorapiv2.ContainerStats)
+	oldStatsMap := make(map[string]*cadvisorContainerStats)
 	go wait.Until(func() { r.collectStats(oldStatsMap) }, r.pollingInterval, r.stopCh)
 }
 
@@ -146,22 +178,22 @@ func (r *ResourceCollector) GetCPUSummary() e2ekubelet.ContainersCPUSummary {
 func (r *ResourceCollector) LogLatest() {
 	summary, err := r.GetLatest()
 	if err != nil {
-		e2elog.Logf("%v", err)
+		framework.Logf("%v", err)
 	}
-	e2elog.Logf("%s", formatResourceUsageStats(summary))
+	framework.Logf("%s", formatResourceUsageStats(summary))
 }
 
 // collectStats collects resource usage from Cadvisor.
-func (r *ResourceCollector) collectStats(oldStatsMap map[string]*cadvisorapiv2.ContainerStats) {
+func (r *ResourceCollector) collectStats(oldStatsMap map[string]*cadvisorContainerStats) {
 	for _, name := range systemContainers {
-		ret, err := r.client.Stats(name, r.request)
+		ret, err := cadvisorStats(name)
 		if err != nil {
-			e2elog.Logf("Error getting container stats, err: %v", err)
+			framework.Logf("Error getting container stats, err: %v", err)
 			return
 		}
 		cStats, ok := ret[name]
-		if !ok {
-			e2elog.Logf("Missing info/stats for container %q", name)
+		if !ok || len(cStats.Stats) == 0 {
+			framework.Logf("Missing info/stats for container %q", name)
 			return
 		}
 
@@ -175,11 +207,11 @@ func (r *ResourceCollector) collectStats(oldStatsMap map[string]*cadvisorapiv2.C
 }
 
 // computeContainerResourceUsage computes resource usage based on new data sample.
-func computeContainerResourceUsage(name string, oldStats, newStats *cadvisorapiv2.ContainerStats) *e2ekubelet.ContainerResourceUsage {
+func computeContainerResourceUsage(name string, oldStats, newStats *cadvisorContainerStats) *e2ekubelet.ContainerResourceUsage {
 	return &e2ekubelet.ContainerResourceUsage{
 		Name:                    name,
 		Timestamp:               newStats.Timestamp,
-		CPUUsageInCores:         float64(newStats.Cpu.Usage.Total-oldStats.Cpu.Usage.Total) / float64(newStats.Timestamp.Sub(oldStats.Timestamp).Nanoseconds()),
+		CPUUsageInCores:         float64(newStats.CPU.Usage.Total-oldStats.CPU.Usage.Total) / float64(newStats.Timestamp.Sub(oldStats.Timestamp).Nanoseconds()),
 		MemoryUsageInBytes:      newStats.Memory.Usage,
 		MemoryWorkingSetInBytes: newStats.Memory.WorkingSet,
 		MemoryRSSInBytes:        newStats.Memory.RSS,
@@ -191,15 +223,15 @@ func computeContainerResourceUsage(name string, oldStats, newStats *cadvisorapiv
 func (r *ResourceCollector) GetLatest() (e2ekubelet.ResourceUsagePerContainer, error) {
 	r.lock.RLock()
 	defer r.lock.RUnlock()
-	kubeletstatsv1alpha1 := make(e2ekubelet.ResourceUsagePerContainer)
+	resourceUsage := make(e2ekubelet.ResourceUsagePerContainer)
 	for key, name := range systemContainers {
 		contStats, ok := r.buffers[name]
 		if !ok || len(contStats) == 0 {
 			return nil, fmt.Errorf("No resource usage data for %s container (%s)", key, name)
 		}
-		kubeletstatsv1alpha1[key] = contStats[len(contStats)-1]
+		resourceUsage[key] = contStats[len(contStats)-1]
 	}
-	return kubeletstatsv1alpha1, nil
+	return resourceUsage, nil
 }
 
 type resourceUsageByCPU []*e2ekubelet.ContainerResourceUsage
@@ -272,7 +304,7 @@ func formatCPUSummary(summary e2ekubelet.ContainersCPUSummary) string {
 	w := tabwriter.NewWriter(buf, 1, 0, 1, ' ', 0)
 	fmt.Fprintf(w, "%s\n", strings.Join(header, "\t"))
 
-	for _, containerName := range framework.TargetContainers() {
+	for _, containerName := range e2ekubelet.TargetContainers() {
 		var s []string
 		s = append(s, fmt.Sprintf("%q", containerName))
 		data, ok := summary[containerName]
@@ -366,20 +398,17 @@ func getCadvisorPod() *v1.Pod {
 }
 
 // deletePodsSync deletes a list of pods and block until pods disappear.
-func deletePodsSync(f *framework.Framework, pods []*v1.Pod) {
+func deletePodsSync(ctx context.Context, f *framework.Framework, pods []*v1.Pod) {
 	var wg sync.WaitGroup
-	for _, pod := range pods {
+	for i := range pods {
+		pod := pods[i]
 		wg.Add(1)
-		go func(pod *v1.Pod) {
+		go func() {
 			defer ginkgo.GinkgoRecover()
 			defer wg.Done()
 
-			err := f.PodClient().Delete(pod.ObjectMeta.Name, metav1.NewDeleteOptions(30))
-			framework.ExpectNoError(err)
-
-			gomega.Expect(e2epod.WaitForPodToDisappear(f.ClientSet, f.Namespace.Name, pod.ObjectMeta.Name, labels.Everything(),
-				30*time.Second, 10*time.Minute)).NotTo(gomega.HaveOccurred())
-		}(pod)
+			e2epod.NewPodClient(f).DeleteSync(ctx, pod.ObjectMeta.Name, metav1.DeleteOptions{}, f.Timeouts.PodDelete)
+		}()
 	}
 	wg.Wait()
 	return
@@ -388,7 +417,7 @@ func deletePodsSync(f *framework.Framework, pods []*v1.Pod) {
 // newTestPods creates a list of pods (specification) for test.
 func newTestPods(numPods int, volume bool, imageName, podType string) []*v1.Pod {
 	var pods []*v1.Pod
-	for i := 0; i < numPods; i++ {
+	for range numPods {
 		podName := "test-" + string(uuid.NewUUID())
 		labels := map[string]string{
 			"type": podType,
@@ -440,7 +469,7 @@ func newTestPods(numPods int, volume bool, imageName, podType string) []*v1.Pod 
 	return pods
 }
 
-// GetResourceSeriesWithLabels gets the time series of resource usage of each container.
+// GetResourceTimeSeries gets the time series of resource usage of each container.
 func (r *ResourceCollector) GetResourceTimeSeries() map[string]*perftype.ResourceSeries {
 	resourceSeries := make(map[string]*perftype.ResourceSeries)
 	for key, name := range systemContainers {
@@ -459,38 +488,6 @@ func (r *ResourceCollector) GetResourceTimeSeries() map[string]*perftype.Resourc
 }
 
 const kubeletProcessName = "kubelet"
-
-func getPidsForProcess(name, pidFile string) ([]int, error) {
-	if len(pidFile) > 0 {
-		if pid, err := getPidFromPidFile(pidFile); err == nil {
-			return []int{pid}, nil
-		} else {
-			// log the error and fall back to pidof
-			runtime.HandleError(err)
-		}
-	}
-	return procfs.PidOf(name)
-}
-
-func getPidFromPidFile(pidFile string) (int, error) {
-	file, err := os.Open(pidFile)
-	if err != nil {
-		return 0, fmt.Errorf("error opening pid file %s: %v", pidFile, err)
-	}
-	defer file.Close()
-
-	data, err := ioutil.ReadAll(file)
-	if err != nil {
-		return 0, fmt.Errorf("error reading pid file %s: %v", pidFile, err)
-	}
-
-	pid, err := strconv.Atoi(string(data))
-	if err != nil {
-		return 0, fmt.Errorf("error parsing %s as a number: %v", string(data), err)
-	}
-
-	return pid, nil
-}
 
 func getContainerNameForProcess(name, pidFile string) (string, error) {
 	pids, err := getPidsForProcess(name, pidFile)
@@ -514,6 +511,14 @@ func getContainer(pid int) (string, error) {
 	cgs, err := cgroups.ParseCgroupFile(fmt.Sprintf("/proc/%d/cgroup", pid))
 	if err != nil {
 		return "", err
+	}
+
+	if cgroups.IsCgroup2UnifiedMode() {
+		unified, found := cgs[""]
+		if !found {
+			return "", cgroups.NewNotFoundError("unified")
+		}
+		return unified, nil
 	}
 
 	cpu, found := cgs["cpu"]

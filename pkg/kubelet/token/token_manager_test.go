@@ -24,12 +24,14 @@ import (
 	authenticationv1 "k8s.io/api/authentication/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/apimachinery/pkg/util/clock"
+	"k8s.io/ktesting"
+	testingclock "k8s.io/utils/clock/testing"
+	"k8s.io/utils/ptr"
 )
 
 func TestTokenCachingAndExpiration(t *testing.T) {
 	type suite struct {
-		clock *clock.FakeClock
+		clock *testingclock.FakeClock
 		tg    *fakeTokenGetter
 		mgr   *Manager
 	}
@@ -83,11 +85,95 @@ func TestTokenCachingAndExpiration(t *testing.T) {
 				}
 			},
 		},
+		{
+			name: "service account recreated - cache miss due to different UID",
+			exp:  time.Hour,
+			f: func(t *testing.T, s *suite) {
+				// First, get a token for service account with UID-1
+				tr1 := &authenticationv1.TokenRequest{
+					ObjectMeta: metav1.ObjectMeta{
+						UID: "service-account-uid-1",
+					},
+					Spec: authenticationv1.TokenRequestSpec{
+						Audiences:         []string{"foo1", "foo2"},
+						ExpirationSeconds: ptr.To[int64](3600),
+						BoundObjectRef: &authenticationv1.BoundObjectReference{
+							Kind: "pod",
+							Name: "foo-pod",
+							UID:  "foo-uid",
+						},
+					},
+				}
+
+				if _, err := s.mgr.GetServiceAccountToken("a", "b", tr1); err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				if s.tg.count != 2 { // First call from setup + this call
+					t.Fatalf("expected first token request: call count was %d", s.tg.count)
+				}
+
+				// Now request token for "recreated" service account with UID-2
+				tr2 := &authenticationv1.TokenRequest{
+					ObjectMeta: metav1.ObjectMeta{
+						UID: "service-account-uid-2",
+					},
+					Spec: authenticationv1.TokenRequestSpec{
+						Audiences:         []string{"foo1", "foo2"},
+						ExpirationSeconds: ptr.To[int64](3600),
+						BoundObjectRef: &authenticationv1.BoundObjectReference{
+							Kind: "pod",
+							Name: "foo-pod",
+							UID:  "foo-uid",
+						},
+					},
+				}
+
+				if _, err := s.mgr.GetServiceAccountToken("a", "b", tr2); err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				if s.tg.count != 3 { // Should be 3 calls total (no cache hit)
+					t.Fatalf("expected cache miss due to different service account UID: call count was %d", s.tg.count)
+				}
+			},
+		},
+		{
+			name: "service account UID consistent - cache hit",
+			exp:  time.Hour,
+			f: func(t *testing.T, s *suite) {
+				// Request token twice with same service account UID
+				tr := &authenticationv1.TokenRequest{
+					ObjectMeta: metav1.ObjectMeta{
+						UID: "consistent-service-account-uid",
+					},
+					Spec: authenticationv1.TokenRequestSpec{
+						Audiences:         []string{"foo1", "foo2"},
+						ExpirationSeconds: ptr.To[int64](3600),
+						BoundObjectRef: &authenticationv1.BoundObjectReference{
+							Kind: "pod",
+							Name: "foo-pod",
+							UID:  "foo-uid",
+						},
+					},
+				}
+
+				if _, err := s.mgr.GetServiceAccountToken("a", "b", tr); err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+
+				if _, err := s.mgr.GetServiceAccountToken("a", "b", tr); err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+
+				if s.tg.count != 2 { // Setup call + first call, second should be cache hit
+					t.Fatalf("expected cache hit with same service account UID: call count was %d", s.tg.count)
+				}
+			},
+		},
 	}
 
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			clock := clock.NewFakeClock(time.Time{}.Add(30 * 24 * time.Hour))
+			clock := testingclock.NewFakeClock(time.Time{}.Add(30 * 24 * time.Hour))
 			expSecs := int64(c.exp.Seconds())
 			s := &suite{
 				clock: clock,
@@ -126,10 +212,12 @@ func TestTokenCachingAndExpiration(t *testing.T) {
 }
 
 func TestRequiresRefresh(t *testing.T) {
+	tCtx := ktesting.Init(t)
 	start := time.Now()
 	cases := []struct {
 		now, exp      time.Time
 		expectRefresh bool
+		requestTweaks func(*authenticationv1.TokenRequest)
 	}{
 		{
 			now:           start.Add(10 * time.Minute),
@@ -151,11 +239,20 @@ func TestRequiresRefresh(t *testing.T) {
 			exp:           start.Add(60 * time.Minute),
 			expectRefresh: true,
 		},
+		{
+			// expiry will be overwritten by the tweak below.
+			now:           start.Add(0 * time.Minute),
+			exp:           start.Add(60 * time.Minute),
+			expectRefresh: false,
+			requestTweaks: func(tr *authenticationv1.TokenRequest) {
+				tr.Spec.ExpirationSeconds = nil
+			},
+		},
 	}
 
 	for i, c := range cases {
 		t.Run(fmt.Sprint(i), func(t *testing.T) {
-			clock := clock.NewFakeClock(c.now)
+			clock := testingclock.NewFakeClock(c.now)
 			secs := int64(c.exp.Sub(start).Seconds())
 			tr := &authenticationv1.TokenRequest{
 				Spec: authenticationv1.TokenRequestSpec{
@@ -165,10 +262,15 @@ func TestRequiresRefresh(t *testing.T) {
 					ExpirationTimestamp: metav1.Time{Time: c.exp},
 				},
 			}
+
+			if c.requestTweaks != nil {
+				c.requestTweaks(tr)
+			}
+
 			mgr := NewManager(nil)
 			mgr.clock = clock
 
-			rr := mgr.requiresRefresh(tr)
+			rr := mgr.requiresRefresh(tCtx, tr)
 			if rr != c.expectRefresh {
 				t.Fatalf("unexpected requiresRefresh result, got: %v, want: %v", rr, c.expectRefresh)
 			}
@@ -207,7 +309,7 @@ func TestDeleteServiceAccountToken(t *testing.T) {
 			expLeftIndex: []int{1},
 		},
 		{
-			name:         "delete all with all suceess requests",
+			name:         "delete all with all success requests",
 			requestIndex: []int{0, 1, 2},
 			deletePodUID: []types.UID{"fake-uid-1", "fake-uid-2", "fake-uid-3"},
 		},
@@ -320,7 +422,7 @@ func TestDeleteServiceAccountToken(t *testing.T) {
 				},
 			}
 			testMgr := NewManager(nil)
-			testMgr.clock = clock.NewFakeClock(time.Time{}.Add(30 * 24 * time.Hour))
+			testMgr.clock = testingclock.NewFakeClock(time.Time{}.Add(30 * 24 * time.Hour))
 
 			successGetToken := func(_, _ string, tr *authenticationv1.TokenRequest) (*authenticationv1.TokenRequest, error) {
 				tr.Status = authenticationv1.TokenRequestStatus{
@@ -389,7 +491,7 @@ func TestCleanup(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			clock := clock.NewFakeClock(time.Time{}.Add(24 * time.Hour))
+			clock := testingclock.NewFakeClock(time.Time{}.Add(24 * time.Hour))
 			mgr := NewManager(nil)
 			mgr.clock = clock
 
@@ -432,7 +534,7 @@ func TestKeyFunc(t *testing.T) {
 					tr: &authenticationv1.TokenRequest{
 						Spec: authenticationv1.TokenRequestSpec{
 							Audiences:         []string{"foo1", "foo2"},
-							ExpirationSeconds: getInt64Point(2000),
+							ExpirationSeconds: ptr.To[int64](2000),
 							BoundObjectRef: &authenticationv1.BoundObjectReference{
 								Kind: "pod",
 								Name: "foo-pod",
@@ -447,7 +549,7 @@ func TestKeyFunc(t *testing.T) {
 					tr: &authenticationv1.TokenRequest{
 						Spec: authenticationv1.TokenRequestSpec{
 							Audiences:         []string{"ame1", "ame2"},
-							ExpirationSeconds: getInt64Point(2000),
+							ExpirationSeconds: ptr.To[int64](2000),
 							BoundObjectRef: &authenticationv1.BoundObjectReference{
 								Kind: "pod",
 								Name: "ame-pod",
@@ -463,7 +565,7 @@ func TestKeyFunc(t *testing.T) {
 				tr: &authenticationv1.TokenRequest{
 					Spec: authenticationv1.TokenRequestSpec{
 						Audiences:         []string{"foo1", "foo2"},
-						ExpirationSeconds: getInt64Point(2000),
+						ExpirationSeconds: ptr.To[int64](2000),
 						BoundObjectRef: &authenticationv1.BoundObjectReference{
 							Kind: "pod",
 							Name: "foo-pod",
@@ -483,7 +585,7 @@ func TestKeyFunc(t *testing.T) {
 					tr: &authenticationv1.TokenRequest{
 						Spec: authenticationv1.TokenRequestSpec{
 							Audiences:         []string{"foo1", "foo2"},
-							ExpirationSeconds: getInt64Point(2000),
+							ExpirationSeconds: ptr.To[int64](2000),
 							BoundObjectRef: &authenticationv1.BoundObjectReference{
 								Kind: "pod",
 								Name: "foo-pod",
@@ -500,7 +602,7 @@ func TestKeyFunc(t *testing.T) {
 					Spec: authenticationv1.TokenRequestSpec{
 						Audiences: []string{"foo1", "foo2"},
 						//everthing is same besides ExpirationSeconds
-						ExpirationSeconds: getInt64Point(2001),
+						ExpirationSeconds: ptr.To[int64](2001),
 						BoundObjectRef: &authenticationv1.BoundObjectReference{
 							Kind: "pod",
 							Name: "foo-pod",
@@ -520,7 +622,7 @@ func TestKeyFunc(t *testing.T) {
 					tr: &authenticationv1.TokenRequest{
 						Spec: authenticationv1.TokenRequestSpec{
 							Audiences:         []string{"foo1", "foo2"},
-							ExpirationSeconds: getInt64Point(2000),
+							ExpirationSeconds: ptr.To[int64](2000),
 							BoundObjectRef: &authenticationv1.BoundObjectReference{
 								Kind: "pod",
 								Name: "foo-pod",
@@ -536,11 +638,173 @@ func TestKeyFunc(t *testing.T) {
 				tr: &authenticationv1.TokenRequest{
 					Spec: authenticationv1.TokenRequestSpec{
 						Audiences:         []string{"foo1", "foo2"},
-						ExpirationSeconds: getInt64Point(2000),
+						ExpirationSeconds: ptr.To[int64](2000),
 						BoundObjectRef: &authenticationv1.BoundObjectReference{
 							Kind: "pod",
 							//everthing is same besides BoundObjectRef.Name
 							Name: "diff-pod",
+							UID:  "foo-uid",
+						},
+					},
+				},
+			},
+			shouldHit: false,
+		},
+		{
+			name: "not hit due to different service account UID",
+			trus: []tokenRequestUnit{
+				{
+					name:      "foo-sa",
+					namespace: "foo-ns",
+					tr: &authenticationv1.TokenRequest{
+						ObjectMeta: metav1.ObjectMeta{
+							UID: "old-service-account-uid-123",
+						},
+						Spec: authenticationv1.TokenRequestSpec{
+							Audiences:         []string{"foo1", "foo2"},
+							ExpirationSeconds: ptr.To[int64](2000),
+							BoundObjectRef: &authenticationv1.BoundObjectReference{
+								Kind: "pod",
+								Name: "foo-pod",
+								UID:  "foo-uid",
+							},
+						},
+					},
+				},
+			},
+			target: tokenRequestUnit{
+				name:      "foo-sa",
+				namespace: "foo-ns",
+				tr: &authenticationv1.TokenRequest{
+					ObjectMeta: metav1.ObjectMeta{
+						UID: "new-service-account-uid-456", // Different service account UID
+					},
+					Spec: authenticationv1.TokenRequestSpec{
+						Audiences:         []string{"foo1", "foo2"},
+						ExpirationSeconds: ptr.To[int64](2000),
+						BoundObjectRef: &authenticationv1.BoundObjectReference{
+							Kind: "pod",
+							Name: "foo-pod",
+							UID:  "foo-uid",
+						},
+					},
+				},
+			},
+			shouldHit: false,
+		},
+		{
+			name: "hit with same service account UID",
+			trus: []tokenRequestUnit{
+				{
+					name:      "foo-sa",
+					namespace: "foo-ns",
+					tr: &authenticationv1.TokenRequest{
+						ObjectMeta: metav1.ObjectMeta{
+							UID: "same-service-account-uid-123",
+						},
+						Spec: authenticationv1.TokenRequestSpec{
+							Audiences:         []string{"foo1", "foo2"},
+							ExpirationSeconds: ptr.To[int64](2000),
+							BoundObjectRef: &authenticationv1.BoundObjectReference{
+								Kind: "pod",
+								Name: "foo-pod",
+								UID:  "foo-uid",
+							},
+						},
+					},
+				},
+			},
+			target: tokenRequestUnit{
+				name:      "foo-sa",
+				namespace: "foo-ns",
+				tr: &authenticationv1.TokenRequest{
+					ObjectMeta: metav1.ObjectMeta{
+						UID: "same-service-account-uid-123", // Same service account UID
+					},
+					Spec: authenticationv1.TokenRequestSpec{
+						Audiences:         []string{"foo1", "foo2"},
+						ExpirationSeconds: ptr.To[int64](2000),
+						BoundObjectRef: &authenticationv1.BoundObjectReference{
+							Kind: "pod",
+							Name: "foo-pod",
+							UID:  "foo-uid",
+						},
+					},
+				},
+			},
+			shouldHit: true,
+		},
+		{
+			name: "hit with empty UID (backward compatibility)",
+			trus: []tokenRequestUnit{
+				{
+					name:      "foo-sa",
+					namespace: "foo-ns",
+					tr: &authenticationv1.TokenRequest{
+						// No UID set
+						Spec: authenticationv1.TokenRequestSpec{
+							Audiences:         []string{"foo1", "foo2"},
+							ExpirationSeconds: ptr.To[int64](2000),
+							BoundObjectRef: &authenticationv1.BoundObjectReference{
+								Kind: "pod",
+								Name: "foo-pod",
+								UID:  "foo-uid",
+							},
+						},
+					},
+				},
+			},
+			target: tokenRequestUnit{
+				name:      "foo-sa",
+				namespace: "foo-ns",
+				tr: &authenticationv1.TokenRequest{
+					// No UID set
+					Spec: authenticationv1.TokenRequestSpec{
+						Audiences:         []string{"foo1", "foo2"},
+						ExpirationSeconds: ptr.To[int64](2000),
+						BoundObjectRef: &authenticationv1.BoundObjectReference{
+							Kind: "pod",
+							Name: "foo-pod",
+							UID:  "foo-uid",
+						},
+					},
+				},
+			},
+			shouldHit: true,
+		},
+		{
+			name: "not hit when one has UID and other doesn't",
+			trus: []tokenRequestUnit{
+				{
+					name:      "foo-sa",
+					namespace: "foo-ns",
+					tr: &authenticationv1.TokenRequest{
+						ObjectMeta: metav1.ObjectMeta{
+							UID: "service-account-uid-123",
+						},
+						Spec: authenticationv1.TokenRequestSpec{
+							Audiences:         []string{"foo1", "foo2"},
+							ExpirationSeconds: ptr.To[int64](2000),
+							BoundObjectRef: &authenticationv1.BoundObjectReference{
+								Kind: "pod",
+								Name: "foo-pod",
+								UID:  "foo-uid",
+							},
+						},
+					},
+				},
+			},
+			target: tokenRequestUnit{
+				name:      "foo-sa",
+				namespace: "foo-ns",
+				tr: &authenticationv1.TokenRequest{
+					// No UID set - should not hit cached entry with UID
+					Spec: authenticationv1.TokenRequestSpec{
+						Audiences:         []string{"foo1", "foo2"},
+						ExpirationSeconds: ptr.To[int64](2000),
+						BoundObjectRef: &authenticationv1.BoundObjectReference{
+							Kind: "pod",
+							Name: "foo-pod",
 							UID:  "foo-uid",
 						},
 					},
@@ -553,7 +817,7 @@ func TestKeyFunc(t *testing.T) {
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			mgr := NewManager(nil)
-			mgr.clock = clock.NewFakeClock(time.Time{}.Add(30 * 24 * time.Hour))
+			mgr.clock = testingclock.NewFakeClock(time.Time{}.Add(30 * 24 * time.Hour))
 			for _, tru := range c.trus {
 				mgr.set(getKeyFunc(tru), &authenticationv1.TokenRequest{
 					Status: authenticationv1.TokenRequestStatus{
@@ -569,14 +833,102 @@ func TestKeyFunc(t *testing.T) {
 			}
 		})
 	}
+}
 
+func TestServiceAccountRecreationCacheInvalidation(t *testing.T) {
+	mgr := NewManager(nil)
+	mgr.clock = testingclock.NewFakeClock(time.Time{}.Add(30 * 24 * time.Hour))
+
+	callCount := 0
+	mgr.getToken = func(name, namespace string, tr *authenticationv1.TokenRequest) (*authenticationv1.TokenRequest, error) {
+		callCount++
+		expSecs := int64(3600)
+		return &authenticationv1.TokenRequest{
+			ObjectMeta: tr.ObjectMeta, // Preserve the UID from request
+			Spec: authenticationv1.TokenRequestSpec{
+				ExpirationSeconds: &expSecs,
+			},
+			Status: authenticationv1.TokenRequestStatus{
+				Token:               fmt.Sprintf("token-%d", callCount),
+				ExpirationTimestamp: metav1.Time{Time: mgr.clock.Now().Add(time.Hour)},
+			},
+		}, nil
+	}
+
+	// 1. Get token for service account with original UID
+	originalTR := &authenticationv1.TokenRequest{
+		ObjectMeta: metav1.ObjectMeta{
+			UID: "original-sa-uid-123",
+		},
+		Spec: authenticationv1.TokenRequestSpec{
+			Audiences:         []string{"test-audience"},
+			ExpirationSeconds: ptr.To[int64](3600),
+		},
+	}
+
+	token1, err := mgr.GetServiceAccountToken("test-ns", "test-sa", originalTR)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if callCount != 1 {
+		t.Fatalf("expected 1 API call, got %d", callCount)
+	}
+	if token1.Status.Token != "token-1" {
+		t.Fatalf("unexpected token: %s", token1.Status.Token)
+	}
+
+	// 2. Request same token again - should be cache hit
+	token2, err := mgr.GetServiceAccountToken("test-ns", "test-sa", originalTR)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if callCount != 1 {
+		t.Fatalf("expected cache hit, but got %d API calls", callCount)
+	}
+	if token2.Status.Token != "token-1" {
+		t.Fatalf("unexpected token from cache: %s", token2.Status.Token)
+	}
+
+	// 3. Service account recreated with new UID - should be cache miss
+	recreatedTR := &authenticationv1.TokenRequest{
+		ObjectMeta: metav1.ObjectMeta{
+			UID: "recreated-sa-uid-456",
+		},
+		Spec: authenticationv1.TokenRequestSpec{
+			Audiences:         []string{"test-audience"},
+			ExpirationSeconds: ptr.To[int64](3600),
+		},
+	}
+
+	token3, err := mgr.GetServiceAccountToken("test-ns", "test-sa", recreatedTR)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if callCount != 2 {
+		t.Fatalf("expected cache miss due to UID change, but got %d API calls", callCount)
+	}
+	if token3.Status.Token != "token-2" {
+		t.Fatalf("unexpected token for recreated SA: %s", token3.Status.Token)
+	}
+
+	// 4. Request for recreated SA again - should be cache hit
+	token4, err := mgr.GetServiceAccountToken("test-ns", "test-sa", recreatedTR)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if callCount != 2 {
+		t.Fatalf("expected cache hit for recreated SA, but got %d API calls", callCount)
+	}
+	if token4.Status.Token != "token-2" {
+		t.Fatalf("unexpected token from cache for recreated SA: %s", token4.Status.Token)
+	}
 }
 
 func getTokenRequest() *authenticationv1.TokenRequest {
 	return &authenticationv1.TokenRequest{
 		Spec: authenticationv1.TokenRequestSpec{
 			Audiences:         []string{"foo1", "foo2"},
-			ExpirationSeconds: getInt64Point(2000),
+			ExpirationSeconds: ptr.To[int64](2000),
 			BoundObjectRef: &authenticationv1.BoundObjectReference{
 				Kind: "pod",
 				Name: "foo-pod",
@@ -584,8 +936,4 @@ func getTokenRequest() *authenticationv1.TokenRequest {
 			},
 		},
 	}
-}
-
-func getInt64Point(v int64) *int64 {
-	return &v
 }

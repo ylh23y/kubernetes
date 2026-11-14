@@ -1,4 +1,4 @@
-// +build !linux
+//go:build !linux
 
 /*
 Copyright 2018 The Kubernetes Authors.
@@ -18,5 +18,7 @@ limitations under the License.
 
 package kubelet
 
+import "context"
+
 // Do nothing.
-func (kl *Kubelet) syncNetworkUtil() {}
+func (kl *Kubelet) initNetworkUtil(_ context.Context) {}

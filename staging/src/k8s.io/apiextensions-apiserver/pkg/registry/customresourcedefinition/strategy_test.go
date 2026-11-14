@@ -19,464 +19,66 @@ package customresourcedefinition
 import (
 	"context"
 	"fmt"
-	"reflect"
+	"sort"
 	"testing"
 
+	"github.com/google/go-cmp/cmp"
+
+	"k8s.io/apiextensions-api/pkg/apis/apiextensions/v1beta1"
 	"k8s.io/apiextensions-apiserver/pkg/apis/apiextensions"
-	"k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1beta1"
+	"k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/validation"
 	apiextensionsfeatures "k8s.io/apiextensions-apiserver/pkg/features"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/util/diff"
 	"k8s.io/apimachinery/pkg/util/validation/field"
-	"k8s.io/apiserver/pkg/endpoints/request"
+	"k8s.io/apimachinery/pkg/util/version"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	featuregatetesting "k8s.io/component-base/featuregate/testing"
+	"k8s.io/utils/ptr"
 )
 
-func TestDropDisableFieldsCustomResourceDefinition(t *testing.T) {
-	t.Log("testing unversioned validation..")
-	for _, validationEnabled := range []bool{true, false} {
-		crdWithUnversionedValidation := func() *apiextensions.CustomResourceDefinition {
-			// crd with non-versioned validation
-			return &apiextensions.CustomResourceDefinition{
-				Spec: apiextensions.CustomResourceDefinitionSpec{
-					Validation: &apiextensions.CustomResourceValidation{
-						OpenAPIV3Schema: &apiextensions.JSONSchemaProps{},
-					},
-				},
-			}
-		}
-		crdWithoutUnversionedValidation := func() *apiextensions.CustomResourceDefinition {
-			// crd with non-versioned validation
-			return &apiextensions.CustomResourceDefinition{
-				Spec: apiextensions.CustomResourceDefinitionSpec{},
-			}
-		}
-		crdInfos := []struct {
-			name            string
-			hasCRValidation bool
-			crd             func() *apiextensions.CustomResourceDefinition
-		}{
-			{
-				name:            "has unversioned validation",
-				hasCRValidation: true,
-				crd:             crdWithUnversionedValidation,
-			},
-			{
-				name:            "doesn't have unversioned validation",
-				hasCRValidation: false,
-				crd:             crdWithoutUnversionedValidation,
-			},
-			{
-				name:            "nil",
-				hasCRValidation: false,
-				crd:             func() *apiextensions.CustomResourceDefinition { return nil },
-			},
-		}
-		for _, oldCRDInfo := range crdInfos {
-			for _, newCRDInfo := range crdInfos {
-				oldCRDHasValidation, oldCRD := oldCRDInfo.hasCRValidation, oldCRDInfo.crd()
-				newCRDHasValidation, newCRD := newCRDInfo.hasCRValidation, newCRDInfo.crd()
-				if newCRD == nil {
-					continue
-				}
-				t.Run(fmt.Sprintf("validation feature enabled=%v, old CRD %v, new CRD %v", validationEnabled, oldCRDInfo.name, newCRDInfo.name),
-					func(t *testing.T) {
-						defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, apiextensionsfeatures.CustomResourceValidation, validationEnabled)()
-						var oldCRDSpec *apiextensions.CustomResourceDefinitionSpec
-						if oldCRD != nil {
-							oldCRDSpec = &oldCRD.Spec
-						}
-						dropDisabledFields(&newCRD.Spec, oldCRDSpec)
-						// old CRD should never be changed
-						if !reflect.DeepEqual(oldCRD, oldCRDInfo.crd()) {
-							t.Errorf("old crd changed: %v", diff.ObjectReflectDiff(oldCRD, oldCRDInfo.crd()))
-						}
-						switch {
-						case validationEnabled || oldCRDHasValidation:
-							if !reflect.DeepEqual(newCRD, newCRDInfo.crd()) {
-								t.Errorf("new crd changed: %v", diff.ObjectReflectDiff(newCRD, newCRDInfo.crd()))
-							}
-						case newCRDHasValidation:
-							if reflect.DeepEqual(newCRD, newCRDInfo.crd()) {
-								t.Errorf("new crd was not changed")
-							}
-							if !reflect.DeepEqual(newCRD, crdWithoutUnversionedValidation()) {
-								t.Errorf("new crd had unversioned validation: %v", diff.ObjectReflectDiff(newCRD, crdWithoutUnversionedValidation()))
-							}
-						default:
-							if !reflect.DeepEqual(newCRD, newCRDInfo.crd()) {
-								t.Errorf("new crd changed: %v", diff.ObjectReflectDiff(newCRD, newCRDInfo.crd()))
-							}
-						}
-					},
-				)
-			}
-		}
+// mkCRD helps construct CustomResourceDefinition objects for testing more
+// legibly and tersely than a Go struct definition.
+func mkCRD(tweaks ...func(*apiextensions.CustomResourceDefinitionSpec)) *apiextensions.CustomResourceDefinition {
+	crd := &apiextensions.CustomResourceDefinition{
+		Spec: apiextensions.CustomResourceDefinitionSpec{
+			Versions: []apiextensions.CustomResourceDefinitionVersion{},
+		},
 	}
 
-	t.Log("testing unversioned subresources...")
-	for _, validationEnabled := range []bool{true, false} {
-		crdWithUnversionedSubresources := func() *apiextensions.CustomResourceDefinition {
-			// crd with unversioned subresources
-			return &apiextensions.CustomResourceDefinition{
-				Spec: apiextensions.CustomResourceDefinitionSpec{
-					Subresources: &apiextensions.CustomResourceSubresources{},
-				},
-			}
-		}
-		crdWithoutUnversionedSubresources := func() *apiextensions.CustomResourceDefinition {
-			// crd without unversioned subresources
-			return &apiextensions.CustomResourceDefinition{
-				Spec: apiextensions.CustomResourceDefinitionSpec{},
-			}
-		}
-		crdInfos := []struct {
-			name              string
-			hasCRSubresources bool
-			crd               func() *apiextensions.CustomResourceDefinition
-		}{
-			{
-				name:              "has unversioned subresources",
-				hasCRSubresources: true,
-				crd:               crdWithUnversionedSubresources,
-			},
-			{
-				name:              "doesn't have unversioned subresources",
-				hasCRSubresources: false,
-				crd:               crdWithoutUnversionedSubresources,
-			},
-			{
-				name:              "nil",
-				hasCRSubresources: false,
-				crd:               func() *apiextensions.CustomResourceDefinition { return nil },
-			},
-		}
-		for _, oldCRDInfo := range crdInfos {
-			for _, newCRDInfo := range crdInfos {
-				oldCRDHasSubresources, oldCRD := oldCRDInfo.hasCRSubresources, oldCRDInfo.crd()
-				newCRDHasSubresources, newCRD := newCRDInfo.hasCRSubresources, newCRDInfo.crd()
-				if newCRD == nil {
-					continue
-				}
-				t.Run(fmt.Sprintf("subresources feature enabled=%v, old CRD %v, new CRD %v", validationEnabled, oldCRDInfo.name, newCRDInfo.name),
-					func(t *testing.T) {
-						defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, apiextensionsfeatures.CustomResourceSubresources, validationEnabled)()
-						var oldCRDSpec *apiextensions.CustomResourceDefinitionSpec
-						if oldCRD != nil {
-							oldCRDSpec = &oldCRD.Spec
-						}
-						dropDisabledFields(&newCRD.Spec, oldCRDSpec)
-						// old CRD should never be changed
-						if !reflect.DeepEqual(oldCRD, oldCRDInfo.crd()) {
-							t.Errorf("old crd changed: %v", diff.ObjectReflectDiff(oldCRD, oldCRDInfo.crd()))
-						}
-						switch {
-						case validationEnabled || oldCRDHasSubresources:
-							if !reflect.DeepEqual(newCRD, newCRDInfo.crd()) {
-								t.Errorf("new crd changed: %v", diff.ObjectReflectDiff(newCRD, newCRDInfo.crd()))
-							}
-						case newCRDHasSubresources:
-							if reflect.DeepEqual(newCRD, newCRDInfo.crd()) {
-								t.Errorf("new crd was not changed")
-							}
-							if !reflect.DeepEqual(newCRD, crdWithoutUnversionedSubresources()) {
-								t.Errorf("new crd had unversioned subresources: %v", diff.ObjectReflectDiff(newCRD, crdWithoutUnversionedSubresources()))
-							}
-						default:
-							if !reflect.DeepEqual(newCRD, newCRDInfo.crd()) {
-								t.Errorf("new crd changed: %v", diff.ObjectReflectDiff(newCRD, newCRDInfo.crd()))
-							}
-						}
-					},
-				)
-			}
-		}
+	for _, tweak := range tweaks {
+		tweak(&crd.Spec)
 	}
 
-	t.Log("testing versioned validation..")
-	for _, conversionEnabled := range []bool{true, false} {
-		for _, validationEnabled := range []bool{true, false} {
-			crdWithVersionedValidation := func() *apiextensions.CustomResourceDefinition {
-				// crd with versioned validation
-				return &apiextensions.CustomResourceDefinition{
-					Spec: apiextensions.CustomResourceDefinitionSpec{
-						Versions: []apiextensions.CustomResourceDefinitionVersion{
-							{
-								Name: "v1",
-								Schema: &apiextensions.CustomResourceValidation{
-									OpenAPIV3Schema: &apiextensions.JSONSchemaProps{},
-								},
-							},
-						},
-					},
-				}
-			}
-			crdWithoutVersionedValidation := func() *apiextensions.CustomResourceDefinition {
-				// crd with versioned validation
-				return &apiextensions.CustomResourceDefinition{
-					Spec: apiextensions.CustomResourceDefinitionSpec{
-						Versions: []apiextensions.CustomResourceDefinitionVersion{
-							{
-								Name: "v1",
-							},
-						},
-					},
-				}
-			}
-			crdInfos := []struct {
-				name            string
-				hasCRValidation bool
-				crd             func() *apiextensions.CustomResourceDefinition
-			}{
-				{
-					name:            "has versioned validation",
-					hasCRValidation: true,
-					crd:             crdWithVersionedValidation,
-				},
-				{
-					name:            "doesn't have versioned validation",
-					hasCRValidation: false,
-					crd:             crdWithoutVersionedValidation,
-				},
-				{
-					name:            "nil",
-					hasCRValidation: false,
-					crd:             func() *apiextensions.CustomResourceDefinition { return nil },
-				},
-			}
-			for _, oldCRDInfo := range crdInfos {
-				for _, newCRDInfo := range crdInfos {
-					oldCRDHasValidation, oldCRD := oldCRDInfo.hasCRValidation, oldCRDInfo.crd()
-					newCRDHasValidation, newCRD := newCRDInfo.hasCRValidation, newCRDInfo.crd()
-					if newCRD == nil {
-						continue
-					}
-					t.Run(fmt.Sprintf("validation feature enabled=%v, old CRD %v, new CRD %v", validationEnabled, oldCRDInfo.name, newCRDInfo.name),
-						func(t *testing.T) {
-							defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, apiextensionsfeatures.CustomResourceValidation, validationEnabled)()
-							defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, apiextensionsfeatures.CustomResourceWebhookConversion, conversionEnabled)()
-							var oldCRDSpec *apiextensions.CustomResourceDefinitionSpec
-							if oldCRD != nil {
-								oldCRDSpec = &oldCRD.Spec
-							}
-							dropDisabledFields(&newCRD.Spec, oldCRDSpec)
-							// old CRD should never be changed
-							if !reflect.DeepEqual(oldCRD, oldCRDInfo.crd()) {
-								t.Errorf("old crd changed: %v", diff.ObjectReflectDiff(oldCRD, oldCRDInfo.crd()))
-							}
-							switch {
-							case (conversionEnabled && validationEnabled) || oldCRDHasValidation:
-								if !reflect.DeepEqual(newCRD, newCRDInfo.crd()) {
-									t.Errorf("new crd changed: %v", diff.ObjectReflectDiff(newCRD, newCRDInfo.crd()))
-								}
-							case !conversionEnabled && !oldCRDHasValidation:
-								if !reflect.DeepEqual(newCRD, crdWithoutVersionedValidation()) {
-									t.Errorf("new crd was not changed")
-								}
-							case newCRDHasValidation:
-								if reflect.DeepEqual(newCRD, newCRDInfo.crd()) {
-									t.Errorf("new crd was not changed")
-								}
-								if !reflect.DeepEqual(newCRD, crdWithoutVersionedValidation()) {
-									t.Errorf("new crd had unversioned validation: %v", diff.ObjectReflectDiff(newCRD, crdWithoutVersionedValidation()))
-								}
-							default:
-								if !reflect.DeepEqual(newCRD, newCRDInfo.crd()) {
-									t.Errorf("new crd changed: %v", diff.ObjectReflectDiff(newCRD, newCRDInfo.crd()))
-								}
-							}
-						},
-					)
-				}
-			}
-		}
-	}
-
-	t.Log("testing versioned subresources w/ conversion enabled..")
-	for _, conversionEnabled := range []bool{true, false} {
-		for _, validationEnabled := range []bool{true, false} {
-			crdWithVersionedSubresources := func() *apiextensions.CustomResourceDefinition {
-				// crd with versioned subresources
-				return &apiextensions.CustomResourceDefinition{
-					Spec: apiextensions.CustomResourceDefinitionSpec{
-						Versions: []apiextensions.CustomResourceDefinitionVersion{
-							{
-								Name:         "v1",
-								Subresources: &apiextensions.CustomResourceSubresources{},
-							},
-						},
-					},
-				}
-			}
-			crdWithoutVersionedSubresources := func() *apiextensions.CustomResourceDefinition {
-				// crd without versioned subresources
-				return &apiextensions.CustomResourceDefinition{
-					Spec: apiextensions.CustomResourceDefinitionSpec{
-						Versions: []apiextensions.CustomResourceDefinitionVersion{
-							{
-								Name: "v1",
-							},
-						},
-					},
-				}
-			}
-			crdInfos := []struct {
-				name              string
-				hasCRSubresources bool
-				crd               func() *apiextensions.CustomResourceDefinition
-			}{
-				{
-					name:              "has versioned subresources",
-					hasCRSubresources: true,
-					crd:               crdWithVersionedSubresources,
-				},
-				{
-					name:              "doesn't have versioned subresources",
-					hasCRSubresources: false,
-					crd:               crdWithoutVersionedSubresources,
-				},
-				{
-					name:              "nil",
-					hasCRSubresources: false,
-					crd:               func() *apiextensions.CustomResourceDefinition { return nil },
-				},
-			}
-			for _, oldCRDInfo := range crdInfos {
-				for _, newCRDInfo := range crdInfos {
-					oldCRDHasSubresources, oldCRD := oldCRDInfo.hasCRSubresources, oldCRDInfo.crd()
-					newCRDHasSubresources, newCRD := newCRDInfo.hasCRSubresources, newCRDInfo.crd()
-					if newCRD == nil {
-						continue
-					}
-					t.Run(fmt.Sprintf("subresources feature enabled=%v, old CRD %v, new CRD %v", validationEnabled, oldCRDInfo.name, newCRDInfo.name),
-						func(t *testing.T) {
-							defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, apiextensionsfeatures.CustomResourceSubresources, validationEnabled)()
-							defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, apiextensionsfeatures.CustomResourceWebhookConversion, conversionEnabled)()
-							var oldCRDSpec *apiextensions.CustomResourceDefinitionSpec
-							if oldCRD != nil {
-								oldCRDSpec = &oldCRD.Spec
-							}
-							dropDisabledFields(&newCRD.Spec, oldCRDSpec)
-							// old CRD should never be changed
-							if !reflect.DeepEqual(oldCRD, oldCRDInfo.crd()) {
-								t.Errorf("old crd changed: %v", diff.ObjectReflectDiff(oldCRD, oldCRDInfo.crd()))
-							}
-							switch {
-							case (conversionEnabled && validationEnabled) || oldCRDHasSubresources:
-								if !reflect.DeepEqual(newCRD, newCRDInfo.crd()) {
-									t.Errorf("new crd changed: %v", diff.ObjectReflectDiff(newCRD, newCRDInfo.crd()))
-								}
-							case !conversionEnabled && !oldCRDHasSubresources:
-								if !reflect.DeepEqual(newCRD, crdWithoutVersionedSubresources()) {
-									t.Errorf("new crd was not changed")
-								}
-							case newCRDHasSubresources:
-								if reflect.DeepEqual(newCRD, newCRDInfo.crd()) {
-									t.Errorf("new crd was not changed")
-								}
-								if !reflect.DeepEqual(newCRD, crdWithoutVersionedSubresources()) {
-									t.Errorf("new crd had versioned subresources: %v", diff.ObjectReflectDiff(newCRD, crdWithoutVersionedSubresources()))
-								}
-							default:
-								if !reflect.DeepEqual(newCRD, newCRDInfo.crd()) {
-									t.Errorf("new crd changed: %v", diff.ObjectReflectDiff(newCRD, newCRDInfo.crd()))
-								}
-							}
-						},
-					)
-				}
-			}
-		}
-	}
-
-	t.Log("testing conversion webhook..")
-	for _, validationEnabled := range []bool{true, false} {
-		crdWithUnversionedConversionWebhook := func() *apiextensions.CustomResourceDefinition {
-			// crd with conversion webhook
-			return &apiextensions.CustomResourceDefinition{
-				Spec: apiextensions.CustomResourceDefinitionSpec{
-					Conversion: &apiextensions.CustomResourceConversion{
-						WebhookClientConfig: &apiextensions.WebhookClientConfig{},
-					},
-				},
-			}
-		}
-		crdWithoutUnversionedConversionWebhook := func() *apiextensions.CustomResourceDefinition {
-			// crd with conversion webhook
-			return &apiextensions.CustomResourceDefinition{
-				Spec: apiextensions.CustomResourceDefinitionSpec{
-					Conversion: &apiextensions.CustomResourceConversion{},
-				},
-			}
-		}
-		crdInfos := []struct {
-			name                   string
-			hasCRConversionWebhook bool
-			crd                    func() *apiextensions.CustomResourceDefinition
-		}{
-			{
-				name:                   "has conversion webhook",
-				hasCRConversionWebhook: true,
-				crd:                    crdWithUnversionedConversionWebhook,
-			},
-			{
-				name:                   "doesn't have conversion webhook",
-				hasCRConversionWebhook: false,
-				crd:                    crdWithoutUnversionedConversionWebhook,
-			},
-			{
-				name:                   "nil",
-				hasCRConversionWebhook: false,
-				crd:                    func() *apiextensions.CustomResourceDefinition { return nil },
-			},
-		}
-		for _, oldCRDInfo := range crdInfos {
-			for _, newCRDInfo := range crdInfos {
-				oldCRDHasConversionWebhook, oldCRD := oldCRDInfo.hasCRConversionWebhook, oldCRDInfo.crd()
-				newCRDHasConversionWebhook, newCRD := newCRDInfo.hasCRConversionWebhook, newCRDInfo.crd()
-				if newCRD == nil {
-					continue
-				}
-				t.Run(fmt.Sprintf("subresources feature enabled=%v, old CRD %v, new CRD %v", validationEnabled, oldCRDInfo.name, newCRDInfo.name),
-					func(t *testing.T) {
-						defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, apiextensionsfeatures.CustomResourceWebhookConversion, validationEnabled)()
-						var oldCRDSpec *apiextensions.CustomResourceDefinitionSpec
-						if oldCRD != nil {
-							oldCRDSpec = &oldCRD.Spec
-						}
-						dropDisabledFields(&newCRD.Spec, oldCRDSpec)
-						// old CRD should never be changed
-						if !reflect.DeepEqual(oldCRD, oldCRDInfo.crd()) {
-							t.Errorf("old crd changed: %v", diff.ObjectReflectDiff(oldCRD, oldCRDInfo.crd()))
-						}
-						switch {
-						case validationEnabled || oldCRDHasConversionWebhook:
-							if !reflect.DeepEqual(newCRD, newCRDInfo.crd()) {
-								t.Errorf("new crd changed: %v", diff.ObjectReflectDiff(newCRD, newCRDInfo.crd()))
-							}
-						case newCRDHasConversionWebhook:
-							if reflect.DeepEqual(newCRD, newCRDInfo.crd()) {
-								t.Errorf("new crd was not changed")
-							}
-							if !reflect.DeepEqual(newCRD, crdWithoutUnversionedConversionWebhook()) {
-								t.Errorf("new crd had webhook conversion: %v", diff.ObjectReflectDiff(newCRD, crdWithoutUnversionedConversionWebhook()))
-							}
-						default:
-							if !reflect.DeepEqual(newCRD, newCRDInfo.crd()) {
-								t.Errorf("new crd changed: %v", diff.ObjectReflectDiff(newCRD, newCRDInfo.crd()))
-							}
-						}
-					},
-				)
-			}
-		}
-	}
-
+	return crd
 }
 
-func strPtr(in string) *string {
-	return &in
+// withListTypeSetItems appends a version whose openAPIV3Schema has one
+// top-level property (fieldName) of type array with x-kubernetes-list-type: set
+// and items of the given itemType. Reused across create/update warning tests.
+func withListTypeSetItems(itemType, fieldName string) func(*apiextensions.CustomResourceDefinitionSpec) {
+	return func(spec *apiextensions.CustomResourceDefinitionSpec) {
+		setType := "set"
+		version := apiextensions.CustomResourceDefinitionVersion{
+			Name:    fmt.Sprintf("v%d", len(spec.Versions)+1),
+			Served:  true,
+			Storage: len(spec.Versions) == 0,
+			Schema: &apiextensions.CustomResourceValidation{
+				OpenAPIV3Schema: &apiextensions.JSONSchemaProps{
+					Type: "object",
+					Properties: map[string]apiextensions.JSONSchemaProps{
+						fieldName: {
+							Type:      "array",
+							XListType: &setType,
+							Items: &apiextensions.JSONSchemaPropsOrArray{
+								Schema: &apiextensions.JSONSchemaProps{Type: itemType},
+							},
+						},
+					},
+				},
+			},
+		}
+		spec.Versions = append(spec.Versions, version)
+	}
 }
 
 func TestValidateAPIApproval(t *testing.T) {
@@ -490,33 +92,26 @@ func TestValidateAPIApproval(t *testing.T) {
 	tests := []struct {
 		name string
 
-		version            string
 		group              string
 		annotationValue    string
 		oldAnnotationValue *string
 		validateError      func(t *testing.T, errors field.ErrorList)
 	}{
 		{
-			name:            "ignore v1beta1",
-			version:         "v1beta1",
-			group:           "sigs.k8s.io",
-			annotationValue: "invalid",
-			validateError:   okFn,
-		},
-		{
 			name:            "ignore non-k8s group",
-			version:         "v1",
 			group:           "other.io",
 			annotationValue: "invalid",
 			validateError:   okFn,
 		},
 		{
 			name:            "invalid annotation create",
-			version:         "v1",
 			group:           "sigs.k8s.io",
 			annotationValue: "invalid",
 			validateError: func(t *testing.T, errors field.ErrorList) {
 				t.Helper()
+				if len(errors) == 0 {
+					t.Fatal("expected errors, got none")
+				}
 				if e, a := `metadata.annotations[api-approved.kubernetes.io]: Invalid value: "invalid": protected groups must have approval annotation "api-approved.kubernetes.io" with either a URL or a reason starting with "unapproved", see https://github.com/kubernetes/enhancements/pull/1111`, errors.ToAggregate().Error(); e != a {
 					t.Fatal(errors)
 				}
@@ -524,20 +119,21 @@ func TestValidateAPIApproval(t *testing.T) {
 		},
 		{
 			name:               "invalid annotation update",
-			version:            "v1",
 			group:              "sigs.k8s.io",
 			annotationValue:    "invalid",
-			oldAnnotationValue: strPtr("invalid"),
+			oldAnnotationValue: ptr.To("invalid"),
 			validateError:      okFn,
 		},
 		{
 			name:               "invalid annotation to missing",
-			version:            "v1",
 			group:              "sigs.k8s.io",
 			annotationValue:    "",
-			oldAnnotationValue: strPtr("invalid"),
+			oldAnnotationValue: ptr.To("invalid"),
 			validateError: func(t *testing.T, errors field.ErrorList) {
 				t.Helper()
+				if len(errors) == 0 {
+					t.Fatal("expected errors, got none")
+				}
 				if e, a := `metadata.annotations[api-approved.kubernetes.io]: Required value: protected groups must have approval annotation "api-approved.kubernetes.io", see https://github.com/kubernetes/enhancements/pull/1111`, errors.ToAggregate().Error(); e != a {
 					t.Fatal(errors)
 				}
@@ -545,12 +141,14 @@ func TestValidateAPIApproval(t *testing.T) {
 		},
 		{
 			name:               "missing to invalid annotation",
-			version:            "v1",
 			group:              "sigs.k8s.io",
 			annotationValue:    "invalid",
-			oldAnnotationValue: strPtr(""),
+			oldAnnotationValue: ptr.To(""),
 			validateError: func(t *testing.T, errors field.ErrorList) {
 				t.Helper()
+				if len(errors) == 0 {
+					t.Fatal("expected errors, got none")
+				}
 				if e, a := `metadata.annotations[api-approved.kubernetes.io]: Invalid value: "invalid": protected groups must have approval annotation "api-approved.kubernetes.io" with either a URL or a reason starting with "unapproved", see https://github.com/kubernetes/enhancements/pull/1111`, errors.ToAggregate().Error(); e != a {
 					t.Fatal(errors)
 				}
@@ -558,11 +156,13 @@ func TestValidateAPIApproval(t *testing.T) {
 		},
 		{
 			name:            "missing annotation",
-			version:         "v1",
 			group:           "sigs.k8s.io",
 			annotationValue: "",
 			validateError: func(t *testing.T, errors field.ErrorList) {
 				t.Helper()
+				if len(errors) == 0 {
+					t.Fatal("expected errors, got none")
+				}
 				if e, a := `metadata.annotations[api-approved.kubernetes.io]: Required value: protected groups must have approval annotation "api-approved.kubernetes.io", see https://github.com/kubernetes/enhancements/pull/1111`, errors.ToAggregate().Error(); e != a {
 					t.Fatal(errors)
 				}
@@ -570,61 +170,634 @@ func TestValidateAPIApproval(t *testing.T) {
 		},
 		{
 			name:               "missing annotation update",
-			version:            "v1",
 			group:              "sigs.k8s.io",
 			annotationValue:    "",
-			oldAnnotationValue: strPtr(""),
+			oldAnnotationValue: ptr.To(""),
 			validateError:      okFn,
 		},
 		{
 			name:            "url",
-			version:         "v1",
 			group:           "sigs.k8s.io",
 			annotationValue: "https://github.com/kubernetes/kubernetes/pull/79724",
 			validateError:   okFn,
 		},
 		{
 			name:            "unapproved",
-			version:         "v1",
 			group:           "sigs.k8s.io",
 			annotationValue: "unapproved, other reason",
 			validateError:   okFn,
-		},
-		{
-			name:            "next version validates",
-			version:         "v2",
-			group:           "sigs.k8s.io",
-			annotationValue: "invalid",
-			validateError: func(t *testing.T, errors field.ErrorList) {
-				t.Helper()
-				if e, a := `metadata.annotations[api-approved.kubernetes.io]: Invalid value: "invalid": protected groups must have approval annotation "api-approved.kubernetes.io" with either a URL or a reason starting with "unapproved", see https://github.com/kubernetes/enhancements/pull/1111`, errors.ToAggregate().Error(); e != a {
-					t.Fatal(errors)
-				}
-			},
 		},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			ctx := request.WithRequestInfo(context.TODO(), &request.RequestInfo{APIVersion: test.version})
 			crd := &apiextensions.CustomResourceDefinition{
-				ObjectMeta: metav1.ObjectMeta{Name: "foo", Annotations: map[string]string{v1beta1.KubeAPIApprovedAnnotation: test.annotationValue}},
+				ObjectMeta: metav1.ObjectMeta{Name: "foos." + test.group, Annotations: map[string]string{v1beta1.KubeAPIApprovedAnnotation: test.annotationValue}, ResourceVersion: "1"},
 				Spec: apiextensions.CustomResourceDefinitionSpec{
-					Group: test.group,
+					Group:    test.group,
+					Scope:    apiextensions.NamespaceScoped,
+					Version:  "v1",
+					Versions: []apiextensions.CustomResourceDefinitionVersion{{Name: "v1", Storage: true, Served: true}},
+					Names:    apiextensions.CustomResourceDefinitionNames{Plural: "foos", Singular: "foo", Kind: "Foo", ListKind: "FooList"},
+					Validation: &apiextensions.CustomResourceValidation{
+						OpenAPIV3Schema: &apiextensions.JSONSchemaProps{Type: "object", XPreserveUnknownFields: ptr.To(true)},
+					},
+				},
+				Status: apiextensions.CustomResourceDefinitionStatus{
+					StoredVersions: []string{"v1"},
 				},
 			}
 			var oldCRD *apiextensions.CustomResourceDefinition
 			if test.oldAnnotationValue != nil {
 				oldCRD = &apiextensions.CustomResourceDefinition{
-					ObjectMeta: metav1.ObjectMeta{Name: "foo", Annotations: map[string]string{v1beta1.KubeAPIApprovedAnnotation: *test.oldAnnotationValue}},
+					ObjectMeta: metav1.ObjectMeta{Name: "foos." + test.group, Annotations: map[string]string{v1beta1.KubeAPIApprovedAnnotation: *test.oldAnnotationValue}, ResourceVersion: "1"},
 					Spec: apiextensions.CustomResourceDefinitionSpec{
-						Group: test.group,
+						Group:    test.group,
+						Scope:    apiextensions.NamespaceScoped,
+						Version:  "v1",
+						Versions: []apiextensions.CustomResourceDefinitionVersion{{Name: "v1", Storage: true, Served: true}},
+						Names:    apiextensions.CustomResourceDefinitionNames{Plural: "foos", Singular: "foo", Kind: "Foo", ListKind: "FooList"},
+						Validation: &apiextensions.CustomResourceValidation{
+							OpenAPIV3Schema: &apiextensions.JSONSchemaProps{Type: "object", XPreserveUnknownFields: ptr.To(true)},
+						},
+					},
+					Status: apiextensions.CustomResourceDefinitionStatus{
+						StoredVersions: []string{"v1"},
 					},
 				}
 			}
 
-			actual := validateAPIApproval(ctx, crd, oldCRD)
+			var actual field.ErrorList
+			ctx := context.TODO()
+			if oldCRD == nil {
+				actual = validation.ValidateCustomResourceDefinition(ctx, crd)
+			} else {
+				actual = validation.ValidateCustomResourceDefinitionUpdate(ctx, crd, oldCRD)
+			}
 			test.validateError(t, actual)
+		})
+	}
+}
+
+// TestDropDisabledFields tests if the drop functionality is working fine or not with feature gate switch
+func TestDropDisabledFields(t *testing.T) {
+	testCases := []struct {
+		name                     string
+		overrideEmulatedVersion  string
+		enableObservedGeneration bool
+		crd                      *apiextensions.CustomResourceDefinition
+		oldCRD                   *apiextensions.CustomResourceDefinition
+		expectedCRD              *apiextensions.CustomResourceDefinition
+	}{
+		{
+			name:                     "Drop observed generation while feature gate is not set",
+			enableObservedGeneration: false,
+			overrideEmulatedVersion:  "1.35", // Pre-alpha before 1.35
+			crd: &apiextensions.CustomResourceDefinition{
+				Status: apiextensions.CustomResourceDefinitionStatus{
+					ObservedGeneration: 123,
+					Conditions: []apiextensions.CustomResourceDefinitionCondition{{
+						ObservedGeneration: 123,
+						Type:               apiextensions.Established,
+					}},
+				},
+			},
+			oldCRD: nil,
+			expectedCRD: &apiextensions.CustomResourceDefinition{
+				Status: apiextensions.CustomResourceDefinitionStatus{
+					Conditions: []apiextensions.CustomResourceDefinitionCondition{{
+						Type: apiextensions.Established,
+					}},
+				},
+			},
+		},
+		{
+			name:                     "Keep observed generation while feature gate is not set",
+			enableObservedGeneration: true,
+			overrideEmulatedVersion:  "1.35", // Pre-alpha before 1.35
+			crd: &apiextensions.CustomResourceDefinition{
+				Status: apiextensions.CustomResourceDefinitionStatus{
+					ObservedGeneration: 123,
+					Conditions: []apiextensions.CustomResourceDefinitionCondition{{
+						ObservedGeneration: 123,
+						Type:               apiextensions.Established,
+					}},
+				},
+			},
+			oldCRD: nil,
+			expectedCRD: &apiextensions.CustomResourceDefinition{
+				Status: apiextensions.CustomResourceDefinitionStatus{
+					ObservedGeneration: 123,
+					Conditions: []apiextensions.CustomResourceDefinitionCondition{{
+						ObservedGeneration: 123,
+						Type:               apiextensions.Established,
+					}},
+				},
+			},
+		},
+		{
+			name:                     "Persists generation if previously set while feature gate is not set",
+			enableObservedGeneration: false,
+			overrideEmulatedVersion:  "1.35", // Pre-alpha before 1.35
+			crd: &apiextensions.CustomResourceDefinition{
+				Status: apiextensions.CustomResourceDefinitionStatus{
+					ObservedGeneration: 123,
+					Conditions: []apiextensions.CustomResourceDefinitionCondition{{
+						ObservedGeneration: 123,
+						Type:               apiextensions.Established,
+					}},
+				},
+			},
+			oldCRD: &apiextensions.CustomResourceDefinition{
+				Status: apiextensions.CustomResourceDefinitionStatus{
+					ObservedGeneration: 123,
+					Conditions: []apiextensions.CustomResourceDefinitionCondition{{
+						ObservedGeneration: 123,
+						Type:               apiextensions.Established,
+					}},
+				},
+			},
+			expectedCRD: &apiextensions.CustomResourceDefinition{
+				Status: apiextensions.CustomResourceDefinitionStatus{
+					ObservedGeneration: 123,
+					Conditions: []apiextensions.CustomResourceDefinitionCondition{{
+						ObservedGeneration: 123,
+						Type:               apiextensions.Established,
+					}},
+				},
+			},
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			fg := featuregatetesting.FeatureOverrides{}
+			if tc.overrideEmulatedVersion == "" {
+				featuregatetesting.SetFeatureGateEmulationVersionDuringTest(t, utilfeature.DefaultFeatureGate, version.MustParse("1.31"))
+			} else {
+				featuregatetesting.SetFeatureGateEmulationVersionDuringTest(t, utilfeature.DefaultFeatureGate, version.MustParse(tc.overrideEmulatedVersion))
+				fg[apiextensionsfeatures.CRDObservedGenerationTracking] = tc.enableObservedGeneration
+			}
+			featuregatetesting.SetFeatureGatesDuringTest(t, utilfeature.DefaultFeatureGate, fg)
+			old := tc.oldCRD.DeepCopy()
+
+			dropDisabledFields(tc.crd, tc.oldCRD)
+
+			// old crd should never be changed
+			if diff := cmp.Diff(tc.oldCRD, old); diff != "" {
+				t.Fatalf("old crd changed from %v to %v\n%v", tc.oldCRD, old, diff)
+			}
+
+			if diff := cmp.Diff(tc.expectedCRD, tc.crd); diff != "" {
+				t.Fatalf("unexpected crd: %v\n%v", tc.crd, diff)
+			}
+		})
+	}
+}
+
+func TestWarningsOnCreate(t *testing.T) {
+	ctx := context.Background()
+	strategy := NewStrategy(nil)
+
+	testcases := map[string]struct {
+		crd                 *apiextensions.CustomResourceDefinition
+		wantWarningMessages []string
+	}{
+		"no unrecognized formats": {
+			wantWarningMessages: []string{},
+			crd: mkCRD(func(spec *apiextensions.CustomResourceDefinitionSpec) {
+				spec.Versions = append(spec.Versions, apiextensions.CustomResourceDefinitionVersion{
+					Name:    "v1",
+					Served:  true,
+					Storage: true,
+					Schema: &apiextensions.CustomResourceValidation{
+						OpenAPIV3Schema: &apiextensions.JSONSchemaProps{
+							Type: "object",
+							Properties: map[string]apiextensions.JSONSchemaProps{
+								"field1": {
+									Type:   "string",
+									Format: "date-time",
+								},
+							},
+						},
+					},
+				})
+			}),
+		},
+		"unrecognized format in version schema": {
+			wantWarningMessages: []string{
+				`unrecognized format "invalidformat"`,
+			},
+			crd: mkCRD(func(spec *apiextensions.CustomResourceDefinitionSpec) {
+				spec.Versions = append(spec.Versions, apiextensions.CustomResourceDefinitionVersion{
+					Name:    "v1",
+					Served:  true,
+					Storage: true,
+					Schema: &apiextensions.CustomResourceValidation{
+						OpenAPIV3Schema: &apiextensions.JSONSchemaProps{
+							Type: "object",
+							Properties: map[string]apiextensions.JSONSchemaProps{
+								"field1": {
+									Type:   "string",
+									Format: "invalidformat",
+								},
+							},
+						},
+					},
+				})
+			}),
+		},
+		"unrecognized format in embedded schema": {
+			wantWarningMessages: []string{
+				`unrecognized format "invalidformat"`,
+			},
+			crd: mkCRD(func(spec *apiextensions.CustomResourceDefinitionSpec) {
+				spec.Versions = append(spec.Versions, apiextensions.CustomResourceDefinitionVersion{
+					Name:    "v1",
+					Served:  true,
+					Storage: true,
+					Schema: &apiextensions.CustomResourceValidation{
+						OpenAPIV3Schema: &apiextensions.JSONSchemaProps{
+							Type: "object",
+							Properties: map[string]apiextensions.JSONSchemaProps{
+								"nested": {
+									Type: "object",
+									Properties: map[string]apiextensions.JSONSchemaProps{
+										"embeddedField": {
+											Type:   "string",
+											Format: "invalidformat",
+										},
+									},
+								},
+							},
+						},
+					},
+				})
+			}),
+		},
+		"unrecognized format in top-level validation schema": {
+			wantWarningMessages: []string{
+				`unrecognized format "invalidformat"`,
+			},
+			crd: mkCRD(func(spec *apiextensions.CustomResourceDefinitionSpec) {
+				spec.Validation = &apiextensions.CustomResourceValidation{
+					OpenAPIV3Schema: &apiextensions.JSONSchemaProps{
+						Type: "object",
+						Properties: map[string]apiextensions.JSONSchemaProps{
+							"field1": {
+								Type:   "string",
+								Format: "invalidformat",
+							},
+						},
+					},
+				}
+			}),
+		},
+		"multiple unrecognized formats": {
+			wantWarningMessages: []string{
+				`unrecognized format "unknownformat1"`,
+				`unrecognized format "unknownformat2"`,
+				`unrecognized format "unknownformat3"`,
+			},
+			crd: mkCRD(func(spec *apiextensions.CustomResourceDefinitionSpec) {
+				spec.Versions = append(spec.Versions, apiextensions.CustomResourceDefinitionVersion{
+					Name:    "v1",
+					Served:  true,
+					Storage: true,
+					Schema: &apiextensions.CustomResourceValidation{
+						OpenAPIV3Schema: &apiextensions.JSONSchemaProps{
+							Type: "object",
+							Properties: map[string]apiextensions.JSONSchemaProps{
+								"field1": {
+									Type:   "string",
+									Format: "unknownformat1",
+								},
+								"field2": {
+									Type:   "string",
+									Format: "unknownformat2",
+								},
+								"nested": {
+									Type: "object",
+									Properties: map[string]apiextensions.JSONSchemaProps{
+										"field3": {
+											Type:   "string",
+											Format: "unknownformat3",
+										},
+									},
+								},
+							},
+						},
+					},
+				})
+			}),
+		},
+		"listType=set on object items": {
+			wantWarningMessages: []string{
+				`x-kubernetes-list-type: set for items of type "object" is not supported by server-side apply or CEL validation rules`,
+			},
+			crd: mkCRD(withListTypeSetItems("object", "endpoints")),
+		},
+		"listType=set on array items": {
+			wantWarningMessages: []string{
+				`x-kubernetes-list-type: set for items of type "array" is not supported by server-side apply or CEL validation rules`,
+			},
+			crd: mkCRD(withListTypeSetItems("array", "cidrGroups")),
+		},
+		"listType=set on both object and array items reports each type": {
+			wantWarningMessages: []string{
+				`x-kubernetes-list-type: set for items of type "array" is not supported by server-side apply or CEL validation rules`,
+				`x-kubernetes-list-type: set for items of type "object" is not supported by server-side apply or CEL validation rules`,
+			},
+			crd: mkCRD(withListTypeSetItems("object", "endpoints"), withListTypeSetItems("array", "cidrGroups")),
+		},
+		"listType=set on scalar items is not flagged": {
+			wantWarningMessages: []string{},
+			crd:                 mkCRD(withListTypeSetItems("string", "verbs")),
+		},
+		"listType=set nested under items and properties is detected": {
+			wantWarningMessages: []string{
+				`x-kubernetes-list-type: set for items of type "object" is not supported by server-side apply or CEL validation rules`,
+			},
+			crd: mkCRD(func(spec *apiextensions.CustomResourceDefinitionSpec) {
+				setType := "set"
+				spec.Versions = append(spec.Versions, apiextensions.CustomResourceDefinitionVersion{
+					Name:    "v1",
+					Served:  true,
+					Storage: true,
+					Schema: &apiextensions.CustomResourceValidation{
+						OpenAPIV3Schema: &apiextensions.JSONSchemaProps{
+							Type: "object",
+							Properties: map[string]apiextensions.JSONSchemaProps{
+								"outer": {
+									Type: "array",
+									Items: &apiextensions.JSONSchemaPropsOrArray{
+										Schema: &apiextensions.JSONSchemaProps{
+											Type: "object",
+											Properties: map[string]apiextensions.JSONSchemaProps{
+												"inner": {
+													Type:      "array",
+													XListType: &setType,
+													Items: &apiextensions.JSONSchemaPropsOrArray{
+														Schema: &apiextensions.JSONSchemaProps{Type: "object"},
+													},
+												},
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				})
+			}),
+		},
+		"listType=set in top-level validation schema": {
+			wantWarningMessages: []string{
+				`x-kubernetes-list-type: set for items of type "object" is not supported by server-side apply or CEL validation rules`,
+			},
+			crd: mkCRD(func(spec *apiextensions.CustomResourceDefinitionSpec) {
+				setType := "set"
+				spec.Validation = &apiextensions.CustomResourceValidation{
+					OpenAPIV3Schema: &apiextensions.JSONSchemaProps{
+						Type: "object",
+						Properties: map[string]apiextensions.JSONSchemaProps{
+							"endpoints": {
+								Type:      "array",
+								XListType: &setType,
+								Items: &apiextensions.JSONSchemaPropsOrArray{
+									Schema: &apiextensions.JSONSchemaProps{Type: "object"},
+								},
+							},
+						},
+					},
+				}
+			}),
+		},
+	}
+
+	for name, tc := range testcases {
+		t.Run(name, func(t *testing.T) {
+			gotWarnings := strategy.WarningsOnCreate(ctx, tc.crd)
+			if len(gotWarnings) != len(tc.wantWarningMessages) {
+				t.Errorf("got %d warnings but expected %d", len(gotWarnings), len(tc.wantWarningMessages))
+				return
+			}
+
+			// Sort gotWarnings to match expected order
+			sort.Strings(gotWarnings)
+
+			for i, expectedMessage := range tc.wantWarningMessages {
+				if gotWarnings[i] != expectedMessage {
+					t.Errorf("warning %d: got %s, expected %s", i, gotWarnings[i], expectedMessage)
+				}
+			}
+		})
+	}
+}
+
+func TestWarningsOnUpdate(t *testing.T) {
+	ctx := context.Background()
+	strategy := NewStrategy(nil)
+
+	testcases := map[string]struct {
+		oldCRD              *apiextensions.CustomResourceDefinition
+		newCRD              *apiextensions.CustomResourceDefinition
+		wantWarningMessages []string
+	}{
+		"no unrecognized formats": {
+			wantWarningMessages: []string{},
+			oldCRD: mkCRD(func(spec *apiextensions.CustomResourceDefinitionSpec) {
+				spec.Versions = append(spec.Versions, apiextensions.CustomResourceDefinitionVersion{
+					Name:    "v1",
+					Served:  true,
+					Storage: true,
+					Schema: &apiextensions.CustomResourceValidation{
+						OpenAPIV3Schema: &apiextensions.JSONSchemaProps{
+							Type: "object",
+							Properties: map[string]apiextensions.JSONSchemaProps{
+								"field1": {
+									Type:   "string",
+									Format: "date-time",
+								},
+							},
+						},
+					},
+				})
+			}),
+			newCRD: mkCRD(func(spec *apiextensions.CustomResourceDefinitionSpec) {
+				spec.Versions = append(spec.Versions, apiextensions.CustomResourceDefinitionVersion{
+					Name:    "v1",
+					Served:  true,
+					Storage: true,
+					Schema: &apiextensions.CustomResourceValidation{
+						OpenAPIV3Schema: &apiextensions.JSONSchemaProps{
+							Type: "object",
+							Properties: map[string]apiextensions.JSONSchemaProps{
+								"field1": {
+									Type:   "string",
+									Format: "date-time",
+								},
+							},
+						},
+					},
+				})
+			}),
+		},
+		"newly introduced unrecognized format": {
+			wantWarningMessages: []string{
+				`unrecognized format "invalidformat"`,
+			},
+			oldCRD: mkCRD(func(spec *apiextensions.CustomResourceDefinitionSpec) {
+				spec.Versions = append(spec.Versions, apiextensions.CustomResourceDefinitionVersion{
+					Name:    "v1",
+					Served:  true,
+					Storage: true,
+					Schema: &apiextensions.CustomResourceValidation{
+						OpenAPIV3Schema: &apiextensions.JSONSchemaProps{
+							Type: "object",
+							Properties: map[string]apiextensions.JSONSchemaProps{
+								"field1": {
+									Type:   "string",
+									Format: "date-time",
+								},
+							},
+						},
+					},
+				})
+			}),
+			newCRD: mkCRD(func(spec *apiextensions.CustomResourceDefinitionSpec) {
+				spec.Versions = append(spec.Versions, apiextensions.CustomResourceDefinitionVersion{
+					Name:    "v1",
+					Served:  true,
+					Storage: true,
+					Schema: &apiextensions.CustomResourceValidation{
+						OpenAPIV3Schema: &apiextensions.JSONSchemaProps{
+							Type: "object",
+							Properties: map[string]apiextensions.JSONSchemaProps{
+								"field1": {
+									Type:   "string",
+									Format: "invalidformat",
+								},
+							},
+						},
+					},
+				})
+			}),
+		},
+		"existing unrecognized format - no warning (ratcheting)": {
+			wantWarningMessages: []string{},
+			oldCRD: mkCRD(func(spec *apiextensions.CustomResourceDefinitionSpec) {
+				spec.Versions = append(spec.Versions, apiextensions.CustomResourceDefinitionVersion{
+					Name:    "v1",
+					Served:  true,
+					Storage: true,
+					Schema: &apiextensions.CustomResourceValidation{
+						OpenAPIV3Schema: &apiextensions.JSONSchemaProps{
+							Type: "object",
+							Properties: map[string]apiextensions.JSONSchemaProps{
+								"field1": {
+									Type:   "string",
+									Format: "invalidformat",
+								},
+							},
+						},
+					},
+				})
+			}),
+			newCRD: mkCRD(func(spec *apiextensions.CustomResourceDefinitionSpec) {
+				spec.Versions = append(spec.Versions, apiextensions.CustomResourceDefinitionVersion{
+					Name:    "v1",
+					Served:  true,
+					Storage: true,
+					Schema: &apiextensions.CustomResourceValidation{
+						OpenAPIV3Schema: &apiextensions.JSONSchemaProps{
+							Type: "object",
+							Properties: map[string]apiextensions.JSONSchemaProps{
+								"field1": {
+									Type:   "string",
+									Format: "invalidformat",
+								},
+							},
+						},
+					},
+				})
+			}),
+		},
+		"multiple newly introduced unrecognized formats": {
+			wantWarningMessages: []string{
+				`unrecognized format "unknownformat1"`,
+				`unrecognized format "unknownformat2"`,
+			},
+			oldCRD: mkCRD(func(spec *apiextensions.CustomResourceDefinitionSpec) {
+				spec.Versions = append(spec.Versions, apiextensions.CustomResourceDefinitionVersion{
+					Name:    "v1",
+					Served:  true,
+					Storage: true,
+					Schema: &apiextensions.CustomResourceValidation{
+						OpenAPIV3Schema: &apiextensions.JSONSchemaProps{
+							Type: "object",
+							Properties: map[string]apiextensions.JSONSchemaProps{
+								"field1": {
+									Type:   "string",
+									Format: "date-time",
+								},
+							},
+						},
+					},
+				})
+			}),
+			newCRD: mkCRD(func(spec *apiextensions.CustomResourceDefinitionSpec) {
+				spec.Versions = append(spec.Versions, apiextensions.CustomResourceDefinitionVersion{
+					Name:    "v1",
+					Served:  true,
+					Storage: true,
+					Schema: &apiextensions.CustomResourceValidation{
+						OpenAPIV3Schema: &apiextensions.JSONSchemaProps{
+							Type: "object",
+							Properties: map[string]apiextensions.JSONSchemaProps{
+								"field1": {
+									Type:   "string",
+									Format: "unknownformat1",
+								},
+								"field2": {
+									Type:   "string",
+									Format: "unknownformat2",
+								},
+							},
+						},
+					},
+				})
+			}),
+		},
+		"pre-existing listType=set on object items does not warn on update": {
+			wantWarningMessages: []string{},
+			oldCRD:              mkCRD(withListTypeSetItems("object", "endpoints")),
+			newCRD:              mkCRD(withListTypeSetItems("object", "endpoints")),
+		},
+		"newly introduced listType=set on array items warns": {
+			wantWarningMessages: []string{
+				`x-kubernetes-list-type: set for items of type "array" is not supported by server-side apply or CEL validation rules`,
+			},
+			oldCRD: mkCRD(withListTypeSetItems("object", "endpoints")),
+			newCRD: mkCRD(withListTypeSetItems("object", "endpoints"), withListTypeSetItems("array", "cidrGroups")),
+		},
+	}
+
+	for name, tc := range testcases {
+		t.Run(name, func(t *testing.T) {
+			gotWarnings := strategy.WarningsOnUpdate(ctx, tc.newCRD, tc.oldCRD)
+			if len(gotWarnings) != len(tc.wantWarningMessages) {
+				t.Errorf("got %d warnings but expected %d", len(gotWarnings), len(tc.wantWarningMessages))
+				return
+			}
+
+			// Sort gotWarnings to match expected order
+			sort.Strings(gotWarnings)
+
+			for i, expectedMessage := range tc.wantWarningMessages {
+				if gotWarnings[i] != expectedMessage {
+					t.Errorf("warning %d: got %s, expected %s", i, gotWarnings[i], expectedMessage)
+				}
+			}
 		})
 	}
 }

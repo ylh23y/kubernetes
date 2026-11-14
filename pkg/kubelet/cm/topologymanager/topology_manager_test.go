@@ -17,54 +17,191 @@ limitations under the License.
 package topologymanager
 
 import (
+	"context"
 	"fmt"
-	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 
-	"k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/kubernetes/pkg/kubelet/cm/topologymanager/socketmask"
+	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	featuregatetesting "k8s.io/component-base/featuregate/testing"
+	"k8s.io/klog/v2"
+
+	cadvisorapi "github.com/google/cadvisor/lib/model"
+
+	"k8s.io/ktesting"
+	"k8s.io/kubernetes/pkg/features"
+	"k8s.io/kubernetes/pkg/kubelet/cm/topologymanager/bitmask"
 	"k8s.io/kubernetes/pkg/kubelet/lifecycle"
 )
 
-func NewTestSocketMask(sockets ...int) socketmask.SocketMask {
-	s, _ := socketmask.NewSocketMask(sockets...)
-	return s
-}
-
-func NewTestSocketMaskFull() socketmask.SocketMask {
-	s, _ := socketmask.NewSocketMask()
-	s.Fill()
+func NewTestBitMask(sockets ...int) bitmask.BitMask {
+	s, _ := bitmask.NewBitMask(sockets...)
 	return s
 }
 
 func TestNewManager(t *testing.T) {
+	logger, _ := ktesting.NewTestContext(t)
+	numaDistanceErr := "error getting NUMA distances from cadvisor"
+	if runtime.GOOS == "windows" {
+		numaDistanceErr = fmt.Sprintf("the %q policy option is not supported on Windows because NUMA node distances are not available", PreferClosestNUMANodes)
+	}
+
 	tcases := []struct {
 		description    string
 		policyName     string
 		expectedPolicy string
 		expectedError  error
+		topologyError  error
+		policyOptions  map[string]string
+		topology       []cadvisorapi.Node
 	}{
+		{
+			description:    "Policy is set to none",
+			policyName:     "none",
+			expectedPolicy: "none",
+		},
 		{
 			description:    "Policy is set to best-effort",
 			policyName:     "best-effort",
 			expectedPolicy: "best-effort",
 		},
 		{
-			description:    "Policy is set to strict",
-			policyName:     "strict",
-			expectedPolicy: "strict",
+			description:    "Policy is set to restricted",
+			policyName:     "restricted",
+			expectedPolicy: "restricted",
+		},
+		{
+			description:    "Policy is set to single-numa-node",
+			policyName:     "single-numa-node",
+			expectedPolicy: "single-numa-node",
 		},
 		{
 			description:   "Policy is set to unknown",
 			policyName:    "unknown",
 			expectedError: fmt.Errorf("unknown policy: \"unknown\""),
 		},
+		{
+			description:    "Unknown policy name best-effort policy",
+			policyName:     "best-effort",
+			expectedPolicy: "best-effort",
+			expectedError:  fmt.Errorf("unknown Topology Manager Policy option:"),
+			policyOptions: map[string]string{
+				"unknown-option": "true",
+			},
+		},
+		{
+			description:    "Unknown policy name restricted policy",
+			policyName:     "restricted",
+			expectedPolicy: "restricted",
+			expectedError:  fmt.Errorf("unknown Topology Manager Policy option:"),
+			policyOptions: map[string]string{
+				"unknown-option": "true",
+			},
+		},
+		{
+			description:    "can't get NUMA distances",
+			policyName:     "best-effort",
+			expectedPolicy: "best-effort",
+			policyOptions: map[string]string{
+				PreferClosestNUMANodes: "true",
+			},
+			expectedError: fmt.Errorf("%s", numaDistanceErr),
+			topology: []cadvisorapi.Node{
+				{
+					Id: 0,
+				},
+			},
+		},
+		{
+			description:    "more than 8 NUMA nodes",
+			policyName:     "best-effort",
+			expectedPolicy: "best-effort",
+			expectedError:  fmt.Errorf("unsupported on machines with more than %v NUMA Nodes", defaultMaxAllowableNUMANodes),
+			topology: []cadvisorapi.Node{
+				{
+					Id: 0,
+				},
+				{
+					Id: 1,
+				},
+				{
+					Id: 2,
+				},
+				{
+					Id: 3,
+				},
+				{
+					Id: 4,
+				},
+				{
+					Id: 5,
+				},
+				{
+					Id: 6,
+				},
+				{
+					Id: 7,
+				},
+				{
+					Id: 8,
+				},
+			},
+		},
 	}
 
 	for _, tc := range tcases {
-		mngr, err := NewManager(tc.policyName)
+		topology := tc.topology
+
+		mngr, err := NewManager(logger, topology, tc.policyName, "container", tc.policyOptions)
+		if tc.expectedError != nil {
+			if !strings.Contains(err.Error(), tc.expectedError.Error()) {
+				t.Errorf("Unexpected error message. Have: %s wants %s", err.Error(), tc.expectedError.Error())
+			}
+		} else {
+			rawMgr := mngr.(*manager)
+			var policyName string
+			if rawScope, ok := rawMgr.scope.(*containerScope); ok {
+				policyName = rawScope.policy.Name()
+			} else if rawScope, ok := rawMgr.scope.(*noneScope); ok {
+				policyName = rawScope.policy.Name()
+			}
+			if policyName != tc.expectedPolicy {
+				t.Errorf("Unexpected policy name. Have: %q wants %q", policyName, tc.expectedPolicy)
+			}
+		}
+	}
+}
+
+func TestManagerScope(t *testing.T) {
+	logger, _ := ktesting.NewTestContext(t)
+	tcases := []struct {
+		description   string
+		scopeName     string
+		expectedScope string
+		expectedError error
+	}{
+		{
+			description:   "Topology Manager Scope is set to container",
+			scopeName:     "container",
+			expectedScope: "container",
+		},
+		{
+			description:   "Topology Manager Scope is set to pod",
+			scopeName:     "pod",
+			expectedScope: "pod",
+		},
+		{
+			description:   "Topology Manager Scope is set to unknown",
+			scopeName:     "unknown",
+			expectedError: fmt.Errorf("unknown scope: \"unknown\""),
+		},
+	}
+
+	for _, tc := range tcases {
+		mngr, err := NewManager(logger, nil, "best-effort", tc.scopeName, nil)
 
 		if tc.expectedError != nil {
 			if !strings.Contains(err.Error(), tc.expectedError.Error()) {
@@ -72,560 +209,63 @@ func TestNewManager(t *testing.T) {
 			}
 		} else {
 			rawMgr := mngr.(*manager)
-			if rawMgr.policy.Name() != tc.expectedPolicy {
-				t.Errorf("Unexpected policy name. Have: %q wants %q", rawMgr.policy.Name(), tc.expectedPolicy)
+			if rawMgr.scope.Name() != tc.expectedScope {
+				t.Errorf("Unexpected scope name. Have: %q wants %q", rawMgr.scope, tc.expectedScope)
 			}
 		}
 	}
+}
+
+// mockAdmissionError represents the reason why allocation was rejected
+type mockAdmissionError struct {
+	reason        string
+	rejectionType lifecycle.RejectionType
+}
+
+func (e *mockAdmissionError) Error() string {
+	return ""
+}
+
+func (e *mockAdmissionError) Type() string {
+	return e.reason
+}
+
+func (e *mockAdmissionError) RejectionType() lifecycle.RejectionType {
+	return e.rejectionType
 }
 
 type mockHintProvider struct {
-	th []TopologyHint
+	th            map[string][]TopologyHint
+	allocateError error
 }
 
-func (m *mockHintProvider) GetTopologyHints(pod v1.Pod, container v1.Container) []TopologyHint {
+func (m *mockHintProvider) GetTopologyHints(_ klog.Logger, _ *v1.Pod, _ *v1.Container, _ lifecycle.Operation) map[string][]TopologyHint {
 	return m.th
 }
 
-func TestGetAffinity(t *testing.T) {
-	tcases := []struct {
-		name          string
-		containerName string
-		podUID        string
-		expected      TopologyHint
-	}{
-		{
-			name:          "case1",
-			containerName: "nginx",
-			podUID:        "0aafa4c4-38e8-11e9-bcb1-a4bf01040474",
-			expected:      TopologyHint{},
-		},
-	}
-	for _, tc := range tcases {
-		mngr := manager{}
-		actual := mngr.GetAffinity(tc.podUID, tc.containerName)
-		if !reflect.DeepEqual(actual, tc.expected) {
-			t.Errorf("Expected Affinity in result to be %v, got %v", tc.expected, actual)
-		}
-	}
+func (m *mockHintProvider) GetPodTopologyHints(_ klog.Logger, _ *v1.Pod, _ lifecycle.Operation) map[string][]TopologyHint {
+	return m.th
 }
 
-func TestCalculateAffinity(t *testing.T) {
-	tcases := []struct {
-		name     string
-		hp       []HintProvider
-		expected TopologyHint
-	}{
-		{
-			name: "TopologyHint not set",
-			hp:   []HintProvider{},
-			expected: TopologyHint{
-				SocketAffinity: NewTestSocketMaskFull(),
-				Preferred:      true,
-			},
-		},
-		{
-			name: "HintProvider returns empty non-nil []TopologyHint",
-			hp: []HintProvider{
-				&mockHintProvider{
-					[]TopologyHint{},
-				},
-			},
-			expected: TopologyHint{
-				SocketAffinity: NewTestSocketMaskFull(),
-				Preferred:      true,
-			},
-		},
-
-		{
-			name: "Single TopologyHint with Preferred as true and SocketAffinity as nil",
-			hp: []HintProvider{
-				&mockHintProvider{
-					[]TopologyHint{
-						{
-							SocketAffinity: nil,
-							Preferred:      true,
-						},
-					},
-				},
-			},
-			expected: TopologyHint{
-				SocketAffinity: NewTestSocketMaskFull(),
-				Preferred:      true,
-			},
-		},
-		{
-			name: "Single TopologyHint with Preferred as false and SocketAffinity as nil",
-			hp: []HintProvider{
-				&mockHintProvider{
-					[]TopologyHint{
-						{
-							SocketAffinity: nil,
-							Preferred:      false,
-						},
-					},
-				},
-			},
-			expected: TopologyHint{
-				SocketAffinity: NewTestSocketMaskFull(),
-				Preferred:      true,
-			},
-		},
-		{
-			name: "Two providers, 1 hint each, same mask, both preferred 1/2",
-			hp: []HintProvider{
-				&mockHintProvider{
-					[]TopologyHint{
-						{
-							SocketAffinity: NewTestSocketMask(0),
-							Preferred:      true,
-						},
-					},
-				},
-				&mockHintProvider{
-					[]TopologyHint{
-						{
-							SocketAffinity: NewTestSocketMask(0),
-							Preferred:      true,
-						},
-					},
-				},
-			},
-			expected: TopologyHint{
-				SocketAffinity: NewTestSocketMask(0),
-				Preferred:      true,
-			},
-		},
-		{
-			name: "Two providers, 1 hint each, same mask, both preferred 2/2",
-			hp: []HintProvider{
-				&mockHintProvider{
-					[]TopologyHint{
-						{
-							SocketAffinity: NewTestSocketMask(1),
-							Preferred:      true,
-						},
-					},
-				},
-				&mockHintProvider{
-					[]TopologyHint{
-						{
-							SocketAffinity: NewTestSocketMask(1),
-							Preferred:      true,
-						},
-					},
-				},
-			},
-			expected: TopologyHint{
-				SocketAffinity: NewTestSocketMask(1),
-				Preferred:      true,
-			},
-		},
-		{
-			name: "Two providers, 1 hint each, 1 wider mask, both preferred 1/2",
-			hp: []HintProvider{
-				&mockHintProvider{
-					[]TopologyHint{
-						{
-							SocketAffinity: NewTestSocketMask(0),
-							Preferred:      true,
-						},
-					},
-				},
-				&mockHintProvider{
-					[]TopologyHint{
-						{
-							SocketAffinity: NewTestSocketMask(0, 1),
-							Preferred:      true,
-						},
-					},
-				},
-			},
-			expected: TopologyHint{
-				SocketAffinity: NewTestSocketMask(0),
-				Preferred:      true,
-			},
-		},
-		{
-			name: "Two providers, 1 hint each, 1 wider mask, both preferred 1/2",
-			hp: []HintProvider{
-				&mockHintProvider{
-					[]TopologyHint{
-						{
-							SocketAffinity: NewTestSocketMask(1),
-							Preferred:      true,
-						},
-					},
-				},
-				&mockHintProvider{
-					[]TopologyHint{
-						{
-							SocketAffinity: NewTestSocketMask(0, 1),
-							Preferred:      true,
-						},
-					},
-				},
-			},
-			expected: TopologyHint{
-				SocketAffinity: NewTestSocketMask(1),
-				Preferred:      true,
-			},
-		},
-		{
-			name: "Two providers, 1 hint each, no common mask",
-			hp: []HintProvider{
-				&mockHintProvider{
-					[]TopologyHint{
-						{
-							SocketAffinity: NewTestSocketMask(0),
-							Preferred:      true,
-						},
-					},
-				},
-				&mockHintProvider{
-					[]TopologyHint{
-						{
-							SocketAffinity: NewTestSocketMask(1),
-							Preferred:      true,
-						},
-					},
-				},
-			},
-			expected: TopologyHint{
-				SocketAffinity: NewTestSocketMaskFull(),
-				Preferred:      false,
-			},
-		},
-		{
-			name: "Two providers, 1 hint each, same mask, 1 preferred, 1 not 1/2",
-			hp: []HintProvider{
-				&mockHintProvider{
-					[]TopologyHint{
-						{
-							SocketAffinity: NewTestSocketMask(0),
-							Preferred:      true,
-						},
-					},
-				},
-				&mockHintProvider{
-					[]TopologyHint{
-						{
-							SocketAffinity: NewTestSocketMask(0),
-							Preferred:      false,
-						},
-					},
-				},
-			},
-			expected: TopologyHint{
-				SocketAffinity: NewTestSocketMask(0),
-				Preferred:      false,
-			},
-		},
-		{
-			name: "Two providers, 1 hint each, same mask, 1 preferred, 1 not 2/2",
-			hp: []HintProvider{
-				&mockHintProvider{
-					[]TopologyHint{
-						{
-							SocketAffinity: NewTestSocketMask(1),
-							Preferred:      true,
-						},
-					},
-				},
-				&mockHintProvider{
-					[]TopologyHint{
-						{
-							SocketAffinity: NewTestSocketMask(1),
-							Preferred:      false,
-						},
-					},
-				},
-			},
-			expected: TopologyHint{
-				SocketAffinity: NewTestSocketMask(1),
-				Preferred:      false,
-			},
-		},
-		{
-			name: "Two providers, 1 no hints, 1 single hint preferred 1/2",
-			hp: []HintProvider{
-				&mockHintProvider{},
-				&mockHintProvider{
-					[]TopologyHint{
-						{
-							SocketAffinity: NewTestSocketMask(0),
-							Preferred:      true,
-						},
-					},
-				},
-			},
-			expected: TopologyHint{
-				SocketAffinity: NewTestSocketMask(0),
-				Preferred:      true,
-			},
-		},
-		{
-			name: "Two providers, 1 no hints, 1 single hint preferred 2/2",
-			hp: []HintProvider{
-				&mockHintProvider{},
-				&mockHintProvider{
-					[]TopologyHint{
-						{
-							SocketAffinity: NewTestSocketMask(1),
-							Preferred:      true,
-						},
-					},
-				},
-			},
-			expected: TopologyHint{
-				SocketAffinity: NewTestSocketMask(1),
-				Preferred:      true,
-			},
-		},
-		{
-			name: "Two providers, 1 with 2 hints, 1 with single hint matching 1/2",
-			hp: []HintProvider{
-				&mockHintProvider{
-					[]TopologyHint{
-						{
-							SocketAffinity: NewTestSocketMask(0),
-							Preferred:      true,
-						},
-						{
-							SocketAffinity: NewTestSocketMask(1),
-							Preferred:      true,
-						},
-					},
-				},
-				&mockHintProvider{
-					[]TopologyHint{
-						{
-							SocketAffinity: NewTestSocketMask(0),
-							Preferred:      true,
-						},
-					},
-				},
-			},
-			expected: TopologyHint{
-				SocketAffinity: NewTestSocketMask(0),
-				Preferred:      true,
-			},
-		},
-		{
-			name: "Two providers, 1 with 2 hints, 1 with single hint matching 2/2",
-			hp: []HintProvider{
-				&mockHintProvider{
-					[]TopologyHint{
-						{
-							SocketAffinity: NewTestSocketMask(0),
-							Preferred:      true,
-						},
-						{
-							SocketAffinity: NewTestSocketMask(1),
-							Preferred:      true,
-						},
-					},
-				},
-				&mockHintProvider{
-					[]TopologyHint{
-						{
-							SocketAffinity: NewTestSocketMask(1),
-							Preferred:      true,
-						},
-					},
-				},
-			},
-			expected: TopologyHint{
-				SocketAffinity: NewTestSocketMask(1),
-				Preferred:      true,
-			},
-		},
-		{
-			name: "Two providers, 1 with 2 hints, 1 with single non-preferred hint matching",
-			hp: []HintProvider{
-				&mockHintProvider{
-					[]TopologyHint{
-						{
-							SocketAffinity: NewTestSocketMask(0),
-							Preferred:      true,
-						},
-						{
-							SocketAffinity: NewTestSocketMask(1),
-							Preferred:      true,
-						},
-					},
-				},
-				&mockHintProvider{
-					[]TopologyHint{
-						{
-							SocketAffinity: NewTestSocketMask(0, 1),
-							Preferred:      false,
-						},
-					},
-				},
-			},
-			expected: TopologyHint{
-				SocketAffinity: NewTestSocketMask(0),
-				Preferred:      false,
-			},
-		},
-		{
-			name: "Two providers, both with 2 hints, matching narrower preferred hint from both",
-			hp: []HintProvider{
-				&mockHintProvider{
-					[]TopologyHint{
-						{
-							SocketAffinity: NewTestSocketMask(0),
-							Preferred:      true,
-						},
-						{
-							SocketAffinity: NewTestSocketMask(1),
-							Preferred:      true,
-						},
-					},
-				},
-				&mockHintProvider{
-					[]TopologyHint{
-						{
-							SocketAffinity: NewTestSocketMask(0),
-							Preferred:      true,
-						},
-						{
-							SocketAffinity: NewTestSocketMask(0, 1),
-							Preferred:      false,
-						},
-					},
-				},
-			},
-			expected: TopologyHint{
-				SocketAffinity: NewTestSocketMask(0),
-				Preferred:      true,
-			},
-		},
-		{
-			name: "Ensure less narrow preferred hints are chosen over narrower non-preferred hints",
-			hp: []HintProvider{
-				&mockHintProvider{
-					[]TopologyHint{
-						{
-							SocketAffinity: NewTestSocketMask(1),
-							Preferred:      true,
-						},
-						{
-							SocketAffinity: NewTestSocketMask(0, 1),
-							Preferred:      false,
-						},
-					},
-				},
-				&mockHintProvider{
-					[]TopologyHint{
-						{
-							SocketAffinity: NewTestSocketMask(0),
-							Preferred:      true,
-						},
-						{
-							SocketAffinity: NewTestSocketMask(1),
-							Preferred:      true,
-						},
-						{
-							SocketAffinity: NewTestSocketMask(0, 1),
-							Preferred:      false,
-						},
-					},
-				},
-			},
-			expected: TopologyHint{
-				SocketAffinity: NewTestSocketMask(1),
-				Preferred:      true,
-			},
-		},
-	}
-
-	for _, tc := range tcases {
-		mngr := manager{}
-		mngr.hintProviders = tc.hp
-		actual := mngr.calculateAffinity(v1.Pod{}, v1.Container{})
-		if !actual.SocketAffinity.IsEqual(tc.expected.SocketAffinity) {
-			t.Errorf("Expected SocketAffinity in result to be %v, got %v", tc.expected.SocketAffinity, actual.SocketAffinity)
-		}
-		if actual.Preferred != tc.expected.Preferred {
-			t.Errorf("Expected Affinity preference in result to be %v, got %v", tc.expected.Preferred, actual.Preferred)
-		}
-	}
+func (m *mockHintProvider) AllocatePod(_ klog.Logger, _ *v1.Pod, _ lifecycle.Operation) error {
+	return nil
 }
 
-func TestAddContainer(t *testing.T) {
-	testCases := []struct {
-		name        string
-		containerID string
-		podUID      types.UID
-	}{
-		{
-			name:        "Case1",
-			containerID: "nginx",
-			podUID:      "0aafa4c4-38e8-11e9-bcb1-a4bf01040474",
-		},
-		{
-			name:        "Case2",
-			containerID: "Busy_Box",
-			podUID:      "b3ee37fc-39a5-11e9-bcb1-a4bf01040474",
-		},
-	}
-	mngr := manager{}
-	mngr.podMap = make(map[string]string)
-	for _, tc := range testCases {
-		pod := v1.Pod{}
-		pod.UID = tc.podUID
-		err := mngr.AddContainer(&pod, tc.containerID)
-		if err != nil {
-			t.Errorf("Expected error to be nil but got: %v", err)
-		}
-		if val, ok := mngr.podMap[tc.containerID]; ok {
-			if reflect.DeepEqual(val, pod.UID) {
-				t.Errorf("Error occurred")
-			}
-		} else {
-			t.Errorf("Error occurred, Pod not added to podMap")
-		}
-	}
+func (m *mockHintProvider) Allocate(_ context.Context, _ *v1.Pod, _ *v1.Container, _ lifecycle.Operation) error {
+	return m.allocateError
 }
 
-func TestRemoveContainer(t *testing.T) {
-	testCases := []struct {
-		name        string
-		containerID string
-		podUID      types.UID
-	}{
-		{
-			name:        "Case1",
-			containerID: "nginx",
-			podUID:      "0aafa4c4-38e8-11e9-bcb1-a4bf01040474",
-		},
-		{
-			name:        "Case2",
-			containerID: "Busy_Box",
-			podUID:      "b3ee37fc-39a5-11e9-bcb1-a4bf01040474",
-		},
-	}
-	var len1, len2 int
-	mngr := manager{}
-	mngr.podMap = make(map[string]string)
-	for _, tc := range testCases {
-		mngr.podMap[tc.containerID] = string(tc.podUID)
-		len1 = len(mngr.podMap)
-		err := mngr.RemoveContainer(tc.containerID)
-		len2 = len(mngr.podMap)
-		if err != nil {
-			t.Errorf("Expected error to be nil but got: %v", err)
-		}
-		if len1-len2 != 1 {
-			t.Errorf("Remove Pod resulted in error")
-		}
-	}
-
+type mockPolicy struct {
+	nonePolicy
+	ph []map[string][]TopologyHint
 }
+
+func (p *mockPolicy) Merge(_ klog.Logger, providersHints []map[string][]TopologyHint) (TopologyHint, bool) {
+	p.ph = providersHints
+	return TopologyHint{}, true
+}
+
 func TestAddHintProvider(t *testing.T) {
-	var len1 int
 	tcases := []struct {
 		name string
 		hp   []HintProvider
@@ -634,29 +274,47 @@ func TestAddHintProvider(t *testing.T) {
 			name: "Add HintProvider",
 			hp: []HintProvider{
 				&mockHintProvider{},
+				&mockHintProvider{},
+				&mockHintProvider{},
 			},
 		},
 	}
 	mngr := manager{}
+	mngr.scope = NewContainerScope(NewNonePolicy())
+	logger, _ := ktesting.NewTestContext(t)
 	for _, tc := range tcases {
-		mngr.hintProviders = []HintProvider{}
-		len1 = len(mngr.hintProviders)
-		mngr.AddHintProvider(tc.hp[0])
-	}
-	len2 := len(mngr.hintProviders)
-	if len2-len1 != 1 {
-		t.Errorf("error")
+		for _, hp := range tc.hp {
+			mngr.AddHintProvider(logger, hp)
+		}
+		if len(tc.hp) != len(mngr.scope.(*containerScope).hintProviders) {
+			t.Errorf("error")
+		}
 	}
 }
 
 func TestAdmit(t *testing.T) {
+	numaInfo := &NUMAInfo{
+		Nodes: []int{0, 1},
+		NUMADistances: NUMADistances{
+			0: {10, 11},
+			1: {11, 10},
+		},
+	}
+
+	opts := PolicyOptions{}
+	bePolicy := NewBestEffortPolicy(numaInfo, opts)
+	restrictedPolicy := NewRestrictedPolicy(numaInfo, opts)
+	singleNumaPolicy := NewSingleNumaNodePolicy(numaInfo, opts)
+
 	tcases := []struct {
-		name     string
-		result   lifecycle.PodAdmitResult
-		qosClass v1.PodQOSClass
-		policy   Policy
-		hp       []HintProvider
-		expected bool
+		name                  string
+		result                lifecycle.PodAdmitResult
+		qosClass              v1.PodQOSClass
+		policy                Policy
+		hp                    []HintProvider
+		expected              bool
+		expectedReason        string
+		expectedRejectionType lifecycle.RejectionType
 	}{
 		{
 			name:     "QOSClass set as BestEffort. None Policy. No Hints.",
@@ -673,19 +331,39 @@ func TestAdmit(t *testing.T) {
 			expected: true,
 		},
 		{
+			name:     "QOSClass set as BestEffort. single-numa-node Policy. No Hints.",
+			qosClass: v1.PodQOSBestEffort,
+			policy:   singleNumaPolicy,
+			hp: []HintProvider{
+				&mockHintProvider{},
+			},
+			expected: true,
+		},
+		{
+			name:     "QOSClass set as BestEffort. Restricted Policy. No Hints.",
+			qosClass: v1.PodQOSBestEffort,
+			policy:   restrictedPolicy,
+			hp: []HintProvider{
+				&mockHintProvider{},
+			},
+			expected: true,
+		},
+		{
 			name:     "QOSClass set as Guaranteed. BestEffort Policy. Preferred Affinity.",
 			qosClass: v1.PodQOSGuaranteed,
-			policy:   NewBestEffortPolicy(),
+			policy:   bePolicy,
 			hp: []HintProvider{
 				&mockHintProvider{
-					[]TopologyHint{
-						{
-							SocketAffinity: NewTestSocketMask(0),
-							Preferred:      true,
-						},
-						{
-							SocketAffinity: NewTestSocketMask(0, 1),
-							Preferred:      false,
+					th: map[string][]TopologyHint{
+						"resource": {
+							{
+								NUMANodeAffinity: NewTestBitMask(0),
+								Preferred:        true,
+							},
+							{
+								NUMANodeAffinity: NewTestBitMask(0, 1),
+								Preferred:        false,
+							},
 						},
 					},
 				},
@@ -695,21 +373,49 @@ func TestAdmit(t *testing.T) {
 		{
 			name:     "QOSClass set as Guaranteed. BestEffort Policy. More than one Preferred Affinity.",
 			qosClass: v1.PodQOSGuaranteed,
-			policy:   NewBestEffortPolicy(),
+			policy:   bePolicy,
 			hp: []HintProvider{
 				&mockHintProvider{
-					[]TopologyHint{
-						{
-							SocketAffinity: NewTestSocketMask(0),
-							Preferred:      true,
+					th: map[string][]TopologyHint{
+						"resource": {
+							{
+								NUMANodeAffinity: NewTestBitMask(0),
+								Preferred:        true,
+							},
+							{
+								NUMANodeAffinity: NewTestBitMask(1),
+								Preferred:        true,
+							},
+							{
+								NUMANodeAffinity: NewTestBitMask(0, 1),
+								Preferred:        false,
+							},
 						},
-						{
-							SocketAffinity: NewTestSocketMask(1),
-							Preferred:      true,
-						},
-						{
-							SocketAffinity: NewTestSocketMask(0, 1),
-							Preferred:      false,
+					},
+				},
+			},
+			expected: true,
+		},
+		{
+			name:     "QOSClass set as Burstable. BestEffort Policy. More than one Preferred Affinity.",
+			qosClass: v1.PodQOSBurstable,
+			policy:   bePolicy,
+			hp: []HintProvider{
+				&mockHintProvider{
+					th: map[string][]TopologyHint{
+						"resource": {
+							{
+								NUMANodeAffinity: NewTestBitMask(0),
+								Preferred:        true,
+							},
+							{
+								NUMANodeAffinity: NewTestBitMask(1),
+								Preferred:        true,
+							},
+							{
+								NUMANodeAffinity: NewTestBitMask(0, 1),
+								Preferred:        false,
+							},
 						},
 					},
 				},
@@ -719,13 +425,15 @@ func TestAdmit(t *testing.T) {
 		{
 			name:     "QOSClass set as Guaranteed. BestEffort Policy. No Preferred Affinity.",
 			qosClass: v1.PodQOSGuaranteed,
-			policy:   NewBestEffortPolicy(),
+			policy:   bePolicy,
 			hp: []HintProvider{
 				&mockHintProvider{
-					[]TopologyHint{
-						{
-							SocketAffinity: NewTestSocketMask(0, 1),
-							Preferred:      false,
+					th: map[string][]TopologyHint{
+						"resource": {
+							{
+								NUMANodeAffinity: NewTestBitMask(0, 1),
+								Preferred:        false,
+							},
 						},
 					},
 				},
@@ -733,19 +441,21 @@ func TestAdmit(t *testing.T) {
 			expected: true,
 		},
 		{
-			name:     "QOSClass set as Guaranteed. Strict Policy. Preferred Affinity.",
+			name:     "QOSClass set as Guaranteed. Restricted Policy. Preferred Affinity.",
 			qosClass: v1.PodQOSGuaranteed,
-			policy:   NewStrictPolicy(),
+			policy:   restrictedPolicy,
 			hp: []HintProvider{
 				&mockHintProvider{
-					[]TopologyHint{
-						{
-							SocketAffinity: NewTestSocketMask(0),
-							Preferred:      true,
-						},
-						{
-							SocketAffinity: NewTestSocketMask(0, 1),
-							Preferred:      false,
+					th: map[string][]TopologyHint{
+						"resource": {
+							{
+								NUMANodeAffinity: NewTestBitMask(0),
+								Preferred:        true,
+							},
+							{
+								NUMANodeAffinity: NewTestBitMask(0, 1),
+								Preferred:        false,
+							},
 						},
 					},
 				},
@@ -753,23 +463,21 @@ func TestAdmit(t *testing.T) {
 			expected: true,
 		},
 		{
-			name:     "QOSClass set as Guaranteed. Strict Policy. More than one Preferred affinity.",
-			qosClass: v1.PodQOSGuaranteed,
-			policy:   NewStrictPolicy(),
+			name:     "QOSClass set as Burstable. Restricted Policy. Preferred Affinity.",
+			qosClass: v1.PodQOSBurstable,
+			policy:   restrictedPolicy,
 			hp: []HintProvider{
 				&mockHintProvider{
-					[]TopologyHint{
-						{
-							SocketAffinity: NewTestSocketMask(0),
-							Preferred:      true,
-						},
-						{
-							SocketAffinity: NewTestSocketMask(1),
-							Preferred:      true,
-						},
-						{
-							SocketAffinity: NewTestSocketMask(0, 1),
-							Preferred:      false,
+					th: map[string][]TopologyHint{
+						"resource": {
+							{
+								NUMANodeAffinity: NewTestBitMask(0),
+								Preferred:        true,
+							},
+							{
+								NUMANodeAffinity: NewTestBitMask(0, 1),
+								Preferred:        false,
+							},
 						},
 					},
 				},
@@ -777,42 +485,456 @@ func TestAdmit(t *testing.T) {
 			expected: true,
 		},
 		{
-			name:     "QOSClass set as Guaranteed. Strict Policy. No Preferred affinity.",
+			name:     "QOSClass set as Guaranteed. Restricted Policy. More than one Preferred affinity.",
 			qosClass: v1.PodQOSGuaranteed,
-			policy:   NewStrictPolicy(),
+			policy:   restrictedPolicy,
 			hp: []HintProvider{
 				&mockHintProvider{
-					[]TopologyHint{
-						{
-							SocketAffinity: NewTestSocketMask(0, 1),
-							Preferred:      false,
+					th: map[string][]TopologyHint{
+						"resource": {
+							{
+								NUMANodeAffinity: NewTestBitMask(0),
+								Preferred:        true,
+							},
+							{
+								NUMANodeAffinity: NewTestBitMask(1),
+								Preferred:        true,
+							},
+							{
+								NUMANodeAffinity: NewTestBitMask(0, 1),
+								Preferred:        false,
+							},
 						},
 					},
 				},
 			},
-			expected: false,
+			expected: true,
+		},
+		{
+			name:     "QOSClass set as Burstable. Restricted Policy. More than one Preferred affinity.",
+			qosClass: v1.PodQOSBurstable,
+			policy:   restrictedPolicy,
+			hp: []HintProvider{
+				&mockHintProvider{
+					th: map[string][]TopologyHint{
+						"resource": {
+							{
+								NUMANodeAffinity: NewTestBitMask(0),
+								Preferred:        true,
+							},
+							{
+								NUMANodeAffinity: NewTestBitMask(1),
+								Preferred:        true,
+							},
+							{
+								NUMANodeAffinity: NewTestBitMask(0, 1),
+								Preferred:        false,
+							},
+						},
+					},
+				},
+			},
+			expected: true,
+		},
+		{
+			name:     "QOSClass set as Guaranteed. Restricted Policy. No Preferred affinity.",
+			qosClass: v1.PodQOSGuaranteed,
+			policy:   restrictedPolicy,
+			hp: []HintProvider{
+				&mockHintProvider{
+					th: map[string][]TopologyHint{
+						"resource": {
+							{
+								NUMANodeAffinity: NewTestBitMask(0, 1),
+								Preferred:        false,
+							},
+						},
+					},
+				},
+			},
+			expected:              false,
+			expectedReason:        ErrorTopologyAffinity,
+			expectedRejectionType: lifecycle.RejectionBlocked,
+		},
+		{
+			name:     "QOSClass set as Burstable. Restricted Policy. No Preferred affinity.",
+			qosClass: v1.PodQOSBurstable,
+			policy:   restrictedPolicy,
+			hp: []HintProvider{
+				&mockHintProvider{
+					th: map[string][]TopologyHint{
+						"resource": {
+							{
+								NUMANodeAffinity: NewTestBitMask(0, 1),
+								Preferred:        false,
+							},
+						},
+					},
+				},
+			},
+			expected:              false,
+			expectedReason:        ErrorTopologyAffinity,
+			expectedRejectionType: lifecycle.RejectionBlocked,
+		},
+		{
+			name:     "QOSClass set as Guaranteed. single-numa-node Policy. Allocation rejected by the HintProvider",
+			qosClass: v1.PodQOSGuaranteed,
+			policy:   singleNumaPolicy,
+			hp: []HintProvider{
+				&mockHintProvider{
+					th: map[string][]TopologyHint{
+						"resource": {
+							{
+								NUMANodeAffinity: NewTestBitMask(0),
+								Preferred:        true,
+							},
+						},
+					},
+					allocateError: &mockAdmissionError{reason: "SMTAlignmentError", rejectionType: lifecycle.RejectionInfeasible},
+				},
+			},
+			expected:              false,
+			expectedReason:        "SMTAlignmentError",
+			expectedRejectionType: lifecycle.RejectionInfeasible,
+		},
+		{
+			name:     "QOSClass set as Guaranteed. BestEffort Policy. Allocation rejected by the 2nd HintProvider",
+			qosClass: v1.PodQOSGuaranteed,
+			policy:   bePolicy,
+			hp: []HintProvider{
+				&mockHintProvider{
+					th: map[string][]TopologyHint{
+						"resource": {
+							{
+								NUMANodeAffinity: NewTestBitMask(0, 1),
+								Preferred:        false,
+							},
+						},
+					},
+				},
+				&mockHintProvider{
+					th: map[string][]TopologyHint{
+						"resource": {
+							{
+								NUMANodeAffinity: NewTestBitMask(0, 1),
+								Preferred:        false,
+							},
+						},
+					},
+					allocateError: &mockAdmissionError{reason: "OutOfCpu", rejectionType: lifecycle.RejectionBlocked},
+				},
+			},
+			expected:              false,
+			expectedReason:        "OutOfCpu",
+			expectedRejectionType: lifecycle.RejectionBlocked,
+		},
+		{
+			name:     "QOSClass set as Burstable. single-numa-node Policy. Preferred affinity on two NUMA nodes",
+			qosClass: v1.PodQOSBurstable,
+			policy:   singleNumaPolicy,
+			hp: []HintProvider{
+				&mockHintProvider{
+					th: map[string][]TopologyHint{
+						"resource": {
+							{
+								NUMANodeAffinity: NewTestBitMask(0, 1),
+								Preferred:        true,
+							},
+						},
+					},
+					allocateError: &mockAdmissionError{reason: "UnexpectedAdmissionError"},
+				},
+			},
+			expected:              false,
+			expectedReason:        ErrorTopologyAffinity,
+			expectedRejectionType: lifecycle.RejectionBlocked,
 		},
 	}
 	for _, tc := range tcases {
-		man := manager{}
-		man.policy = tc.policy
-		man.podTopologyHints = make(map[string]map[string]TopologyHint)
-		man.hintProviders = tc.hp
-		pod := &v1.Pod{
-			Spec: v1.PodSpec{
-				Containers: []v1.Container{
-					{
-						Resources: v1.ResourceRequirements{},
+		t.Run(tc.name, func(t *testing.T) {
+			tCtx := ktesting.Init(t)
+
+			ctnScopeManager := manager{}
+			ctnScopeManager.scope = NewContainerScope(tc.policy)
+			ctnScopeManager.scope.(*containerScope).hintProviders = tc.hp
+
+			podScopeManager := manager{}
+			podScopeManager.scope = NewPodScope(tc.policy)
+			podScopeManager.scope.(*podScope).hintProviders = tc.hp
+
+			pod := &v1.Pod{
+				Spec: v1.PodSpec{
+					Containers: []v1.Container{
+						{
+							Resources: v1.ResourceRequirements{},
+						},
 					},
 				},
+				Status: v1.PodStatus{
+					QOSClass: tc.qosClass,
+				},
+			}
+
+			podAttr := lifecycle.PodAdmitAttributes{
+				Pod: pod,
+			}
+
+			// Container scope Admit
+			ctnActual := ctnScopeManager.Admit(tCtx, &podAttr)
+			if ctnActual.Admit != tc.expected {
+				t.Errorf("Error occurred, expected Admit in result to be %v got %v", tc.expected, ctnActual.Admit)
+			}
+			if !ctnActual.Admit && ctnActual.Reason != tc.expectedReason {
+				t.Errorf("Error occurred, expected Reason in result to be %v got %v", tc.expectedReason, ctnActual.Reason)
+			}
+			if !ctnActual.Admit && ctnActual.RejectionType != tc.expectedRejectionType {
+				t.Errorf("Error occurred, expected RejectionType in result to be %v got %v", tc.expectedRejectionType, ctnActual.RejectionType)
+			}
+
+			// Pod scope Admit
+			podActual := podScopeManager.Admit(tCtx, &podAttr)
+			if podActual.Admit != tc.expected {
+				t.Errorf("Error occurred, expected Admit in result to be %v got %v", tc.expected, podActual.Admit)
+			}
+			if !podActual.Admit && podActual.Reason != tc.expectedReason {
+				t.Errorf("Error occurred, expected Reason in result to be %v got %v", tc.expectedReason, podActual.Reason)
+			}
+			if !podActual.Admit && podActual.RejectionType != tc.expectedRejectionType {
+				t.Errorf("Error occurred, expected RejectionType in result to be %v got %v", tc.expectedRejectionType, podActual.RejectionType)
+			}
+		})
+	}
+}
+
+type trackingHintProvider struct {
+	podHintsCalled          bool
+	containerHintsCalled    bool
+	allocatePodCalled       bool
+	allocateContainerCalled bool
+	hints                   map[string][]TopologyHint
+}
+
+func (m *trackingHintProvider) GetTopologyHints(_ klog.Logger, _ *v1.Pod, _ *v1.Container, _ lifecycle.Operation) map[string][]TopologyHint {
+	m.containerHintsCalled = true
+	return m.hints
+}
+
+func (m *trackingHintProvider) GetPodTopologyHints(_ klog.Logger, _ *v1.Pod, _ lifecycle.Operation) map[string][]TopologyHint {
+	m.podHintsCalled = true
+	return m.hints
+}
+
+func (m *trackingHintProvider) AllocatePod(_ klog.Logger, _ *v1.Pod, _ lifecycle.Operation) error {
+	m.allocatePodCalled = true
+	return nil
+}
+
+func (m *trackingHintProvider) Allocate(_ context.Context, _ *v1.Pod, _ *v1.Container, _ lifecycle.Operation) error {
+	m.allocateContainerCalled = true
+	return nil
+}
+
+func TestAdmitWithPodLevelResources(t *testing.T) {
+	numaInfo := &NUMAInfo{
+		Nodes: []int{0, 1},
+		NUMADistances: NUMADistances{
+			0: {10, 11},
+			1: {11, 10},
+		},
+	}
+	opts := PolicyOptions{}
+	restrictedPolicy := NewRestrictedPolicy(numaInfo, opts)
+
+	tcases := []struct {
+		name                            string
+		podLevelResourcesEnabled        bool
+		podLevelResourceManagersEnabled bool
+		pod                             *v1.Pod
+		expectedAdmit                   bool
+		expectedPodHintsCalled          bool
+		expectedContainerHintsCalled    bool
+		expectedAllocatePodCalled       bool
+		expectedAllocateContainerCalled bool
+		scope                           Scope
+	}{
+		{
+			name:                            "pod scope, feature disabled, falls back to container level flow",
+			podLevelResourcesEnabled:        true,
+			podLevelResourceManagersEnabled: false,
+			pod: &v1.Pod{
+				Spec: v1.PodSpec{
+					Resources:  &v1.ResourceRequirements{Requests: v1.ResourceList{v1.ResourceCPU: resource.MustParse("2")}},
+					Containers: []v1.Container{{Name: "c1", Resources: v1.ResourceRequirements{Requests: v1.ResourceList{v1.ResourceCPU: resource.MustParse("2")}}}},
+				},
+				Status: v1.PodStatus{QOSClass: v1.PodQOSGuaranteed},
 			},
-		}
-		podAttr := lifecycle.PodAdmitAttributes{}
-		pod.Status.QOSClass = tc.qosClass
-		podAttr.Pod = pod
-		actual := man.Admit(&podAttr)
-		if actual.Admit != tc.expected {
-			t.Errorf("Error occurred, expected Admit in result to be %v got %v", tc.expected, actual.Admit)
-		}
+			expectedAdmit:                   true,
+			expectedPodHintsCalled:          true,
+			expectedContainerHintsCalled:    false,
+			expectedAllocatePodCalled:       false,
+			expectedAllocateContainerCalled: true,
+			scope:                           NewPodScope(restrictedPolicy),
+		},
+		{
+			name:                            "pod scope, feature enabled, uses pod-level flow",
+			podLevelResourcesEnabled:        true,
+			podLevelResourceManagersEnabled: true,
+			pod: &v1.Pod{
+				Spec: v1.PodSpec{
+					Resources:  &v1.ResourceRequirements{Requests: v1.ResourceList{v1.ResourceCPU: resource.MustParse("2")}},
+					Containers: []v1.Container{{Name: "c1", Resources: v1.ResourceRequirements{Requests: v1.ResourceList{v1.ResourceCPU: resource.MustParse("2")}}}},
+				},
+				Status: v1.PodStatus{QOSClass: v1.PodQOSGuaranteed},
+			},
+			expectedAdmit:                   true,
+			expectedPodHintsCalled:          true,
+			expectedContainerHintsCalled:    false,
+			expectedAllocatePodCalled:       true,
+			expectedAllocateContainerCalled: false,
+			scope:                           NewPodScope(restrictedPolicy),
+		},
+		{
+			name:                            "container scope, feature enabled, uses container-level flow",
+			podLevelResourcesEnabled:        true,
+			podLevelResourceManagersEnabled: true,
+			pod: &v1.Pod{
+				Spec: v1.PodSpec{
+					Resources:  &v1.ResourceRequirements{Requests: v1.ResourceList{v1.ResourceCPU: resource.MustParse("2")}},
+					Containers: []v1.Container{{Name: "c1", Resources: v1.ResourceRequirements{Requests: v1.ResourceList{v1.ResourceCPU: resource.MustParse("2")}}}},
+				},
+				Status: v1.PodStatus{QOSClass: v1.PodQOSGuaranteed},
+			},
+			expectedAdmit:                   true,
+			expectedPodHintsCalled:          false,
+			expectedContainerHintsCalled:    true,
+			expectedAllocatePodCalled:       false,
+			expectedAllocateContainerCalled: true,
+			scope:                           NewContainerScope(restrictedPolicy),
+		},
+		{
+			name:                            "container scope, feature disabled, uses container-level flow",
+			podLevelResourcesEnabled:        true,
+			podLevelResourceManagersEnabled: false,
+			pod: &v1.Pod{
+				Spec: v1.PodSpec{
+					Resources:  &v1.ResourceRequirements{Requests: v1.ResourceList{v1.ResourceCPU: resource.MustParse("2")}},
+					Containers: []v1.Container{{Name: "c1", Resources: v1.ResourceRequirements{Requests: v1.ResourceList{v1.ResourceCPU: resource.MustParse("2")}}}},
+				},
+				Status: v1.PodStatus{QOSClass: v1.PodQOSGuaranteed},
+			},
+			expectedAdmit:                   true,
+			expectedPodHintsCalled:          false,
+			expectedContainerHintsCalled:    true,
+			expectedAllocatePodCalled:       false,
+			expectedAllocateContainerCalled: true,
+			scope:                           NewContainerScope(restrictedPolicy),
+		},
+	}
+
+	for _, tc := range tcases {
+		t.Run(tc.name, func(t *testing.T) {
+			tCtx := ktesting.Init(t)
+			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.PodLevelResources, tc.podLevelResourcesEnabled)
+			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.PodLevelResourceManagers, tc.podLevelResourceManagersEnabled)
+
+			tracker := &trackingHintProvider{
+				hints: map[string][]TopologyHint{
+					"resource": {
+						{NUMANodeAffinity: NewTestBitMask(0), Preferred: true},
+					},
+				},
+			}
+
+			m := manager{scope: tc.scope}
+			tc.scope.AddHintProvider(tCtx.Logger(), tracker)
+
+			podAttr := lifecycle.PodAdmitAttributes{Pod: tc.pod}
+			actual := m.Admit(tCtx, &podAttr)
+
+			if actual.Admit != tc.expectedAdmit {
+				t.Errorf("Expected Admit to be %v got %v", tc.expectedAdmit, actual.Admit)
+			}
+			if tracker.podHintsCalled != tc.expectedPodHintsCalled {
+				t.Errorf("Expected podHintsCalled to be %v got %v", tc.expectedPodHintsCalled, tracker.podHintsCalled)
+			}
+			if tracker.containerHintsCalled != tc.expectedContainerHintsCalled {
+				t.Errorf("Expected containerHintsCalled to be %v got %v", tc.expectedContainerHintsCalled, tracker.containerHintsCalled)
+			}
+			if tracker.allocatePodCalled != tc.expectedAllocatePodCalled {
+				t.Errorf("Expected allocatePodCalled to be %v got %v", tc.expectedAllocatePodCalled, tracker.allocatePodCalled)
+			}
+			if tracker.allocateContainerCalled != tc.expectedAllocateContainerCalled {
+				t.Errorf("Expected allocateContainerCalled to be %v got %v", tc.expectedAllocateContainerCalled, tracker.allocateContainerCalled)
+			}
+		})
+	}
+}
+
+func TestAdmitDryRun(t *testing.T) {
+	numaInfo := &NUMAInfo{
+		Nodes: []int{0, 1},
+		NUMADistances: NUMADistances{
+			0: {10, 11},
+			1: {11, 10},
+		},
+	}
+	pod := &v1.Pod{
+		Spec: v1.PodSpec{
+			Containers: []v1.Container{{Name: "c1"}},
+		},
+		Status: v1.PodStatus{QOSClass: v1.PodQOSGuaranteed},
+	}
+	tcases := []struct {
+		name          string
+		scope         Scope
+		hints         []TopologyHint
+		expectedAdmit bool
+	}{{
+		name:          "container scope, aligned",
+		scope:         NewContainerScope(NewSingleNumaNodePolicy(numaInfo, PolicyOptions{})),
+		hints:         []TopologyHint{{NUMANodeAffinity: NewTestBitMask(0), Preferred: true}},
+		expectedAdmit: true,
+	}, {
+		name:          "container scope, not aligned",
+		scope:         NewContainerScope(NewSingleNumaNodePolicy(numaInfo, PolicyOptions{})),
+		hints:         []TopologyHint{{NUMANodeAffinity: NewTestBitMask(0, 1), Preferred: false}},
+		expectedAdmit: false,
+	}, {
+		name:          "pod scope, aligned",
+		scope:         NewPodScope(NewSingleNumaNodePolicy(numaInfo, PolicyOptions{})),
+		hints:         []TopologyHint{{NUMANodeAffinity: NewTestBitMask(0), Preferred: true}},
+		expectedAdmit: true,
+	}, {
+		name:          "pod scope, not aligned",
+		scope:         NewPodScope(NewSingleNumaNodePolicy(numaInfo, PolicyOptions{})),
+		hints:         []TopologyHint{{NUMANodeAffinity: NewTestBitMask(0, 1), Preferred: false}},
+		expectedAdmit: false,
+	}, {
+		name:          "none scope",
+		scope:         NewNoneScope(),
+		expectedAdmit: true,
+	}}
+
+	for _, tc := range tcases {
+		t.Run(tc.name, func(t *testing.T) {
+			tCtx := ktesting.Init(t)
+			tracker := &trackingHintProvider{hints: map[string][]TopologyHint{"resource": tc.hints}}
+			m := manager{scope: tc.scope}
+			tc.scope.AddHintProvider(tCtx.Logger(), tracker)
+
+			actual := m.Admit(tCtx, &lifecycle.PodAdmitAttributes{Pod: pod, Operation: lifecycle.UpdateOperation, DryRun: true})
+			if actual.Admit != tc.expectedAdmit {
+				t.Errorf("Expected Admit to be %v got %v", tc.expectedAdmit, actual.Admit)
+			}
+			if !actual.Admit && actual.Reason != ErrorTopologyAffinity {
+				t.Errorf("Expected Reason to be %v got %v", ErrorTopologyAffinity, actual.Reason)
+			}
+			if tracker.allocatePodCalled || tracker.allocateContainerCalled {
+				t.Errorf("Expected no allocation in dry run")
+			}
+			if hint := tc.scope.GetAffinity(tCtx.Logger(), string(pod.UID), "c1"); hint.NUMANodeAffinity != nil {
+				t.Errorf("Expected no stored topology hint in dry run, got %v", hint)
+			}
+		})
 	}
 }

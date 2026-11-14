@@ -18,12 +18,13 @@ package phases
 
 import (
 	"fmt"
+	"path/filepath"
 
-	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
 
 	clientset "k8s.io/client-go/kubernetes"
-	"k8s.io/klog"
+	"k8s.io/klog/v2"
+
 	"k8s.io/kubernetes/cmd/kubeadm/app/cmd/options"
 	"k8s.io/kubernetes/cmd/kubeadm/app/cmd/phases/workflow"
 	cmdutil "k8s.io/kubernetes/cmd/kubeadm/app/cmd/util"
@@ -32,6 +33,7 @@ import (
 	"k8s.io/kubernetes/cmd/kubeadm/app/phases/controlplane"
 	"k8s.io/kubernetes/cmd/kubeadm/app/phases/copycerts"
 	kubeconfigphase "k8s.io/kubernetes/cmd/kubeadm/app/phases/kubeconfig"
+	"k8s.io/kubernetes/cmd/kubeadm/app/util/errors"
 	kubeconfigutil "k8s.io/kubernetes/cmd/kubeadm/app/util/kubeconfig"
 )
 
@@ -78,6 +80,8 @@ func getControlPlanePreparePhaseFlags(name string) []string {
 			options.TLSBootstrapToken,
 			options.TokenStr,
 			options.CertificateKey,
+			options.Patches,
+			options.DryRun,
 		}
 	case "download-certs":
 		flags = []string{
@@ -90,6 +94,7 @@ func getControlPlanePreparePhaseFlags(name string) []string {
 			options.TLSBootstrapToken,
 			options.TokenStr,
 			options.CertificateKey,
+			options.DryRun,
 		}
 	case "certs":
 		flags = []string{
@@ -103,6 +108,7 @@ func getControlPlanePreparePhaseFlags(name string) []string {
 			options.TokenDiscoverySkipCAHash,
 			options.TLSBootstrapToken,
 			options.TokenStr,
+			options.DryRun,
 		}
 	case "kubeconfig":
 		flags = []string{
@@ -115,6 +121,7 @@ func getControlPlanePreparePhaseFlags(name string) []string {
 			options.TLSBootstrapToken,
 			options.TokenStr,
 			options.CertificateKey,
+			options.DryRun,
 		}
 	case "control-plane":
 		flags = []string{
@@ -122,6 +129,8 @@ func getControlPlanePreparePhaseFlags(name string) []string {
 			options.APIServerBindPort,
 			options.CfgPath,
 			options.ControlPlane,
+			options.Patches,
+			options.DryRun,
 		}
 	default:
 		flags = []string{}
@@ -132,7 +141,7 @@ func getControlPlanePreparePhaseFlags(name string) []string {
 func newControlPlanePrepareDownloadCertsSubphase() workflow.Phase {
 	return workflow.Phase{
 		Name:         "download-certs [api-server-endpoint]",
-		Short:        fmt.Sprintf("[EXPERIMENTAL] Download certificates shared among control-plane nodes from the %s Secret", kubeadmconstants.KubeadmCertsSecret),
+		Short:        fmt.Sprintf("Download certificates shared among control-plane nodes from the %s Secret", kubeadmconstants.KubeadmCertsSecret),
 		Run:          runControlPlanePrepareDownloadCertsPhaseLocal,
 		InheritFlags: getControlPlanePreparePhaseFlags("download-certs"),
 	}
@@ -182,14 +191,21 @@ func runControlPlanePrepareControlPlaneSubphase(c workflow.RunData) error {
 		return err
 	}
 
-	fmt.Printf("[control-plane] Using manifest folder %q\n", kubeadmconstants.GetStaticPodDirectory())
+	fmt.Printf("[control-plane] Using manifest folder %q\n", data.ManifestDir())
+
+	// If we're dry-running, set CertificatesDir to default value to get the right cert path in static pod yaml
+	if data.DryRun() {
+		cfg.CertificatesDir = filepath.Join(kubeadmconstants.KubernetesDir, kubeadmconstants.DefaultCertificateDir)
+	}
 
 	for _, component := range kubeadmconstants.ControlPlaneComponents {
 		fmt.Printf("[control-plane] Creating static Pod manifest for %q\n", component)
 		err := controlplane.CreateStaticPodFiles(
-			kubeadmconstants.GetStaticPodDirectory(),
+			data.ManifestDir(),
+			data.PatchesDir(),
 			&cfg.ClusterConfiguration,
 			&cfg.LocalAPIEndpoint,
+			data.DryRun(),
 			component,
 		)
 		if err != nil {
@@ -214,6 +230,11 @@ func runControlPlanePrepareDownloadCertsPhaseLocal(c workflow.RunData) error {
 	if err != nil {
 		return err
 	}
+
+	// If we're dry-running, download certs to tmp dir, and defer to restore to the path originally specified by the user
+	certsDir := cfg.CertificatesDir
+	cfg.CertificatesDir = data.CertificateWriteDir()
+	defer func() { cfg.CertificatesDir = certsDir }()
 
 	client, err := bootstrapClient(data)
 	if err != nil {
@@ -244,6 +265,10 @@ func runControlPlanePrepareCertsPhaseLocal(c workflow.RunData) error {
 
 	fmt.Printf("[certs] Using certificateDir folder %q\n", cfg.CertificatesDir)
 
+	// if dryrunning, write certificates files to a temporary folder (and defer restore to the path originally specified by the user)
+	certsDir := cfg.CertificatesDir
+	cfg.CertificatesDir = data.CertificateWriteDir()
+	defer func() { cfg.CertificatesDir = certsDir }()
 	// Generate missing certificates (if any)
 	return certsphase.CreatePKIAssets(cfg)
 }
@@ -265,12 +290,17 @@ func runControlPlanePrepareKubeconfigPhaseLocal(c workflow.RunData) error {
 	}
 
 	fmt.Println("[kubeconfig] Generating kubeconfig files")
-	fmt.Printf("[kubeconfig] Using kubeconfig folder %q\n", kubeadmconstants.KubernetesDir)
+	fmt.Printf("[kubeconfig] Using kubeconfig folder %q\n", data.KubeConfigDir())
+
+	// If we're dry-running, load certs from tmp dir, and defer to restore to the path originally specified by the user
+	certsDir := cfg.CertificatesDir
+	cfg.CertificatesDir = data.CertificateWriteDir()
+	defer func() { cfg.CertificatesDir = certsDir }()
 
 	// Generate kubeconfig files for controller manager, scheduler and for the admin/kubeadm itself
 	// NB. The kubeconfig file for kubelet will be generated by the TLS bootstrap process in
 	// following steps of the join --control-plane workflow
-	if err := kubeconfigphase.CreateJoinControlPlaneKubeConfigFiles(kubeadmconstants.KubernetesDir, cfg); err != nil {
+	if err := kubeconfigphase.CreateJoinControlPlaneKubeConfigFiles(data.KubeConfigDir(), cfg); err != nil {
 		return errors.Wrap(err, "error generating kubeconfig files")
 	}
 
@@ -278,6 +308,14 @@ func runControlPlanePrepareKubeconfigPhaseLocal(c workflow.RunData) error {
 }
 
 func bootstrapClient(data JoinData) (clientset.Interface, error) {
+	if data.DryRun() {
+		client, err := data.Client()
+		if err != nil {
+			return nil, err
+		}
+		return client, nil
+	}
+
 	tlsBootstrapCfg, err := data.TLSBootstrapCfg()
 	if err != nil {
 		return nil, errors.Wrap(err, "unable to access the cluster")

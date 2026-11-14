@@ -18,35 +18,39 @@ package ssh
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"net"
 	"os"
 	"path/filepath"
+	"slices"
 	"time"
 
 	"github.com/onsi/gomega"
+
 	"golang.org/x/crypto/ssh"
+
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/util/wait"
 	clientset "k8s.io/client-go/kubernetes"
-	sshutil "k8s.io/kubernetes/pkg/ssh"
-	e2elog "k8s.io/kubernetes/test/e2e/framework/log"
-	testutils "k8s.io/kubernetes/test/utils"
+	"k8s.io/kubernetes/test/e2e/framework"
 )
 
 const (
-	// ssh port
-	sshPort = "22"
+	// SSHPort is tcp port number of SSH
+	SSHPort = "22"
 
 	// pollNodeInterval is how often to Poll pods.
 	pollNodeInterval = 2 * time.Second
 
 	// singleCallTimeout is how long to try single API calls (like 'get' or 'list'). Used to prevent
 	// transient failures from failing tests.
-	// TODO: client should not apply this timeout to Watch calls. Increased from 30s until that is fixed.
 	singleCallTimeout = 5 * time.Minute
+
+	// sshBastionEnvKey is the environment variable key for running SSH commands via bastion.
+	sshBastionEnvKey = "KUBE_SSH_BASTION"
 )
 
 // GetSigner returns an ssh.Signer for the provider ("gce", etc.) that can be
@@ -54,7 +58,7 @@ const (
 func GetSigner(provider string) (ssh.Signer, error) {
 	// honor a consistent SSH key across all providers
 	if path := os.Getenv("KUBE_SSH_KEY_PATH"); len(path) > 0 {
-		return sshutil.MakePrivateKeySignerFromFile(path)
+		return makePrivateKeySignerFromFile(path)
 	}
 
 	// Select the key itself to use. When implementing more providers here,
@@ -62,8 +66,11 @@ func GetSigner(provider string) (ssh.Signer, error) {
 	// support.
 	keyfile := ""
 	switch provider {
-	case "gce", "gke", "kubemark":
+	case "gce":
 		keyfile = os.Getenv("GCE_SSH_KEY")
+		if keyfile == "" {
+			keyfile = os.Getenv("GCE_SSH_PRIVATE_KEY_FILE")
+		}
 		if keyfile == "" {
 			keyfile = "google_compute_engine"
 		}
@@ -82,6 +89,11 @@ func GetSigner(provider string) (ssh.Signer, error) {
 		if keyfile == "" {
 			keyfile = "id_rsa"
 		}
+	case "azure":
+		keyfile = os.Getenv("AZURE_SSH_KEY")
+		if keyfile == "" {
+			keyfile = "id_rsa"
+		}
 	default:
 		return nil, fmt.Errorf("GetSigner(...) not implemented for %s", provider)
 	}
@@ -93,39 +105,48 @@ func GetSigner(provider string) (ssh.Signer, error) {
 		keyfile = filepath.Join(keydir, keyfile)
 	}
 
-	return sshutil.MakePrivateKeySignerFromFile(keyfile)
+	return makePrivateKeySignerFromFile(keyfile)
 }
 
-// NodeSSHHosts returns SSH-able host names for all schedulable nodes - this
-// excludes master node. If it can't find any external IPs, it falls back to
-// looking for internal IPs. If it can't find an internal IP for every node it
-// returns an error, though it still returns all hosts that it found in that
-// case.
-func NodeSSHHosts(c clientset.Interface) ([]string, error) {
-	nodelist := waitListSchedulableNodesOrDie(c)
-
-	hosts := nodeAddresses(nodelist, v1.NodeExternalIP)
-	// If ExternalIPs aren't set, assume the test programs can reach the
-	// InternalIP. Simplified exception logic here assumes that the hosts will
-	// either all have ExternalIP or none will. Simplifies handling here and
-	// should be adequate since the setting of the external IPs is provider
-	// specific: they should either all have them or none of them will.
-	if len(hosts) == 0 {
-		e2elog.Logf("No external IP address on nodes, falling back to internal IPs")
-		hosts = nodeAddresses(nodelist, v1.NodeInternalIP)
+func makePrivateKeySignerFromFile(key string) (ssh.Signer, error) {
+	buffer, err := os.ReadFile(key)
+	if err != nil {
+		return nil, fmt.Errorf("error reading SSH key %s: %w", key, err)
 	}
 
-	// Error if any node didn't have an external/internal IP.
+	signer, err := ssh.ParsePrivateKey(buffer)
+	if err != nil {
+		return nil, fmt.Errorf("error parsing SSH key: %w", err)
+	}
+
+	return signer, err
+}
+
+// NodeSSHHosts returns SSH-able host names for all schedulable nodes.
+// If it can't find any external IPs, it falls back to
+// looking for internal IPs. If it can't find an internal IP for every node it
+// returns an error.
+func NodeSSHHosts(ctx context.Context, c clientset.Interface) ([]string, error) {
+	nodelist := waitListSchedulableNodesOrDie(ctx, c)
+
+	hosts := nodeAddresses(nodelist, v1.NodeExternalIP)
+	// If  ExternalIPs aren't available for all nodes, try falling back to the InternalIPs.
+	if len(hosts) < len(nodelist.Items) {
+		framework.Logf("No external IP address on nodes, falling back to internal IPs")
+		hosts = nodeAddresses(nodelist, v1.NodeInternalIP)
+	}
 	if len(hosts) != len(nodelist.Items) {
-		return hosts, fmt.Errorf(
+		// Something is wrong; all schedulable nodes should have at least one IP.
+		return nil, fmt.Errorf(
 			"only found %d IPs on nodes, but found %d nodes. Nodelist: %v",
 			len(hosts), len(nodelist.Items), nodelist)
 	}
 
 	sshHosts := make([]string, 0, len(hosts))
-	for _, h := range hosts {
-		sshHosts = append(sshHosts, net.JoinHostPort(h, sshPort))
+	for _, host := range hosts {
+		sshHosts = append(sshHosts, net.JoinHostPort(host, SSHPort))
 	}
+
 	return sshHosts, nil
 }
 
@@ -142,20 +163,20 @@ type Result struct {
 // NodeExec execs the given cmd on node via SSH. Note that the nodeName is an sshable name,
 // eg: the name returned by framework.GetMasterHost(). This is also not guaranteed to work across
 // cloud providers since it involves ssh.
-func NodeExec(nodeName, cmd, provider string) (Result, error) {
-	return SSH(cmd, net.JoinHostPort(nodeName, sshPort), provider)
+func NodeExec(ctx context.Context, nodeName, cmd, provider string) (Result, error) {
+	return SSH(ctx, cmd, net.JoinHostPort(nodeName, SSHPort), provider)
 }
 
 // SSH synchronously SSHs to a node running on provider and runs cmd. If there
 // is no error performing the SSH, the stdout, stderr, and exit code are
 // returned.
-func SSH(cmd, host, provider string) (Result, error) {
+func SSH(ctx context.Context, cmd, host, provider string) (Result, error) {
 	result := Result{Host: host, Cmd: cmd}
 
 	// Get a signer for the provider.
 	signer, err := GetSigner(provider)
 	if err != nil {
-		return result, fmt.Errorf("error getting signer for provider %s: '%v'", provider, err)
+		return result, fmt.Errorf("error getting signer for provider %s: %w", provider, err)
 	}
 
 	// RunSSHCommand will default to Getenv("USER") if user == "", but we're
@@ -165,15 +186,33 @@ func SSH(cmd, host, provider string) (Result, error) {
 		result.User = os.Getenv("USER")
 	}
 
-	if bastion := os.Getenv("KUBE_SSH_BASTION"); len(bastion) > 0 {
-		stdout, stderr, code, err := RunSSHCommandViaBastion(cmd, result.User, bastion, host, signer)
-		result.Stdout = stdout
-		result.Stderr = stderr
-		result.Code = code
-		return result, err
+	client, err := framework.LoadClientset()
+	if err != nil {
+		return result, fmt.Errorf("error creating client to resolve SSH addresses: %w", err)
+	}
+	nodes, err := client.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return result, fmt.Errorf("error listing nodes to resolve SSH addresses: %w", err)
 	}
 
-	stdout, stderr, code, err := sshutil.RunSSHCommand(cmd, result.User, host, signer)
+	bastion := os.Getenv(sshBastionEnvKey)
+	if bastion == "" {
+		bastion, err = controlPlaneBastion(nodes)
+		if err != nil {
+			return result, err
+		}
+	}
+
+	// The bastion is inside the cluster network, where a node's external IP
+	// is not necessarily reachable: on AWS the connection leaves through the
+	// internet gateway and the node's security group rejects it. Dial the
+	// node's internal IP from the bastion instead.
+	target := internalHost(nodes, host)
+	if target != host {
+		framework.Logf("SSH to %s via bastion %s: using internal address %s", host, bastion, target)
+	}
+
+	stdout, stderr, code, err := runSSHCommandViaBastion(ctx, cmd, result.User, bastion, target, signer)
 	result.Stdout = stdout
 	result.Stderr = stderr
 	result.Code = code
@@ -181,11 +220,52 @@ func SSH(cmd, host, provider string) (Result, error) {
 	return result, err
 }
 
-// RunSSHCommandViaBastion returns the stdout, stderr, and exit code from running cmd on
+// controlPlaneBastion returns the SSH address of the first control-plane node
+// that has an external IP.
+func controlPlaneBastion(nodes *v1.NodeList) (string, error) {
+	for _, node := range nodes.Items {
+		_, isControlPlane := node.Labels[framework.ControlPlaneLabel]
+		for _, taint := range node.Spec.Taints {
+			if taint.Key == framework.ControlPlaneLabel && taint.Effect == v1.TaintEffectNoSchedule {
+				isControlPlane = true
+				break
+			}
+		}
+		if isControlPlane {
+			if ips := framework.GetNodeExternalIPs(&node); len(ips) > 0 {
+				return net.JoinHostPort(ips[0], SSHPort), nil
+			}
+		}
+	}
+	return "", fmt.Errorf("no control-plane node with an external IP found; set %s to an SSH bastion address (host:port)", sshBastionEnvKey)
+}
+
+// internalHost returns the "<internal IP>:<port>" address of the node whose
+// external IP is the host part of host. Any other host is returned unchanged.
+func internalHost(nodes *v1.NodeList, host string) string {
+	ip, port, err := net.SplitHostPort(host)
+	if err != nil {
+		return host
+	}
+	for i := range nodes.Items {
+		node := &nodes.Items[i]
+		if !slices.Contains(framework.GetNodeExternalIPs(node), ip) {
+			continue
+		}
+		for _, addr := range node.Status.Addresses {
+			if addr.Type == v1.NodeInternalIP && addr.Address != "" {
+				return net.JoinHostPort(addr.Address, port)
+			}
+		}
+	}
+	return host
+}
+
+// runSSHCommandViaBastion returns the stdout, stderr, and exit code from running cmd on
 // host as specific user, along with any SSH-level error. It uses an SSH proxy to connect
 // to bastion, then via that tunnel connects to the remote host. Similar to
 // sshutil.RunSSHCommand but scoped to the needs of the test infrastructure.
-func RunSSHCommandViaBastion(cmd, user, bastion, host string, signer ssh.Signer) (string, string, int, error) {
+func runSSHCommandViaBastion(ctx context.Context, cmd, user, bastion, host string, signer ssh.Signer) (string, string, int, error) {
 	// Setup the config, dial the server, and open a session.
 	config := &ssh.ClientConfig{
 		User:            user,
@@ -195,7 +275,7 @@ func RunSSHCommandViaBastion(cmd, user, bastion, host string, signer ssh.Signer)
 	}
 	bastionClient, err := ssh.Dial("tcp", bastion, config)
 	if err != nil {
-		err = wait.Poll(5*time.Second, 20*time.Second, func() (bool, error) {
+		err = wait.PollUntilContextTimeout(ctx, 5*time.Second, 20*time.Second, false, func(ctx context.Context) (bool, error) {
 			fmt.Printf("error dialing %s@%s: '%v', retrying\n", user, bastion, err)
 			if bastionClient, err = ssh.Dial("tcp", bastion, config); err != nil {
 				return false, err
@@ -204,26 +284,26 @@ func RunSSHCommandViaBastion(cmd, user, bastion, host string, signer ssh.Signer)
 		})
 	}
 	if err != nil {
-		return "", "", 0, fmt.Errorf("error getting SSH client to %s@%s: %v", user, bastion, err)
+		return "", "", 0, fmt.Errorf("error getting SSH client to %s@%s: %w", user, bastion, err)
 	}
 	defer bastionClient.Close()
 
 	conn, err := bastionClient.Dial("tcp", host)
 	if err != nil {
-		return "", "", 0, fmt.Errorf("error dialing %s from bastion: %v", host, err)
+		return "", "", 0, fmt.Errorf("error dialing %s from bastion: %w", host, err)
 	}
 	defer conn.Close()
 
 	ncc, chans, reqs, err := ssh.NewClientConn(conn, host, config)
 	if err != nil {
-		return "", "", 0, fmt.Errorf("error creating forwarding connection %s from bastion: %v", host, err)
+		return "", "", 0, fmt.Errorf("error creating forwarding connection %s from bastion: %w", host, err)
 	}
 	client := ssh.NewClient(ncc, chans, reqs)
 	defer client.Close()
 
 	session, err := client.NewSession()
 	if err != nil {
-		return "", "", 0, fmt.Errorf("error creating session to %s@%s from bastion: '%v'", user, host, err)
+		return "", "", 0, fmt.Errorf("error creating session to %s@%s from bastion: %w", user, host, err)
 	}
 	defer session.Close()
 
@@ -243,7 +323,7 @@ func RunSSHCommandViaBastion(cmd, user, bastion, host string, signer ssh.Signer)
 		} else {
 			// Some other kind of error happened (e.g. an IOError); consider the
 			// SSH unsuccessful.
-			err = fmt.Errorf("failed running `%s` on %s@%s: '%v'", cmd, user, host, err)
+			err = fmt.Errorf("failed running `%s` on %s@%s: %w", cmd, user, host, err)
 		}
 	}
 	return bout.String(), berr.String(), code, err
@@ -252,19 +332,19 @@ func RunSSHCommandViaBastion(cmd, user, bastion, host string, signer ssh.Signer)
 // LogResult records result log
 func LogResult(result Result) {
 	remote := fmt.Sprintf("%s@%s", result.User, result.Host)
-	e2elog.Logf("ssh %s: command:   %s", remote, result.Cmd)
-	e2elog.Logf("ssh %s: stdout:    %q", remote, result.Stdout)
-	e2elog.Logf("ssh %s: stderr:    %q", remote, result.Stderr)
-	e2elog.Logf("ssh %s: exit code: %d", remote, result.Code)
+	framework.Logf("ssh %s: command:   %s", remote, result.Cmd)
+	framework.Logf("ssh %s: stdout:    %q", remote, result.Stdout)
+	framework.Logf("ssh %s: stderr:    %q", remote, result.Stderr)
+	framework.Logf("ssh %s: exit code: %d", remote, result.Code)
 }
 
 // IssueSSHCommandWithResult tries to execute a SSH command and returns the execution result
-func IssueSSHCommandWithResult(cmd, provider string, node *v1.Node) (*Result, error) {
-	e2elog.Logf("Getting external IP address for %s", node.Name)
+func IssueSSHCommandWithResult(ctx context.Context, cmd, provider string, node *v1.Node) (*Result, error) {
+	framework.Logf("Getting external IP address for %s", node.Name)
 	host := ""
 	for _, a := range node.Status.Addresses {
 		if a.Type == v1.NodeExternalIP && a.Address != "" {
-			host = net.JoinHostPort(a.Address, sshPort)
+			host = net.JoinHostPort(a.Address, SSHPort)
 			break
 		}
 	}
@@ -273,7 +353,7 @@ func IssueSSHCommandWithResult(cmd, provider string, node *v1.Node) (*Result, er
 		// No external IPs were found, let's try to use internal as plan B
 		for _, a := range node.Status.Addresses {
 			if a.Type == v1.NodeInternalIP && a.Address != "" {
-				host = net.JoinHostPort(a.Address, sshPort)
+				host = net.JoinHostPort(a.Address, SSHPort)
 				break
 			}
 		}
@@ -283,8 +363,8 @@ func IssueSSHCommandWithResult(cmd, provider string, node *v1.Node) (*Result, er
 		return nil, fmt.Errorf("couldn't find any IP address for node %s", node.Name)
 	}
 
-	e2elog.Logf("SSH %q on %s(%s)", cmd, node.Name, host)
-	result, err := SSH(cmd, host, provider)
+	framework.Logf("SSH %q on %s(%s)", cmd, node.Name, host)
+	result, err := SSH(ctx, cmd, host, provider)
 	LogResult(result)
 
 	if result.Code != 0 || err != nil {
@@ -296,8 +376,8 @@ func IssueSSHCommandWithResult(cmd, provider string, node *v1.Node) (*Result, er
 }
 
 // IssueSSHCommand tries to execute a SSH command
-func IssueSSHCommand(cmd, provider string, node *v1.Node) error {
-	_, err := IssueSSHCommandWithResult(cmd, provider, node)
+func IssueSSHCommand(ctx context.Context, cmd, provider string, node *v1.Node) error {
+	_, err := IssueSSHCommandWithResult(ctx, cmd, provider, node)
 	if err != nil {
 		return err
 	}
@@ -319,17 +399,14 @@ func nodeAddresses(nodelist *v1.NodeList, addrType v1.NodeAddressType) []string 
 }
 
 // waitListSchedulableNodes is a wrapper around listing nodes supporting retries.
-func waitListSchedulableNodes(c clientset.Interface) (*v1.NodeList, error) {
+func waitListSchedulableNodes(ctx context.Context, c clientset.Interface) (*v1.NodeList, error) {
 	var nodes *v1.NodeList
 	var err error
-	if wait.PollImmediate(pollNodeInterval, singleCallTimeout, func() (bool, error) {
-		nodes, err = c.CoreV1().Nodes().List(metav1.ListOptions{FieldSelector: fields.Set{
+	if wait.PollUntilContextTimeout(ctx, pollNodeInterval, singleCallTimeout, true, func(ctx context.Context) (bool, error) {
+		nodes, err = c.CoreV1().Nodes().List(ctx, metav1.ListOptions{FieldSelector: fields.Set{
 			"spec.unschedulable": "false",
 		}.AsSelector().String()})
 		if err != nil {
-			if testutils.IsRetryableAPIError(err) {
-				return false, nil
-			}
 			return false, err
 		}
 		return true, nil
@@ -340,8 +417,8 @@ func waitListSchedulableNodes(c clientset.Interface) (*v1.NodeList, error) {
 }
 
 // waitListSchedulableNodesOrDie is a wrapper around listing nodes supporting retries.
-func waitListSchedulableNodesOrDie(c clientset.Interface) *v1.NodeList {
-	nodes, err := waitListSchedulableNodes(c)
+func waitListSchedulableNodesOrDie(ctx context.Context, c clientset.Interface) *v1.NodeList {
+	nodes, err := waitListSchedulableNodes(ctx, c)
 	if err != nil {
 		expectNoError(err, "Non-retryable failure or timed out while listing nodes for e2e cluster.")
 	}
@@ -357,7 +434,7 @@ func expectNoError(err error, explain ...interface{}) {
 // (for example, for call chain f -> g -> ExpectNoErrorWithOffset(1, ...) error would be logged for "f").
 func expectNoErrorWithOffset(offset int, err error, explain ...interface{}) {
 	if err != nil {
-		e2elog.Logf("Unexpected error occurred: %v", err)
+		framework.Logf("Unexpected error occurred: %v", err)
 	}
 	gomega.ExpectWithOffset(1+offset, err).NotTo(gomega.HaveOccurred(), explain...)
 }

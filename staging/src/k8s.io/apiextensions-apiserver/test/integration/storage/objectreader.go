@@ -23,9 +23,9 @@ import (
 	"path"
 	"time"
 
-	"github.com/coreos/etcd/clientv3"
-	"github.com/coreos/etcd/pkg/transport"
-	apiextensionsv1beta1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1beta1"
+	"go.etcd.io/etcd/client/pkg/v3/transport"
+	clientv3 "go.etcd.io/etcd/client/v3"
+	apiextensionsv1 "k8s.io/apiextensions-api/pkg/apis/apiextensions/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apiserver/pkg/registry/generic"
 	"k8s.io/apiserver/pkg/storage/storagebackend"
@@ -35,11 +35,11 @@ import (
 type EtcdObjectReader struct {
 	etcdClient    *clientv3.Client
 	storagePrefix string
-	crd           *apiextensionsv1beta1.CustomResourceDefinition
+	crd           *apiextensionsv1.CustomResourceDefinition
 }
 
 // NewEtcdObjectReader creates a reader for accessing custom resource objects directly from etcd.
-func NewEtcdObjectReader(etcdClient *clientv3.Client, restOptions *generic.RESTOptions, crd *apiextensionsv1beta1.CustomResourceDefinition) *EtcdObjectReader {
+func NewEtcdObjectReader(etcdClient *clientv3.Client, restOptions *generic.RESTOptions, crd *apiextensionsv1.CustomResourceDefinition) *EtcdObjectReader {
 	return &EtcdObjectReader{etcdClient, restOptions.StorageConfig.Prefix, crd}
 }
 
@@ -101,9 +101,9 @@ func (s *EtcdObjectReader) SetStoredCustomResource(ns, name string, obj *unstruc
 // GetEtcdClients returns an initialized  clientv3.Client and clientv3.KV.
 func GetEtcdClients(config storagebackend.TransportConfig) (*clientv3.Client, clientv3.KV, error) {
 	tlsInfo := transport.TLSInfo{
-		CertFile: config.CertFile,
-		KeyFile:  config.KeyFile,
-		CAFile:   config.CAFile,
+		CertFile:      config.CertFile,
+		KeyFile:       config.KeyFile,
+		TrustedCAFile: config.TrustedCAFile,
 	}
 
 	tlsConfig, err := tlsInfo.ClientConfig()
@@ -112,8 +112,9 @@ func GetEtcdClients(config storagebackend.TransportConfig) (*clientv3.Client, cl
 	}
 
 	cfg := clientv3.Config{
-		Endpoints: config.ServerList,
-		TLS:       tlsConfig,
+		Endpoints:   config.ServerList,
+		DialTimeout: 20 * time.Second,
+		TLS:         tlsConfig,
 	}
 
 	c, err := clientv3.New(cfg)
@@ -122,4 +123,17 @@ func GetEtcdClients(config storagebackend.TransportConfig) (*clientv3.Client, cl
 	}
 
 	return c, clientv3.NewKV(c), nil
+}
+
+// SetStoredCustomResourceDefinition writes the storage representation of a CRD to etcd.
+func (s *EtcdObjectReader) SetStoredCustomResourceDefinition(name string, crd *apiextensionsv1.CustomResourceDefinition) error {
+	bs, err := json.Marshal(crd)
+	if err != nil {
+		return err
+	}
+	key := path.Join("/", s.storagePrefix, "apiextensions.k8s.io", "customresourcedefinitions", name)
+	if _, err := s.etcdClient.Put(context.Background(), key, string(bs)); err != nil {
+		return fmt.Errorf("error setting CRD %s in etcd at key %s: %w", name, key, err)
+	}
+	return nil
 }

@@ -17,13 +17,15 @@ limitations under the License.
 package leaderelection
 
 import (
+	"context"
 	"fmt"
 	"testing"
 	"time"
 
-	"k8s.io/apimachinery/pkg/util/clock"
-	rl "k8s.io/client-go/tools/leaderelection/resourcelock"
 	"net/http"
+
+	rl "k8s.io/client-go/tools/leaderelection/resourcelock"
+	testingclock "k8s.io/utils/clock/testing"
 )
 
 type fakeLock struct {
@@ -31,17 +33,17 @@ type fakeLock struct {
 }
 
 // Get is a dummy to allow us to have a fakeLock for testing.
-func (fl *fakeLock) Get() (ler *rl.LeaderElectionRecord, err error) {
-	return nil, nil
+func (fl *fakeLock) Get(ctx context.Context) (ler *rl.LeaderElectionRecord, rawRecord []byte, err error) {
+	return nil, nil, nil
 }
 
 // Create is a dummy to allow us to have a fakeLock for testing.
-func (fl *fakeLock) Create(ler rl.LeaderElectionRecord) error {
+func (fl *fakeLock) Create(ctx context.Context, ler rl.LeaderElectionRecord) error {
 	return nil
 }
 
 // Update is a dummy to allow us to have a fakeLock for testing.
-func (fl *fakeLock) Update(ler rl.LeaderElectionRecord) error {
+func (fl *fakeLock) Update(ctx context.Context, ler rl.LeaderElectionRecord) error {
 	return nil
 }
 
@@ -89,7 +91,7 @@ func TestLeaderElectionHealthChecker(t *testing.T) {
 					HolderIdentity: "healthTest",
 				},
 				observedTime: current,
-				clock:        clock.NewFakeClock(current.Add(time.Hour)),
+				clock:        testingclock.NewFakeClock(current.Add(time.Hour)),
 			},
 		},
 		{
@@ -106,7 +108,7 @@ func TestLeaderElectionHealthChecker(t *testing.T) {
 					HolderIdentity: "otherServer",
 				},
 				observedTime: current,
-				clock:        clock.NewFakeClock(current.Add(time.Hour)),
+				clock:        testingclock.NewFakeClock(current.Add(time.Hour)),
 			},
 		},
 		{
@@ -123,7 +125,7 @@ func TestLeaderElectionHealthChecker(t *testing.T) {
 					HolderIdentity: "healthTest",
 				},
 				observedTime: current,
-				clock:        clock.NewFakeClock(current),
+				clock:        testingclock.NewFakeClock(current),
 			},
 		},
 		{
@@ -140,7 +142,7 @@ func TestLeaderElectionHealthChecker(t *testing.T) {
 					HolderIdentity: "healthTest",
 				},
 				observedTime: current,
-				clock:        clock.NewFakeClock(current.Add(time.Minute).Add(time.Second)),
+				clock:        testingclock.NewFakeClock(current.Add(time.Minute).Add(time.Second)),
 			},
 		},
 	}

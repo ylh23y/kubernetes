@@ -18,7 +18,6 @@ package watch
 
 import (
 	"errors"
-	"flag"
 	"fmt"
 	"reflect"
 	"strconv"
@@ -26,24 +25,21 @@ import (
 	"testing"
 	"time"
 
-	"github.com/davecgh/go-spew/spew"
+	"github.com/google/go-cmp/cmp"
+	"github.com/onsi/gomega"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/apimachinery/pkg/util/diff"
-	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/tools/cache"
-	"k8s.io/klog"
+	"k8s.io/ktesting"
+	"k8s.io/utils/dump"
 )
 
 func init() {
-	// Enable klog which is used in dependencies
-	klog.InitFlags(nil)
-	flag.Set("logtostderr", "true")
-	flag.Set("v", "9")
+	ktesting.SetDefaultVerbosity(9)
 }
 
 type testObject struct {
@@ -54,7 +50,7 @@ func (o testObject) GetObjectKind() schema.ObjectKind { return schema.EmptyObjec
 func (o testObject) DeepCopyObject() runtime.Object   { return o }
 func (o testObject) GetResourceVersion() string       { return o.resourceVersion }
 
-func withCounter(w cache.Watcher) (*uint32, cache.Watcher) {
+func withCounter(w cache.Watcher) (*uint32, cache.WatcherWithContext) {
 	var counter uint32
 	return &counter, &cache.ListWatch{
 		WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
@@ -199,6 +195,29 @@ func TestRetryWatcher(t *testing.T) {
 			},
 		},
 		{
+			name:      "recovers from 410 Gone error on watch establishment",
+			initialRV: "1",
+			watchClient: &cache.ListWatch{
+				WatchFunc: func() func(options metav1.ListOptions) (watch.Interface, error) {
+					firstRun := true
+					return func(options metav1.ListOptions) (watch.Interface, error) {
+						if firstRun {
+							firstRun = false
+							return nil, apierrors.NewResourceExpired("")
+						}
+
+						return watch.NewProxyWatcher(arrayToChannel(fromRV(options.ResourceVersion, []watch.Event{
+							makeTestEvent(2),
+						}))), nil
+					}
+				}(),
+			},
+			watchCount: 2,
+			expected: []watch.Event{
+				makeTestEvent(2),
+			},
+		},
+		{
 			name:      "recovers if watchClient returns nil watcher",
 			initialRV: "1",
 			watchClient: &cache.ListWatch{
@@ -285,6 +304,42 @@ func TestRetryWatcher(t *testing.T) {
 				{
 					Type:   watch.Error,
 					Object: &apierrors.NewGone("").ErrStatus,
+				},
+			},
+		},
+		{
+			name:      "fails on Forbidden",
+			initialRV: "5",
+			watchClient: &cache.ListWatch{
+				WatchFunc: func() func(options metav1.ListOptions) (watch.Interface, error) {
+					return func(options metav1.ListOptions) (watch.Interface, error) {
+						return nil, apierrors.NewForbidden(schema.GroupResource{}, "", errors.New("unknown"))
+					}
+				}(),
+			},
+			watchCount: 1,
+			expected: []watch.Event{
+				{
+					Type:   watch.Error,
+					Object: &apierrors.NewForbidden(schema.GroupResource{}, "", errors.New("unknown")).ErrStatus,
+				},
+			},
+		},
+		{
+			name:      "fails on Unauthorized",
+			initialRV: "5",
+			watchClient: &cache.ListWatch{
+				WatchFunc: func() func(options metav1.ListOptions) (watch.Interface, error) {
+					return func(options metav1.ListOptions) (watch.Interface, error) {
+						return nil, apierrors.NewUnauthorized("")
+					}
+				}(),
+			},
+			watchCount: 1,
+			expected: []watch.Event{
+				{
+					Type:   watch.Error,
+					Object: &apierrors.NewUnauthorized("").ErrStatus,
 				},
 			},
 		},
@@ -511,12 +566,12 @@ func TestRetryWatcher(t *testing.T) {
 	}
 
 	for _, tc := range tt {
-		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
+			tCtx := ktesting.Init(t)
 			t.Parallel()
 
 			atomicCounter, watchFunc := withCounter(tc.watchClient)
-			watcher, err := newRetryWatcher(tc.initialRV, watchFunc, time.Duration(0))
+			watcher, err := newRetryWatcher(tCtx, tc.initialRV, watchFunc, time.Duration(0))
 			if err != nil {
 				t.Fatalf("failed to create a RetryWatcher: %v", err)
 			}
@@ -530,7 +585,7 @@ func TestRetryWatcher(t *testing.T) {
 			for i := 0; i < len(tc.expected); i++ {
 				event, ok := <-watcher.ResultChan()
 				if !ok {
-					t.Error(spew.Errorf("expected event %#+v, but channel is closed"), tc.expected[i])
+					t.Errorf("expected event %s, but channel is closed", dump.Pretty(tc.expected[i]))
 					break
 				}
 
@@ -544,27 +599,20 @@ func TestRetryWatcher(t *testing.T) {
 			select {
 			case event, ok := <-watcher.ResultChan():
 				if ok {
-					t.Error(spew.Errorf("Unexpected event received after reading all the expected ones: %#+v", event))
+					t.Errorf("Unexpected event received after reading all the expected ones: %s", dump.Pretty(event))
 				}
 			case <-time.After(10 * time.Millisecond):
 				break
 			}
 
-			var counter uint32
 			// We always count with the last watch reestablishing which is imminent but still a race.
 			// We will wait for the last watch to reestablish to avoid it.
-			err = wait.PollImmediate(10*time.Millisecond, 10*time.Second, func() (done bool, err error) {
-				counter = atomic.LoadUint32(atomicCounter)
-				return counter == tc.watchCount, nil
-			})
-			if err == wait.ErrWaitTimeout {
-				t.Errorf("expected %d watcher starts, but it has started %d times", tc.watchCount, counter)
-			} else if err != nil {
-				t.Fatal(err)
-			}
+			tCtx.Eventually(func() uint32 {
+				return atomic.LoadUint32(atomicCounter)
+			}).WithTimeout(10*time.Second).WithPolling(10*time.Millisecond).Should(gomega.Equal(tc.watchCount), "watch count")
 
 			if !reflect.DeepEqual(tc.expected, got) {
-				t.Fatal(spew.Errorf("expected %#+v, got %#+v;\ndiff: %s", tc.expected, got, diff.ObjectReflectDiff(tc.expected, got)))
+				t.Fatalf("expected %s, got %s;\ndiff: %s", dump.Pretty(tc.expected), dump.Pretty(got), cmp.Diff(tc.expected, got))
 			}
 		})
 	}
@@ -586,12 +634,15 @@ func TestRetryWatcherToFinishWithUnreadEvents(t *testing.T) {
 	time.Sleep(10 * time.Millisecond)
 
 	watcher.Stop()
+	// Verify a second stop does not cause a panic
+	watcher.Stop()
 
+	maxTime := time.Second
 	select {
 	case <-watcher.Done():
 		break
-	case <-time.After(10 * time.Millisecond):
-		t.Error("Failed to close the watcher")
+	case <-time.After(maxTime):
+		t.Errorf("The watcher failed to be closed in %s", maxTime)
 	}
 
 	// RetryWatcher result channel should be closed

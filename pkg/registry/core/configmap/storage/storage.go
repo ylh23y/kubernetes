@@ -21,7 +21,6 @@ import (
 	"k8s.io/apiserver/pkg/registry/generic"
 	genericregistry "k8s.io/apiserver/pkg/registry/generic/registry"
 	"k8s.io/apiserver/pkg/registry/rest"
-	"k8s.io/apiserver/pkg/storage"
 	api "k8s.io/kubernetes/pkg/apis/core"
 	"k8s.io/kubernetes/pkg/printers"
 	printersinternal "k8s.io/kubernetes/pkg/printers/internalversion"
@@ -35,11 +34,13 @@ type REST struct {
 }
 
 // NewREST returns a RESTStorage object that will work with ConfigMap objects.
-func NewREST(optsGetter generic.RESTOptionsGetter) *REST {
+func NewREST(optsGetter generic.RESTOptionsGetter) (*REST, error) {
 	store := &genericregistry.Store{
-		NewFunc:                  func() runtime.Object { return &api.ConfigMap{} },
-		NewListFunc:              func() runtime.Object { return &api.ConfigMapList{} },
-		DefaultQualifiedResource: api.Resource("configmaps"),
+		NewFunc:                   func() runtime.Object { return &api.ConfigMap{} },
+		NewListFunc:               func() runtime.Object { return &api.ConfigMapList{} },
+		PredicateFunc:             configmap.Matcher,
+		DefaultQualifiedResource:  api.Resource("configmaps"),
+		SingularQualifiedResource: api.Resource("configmap"),
 
 		CreateStrategy: configmap.Strategy,
 		UpdateStrategy: configmap.Strategy,
@@ -50,12 +51,11 @@ func NewREST(optsGetter generic.RESTOptionsGetter) *REST {
 	options := &generic.StoreOptions{
 		RESTOptions: optsGetter,
 		AttrFunc:    configmap.GetAttrs,
-		TriggerFunc: map[string]storage.IndexerFunc{"metadata.name": configmap.NameTriggerFunc},
 	}
 	if err := store.CompleteWithOptions(options); err != nil {
-		panic(err) // TODO: Propagate error up
+		return nil, err
 	}
-	return &REST{store}
+	return &REST{store}, nil
 }
 
 // Implement ShortNamesProvider

@@ -17,8 +17,10 @@ limitations under the License.
 package garbagecollector
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"reflect"
 
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -26,7 +28,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/util/retry"
-	"k8s.io/klog"
+	"k8s.io/klog/v2"
 )
 
 // cluster scoped resources don't have namespaces.  Default to the item's namespace, but clear it for cluster scoped resources
@@ -48,15 +50,33 @@ func (gc *GarbageCollector) apiResource(apiVersion, kind string) (schema.GroupVe
 	return mapping.Resource, mapping.Scope == meta.RESTScopeNamespace, nil
 }
 
-func (gc *GarbageCollector) deleteObject(item objectReference, policy *metav1.DeletionPropagation) error {
+func (gc *GarbageCollector) deleteObject(item objectReference, resourceVersion string, ownersAtResourceVersion []metav1.OwnerReference, policy *metav1.DeletionPropagation) error {
 	resource, namespaced, err := gc.apiResource(item.APIVersion, item.Kind)
 	if err != nil {
 		return err
 	}
 	uid := item.UID
 	preconditions := metav1.Preconditions{UID: &uid}
+	if len(resourceVersion) > 0 {
+		preconditions.ResourceVersion = &resourceVersion
+	}
 	deleteOptions := metav1.DeleteOptions{Preconditions: &preconditions, PropagationPolicy: policy}
-	return gc.metadataClient.Resource(resource).Namespace(resourceDefaultNamespace(namespaced, item.Namespace)).Delete(item.Name, &deleteOptions)
+	resourceClient := gc.metadataClient.Resource(resource).Namespace(resourceDefaultNamespace(namespaced, item.Namespace))
+	err = resourceClient.Delete(context.TODO(), item.Name, deleteOptions)
+	if errors.IsConflict(err) && len(resourceVersion) > 0 {
+		// check if the ownerReferences changed
+		liveObject, liveErr := resourceClient.Get(context.TODO(), item.Name, metav1.GetOptions{})
+		if errors.IsNotFound(liveErr) {
+			// object we wanted to delete is gone, return NotFound so caller can handle it consistently
+			return liveErr
+		}
+		if liveErr == nil && liveObject.UID == item.UID && liveObject.ResourceVersion != resourceVersion && reflect.DeepEqual(liveObject.OwnerReferences, ownersAtResourceVersion) {
+			// object changed, causing a conflict error, but ownerReferences did not change.
+			// retry delete without resourceVersion precondition so rapid updates unrelated to ownerReferences don't starve GC
+			return gc.deleteObject(item, "", nil, policy)
+		}
+	}
+	return err
 }
 
 func (gc *GarbageCollector) getObject(item objectReference) (*metav1.PartialObjectMetadata, error) {
@@ -64,7 +84,13 @@ func (gc *GarbageCollector) getObject(item objectReference) (*metav1.PartialObje
 	if err != nil {
 		return nil, err
 	}
-	return gc.metadataClient.Resource(resource).Namespace(resourceDefaultNamespace(namespaced, item.Namespace)).Get(item.Name, metav1.GetOptions{})
+	namespace := resourceDefaultNamespace(namespaced, item.Namespace)
+	if namespaced && len(namespace) == 0 {
+		// the type is namespaced, but we have no namespace coordinate.
+		// the only way this can happen is if a cluster-scoped object referenced this type as an owner.
+		return nil, namespacedOwnerOfClusterScopedObjectErr
+	}
+	return gc.metadataClient.Resource(resource).Namespace(namespace).Get(context.TODO(), item.Name, metav1.GetOptions{})
 }
 
 func (gc *GarbageCollector) patchObject(item objectReference, patch []byte, pt types.PatchType) (*metav1.PartialObjectMetadata, error) {
@@ -72,10 +98,10 @@ func (gc *GarbageCollector) patchObject(item objectReference, patch []byte, pt t
 	if err != nil {
 		return nil, err
 	}
-	return gc.metadataClient.Resource(resource).Namespace(resourceDefaultNamespace(namespaced, item.Namespace)).Patch(item.Name, pt, patch, metav1.PatchOptions{})
+	return gc.metadataClient.Resource(resource).Namespace(resourceDefaultNamespace(namespaced, item.Namespace)).Patch(context.TODO(), item.Name, pt, patch, metav1.PatchOptions{})
 }
 
-func (gc *GarbageCollector) removeFinalizer(owner *node, targetFinalizer string) error {
+func (gc *GarbageCollector) removeFinalizer(logger klog.Logger, owner *node, targetFinalizer string) error {
 	err := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
 		ownerObject, err := gc.getObject(owner.identity)
 		if errors.IsNotFound(err) {
@@ -99,7 +125,7 @@ func (gc *GarbageCollector) removeFinalizer(owner *node, targetFinalizer string)
 			newFinalizers = append(newFinalizers, f)
 		}
 		if !found {
-			klog.V(5).Infof("the %s finalizer is already removed from object %s", targetFinalizer, owner.identity)
+			logger.V(5).Info("finalizer already removed from object", "finalizer", targetFinalizer, "object", owner.identity)
 			return nil
 		}
 

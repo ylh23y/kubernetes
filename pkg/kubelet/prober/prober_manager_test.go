@@ -17,29 +17,38 @@ limitations under the License.
 package prober
 
 import (
+	"context"
 	"fmt"
+	"slices"
 	"strconv"
 	"testing"
+	"testing/synctest"
 	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/wait"
-	"k8s.io/klog"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	"k8s.io/client-go/tools/record"
+	featuregatetesting "k8s.io/component-base/featuregate/testing"
+	"k8s.io/klog/v2"
+	"k8s.io/ktesting"
+	"k8s.io/kubernetes/pkg/features"
 	kubecontainer "k8s.io/kubernetes/pkg/kubelet/container"
 	"k8s.io/kubernetes/pkg/kubelet/prober/results"
 	"k8s.io/kubernetes/pkg/probe"
 )
 
 func init() {
-	runtime.ReallyCrash = true
 }
 
 var defaultProbe = &v1.Probe{
-	Handler: v1.Handler{
+	ProbeHandler: v1.ProbeHandler{
 		Exec: &v1.ExecAction{},
 	},
 	TimeoutSeconds:   1,
@@ -49,6 +58,12 @@ var defaultProbe = &v1.Probe{
 }
 
 func TestAddRemovePods(t *testing.T) {
+	ktesting.Init(t).SyncTest("", testAddRemovePods)
+}
+
+func testAddRemovePods(tCtx ktesting.TContext) {
+	t := tCtx.TB()
+
 	noProbePod := v1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			UID: "no_probe_pod",
@@ -58,6 +73,8 @@ func TestAddRemovePods(t *testing.T) {
 				Name: "no_probe1",
 			}, {
 				Name: "no_probe2",
+			}, {
+				Name: "no_probe3",
 			}},
 		},
 	}
@@ -68,15 +85,20 @@ func TestAddRemovePods(t *testing.T) {
 		},
 		Spec: v1.PodSpec{
 			Containers: []v1.Container{{
-				Name: "no_probe1",
+				Name: "probe1",
 			}, {
 				Name:           "readiness",
 				ReadinessProbe: defaultProbe,
 			}, {
-				Name: "no_probe2",
+				Name: "probe2",
 			}, {
 				Name:          "liveness",
 				LivenessProbe: defaultProbe,
+			}, {
+				Name: "probe3",
+			}, {
+				Name:         "startup",
+				StartupProbe: defaultProbe,
 			}},
 		},
 	}
@@ -88,16 +110,17 @@ func TestAddRemovePods(t *testing.T) {
 	}
 
 	// Adding a pod with no probes should be a no-op.
-	m.AddPod(&noProbePod)
+	m.SyncPod(tCtx, &noProbePod)
 	if err := expectProbes(m, nil); err != nil {
 		t.Error(err)
 	}
 
 	// Adding a pod with probes.
-	m.AddPod(&probePod)
+	m.SyncPod(tCtx, &probePod)
 	probePaths := []probeKey{
 		{"probe_pod", "readiness", readiness},
 		{"probe_pod", "liveness", liveness},
+		{"probe_pod", "startup", startup},
 	}
 	if err := expectProbes(m, probePaths); err != nil {
 		t.Error(err)
@@ -111,7 +134,7 @@ func TestAddRemovePods(t *testing.T) {
 
 	// Removing probed pod.
 	m.RemovePod(&probePod)
-	if err := waitForWorkerExit(m, probePaths); err != nil {
+	if err := waitForWorkerExit(t, m, probePaths); err != nil {
 		t.Fatal(err)
 	}
 	if err := expectProbes(m, nil); err != nil {
@@ -125,7 +148,394 @@ func TestAddRemovePods(t *testing.T) {
 	}
 }
 
+func TestSyncPodContinuesAfterExistingWorker(t *testing.T) {
+	ktesting.Init(t).SyncTest("", testSyncPodContinuesAfterExistingWorker)
+}
+
+func testSyncPodContinuesAfterExistingWorker(tCtx ktesting.TContext) {
+	t := tCtx.TB()
+	ctx := tCtx.Context
+
+	pod := v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			UID: "test_pod",
+		},
+		Spec: v1.PodSpec{
+			Containers: []v1.Container{
+				{
+					Name:           "container_a",
+					ReadinessProbe: defaultProbe,
+				},
+				{
+					Name:           "container_b",
+					ReadinessProbe: defaultProbe,
+				},
+			},
+		},
+	}
+
+	m := newTestManager()
+	defer cleanup(t, m)
+
+	// First SyncPod: registers workers for both containers.
+	m.SyncPod(ctx, &pod)
+	if err := expectProbes(m, []probeKey{
+		{"test_pod", "container_a", readiness},
+		{"test_pod", "container_b", readiness},
+	}); err != nil {
+		t.Fatalf("after first SyncPod: %v", err)
+	}
+
+	// Simulate container_b's worker being removed while container_a's is still present.
+	m.workers[probeKey{"test_pod", "container_b", readiness}].stop()
+	synctest.Wait()
+
+	// Second SyncPod: should re-register container_b's missing worker.
+	// Previously, hitting container_a's existing worker caused an early return,
+	// so container_b was never re-registered.
+	m.SyncPod(ctx, &pod)
+
+	if err := expectProbes(m, []probeKey{
+		{"test_pod", "container_a", readiness},
+		{"test_pod", "container_b", readiness},
+	}); err != nil {
+		t.Errorf("container_b worker was not re-registered after second SyncPod: %v", err)
+	}
+}
+
+func TestSyncPodStopsRemovedContainerWorkers(t *testing.T) {
+	ktesting.Init(t).SyncTest("", testSyncPodStopsRemovedContainerWorkers)
+}
+
+func testSyncPodStopsRemovedContainerWorkers(tCtx ktesting.TContext) {
+	restartPolicyAlways := v1.ContainerRestartPolicyAlways
+	t := tCtx.TB()
+	ctx := tCtx.Context
+
+	pod := &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{UID: "test_pod"},
+		Spec: v1.PodSpec{
+			InitContainers: []v1.Container{{
+				Name:           "sidecar",
+				RestartPolicy:  &restartPolicyAlways,
+				ReadinessProbe: defaultProbe,
+			}},
+			Containers: []v1.Container{{
+				Name:           "keep",
+				ReadinessProbe: defaultProbe,
+				LivenessProbe:  defaultProbe,
+			}, {
+				Name:           "removed",
+				ReadinessProbe: defaultProbe,
+				LivenessProbe:  defaultProbe,
+				StartupProbe:   defaultProbe,
+			}},
+		},
+	}
+	otherPod := &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{UID: "other_pod"},
+		Spec: v1.PodSpec{
+			Containers: []v1.Container{{
+				Name:           "removed",
+				ReadinessProbe: defaultProbe,
+			}},
+		},
+	}
+
+	m := newTestManager()
+	defer cleanup(t, m)
+
+	m.SyncPod(ctx, pod)
+	m.SyncPod(ctx, otherPod)
+	remaining := []probeKey{
+		{"test_pod", "sidecar", readiness},
+		{"test_pod", "keep", readiness},
+		{"test_pod", "keep", liveness},
+		{"other_pod", "removed", readiness},
+	}
+	removed := []probeKey{
+		{"test_pod", "removed", readiness},
+		{"test_pod", "removed", liveness},
+		{"test_pod", "removed", startup},
+	}
+	require.NoError(t, expectProbes(m, append(slices.Clone(remaining), removed...)))
+
+	updated := pod.DeepCopy()
+	updated.Spec.Containers = updated.Spec.Containers[:1]
+	m.SyncPod(ctx, updated)
+	// The removed container's workers exit; workers of other containers and pods are kept.
+	waitForStoppedWorkers()
+	require.NoError(t, expectProbes(m, remaining))
+}
+
+// TestSyncPodReaddedContainerGetsNewWorker checks that a container added back under the name of a
+// removed container gets a new worker, which the removed container's exiting worker leaves alone.
+func TestSyncPodReaddedContainerGetsNewWorker(t *testing.T) {
+	ktesting.Init(t).SyncTest("", testSyncPodReaddedContainerGetsNewWorker)
+}
+
+func testSyncPodReaddedContainerGetsNewWorker(tCtx ktesting.TContext) {
+	t := tCtx.TB()
+	ctx := tCtx.Context
+	pod := &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{UID: "test_pod"},
+		Spec: v1.PodSpec{
+			Containers: []v1.Container{{Name: "keep"}, {Name: "readded", ReadinessProbe: defaultProbe}},
+		},
+	}
+	key := probeKey{"test_pod", "readded", readiness}
+	m := newTestManager()
+	defer cleanup(t, m)
+
+	m.SyncPod(ctx, pod)
+	require.NoError(t, expectProbes(m, []probeKey{key}))
+	oldWorker := m.workers[key]
+
+	removed := pod.DeepCopy()
+	removed.Spec.Containers = removed.Spec.Containers[:1]
+	m.SyncPod(ctx, removed)
+	// Added back before the old worker exits.
+	m.SyncPod(ctx, pod)
+	waitForStoppedWorkers()
+
+	require.NoError(t, expectProbes(m, []probeKey{key}))
+	m.workerLock.RLock()
+	defer m.workerLock.RUnlock()
+	assert.NotSame(t, oldWorker, m.workers[key], "the re-added container should have a new worker")
+}
+
+func TestStopProbesOfContainersMissingFromSpec(t *testing.T) {
+	ktesting.Init(t).SyncTest("", testStopProbesOfContainersMissingFromSpec)
+}
+
+func testStopProbesOfContainersMissingFromSpec(tCtx ktesting.TContext) {
+	t := tCtx.TB()
+	ctx := tCtx.Context
+
+	pod := &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{UID: "test_pod"},
+		Spec: v1.PodSpec{
+			Containers: []v1.Container{
+				{Name: "keep", ReadinessProbe: defaultProbe, LivenessProbe: defaultProbe},
+				{Name: "removed", ReadinessProbe: defaultProbe, LivenessProbe: defaultProbe},
+			},
+		},
+	}
+	m := newTestManager()
+	defer cleanup(t, m)
+	m.SyncPod(ctx, pod)
+
+	// The pod starts terminating with a spec that no longer has "removed",
+	// before SyncPod has seen that spec.
+	updated := pod.DeepCopy()
+	updated.Spec.Containers = updated.Spec.Containers[:1]
+	m.StopLivenessAndStartup(updated)
+	require.NoError(t, waitForWorkerExit(t, m, []probeKey{
+		{"test_pod", "keep", liveness},
+		{"test_pod", "removed", liveness},
+	}))
+	require.NoError(t, expectProbes(m, []probeKey{
+		{"test_pod", "keep", readiness},
+		{"test_pod", "removed", readiness},
+	}))
+
+	m.RemovePod(updated)
+	require.NoError(t, waitForWorkerExit(t, m, []probeKey{
+		{"test_pod", "keep", readiness},
+		{"test_pod", "removed", readiness},
+	}))
+	require.NoError(t, expectProbes(m, nil))
+}
+
+func TestUpdatePodStatusRemovedContainerNotReady(t *testing.T) {
+	tCtx := ktesting.Init(t)
+	m := newTestManager()
+	defer cleanup(t, m)
+
+	pod := &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{UID: "test_pod"},
+		Spec:       v1.PodSpec{Containers: []v1.Container{{Name: "main"}}},
+	}
+	running := v1.ContainerState{Running: &v1.ContainerStateRunning{}}
+	status := &v1.PodStatus{ContainerStatuses: []v1.ContainerStatus{
+		{Name: "main", ContainerID: "test://main", State: running},
+		{Name: "removed", ContainerID: "test://removed", State: running},
+	}}
+	m.UpdatePodStatus(tCtx, pod, status)
+	assert.True(t, status.ContainerStatuses[0].Ready, "main")
+	assert.False(t, status.ContainerStatuses[1].Ready, "removed")
+}
+
+func TestAddRemovePodsWithRestartableInitContainer(t *testing.T) {
+	tCtx := ktesting.Init(t)
+	m := newTestManager()
+	defer cleanup(t, m)
+	if err := expectProbes(m, nil); err != nil {
+		t.Error(err)
+	}
+
+	testCases := []struct {
+		desc                        string
+		probePaths                  []probeKey
+		hasRestartableInitContainer bool
+	}{
+		{
+			desc:                        "pod without sidecar",
+			probePaths:                  nil,
+			hasRestartableInitContainer: false,
+		},
+		{
+			desc: "pod with sidecar",
+			probePaths: []probeKey{
+				{"restartable_init_container_pod", "restartable-init", liveness},
+				{"restartable_init_container_pod", "restartable-init", readiness},
+				{"restartable_init_container_pod", "restartable-init", startup},
+			},
+			hasRestartableInitContainer: true,
+		},
+	}
+
+	containerRestartPolicy := func(hasRestartableInitContainer bool) *v1.ContainerRestartPolicy {
+		if !hasRestartableInitContainer {
+			return nil
+		}
+		restartPolicy := v1.ContainerRestartPolicyAlways
+		return &restartPolicy
+	}
+
+	for _, tc := range testCases {
+		tCtx.SyncTest(tc.desc, func(tCtx ktesting.TContext) {
+			t := tCtx.TB()
+			probePod := v1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					UID: "restartable_init_container_pod",
+				},
+				Spec: v1.PodSpec{
+					InitContainers: []v1.Container{{
+						Name: "init",
+					}, {
+						Name:           "restartable-init",
+						LivenessProbe:  defaultProbe,
+						ReadinessProbe: defaultProbe,
+						StartupProbe:   defaultProbe,
+						RestartPolicy:  containerRestartPolicy(tc.hasRestartableInitContainer),
+					}},
+					Containers: []v1.Container{{
+						Name: "main",
+					}},
+				},
+			}
+
+			// Adding a pod with probes.
+			m.SyncPod(tCtx, &probePod)
+			if err := expectProbes(m, tc.probePaths); err != nil {
+				t.Error(err)
+			}
+
+			// Removing probed pod.
+			m.RemovePod(&probePod)
+			if err := waitForWorkerExit(t, m, tc.probePaths); err != nil {
+				t.Fatal(err)
+			}
+			if err := expectProbes(m, nil); err != nil {
+				t.Error(err)
+			}
+
+			// Removing already removed pods should be a no-op.
+			m.RemovePod(&probePod)
+			if err := expectProbes(m, nil); err != nil {
+				t.Error(err)
+			}
+		})
+	}
+}
+
+func TestStopLivenessAndStartup(t *testing.T) {
+	ktesting.Init(t).SyncTest("", testStopLivenessAndStartup)
+}
+
+func testStopLivenessAndStartup(tCtx ktesting.TContext) {
+	t := tCtx.TB()
+	m := newTestManager()
+	defer cleanup(t, m)
+
+	restartPolicyAlways := v1.ContainerRestartPolicyAlways
+	pod := v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			UID: "stop_probe_pod",
+		},
+		Spec: v1.PodSpec{
+			InitContainers: []v1.Container{
+				{
+					Name: "regular-init",
+				},
+				{
+					Name:           "sidecar",
+					RestartPolicy:  &restartPolicyAlways,
+					StartupProbe:   defaultProbe,
+					LivenessProbe:  defaultProbe,
+					ReadinessProbe: defaultProbe,
+				},
+			},
+			Containers: []v1.Container{
+				{
+					Name:           "main",
+					StartupProbe:   defaultProbe,
+					LivenessProbe:  defaultProbe,
+					ReadinessProbe: defaultProbe,
+				},
+			},
+		},
+	}
+
+	m.SyncPod(tCtx, &pod)
+	allProbes := []probeKey{
+		{"stop_probe_pod", "sidecar", startup},
+		{"stop_probe_pod", "sidecar", liveness},
+		{"stop_probe_pod", "sidecar", readiness},
+		{"stop_probe_pod", "main", startup},
+		{"stop_probe_pod", "main", liveness},
+		{"stop_probe_pod", "main", readiness},
+	}
+	if err := expectProbes(m, allProbes); err != nil {
+		t.Fatal(err)
+	}
+
+	m.StopLivenessAndStartup(&pod)
+
+	stoppedProbes := []probeKey{
+		{"stop_probe_pod", "sidecar", startup},
+		{"stop_probe_pod", "sidecar", liveness},
+		{"stop_probe_pod", "main", startup},
+		{"stop_probe_pod", "main", liveness},
+	}
+	if err := waitForWorkerExit(t, m, stoppedProbes); err != nil {
+		t.Fatal(err)
+	}
+
+	remainingProbes := []probeKey{
+		{"stop_probe_pod", "sidecar", readiness},
+		{"stop_probe_pod", "main", readiness},
+	}
+	if err := expectProbes(m, remainingProbes); err != nil {
+		t.Error(err)
+	}
+
+	m.RemovePod(&pod)
+	if err := waitForWorkerExit(t, m, remainingProbes); err != nil {
+		t.Fatal(err)
+	}
+	if err := expectProbes(m, nil); err != nil {
+		t.Error(err)
+	}
+}
+
 func TestCleanupPods(t *testing.T) {
+	ktesting.Init(t).SyncTest("", testCleanupPods)
+}
+
+func testCleanupPods(tCtx ktesting.TContext) {
+	t := tCtx.TB()
 	m := newTestManager()
 	defer cleanup(t, m)
 	podToCleanup := v1.Pod{
@@ -139,6 +549,9 @@ func TestCleanupPods(t *testing.T) {
 			}, {
 				Name:          "prober2",
 				LivenessProbe: defaultProbe,
+			}, {
+				Name:         "prober3",
+				StartupProbe: defaultProbe,
 			}},
 		},
 	}
@@ -153,11 +566,14 @@ func TestCleanupPods(t *testing.T) {
 			}, {
 				Name:          "prober2",
 				LivenessProbe: defaultProbe,
+			}, {
+				Name:         "prober3",
+				StartupProbe: defaultProbe,
 			}},
 		},
 	}
-	m.AddPod(&podToCleanup)
-	m.AddPod(&podToKeep)
+	m.SyncPod(tCtx, &podToCleanup)
+	m.SyncPod(tCtx, &podToKeep)
 
 	desiredPods := map[types.UID]sets.Empty{}
 	desiredPods[podToKeep.UID] = sets.Empty{}
@@ -166,12 +582,14 @@ func TestCleanupPods(t *testing.T) {
 	removedProbes := []probeKey{
 		{"pod_cleanup", "prober1", readiness},
 		{"pod_cleanup", "prober2", liveness},
+		{"pod_cleanup", "prober3", startup},
 	}
 	expectedProbes := []probeKey{
 		{"pod_keep", "prober1", readiness},
 		{"pod_keep", "prober2", liveness},
+		{"pod_keep", "prober3", startup},
 	}
-	if err := waitForWorkerExit(m, removedProbes); err != nil {
+	if err := waitForWorkerExit(t, m, removedProbes); err != nil {
 		t.Fatal(err)
 	}
 	if err := expectProbes(m, expectedProbes); err != nil {
@@ -180,6 +598,11 @@ func TestCleanupPods(t *testing.T) {
 }
 
 func TestCleanupRepeated(t *testing.T) {
+	ktesting.Init(t).SyncTest("", testCleanupRepeated)
+}
+
+func testCleanupRepeated(tCtx ktesting.TContext) {
+	t := tCtx.TB()
 	m := newTestManager()
 	defer cleanup(t, m)
 	podTemplate := v1.Pod{
@@ -188,6 +611,7 @@ func TestCleanupRepeated(t *testing.T) {
 				Name:           "prober1",
 				ReadinessProbe: defaultProbe,
 				LivenessProbe:  defaultProbe,
+				StartupProbe:   defaultProbe,
 			}},
 		},
 	}
@@ -196,7 +620,7 @@ func TestCleanupRepeated(t *testing.T) {
 	for i := 0; i < numTestPods; i++ {
 		pod := podTemplate
 		pod.UID = types.UID(strconv.Itoa(i))
-		m.AddPod(&pod)
+		m.SyncPod(tCtx, &pod)
 	}
 
 	for i := 0; i < 10; i++ {
@@ -205,6 +629,8 @@ func TestCleanupRepeated(t *testing.T) {
 }
 
 func TestUpdatePodStatus(t *testing.T) {
+	ctx := ktesting.Init(t)
+	logger := ctx.Logger()
 	unprobed := v1.ContainerStatus{
 		Name:        "unprobed_container",
 		ContainerID: "test://unprobed_container_id",
@@ -233,6 +659,20 @@ func TestUpdatePodStatus(t *testing.T) {
 			Running: &v1.ContainerStateRunning{},
 		},
 	}
+	notStartedNoReadiness := v1.ContainerStatus{
+		Name:        "not_started_container_no_readiness",
+		ContainerID: "test://not_started_container_no_readiness_id",
+		State: v1.ContainerState{
+			Running: &v1.ContainerStateRunning{},
+		},
+	}
+	startedNoReadiness := v1.ContainerStatus{
+		Name:        "started_container_no_readiness",
+		ContainerID: "test://started_container_no_readiness_id",
+		State: v1.ContainerState{
+			Running: &v1.ContainerStateRunning{},
+		},
+	}
 	terminated := v1.ContainerStatus{
 		Name:        "terminated_container",
 		ContainerID: "test://terminated_container_id",
@@ -243,7 +683,7 @@ func TestUpdatePodStatus(t *testing.T) {
 	podStatus := v1.PodStatus{
 		Phase: v1.PodRunning,
 		ContainerStatuses: []v1.ContainerStatus{
-			unprobed, probedReady, probedPending, probedUnready, terminated,
+			unprobed, probedReady, probedPending, probedUnready, notStartedNoReadiness, startedNoReadiness, terminated,
 		},
 	}
 
@@ -252,24 +692,44 @@ func TestUpdatePodStatus(t *testing.T) {
 
 	// Setup probe "workers" and cached results.
 	m.workers = map[probeKey]*worker{
-		{testPodUID, unprobed.Name, liveness}:       {},
-		{testPodUID, probedReady.Name, readiness}:   {},
-		{testPodUID, probedPending.Name, readiness}: {},
-		{testPodUID, probedUnready.Name, readiness}: {},
-		{testPodUID, terminated.Name, readiness}:    {},
+		{testPodUID, unprobed.Name, liveness}:             {},
+		{testPodUID, probedReady.Name, readiness}:         {},
+		{testPodUID, probedPending.Name, readiness}:       {},
+		{testPodUID, probedUnready.Name, readiness}:       {},
+		{testPodUID, notStartedNoReadiness.Name, startup}: {},
+		{testPodUID, startedNoReadiness.Name, startup}:    {},
+		{testPodUID, terminated.Name, readiness}:          {},
 	}
-	m.readinessManager.Set(kubecontainer.ParseContainerID(probedReady.ContainerID), results.Success, &v1.Pod{})
-	m.readinessManager.Set(kubecontainer.ParseContainerID(probedUnready.ContainerID), results.Failure, &v1.Pod{})
-	m.readinessManager.Set(kubecontainer.ParseContainerID(terminated.ContainerID), results.Success, &v1.Pod{})
+	m.readinessManager.Set(kubecontainer.ParseContainerID(logger, probedReady.ContainerID), results.Success, &v1.Pod{})
+	m.readinessManager.Set(kubecontainer.ParseContainerID(logger, probedUnready.ContainerID), results.Failure, &v1.Pod{})
+	m.startupManager.Set(kubecontainer.ParseContainerID(logger, startedNoReadiness.ContainerID), results.Success, &v1.Pod{})
+	m.readinessManager.Set(kubecontainer.ParseContainerID(logger, terminated.ContainerID), results.Success, &v1.Pod{})
 
-	m.UpdatePodStatus(testPodUID, &podStatus)
+	m.UpdatePodStatus(ctx, &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			UID: testPodUID,
+		},
+		Spec: v1.PodSpec{
+			Containers: []v1.Container{
+				{Name: unprobed.Name},
+				{Name: probedReady.Name},
+				{Name: probedPending.Name},
+				{Name: probedUnready.Name},
+				{Name: notStartedNoReadiness.Name},
+				{Name: startedNoReadiness.Name},
+				{Name: terminated.Name},
+			},
+		},
+	}, &podStatus)
 
 	expectedReadiness := map[probeKey]bool{
-		{testPodUID, unprobed.Name, readiness}:      true,
-		{testPodUID, probedReady.Name, readiness}:   true,
-		{testPodUID, probedPending.Name, readiness}: false,
-		{testPodUID, probedUnready.Name, readiness}: false,
-		{testPodUID, terminated.Name, readiness}:    false,
+		{testPodUID, unprobed.Name, readiness}:              true,
+		{testPodUID, probedReady.Name, readiness}:           true,
+		{testPodUID, probedPending.Name, readiness}:         false,
+		{testPodUID, probedUnready.Name, readiness}:         false,
+		{testPodUID, notStartedNoReadiness.Name, readiness}: false,
+		{testPodUID, startedNoReadiness.Name, readiness}:    true,
+		{testPodUID, terminated.Name, readiness}:            false,
 	}
 	for _, c := range podStatus.ContainerStatuses {
 		expected, ok := expectedReadiness[probeKey{testPodUID, c.Name, readiness}]
@@ -283,7 +743,360 @@ func TestUpdatePodStatus(t *testing.T) {
 	}
 }
 
+func TestUpdatePodStatusWithInitContainers(t *testing.T) {
+	logger, _ := ktesting.NewTestContext(t)
+	notStarted := v1.ContainerStatus{
+		Name:        "not_started_container",
+		ContainerID: "test://not_started_container_id",
+		State: v1.ContainerState{
+			Running: &v1.ContainerStateRunning{},
+		},
+	}
+	started := v1.ContainerStatus{
+		Name:        "started_container",
+		ContainerID: "test://started_container_id",
+		State: v1.ContainerState{
+			Running: &v1.ContainerStateRunning{},
+		},
+	}
+	terminated := v1.ContainerStatus{
+		Name:        "terminated_container",
+		ContainerID: "test://terminated_container_id",
+		State: v1.ContainerState{
+			Terminated: &v1.ContainerStateTerminated{},
+		},
+	}
+
+	m := newTestManager()
+	// no cleanup: using fake workers.
+
+	// Setup probe "workers" and cached results.
+	m.workers = map[probeKey]*worker{
+		{testPodUID, notStarted.Name, startup}: {},
+		{testPodUID, started.Name, startup}:    {},
+	}
+	m.startupManager.Set(kubecontainer.ParseContainerID(logger, started.ContainerID), results.Success, &v1.Pod{})
+
+	testCases := []struct {
+		desc                        string
+		expectedStartup             map[probeKey]bool
+		expectedReadiness           map[probeKey]bool
+		hasRestartableInitContainer bool
+	}{
+		{
+			desc: "init containers",
+			expectedStartup: map[probeKey]bool{
+				{testPodUID, notStarted.Name, startup}: false,
+				{testPodUID, started.Name, startup}:    true,
+				{testPodUID, terminated.Name, startup}: false,
+			},
+			expectedReadiness: map[probeKey]bool{
+				{testPodUID, notStarted.Name, readiness}: false,
+				{testPodUID, started.Name, readiness}:    false,
+				{testPodUID, terminated.Name, readiness}: true,
+			},
+			hasRestartableInitContainer: false,
+		},
+		{
+			desc: "init container with Always restartPolicy",
+			expectedStartup: map[probeKey]bool{
+				{testPodUID, notStarted.Name, startup}: false,
+				{testPodUID, started.Name, startup}:    true,
+				{testPodUID, terminated.Name, startup}: false,
+			},
+			expectedReadiness: map[probeKey]bool{
+				{testPodUID, notStarted.Name, readiness}: false,
+				{testPodUID, started.Name, readiness}:    true,
+				{testPodUID, terminated.Name, readiness}: false,
+			},
+			hasRestartableInitContainer: true,
+		},
+	}
+
+	containerRestartPolicy := func(enableSidecarContainers bool) *v1.ContainerRestartPolicy {
+		if !enableSidecarContainers {
+			return nil
+		}
+		restartPolicy := v1.ContainerRestartPolicyAlways
+		return &restartPolicy
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.desc, func(t *testing.T) {
+			ctx := ktesting.Init(t)
+			podStatus := v1.PodStatus{
+				Phase: v1.PodRunning,
+				InitContainerStatuses: []v1.ContainerStatus{
+					notStarted, started, terminated,
+				},
+			}
+
+			m.UpdatePodStatus(ctx, &v1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					UID: testPodUID,
+				},
+				Spec: v1.PodSpec{
+					InitContainers: []v1.Container{
+						{
+							Name:          notStarted.Name,
+							RestartPolicy: containerRestartPolicy(tc.hasRestartableInitContainer),
+						},
+						{
+							Name:          started.Name,
+							RestartPolicy: containerRestartPolicy(tc.hasRestartableInitContainer),
+						},
+						{
+							Name:          terminated.Name,
+							RestartPolicy: containerRestartPolicy(tc.hasRestartableInitContainer),
+						},
+					},
+				},
+			}, &podStatus)
+
+			for _, c := range podStatus.InitContainerStatuses {
+				{
+					expected, ok := tc.expectedStartup[probeKey{testPodUID, c.Name, startup}]
+					if !ok {
+						t.Fatalf("Missing expectation for test case: %v", c.Name)
+					}
+					if expected != *c.Started {
+						t.Errorf("Unexpected startup for container %v: Expected %v but got %v",
+							c.Name, expected, *c.Started)
+					}
+				}
+				{
+					expected, ok := tc.expectedReadiness[probeKey{testPodUID, c.Name, readiness}]
+					if !ok {
+						t.Fatalf("Missing expectation for test case: %v", c.Name)
+					}
+					if expected != c.Ready {
+						t.Errorf("Unexpected readiness for container %v: Expected %v but got %v",
+							c.Name, expected, c.Ready)
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestUpdatePodStatusOnKubeletRestart(t *testing.T) {
+	const (
+		containerName  = "test_container"
+		oldContainerID = "test://old-container-id"
+		newContainerID = "test://new_container_id"
+	)
+
+	tests := []struct {
+		name string
+		// featureEnabled toggles ChangeContainerStatusOnKubeletRestart feature gate.
+		// When enabled, readiness is never preserved across a kubelet restart.
+		featureEnabled bool
+		// apiContainerID is the container ID in the pod status the kubelet last
+		// observed from the API server, which may be outdated.
+		apiContainerID               string
+		firstSyncAfterKubeletRestart bool
+		expectedReady                bool
+	}{
+		{
+			name:           "feature is disabled, the container survived the kubelet restart",
+			featureEnabled: false,
+			apiContainerID: newContainerID,
+			expectedReady:  true,
+		},
+		{
+			name:           "feature is disabled, the container was replaced while the API server was unreachable",
+			featureEnabled: false,
+			apiContainerID: oldContainerID,
+			expectedReady:  false,
+		},
+		{
+			name:                         "feature is disabled, the container survived the kubelet restart, first sync",
+			featureEnabled:               false,
+			apiContainerID:               newContainerID,
+			firstSyncAfterKubeletRestart: true,
+			expectedReady:                true,
+		},
+		{
+			name:                         "feature is disabled, the container was replaced while the API server was unreachable, first sync",
+			featureEnabled:               false,
+			apiContainerID:               oldContainerID,
+			firstSyncAfterKubeletRestart: true,
+			expectedReady:                false,
+		},
+		{
+			name:           "feature is enabled, the container survived the kubelet restart",
+			featureEnabled: true,
+			apiContainerID: newContainerID,
+			expectedReady:  false,
+		},
+		{
+			name:           "feature is enabled, the container was replaced while the API server was unreachable",
+			featureEnabled: true,
+			apiContainerID: oldContainerID,
+			expectedReady:  false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ChangeContainerStatusOnKubeletRestart, tc.featureEnabled)
+
+			ctx := ktesting.Init(t)
+			m := newTestManager()
+			// no cleanup: using fake workers.
+
+			// On the first sync after a kubelet restart there is no readiness worker yet,
+			// because the kubelet updates the pod status before it starts probing. The
+			// worker a later sync registers has not produced a result yet.
+			if !tc.firstSyncAfterKubeletRestart {
+				m.workers = map[probeKey]*worker{
+					{testPodUID, containerName, readiness}: {
+						probeType:       readiness,
+						manualTriggerCh: make(chan struct{}, 1),
+					},
+				}
+			}
+
+			// The runtime reports a container that started before the kubelet
+			// restart grace period, so its start time alone makes it look like a
+			// container that survived the restart.
+			startedBeforeKubeletRestart := metav1.Time{Time: kubeletRestartGracePeriod(m.start).Add(-time.Minute)}
+			podStatus := v1.PodStatus{
+				Phase: v1.PodRunning,
+				ContainerStatuses: []v1.ContainerStatus{{
+					Name:        containerName,
+					ContainerID: newContainerID,
+					State: v1.ContainerState{
+						Running: &v1.ContainerStateRunning{StartedAt: startedBeforeKubeletRestart},
+					},
+				}},
+			}
+
+			pod := &v1.Pod{
+				ObjectMeta: metav1.ObjectMeta{UID: testPodUID},
+				Spec: v1.PodSpec{
+					Containers: []v1.Container{{Name: containerName, ReadinessProbe: defaultProbe}},
+				},
+				Status: v1.PodStatus{
+					Conditions: []v1.PodCondition{{Type: v1.PodReady, Status: v1.ConditionTrue}},
+					ContainerStatuses: []v1.ContainerStatus{{
+						Name:        containerName,
+						ContainerID: tc.apiContainerID,
+						Ready:       true,
+					}},
+				},
+			}
+
+			m.UpdatePodStatus(ctx, pod, &podStatus)
+
+			if got := podStatus.ContainerStatuses[0].Ready; got != tc.expectedReady {
+				t.Errorf("Unexpected readiness for container %v: expected %v but got %v", containerName, tc.expectedReady, got)
+			}
+		})
+	}
+}
+
+func TestUpdatePodStatusOnKubeletRestartWithMultipleContainers(t *testing.T) {
+	featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ChangeContainerStatusOnKubeletRestart, false)
+
+	const (
+		survivedContainer      = "survived_container"
+		survivedContainerID    = "test://survived_container_id"
+		replacedContainer      = "replaced_container"
+		replacedOldContainerID = "test://replaced_container_old_id"
+		replacedNewContainerID = "test://replaced_container_new_id"
+	)
+
+	ctx := ktesting.Init(t)
+	m := newTestManager()
+	// no cleanup: using fake workers.
+
+	// Neither readiness probe has produced a result yet.
+	m.workers = map[probeKey]*worker{
+		{testPodUID, survivedContainer, readiness}: {
+			probeType:       readiness,
+			manualTriggerCh: make(chan struct{}, 1),
+		},
+		{testPodUID, replacedContainer, readiness}: {
+			probeType:       readiness,
+			manualTriggerCh: make(chan struct{}, 1),
+		},
+	}
+
+	startedBeforeKubeletRestart := metav1.Time{Time: kubeletRestartGracePeriod(m.start).Add(-time.Minute)}
+	runningStatus := func(name, id string) v1.ContainerStatus {
+		return v1.ContainerStatus{
+			Name:        name,
+			ContainerID: id,
+			State: v1.ContainerState{
+				Running: &v1.ContainerStateRunning{StartedAt: startedBeforeKubeletRestart},
+			},
+		}
+	}
+
+	podStatus := v1.PodStatus{
+		Phase: v1.PodRunning,
+		ContainerStatuses: []v1.ContainerStatus{
+			runningStatus(survivedContainer, survivedContainerID),
+			runningStatus(replacedContainer, replacedNewContainerID),
+		},
+	}
+
+	pod := &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{UID: testPodUID},
+		Spec: v1.PodSpec{
+			Containers: []v1.Container{
+				{Name: survivedContainer, ReadinessProbe: defaultProbe},
+				{Name: replacedContainer, ReadinessProbe: defaultProbe},
+			},
+		},
+		Status: v1.PodStatus{
+			Conditions: []v1.PodCondition{{Type: v1.PodReady, Status: v1.ConditionTrue}},
+			ContainerStatuses: []v1.ContainerStatus{
+				{Name: survivedContainer, ContainerID: survivedContainerID, Ready: true},
+				{Name: replacedContainer, ContainerID: replacedOldContainerID, Ready: true},
+			},
+		},
+	}
+
+	m.UpdatePodStatus(ctx, pod, &podStatus)
+
+	if !podStatus.ContainerStatuses[0].Ready {
+		t.Errorf("Expected container %v to keep its readiness across the kubelet restart", survivedContainer)
+	}
+	if podStatus.ContainerStatuses[1].Ready {
+		t.Errorf("Expected container %v not to inherit the replaced container's readiness", replacedContainer)
+	}
+
+	// Marking the new container NotReady flips the pod's Ready condition to False.
+	// setReadyStateOnKubeletRestart backs off whenever PodReady is not True, so on
+	// the next sync it also drops the container that did survive the restart,
+	// because its own readiness probe still has not produced a result.
+	pod.Status.Conditions[0].Status = v1.ConditionFalse
+
+	m.UpdatePodStatus(ctx, pod, &podStatus)
+
+	for _, c := range podStatus.ContainerStatuses {
+		if c.Ready {
+			t.Errorf("Expected container %v to be NotReady once the pod is no longer Ready", c.Name)
+		}
+	}
+}
+
+func (m *manager) extractedReadinessHandling(logger klog.Logger) {
+	update := <-m.readinessManager.Updates()
+	// This code corresponds to an extract from kubelet.syncLoopIteration()
+	ready := update.Result == results.Success
+	m.statusManager.SetContainerReadiness(logger, update.PodUID, update.ContainerID, ready)
+}
+
 func TestUpdateReadiness(t *testing.T) {
+	ktesting.Init(t).SyncTest("", testUpdateReadiness)
+}
+
+func testUpdateReadiness(tCtx ktesting.TContext) {
+	t := tCtx.TB()
+	logger := tCtx.Logger()
 	testPod := getTestPod()
 	setTestProbe(testPod, readiness, v1.Probe{})
 	m := newTestManager()
@@ -291,10 +1104,10 @@ func TestUpdateReadiness(t *testing.T) {
 
 	// Start syncing readiness without leaking goroutine.
 	stopCh := make(chan struct{})
-	go wait.Until(m.updateReadiness, 0, stopCh)
+	go wait.Until(func() { m.extractedReadinessHandling(logger) }, 0, stopCh)
 	defer func() {
 		close(stopCh)
-		// Send an update to exit updateReadiness()
+		// Send an update to exit extractedReadinessHandling()
 		m.readinessManager.Set(kubecontainer.ContainerID{}, results.Success, &v1.Pod{})
 	}()
 
@@ -302,16 +1115,16 @@ func TestUpdateReadiness(t *testing.T) {
 	exec.set(probe.Success, nil)
 	m.prober.exec = &exec
 
-	m.statusManager.SetPodStatus(testPod, getTestRunningStatus())
+	m.statusManager.SetPodStatus(logger, testPod, getTestRunningStatus())
 
-	m.AddPod(testPod)
+	m.SyncPod(tCtx, testPod)
 	probePaths := []probeKey{{testPodUID, testContainerName, readiness}}
 	if err := expectProbes(m, probePaths); err != nil {
 		t.Error(err)
 	}
 
 	// Wait for ready status.
-	if err := waitForReadyStatus(m, true); err != nil {
+	if err := waitForReadyStatus(t, m, true); err != nil {
 		t.Error(err)
 	}
 
@@ -319,7 +1132,7 @@ func TestUpdateReadiness(t *testing.T) {
 	exec.set(probe.Failure, nil)
 
 	// Wait for failed status.
-	if err := waitForReadyStatus(m, false); err != nil {
+	if err := waitForReadyStatus(t, m, false); err != nil {
 		t.Error(err)
 	}
 }
@@ -353,7 +1166,7 @@ outer:
 const interval = 1 * time.Second
 
 // Wait for the given workers to exit & clean up.
-func waitForWorkerExit(m *manager, workerPaths []probeKey) error {
+func waitForWorkerExit(t ktesting.TB, m *manager, workerPaths []probeKey) error {
 	for _, w := range workerPaths {
 		condition := func() (bool, error) {
 			_, exists := m.getWorker(w.podUID, w.containerName, w.probeType)
@@ -362,7 +1175,7 @@ func waitForWorkerExit(m *manager, workerPaths []probeKey) error {
 		if exited, _ := condition(); exited {
 			continue // Already exited, no need to poll.
 		}
-		klog.Infof("Polling %v", w)
+		t.Logf("Polling %v", w)
 		if err := wait.Poll(interval, wait.ForeverTestTimeout, condition); err != nil {
 			return err
 		}
@@ -372,7 +1185,7 @@ func waitForWorkerExit(m *manager, workerPaths []probeKey) error {
 }
 
 // Wait for the given workers to exit & clean up.
-func waitForReadyStatus(m *manager, ready bool) error {
+func waitForReadyStatus(t ktesting.TB, m *manager, ready bool) error {
 	condition := func() (bool, error) {
 		status, ok := m.statusManager.GetPodStatus(testPodUID)
 		if !ok {
@@ -387,7 +1200,7 @@ func waitForReadyStatus(m *manager, ready bool) error {
 		}
 		return status.ContainerStatuses[0].Ready == ready, nil
 	}
-	klog.Infof("Polling for ready state %v", ready)
+	t.Logf("Polling for ready state %v", ready)
 	if err := wait.Poll(interval, wait.ForeverTestTimeout, condition); err != nil {
 		return err
 	}
@@ -395,14 +1208,22 @@ func waitForReadyStatus(m *manager, ready bool) error {
 	return nil
 }
 
+// waitForStoppedWorkers lets the workers stopped so far exit, inside a synctest bubble. A new
+// worker first sleeps for up to one period without watching its stop channel, and synctest.Wait
+// alone doesn't advance the fake clock past that sleep.
+func waitForStoppedWorkers() {
+	time.Sleep(time.Duration(defaultProbe.PeriodSeconds) * time.Second)
+	synctest.Wait()
+}
+
 // cleanup running probes to avoid leaking goroutines.
-func cleanup(t *testing.T, m *manager) {
+func cleanup(t ktesting.TB, m *manager) {
 	m.CleanupPods(nil)
 
 	condition := func() (bool, error) {
 		workerCount := m.workerCount()
 		if workerCount > 0 {
-			klog.Infof("Waiting for %d workers to exit...", workerCount)
+			t.Logf("Waiting for %d workers to exit...", workerCount)
 		}
 		return workerCount == 0, nil
 	}
@@ -411,5 +1232,120 @@ func cleanup(t *testing.T, m *manager) {
 	}
 	if err := wait.Poll(interval, wait.ForeverTestTimeout, condition); err != nil {
 		t.Fatalf("Error during cleanup: %v", err)
+	}
+}
+
+// ctxAwareRunner implements kubecontainer.CommandRunner and fails once the
+// probe context is canceled, like a real CRI runtime client.
+type ctxAwareRunner struct{}
+
+func (r ctxAwareRunner) RunInContainer(ctx context.Context, id kubecontainer.ContainerID, cmd []string, timeout time.Duration) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return []byte("ok"), nil
+}
+
+// TestProbeWorkersSurviveSyncContextCancellation verifies that probe workers
+// keep probing after the context passed to SyncPod is canceled. The pod worker
+// cancels its sync context when a pod begins terminating, and readiness probes
+// must keep executing through termination so a failing probe can mark the pod
+// NotReady. Regression test for https://github.com/kubernetes/kubernetes/issues/140881.
+func TestProbeWorkersSurviveSyncContextCancellation(t *testing.T) {
+	ktesting.Init(t).SyncTest("", testProbeWorkersSurviveSyncContextCancellation)
+}
+
+func testProbeWorkersSurviveSyncContextCancellation(tCtx ktesting.TContext) {
+	t := tCtx.TB()
+	logger := tCtx.Logger()
+	testPod := getTestPod()
+	setTestProbe(testPod, readiness, v1.Probe{})
+	m := newTestManager()
+	defer cleanup(t, m)
+
+	// Probe through the real exec prober backed by a runner that honors
+	// context cancellation, mirroring how CRI ExecSync fails once its
+	// context is canceled.
+	m.prober = newProber(ctxAwareRunner{}, &record.FakeRecorder{})
+
+	m.statusManager.SetPodStatus(logger, testPod, getTestRunningStatus())
+
+	ctx, cancel := context.WithCancel(tCtx)
+	m.SyncPod(ctx, testPod)
+	// Simulate the pod worker canceling the sync context at the start of
+	// pod termination.
+	cancel()
+
+	// The readiness worker seeds the result cache with Failure for a new
+	// container, then must record Success from an actual probe execution.
+	for {
+		select {
+		case update := <-m.readinessManager.Updates():
+			if update.Result == results.Success {
+				return
+			}
+		case <-time.After(wait.ForeverTestTimeout):
+			t.Fatal("Probe worker recorded no probe result after the sync context was canceled; probes are likely being canceled by pod termination")
+		}
+	}
+}
+
+func TestCanInheritProbeState(t *testing.T) {
+	const (
+		containerName = "test-container"
+		oldID         = "test://old_container_id"
+		newID         = "test://new_container_id"
+	)
+
+	tests := []struct {
+		name                 string
+		apiContainerStatuses []v1.ContainerStatus
+		runtimeID            string
+		expected             bool
+	}{
+		{
+			name:                 "no status from the API server is available",
+			apiContainerStatuses: nil,
+			runtimeID:            newID,
+			expected:             true,
+		},
+		{
+			name:                 "the API server knows the same container",
+			apiContainerStatuses: []v1.ContainerStatus{{Name: containerName, ContainerID: oldID}},
+			runtimeID:            oldID,
+			expected:             true,
+		},
+		{
+			name:                 "the container was replaced",
+			apiContainerStatuses: []v1.ContainerStatus{{Name: containerName, ContainerID: oldID}},
+			runtimeID:            newID,
+			expected:             false,
+		},
+		{
+			name:                 "the container is not in the API server status",
+			apiContainerStatuses: []v1.ContainerStatus{{Name: "other-container", ContainerID: oldID}},
+			runtimeID:            newID,
+			expected:             true,
+		},
+		{
+			name:                 "the API server status has no container ID",
+			apiContainerStatuses: []v1.ContainerStatus{{Name: containerName}},
+			runtimeID:            newID,
+			expected:             true,
+		},
+		{
+			name:                 "the runtime has no container ID",
+			apiContainerStatuses: []v1.ContainerStatus{{Name: containerName, ContainerID: oldID}},
+			runtimeID:            "",
+			expected:             true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := canInheritProbeState(tc.apiContainerStatuses, containerName, tc.runtimeID); got != tc.expected {
+				t.Errorf("canInheritProbeState() = %v, want %v", got, tc.expected)
+			}
+		})
 	}
 }

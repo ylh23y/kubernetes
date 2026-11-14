@@ -17,20 +17,25 @@ limitations under the License.
 package establish
 
 import (
+	"context"
 	"fmt"
 	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/apimachinery/pkg/util/validation/field"
 	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/apiserver/pkg/util/webhook"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
-	"k8s.io/klog"
+	"k8s.io/klog/v2"
 
-	"k8s.io/apiextensions-apiserver/pkg/apis/apiextensions"
-	client "k8s.io/apiextensions-apiserver/pkg/client/clientset/internalclientset/typed/apiextensions/internalversion"
-	informers "k8s.io/apiextensions-apiserver/pkg/client/informers/internalversion/apiextensions/internalversion"
-	listers "k8s.io/apiextensions-apiserver/pkg/client/listers/apiextensions/internalversion"
+	apiextensionsv1 "k8s.io/apiextensions-api/pkg/apis/apiextensions/v1"
+	client "k8s.io/apiextensions-api/pkg/client/clientset/clientset/typed/apiextensions/v1"
+	informers "k8s.io/apiextensions-api/pkg/client/informers/externalversions/apiextensions/v1"
+	listers "k8s.io/apiextensions-api/pkg/client/listers/apiextensions/v1"
+	apiextensionshelpers "k8s.io/apiextensions-apiserver/pkg/apihelpers"
 )
 
 // EstablishingController controls how and when CRD is established.
@@ -40,9 +45,9 @@ type EstablishingController struct {
 	crdSynced cache.InformerSynced
 
 	// To allow injection for testing.
-	syncFn func(key string) error
+	syncFn func(ctx context.Context, key string) error
 
-	queue workqueue.RateLimitingInterface
+	queue workqueue.TypedRateLimitingInterface[string]
 }
 
 // NewEstablishingController creates new EstablishingController.
@@ -52,7 +57,10 @@ func NewEstablishingController(crdInformer informers.CustomResourceDefinitionInf
 		crdClient: crdClient,
 		crdLister: crdInformer.Lister(),
 		crdSynced: crdInformer.Informer().HasSynced,
-		queue:     workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "crdEstablishing"),
+		queue: workqueue.NewTypedRateLimitingQueueWithConfig(
+			workqueue.DefaultTypedControllerRateLimiter[string](),
+			workqueue.TypedRateLimitingQueueConfig[string]{Name: "crdEstablishing"},
+		),
 	}
 
 	ec.syncFn = ec.sync
@@ -65,39 +73,45 @@ func (ec *EstablishingController) QueueCRD(key string, timeout time.Duration) {
 	ec.queue.AddAfter(key, timeout)
 }
 
-// Run starts the EstablishingController.
-func (ec *EstablishingController) Run(stopCh <-chan struct{}) {
+// RunWithContext starts the EstablishingController.
+func (ec *EstablishingController) RunWithContext(ctx context.Context) {
 	defer utilruntime.HandleCrash()
 	defer ec.queue.ShutDown()
 
-	klog.Infof("Starting EstablishingController")
-	defer klog.Infof("Shutting down EstablishingController")
+	logger := klog.FromContext(ctx)
+	logger.V(2).Info("Starting EstablishingController")
+	defer logger.V(2).Info("Shutting down EstablishingController")
 
-	if !cache.WaitForCacheSync(stopCh, ec.crdSynced) {
+	if !cache.WaitForCacheSync(ctx.Done(), ec.crdSynced) {
 		return
 	}
 
-	// only start one worker thread since its a slow moving API
-	go wait.Until(ec.runWorker, time.Second, stopCh)
+	// only start one worker thread since the EstablishingController is not a bottleneck
+	go wait.UntilWithContext(ctx, ec.runWorker, time.Second)
 
-	<-stopCh
+	<-ctx.Done()
 }
 
-func (ec *EstablishingController) runWorker() {
-	for ec.processNextWorkItem() {
+//logcheck:context // RunWithContext should be used instead of Run in code which supports contextual logging.
+func (ec *EstablishingController) Run(stopCh <-chan struct{}) {
+	ec.RunWithContext(wait.ContextForChannel(stopCh))
+}
+
+func (ec *EstablishingController) runWorker(ctx context.Context) {
+	for ec.processNextWorkItem(ctx) {
 	}
 }
 
 // processNextWorkItem deals with one key off the queue.
 // It returns false when it's time to quit.
-func (ec *EstablishingController) processNextWorkItem() bool {
+func (ec *EstablishingController) processNextWorkItem(ctx context.Context) bool {
 	key, quit := ec.queue.Get()
 	if quit {
 		return false
 	}
 	defer ec.queue.Done(key)
 
-	err := ec.syncFn(key.(string))
+	err := ec.syncFn(ctx, key)
 	if err == nil {
 		ec.queue.Forget(key)
 		return true
@@ -110,7 +124,7 @@ func (ec *EstablishingController) processNextWorkItem() bool {
 }
 
 // sync is used to turn CRDs into the Established state.
-func (ec *EstablishingController) sync(key string) error {
+func (ec *EstablishingController) sync(ctx context.Context, key string) error {
 	cachedCRD, err := ec.crdLister.Get(key)
 	if apierrors.IsNotFound(err) {
 		return nil
@@ -119,22 +133,38 @@ func (ec *EstablishingController) sync(key string) error {
 		return err
 	}
 
-	if !apiextensions.IsCRDConditionTrue(cachedCRD, apiextensions.NamesAccepted) ||
-		apiextensions.IsCRDConditionTrue(cachedCRD, apiextensions.Established) {
+	if !apiextensionshelpers.IsCRDConditionTrue(cachedCRD, apiextensionsv1.NamesAccepted) ||
+		apiextensionshelpers.IsCRDConditionTrue(cachedCRD, apiextensionsv1.Established) {
 		return nil
 	}
 
 	crd := cachedCRD.DeepCopy()
-	establishedCondition := apiextensions.CustomResourceDefinitionCondition{
-		Type:    apiextensions.Established,
-		Status:  apiextensions.ConditionTrue,
-		Reason:  "InitialNamesAccepted",
-		Message: "the initial names have been accepted",
+
+	// If the conversion webhook CABundle is invalid, set Established
+	// condition to false and provide a reason
+	if cachedCRD.Spec.Conversion != nil &&
+		cachedCRD.Spec.Conversion.Webhook != nil &&
+		cachedCRD.Spec.Conversion.Webhook.ClientConfig != nil &&
+		len(webhook.ValidateCABundle(field.NewPath(""), cachedCRD.Spec.Conversion.Webhook.ClientConfig.CABundle)) > 0 {
+		errorCondition := apiextensionsv1.CustomResourceDefinitionCondition{
+			Type:    apiextensionsv1.Established,
+			Status:  apiextensionsv1.ConditionFalse,
+			Reason:  "InvalidCABundle",
+			Message: "The conversion webhook CABundle is invalid",
+		}
+		apiextensionshelpers.SetCRDCondition(crd, errorCondition)
+	} else {
+		establishedCondition := apiextensionsv1.CustomResourceDefinitionCondition{
+			Type:    apiextensionsv1.Established,
+			Status:  apiextensionsv1.ConditionTrue,
+			Reason:  "InitialNamesAccepted",
+			Message: "the initial names have been accepted",
+		}
+		apiextensionshelpers.SetCRDCondition(crd, establishedCondition)
 	}
-	apiextensions.SetCRDCondition(crd, establishedCondition)
 
 	// Update server with new CRD condition.
-	_, err = ec.crdClient.CustomResourceDefinitions().UpdateStatus(crd)
+	_, err = ec.crdClient.CustomResourceDefinitions().UpdateStatus(ctx, crd, metav1.UpdateOptions{})
 	if apierrors.IsNotFound(err) || apierrors.IsConflict(err) {
 		// deleted or changed in the meantime, we'll get called again
 		return nil

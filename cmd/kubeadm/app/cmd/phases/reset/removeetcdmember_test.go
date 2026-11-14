@@ -17,43 +17,25 @@ limitations under the License.
 package phases
 
 import (
-	"io/ioutil"
+	_ "embed"
 	"os"
 	"path/filepath"
 	"testing"
 
 	"github.com/lithammer/dedent"
+
 	kubeadmapi "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm"
-	testutil "k8s.io/kubernetes/cmd/kubeadm/test"
 )
 
-const (
-	etcdPod = `apiVersion: v1
-kind: Pod
-metadata:
-spec:
-  volumes:
-  - hostPath:
-      path: /path/to/etcd
-      type: DirectoryOrCreate
-    name: etcd-data
-  - hostPath:
-      path: /etc/kubernetes/pki/etcd
-      type: DirectoryOrCreate
-    name: etcd-certs`
+var (
+	//go:embed testdata/etcd-pod.yaml
+	etcdPod string
 
-	etcdPodWithoutDataVolume = `apiVersion: v1
-kind: Pod
-metadata:
-spec:
-  volumes:
-  - hostPath:
-      path: /etc/kubernetes/pki/etcd
-      type: DirectoryOrCreate
-    name: etcd-certs`
-
-	etcdPodInvalid = `invalid pod`
+	//go:embed testdata/etcd-pod-without-data-volume.yaml
+	etcdPodWithoutDataVolume string
 )
+
+const etcdPodInvalid = `invalid pod`
 
 func TestGetEtcdDataDir(t *testing.T) {
 	tests := map[string]struct {
@@ -63,10 +45,11 @@ func TestGetEtcdDataDir(t *testing.T) {
 		writeManifest bool
 		validConfig   bool
 	}{
-		"non-existent file returns error": {
-			expectErr:     true,
+		"non-existent file returns default data dir": {
+			expectErr:     false,
 			writeManifest: false,
 			validConfig:   true,
+			dataDir:       "/var/lib/etcd",
 		},
 		"return etcd data dir": {
 			dataDir:       "/path/to/etcd",
@@ -98,12 +81,11 @@ func TestGetEtcdDataDir(t *testing.T) {
 
 	for name, test := range tests {
 		t.Run(name, func(t *testing.T) {
-			tmpdir := testutil.SetupTempDir(t)
-			defer os.RemoveAll(tmpdir)
+			tmpdir := t.TempDir()
 
 			manifestPath := filepath.Join(tmpdir, "etcd.yaml")
 			if test.writeManifest {
-				err := ioutil.WriteFile(manifestPath, []byte(test.podYaml), 0644)
+				err := os.WriteFile(manifestPath, []byte(test.podYaml), 0644)
 				if err != nil {
 					t.Fatalf(dedent.Dedent("failed to write pod manifest\n%s\n\tfatal error: %v"), name, err)
 				}

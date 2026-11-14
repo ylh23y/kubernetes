@@ -19,8 +19,8 @@ package webhook
 import (
 	"testing"
 
+	"github.com/google/go-cmp/cmp"
 	"k8s.io/apimachinery/pkg/api/equality"
-	"k8s.io/apimachinery/pkg/util/diff"
 	"k8s.io/client-go/rest"
 	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 )
@@ -63,6 +63,30 @@ func TestAuthenticationDetection(t *testing.T) {
 				},
 			},
 			expected: rest.Config{BearerToken: "foo"},
+		},
+		{
+			name:       "match with impersonation",
+			serverName: "foo.com",
+			kubeconfig: clientcmdapi.Config{
+				AuthInfos: map[string]*clientcmdapi.AuthInfo{
+					"foo.com": {
+						Token:                "foo",
+						Impersonate:          "user-a",
+						ImpersonateUID:       "user-a-uid-1111",
+						ImpersonateGroups:    []string{"user-a-group1", "user-a-group2"},
+						ImpersonateUserExtra: map[string][]string{"foo": {"bar", "baz", "etc"}},
+					},
+				},
+			},
+			expected: rest.Config{
+				BearerToken: "foo",
+				Impersonate: rest.ImpersonationConfig{
+					UserName: "user-a",
+					UID:      "user-a-uid-1111",
+					Groups:   []string{"user-a-group1", "user-a-group2"},
+					Extra:    map[string][]string{"foo": {"bar", "baz", "etc"}},
+				},
+			},
 		},
 		{
 			name:       "partial star match",
@@ -109,6 +133,90 @@ func TestAuthenticationDetection(t *testing.T) {
 			},
 			expected: rest.Config{BearerToken: "first"},
 		},
+		{
+			name:       "exact match with default https port",
+			serverName: "one.two.three.com:443",
+			kubeconfig: clientcmdapi.Config{
+				AuthInfos: map[string]*clientcmdapi.AuthInfo{
+					"one.two.three.com:443": {Token: "exact"},
+					"*.two.three.com":       {Token: "first"},
+					"*.three.com":           {Token: "second"},
+					"*.com":                 {Token: "third"},
+					"*":                     {Token: "fallback"},
+				},
+			},
+			expected: rest.Config{BearerToken: "exact"},
+		},
+		{
+			name:       "wildcard match with default https port",
+			serverName: "one.two.three.com:443",
+			kubeconfig: clientcmdapi.Config{
+				AuthInfos: map[string]*clientcmdapi.AuthInfo{
+					"*.two.three.com:443": {Token: "first-with-port"},
+					"*.two.three.com":     {Token: "first"},
+					"*.three.com":         {Token: "second"},
+					"*.com":               {Token: "third"},
+					"*":                   {Token: "fallback"},
+				},
+			},
+			expected: rest.Config{BearerToken: "first-with-port"},
+		},
+		{
+			name:       "wildcard match without default https port",
+			serverName: "one.two.three.com:443",
+			kubeconfig: clientcmdapi.Config{
+				AuthInfos: map[string]*clientcmdapi.AuthInfo{
+					"*.two.three.com": {Token: "first"},
+					"*.three.com":     {Token: "second"},
+					"*.com":           {Token: "third"},
+					"*":               {Token: "fallback"},
+				},
+			},
+			expected: rest.Config{BearerToken: "first"},
+		},
+		{
+			name:       "exact match with non-default https port",
+			serverName: "one.two.three.com:8443",
+			kubeconfig: clientcmdapi.Config{
+				AuthInfos: map[string]*clientcmdapi.AuthInfo{
+					"one.two.three.com:8443": {Token: "exact"},
+					"*.two.three.com":        {Token: "first"},
+					"*.three.com":            {Token: "second"},
+					"*.com":                  {Token: "third"},
+					"*":                      {Token: "fallback"},
+				},
+			},
+			expected: rest.Config{BearerToken: "exact"},
+		},
+		{
+			name:       "wildcard match with non-default https port",
+			serverName: "one.two.three.com:8443",
+			kubeconfig: clientcmdapi.Config{
+				AuthInfos: map[string]*clientcmdapi.AuthInfo{
+					"*.two.three.com:8443": {Token: "first-with-port"},
+					"one.two.three.com":    {Token: "first-without-port"},
+					"*.two.three.com":      {Token: "first"},
+					"*.three.com":          {Token: "second"},
+					"*.com":                {Token: "third"},
+					"*":                    {Token: "fallback"},
+				},
+			},
+			expected: rest.Config{BearerToken: "first-with-port"},
+		},
+		{
+			name:       "wildcard match without non-default https port",
+			serverName: "one.two.three.com:8443",
+			kubeconfig: clientcmdapi.Config{
+				AuthInfos: map[string]*clientcmdapi.AuthInfo{
+					"one.two.three.com": {Token: "first-without-port"},
+					"*.two.three.com":   {Token: "first"},
+					"*.three.com":       {Token: "second"},
+					"*.com":             {Token: "third"},
+					"*":                 {Token: "fallback"},
+				},
+			},
+			expected: rest.Config{BearerToken: "fallback"},
+		},
 	}
 
 	for _, tc := range tests {
@@ -122,7 +230,7 @@ func TestAuthenticationDetection(t *testing.T) {
 			actual.Timeout = 0
 
 			if !equality.Semantic.DeepEqual(*actual, tc.expected) {
-				t.Errorf("%v", diff.ObjectReflectDiff(tc.expected, *actual))
+				t.Errorf("%v", cmp.Diff(tc.expected, *actual))
 			}
 		})
 	}

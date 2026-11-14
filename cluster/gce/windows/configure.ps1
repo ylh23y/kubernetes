@@ -84,6 +84,25 @@ function FetchAndImport-ModuleFromMetadata {
   Import-Module -Force C:\$Filename
 }
 
+# Returns true if the ENABLE_STACKDRIVER_WINDOWS or ENABLE_NODE_LOGGING field in kube_env is true.
+# $KubeEnv is a hash table containing the kube-env metadata keys+values.
+# ENABLE_NODE_LOGGING is used for legacy Stackdriver Logging, and will be deprecated (always set to False)
+# soon. ENABLE_STACKDRIVER_WINDOWS is added to indicate whether logging is enabled for windows nodes.
+function IsLoggingEnabled {
+  param (
+    [parameter(Mandatory=$true)] [hashtable]$KubeEnv
+  )
+
+  if ($KubeEnv.Contains('ENABLE_STACKDRIVER_WINDOWS') -and `
+      ($KubeEnv['ENABLE_STACKDRIVER_WINDOWS'] -eq 'true')) {
+    return $true
+  } elseif ($KubeEnv.Contains('ENABLE_NODE_LOGGING') -and `
+      ($KubeEnv['ENABLE_NODE_LOGGING'] -eq 'true')) {
+    return $true
+  }
+  return $false
+}
+
 try {
   # Don't use FetchAndImport-ModuleFromMetadata for common.psm1 - the common
   # module includes variables and functions that any other function may depend
@@ -98,9 +117,37 @@ try {
   FetchAndImport-ModuleFromMetadata 'k8s-node-setup-psm1' 'k8s-node-setup.psm1'
 
   Dump-DebugInfoToConsole
-  Set-PrerequisiteOptions
+
   $kube_env = Fetch-KubeEnv
-  Disable-WindowsDefender
+  Set-EnvironmentVars
+
+  # Set to true if there's a feature that needs a reboot
+  $restart_computer = $false
+
+  $should_enable_hyperv = Test-ShouldEnableHyperVFeature
+  $hyperv_feature_enabled = Test-HyperVFeatureEnabled
+  if ($should_enable_hyperv -and -not ($hyperv_feature_enabled)) {
+    Enable-HyperVFeature
+    Log-Output 'Restarting computer after enabling Windows Hyper-V feature'
+    $restart_computer = $true
+  }
+
+  if (-not (Test-ContainersFeatureInstalled)) {
+    Install-ContainersFeature
+    Log-Output 'Restarting computer after enabling Windows Containers feature'
+    $restart_computer = $true
+  }
+
+  if ($restart_computer) {
+    Restart-Computer -Force
+    # Restart-Computer does not stop the rest of the script from executing.
+    exit 0
+  }
+
+  # Set the TCP/IP Parameters to keep idle connections alive.
+  Set-WindowsTCPParameters
+
+  Set-PrerequisiteOptions
 
   if (Test-IsTestCluster $kube_env) {
     Log-Output 'Test cluster detected, installing OpenSSH.'
@@ -109,35 +156,55 @@ try {
     StartProcess-WriteSshKeys
   }
 
-  Set-EnvironmentVars
   Create-Directories
   Download-HelperScripts
-  InstallAndStart-LoggingAgent
 
-  Create-DockerRegistryKey
-  Configure-Dockerd
-  Pull-InfraContainer
+  DownloadAndInstall-Crictl
+  Configure-Crictl
+  Setup-ContainerRuntime
   DownloadAndInstall-KubernetesBinaries
+  DownloadAndInstall-CSIProxyBinaries
+  DownloadAndInstall-AuthProviderGcpBinary
+  Start-CSIProxy
   Create-NodePki
   Create-KubeletKubeconfig
   Create-KubeproxyKubeconfig
+  Create-AuthProviderGcpConfig
   Set-PodCidr
   Configure-HostNetworkingService
-  Configure-CniNetworking
+  Prepare-CniNetworking
+  Configure-HostDnsConf
   Configure-GcePdTools
   Configure-Kubelet
 
+  # Even if Logging agent is already installed, the function will still [re]start the service.
+  if (IsLoggingEnabled $kube_env) {
+    Install-LoggingAgent
+    Configure-LoggingAgent
+    Restart-LoggingAgent
+  }
+  # Flush cache to disk before starting kubelet & kube-proxy services
+  # to make metadata server route and stackdriver service more persistent.
+  Write-Volumecache C -PassThru
   Start-WorkerServices
   Log-Output 'Waiting 15 seconds for node to join cluster.'
   Start-Sleep 15
   Verify-WorkerServices
 
   $config = New-FileRotationConfig
+  # TODO(random-liu): Generate containerd log into the log directory.
   Schedule-LogRotation -Pattern '.*\.log$' -Path ${env:LOGS_DIR} -RepetitionInterval $(New-Timespan -Hour 1) -Config $config
+
+  Pull-InfraContainer
+  # Flush cache to disk to persist the setup status
+  Write-Volumecache C -PassThru
 }
 catch {
   Write-Host 'Exception caught in script:'
   Write-Host $_.InvocationInfo.PositionMessage
   Write-Host "Kubernetes Windows node setup failed: $($_.Exception.Message)"
+  # Make sure kubelet won't remain running in case any failure happened during the startup.
+  Write-Host "Cleaning up, Unregistering WorkerServices..."
+  Unregister-WorkerServices
   exit 1
 }

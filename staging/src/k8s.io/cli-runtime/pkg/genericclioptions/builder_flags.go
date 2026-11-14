@@ -21,6 +21,7 @@ import (
 
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/cli-runtime/pkg/resource"
+	"k8s.io/utils/ptr"
 )
 
 // ResourceBuilderFlags are flags for finding resources
@@ -47,56 +48,68 @@ func NewResourceBuilderFlags() *ResourceBuilderFlags {
 		FileNameFlags: &FileNameFlags{
 			Usage:     "identifying the resource.",
 			Filenames: &filenames,
-			Recursive: boolPtr(true),
+			Recursive: ptr.To(true),
 		},
 	}
 }
 
-func (o *ResourceBuilderFlags) WithFile(recurse bool, files ...string) *ResourceBuilderFlags {
+// WithFile sets the FileNameFlags.
+// If recurse is set, it will process directory recursively. Useful when you want to manage related manifests
+// organized within the same directory.
+func (o *ResourceBuilderFlags) WithFile(recurse bool, kustomize *string, files ...string) *ResourceBuilderFlags {
 	o.FileNameFlags = &FileNameFlags{
 		Usage:     "identifying the resource.",
 		Filenames: &files,
-		Recursive: boolPtr(recurse),
+		Kustomize: kustomize,
+		Recursive: ptr.To(recurse),
 	}
 
 	return o
 }
 
+// WithLabelSelector sets the LabelSelector flag
 func (o *ResourceBuilderFlags) WithLabelSelector(selector string) *ResourceBuilderFlags {
 	o.LabelSelector = &selector
 	return o
 }
 
+// WithFieldSelector sets the FieldSelector flag
 func (o *ResourceBuilderFlags) WithFieldSelector(selector string) *ResourceBuilderFlags {
 	o.FieldSelector = &selector
 	return o
 }
 
+// WithAllNamespaces sets the AllNamespaces flag
 func (o *ResourceBuilderFlags) WithAllNamespaces(defaultVal bool) *ResourceBuilderFlags {
 	o.AllNamespaces = &defaultVal
 	return o
 }
 
+// WithAll sets the All flag
 func (o *ResourceBuilderFlags) WithAll(defaultVal bool) *ResourceBuilderFlags {
 	o.All = &defaultVal
 	return o
 }
 
+// WithLocal sets the Local flag
 func (o *ResourceBuilderFlags) WithLocal(defaultVal bool) *ResourceBuilderFlags {
 	o.Local = &defaultVal
 	return o
 }
 
+// WithScheme sets the Scheme flag
 func (o *ResourceBuilderFlags) WithScheme(scheme *runtime.Scheme) *ResourceBuilderFlags {
 	o.Scheme = scheme
 	return o
 }
 
+// WithLatest sets the Latest flag
 func (o *ResourceBuilderFlags) WithLatest() *ResourceBuilderFlags {
 	o.Latest = true
 	return o
 }
 
+// StopOnError sets the StopOnFirstError flag
 func (o *ResourceBuilderFlags) StopOnError() *ResourceBuilderFlags {
 	o.StopOnFirstError = true
 	return o
@@ -129,6 +142,10 @@ func (o *ResourceBuilderFlags) ToBuilder(restClientGetter RESTClientGetter, reso
 
 	builder := resource.NewBuilder(restClientGetter).
 		NamespaceParam(namespace).DefaultNamespace()
+
+	if o.AllNamespaces != nil {
+		builder.AllNamespaces(*o.AllNamespaces)
+	}
 
 	if o.Scheme != nil {
 		builder.WithScheme(o.Scheme, o.Scheme.PrioritizedVersionsAllGroups()...)
@@ -209,8 +226,4 @@ func ResourceFinderForResult(result resource.Visitor) ResourceFinder {
 	return ResourceFinderFunc(func() resource.Visitor {
 		return result
 	})
-}
-
-func boolPtr(val bool) *bool {
-	return &val
 }

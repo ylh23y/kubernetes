@@ -17,24 +17,30 @@ limitations under the License.
 package exec
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"net/url"
 	"time"
 
-	dockerterm "github.com/docker/docker/pkg/term"
+	dockerterm "github.com/moby/term"
 	"github.com/spf13/cobra"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/cli-runtime/pkg/genericclioptions"
+	"k8s.io/cli-runtime/pkg/genericiooptions"
 	"k8s.io/cli-runtime/pkg/resource"
 	coreclient "k8s.io/client-go/kubernetes/typed/core/v1"
 	restclient "k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/remotecommand"
+	"k8s.io/streaming/pkg/httpstream"
 
+	"k8s.io/apimachinery/pkg/api/meta"
 	cmdutil "k8s.io/kubectl/pkg/cmd/util"
+	"k8s.io/kubectl/pkg/cmd/util/podcmd"
 	"k8s.io/kubectl/pkg/polymorphichelpers"
 	"k8s.io/kubectl/pkg/scheme"
+	"k8s.io/kubectl/pkg/util/completion"
 	"k8s.io/kubectl/pkg/util/i18n"
 	"k8s.io/kubectl/pkg/util/interrupt"
 	"k8s.io/kubectl/pkg/util/templates"
@@ -43,84 +49,132 @@ import (
 
 var (
 	execExample = templates.Examples(i18n.T(`
-		# Get output from running 'date' command from pod mypod, using the first container by default
-		kubectl exec mypod date
+		# Get output from running the 'date' command from pod mypod, using the first container by default
+		kubectl exec mypod -- date
 
-		# Get output from running 'date' command in ruby-container from pod mypod
-		kubectl exec mypod -c ruby-container date
+		# Get output from running the 'date' command in ruby-container from pod mypod
+		kubectl exec mypod -c ruby-container -- date
 
-		# Switch to raw terminal mode, sends stdin to 'bash' in ruby-container from pod mypod
+		# Switch to raw terminal mode; sends stdin to 'bash' in ruby-container from pod mypod
 		# and sends stdout/stderr from 'bash' back to the client
 		kubectl exec mypod -c ruby-container -i -t -- bash -il
 
-		# List contents of /usr from the first container of pod mypod and sort by modification time.
+		# List contents of /usr from the first container of pod mypod and sort by modification time
 		# If the command you want to execute in the pod has any flags in common (e.g. -i),
-		# you must use two dashes (--) to separate your command's flags/arguments.
+		# you must use two dashes (--) to separate your command's flags/arguments
 		# Also note, do not surround your command and its flags/arguments with quotes
-		# unless that is how you would execute it normally (i.e., do ls -t /usr, not "ls -t /usr").
+		# unless that is how you would execute it normally (i.e., do ls -t /usr, not "ls -t /usr")
 		kubectl exec mypod -i -t -- ls -t /usr
 
 		# Get output from running 'date' command from the first pod of the deployment mydeployment, using the first container by default
-		kubectl exec deploy/mydeployment date
+		kubectl exec deploy/mydeployment -- date
 
 		# Get output from running 'date' command from the first pod of the service myservice, using the first container by default
-		kubectl exec svc/myservice date
+		kubectl exec svc/myservice -- date
 		`))
 )
 
 const (
-	execUsageStr          = "expected 'exec (POD | TYPE/NAME) COMMAND [ARG1] [ARG2] ... [ARGN]'.\nPOD or TYPE/NAME and COMMAND are required arguments for the exec command"
 	defaultPodExecTimeout = 60 * time.Second
 )
 
-func NewCmdExec(f cmdutil.Factory, streams genericclioptions.IOStreams) *cobra.Command {
-	options := &ExecOptions{
-		StreamOptions: StreamOptions{
-			IOStreams: streams,
-		},
+// ExecFlags directly reflect the information that CLI is gathering via flags.
+type ExecFlags struct {
+	resource.FilenameOptions
 
-		Executor: &DefaultRemoteExecutor{},
+	ContainerName string
+	Stdin         bool
+	TTY           bool
+	Quiet         bool
+
+	genericiooptions.IOStreams
+}
+
+// NewExecFlags returns a default ExecFlags
+func NewExecFlags(streams genericiooptions.IOStreams) *ExecFlags {
+	return &ExecFlags{
+		IOStreams: streams,
 	}
+}
+
+func NewCmdExec(f cmdutil.Factory, streams genericiooptions.IOStreams) *cobra.Command {
+	flags := NewExecFlags(streams)
 	cmd := &cobra.Command{
 		Use:                   "exec (POD | TYPE/NAME) [-c CONTAINER] [flags] -- COMMAND [args...]",
 		DisableFlagsInUseLine: true,
 		Short:                 i18n.T("Execute a command in a container"),
-		Long:                  "Execute a command in a container.",
+		Long:                  i18n.T("Execute a command in a container."),
 		Example:               execExample,
+		ValidArgsFunction:     completion.PodResourceNameCompletionFunc(f),
 		Run: func(cmd *cobra.Command, args []string) {
 			argsLenAtDash := cmd.ArgsLenAtDash()
-			cmdutil.CheckErr(options.Complete(f, cmd, args, argsLenAtDash))
-			cmdutil.CheckErr(options.Validate())
-			cmdutil.CheckErr(options.Run())
+			o, err := flags.ToOptions(f, cmd, args, argsLenAtDash)
+			cmdutil.CheckErr(err)
+			cmdutil.CheckErr(o.Validate())
+			cmdutil.CheckErr(o.Run())
 		},
 	}
-	cmdutil.AddPodRunningTimeoutFlag(cmd, defaultPodExecTimeout)
-	// TODO support UID
-	cmd.Flags().StringVarP(&options.ContainerName, "container", "c", options.ContainerName, "Container name. If omitted, the first container in the pod will be chosen")
-	cmd.Flags().BoolVarP(&options.Stdin, "stdin", "i", options.Stdin, "Pass stdin to the container")
-	cmd.Flags().BoolVarP(&options.TTY, "tty", "t", options.TTY, "Stdin is a TTY")
+	flags.AddFlags(cmd)
+	cmdutil.CheckErr(cmd.RegisterFlagCompletionFunc("container", completion.ContainerCompletionFunc(f)))
 	return cmd
+}
+
+// AddFlags registers flags for a cli
+func (flags *ExecFlags) AddFlags(cmd *cobra.Command) {
+	cmdutil.AddPodRunningTimeoutFlag(cmd, defaultPodExecTimeout)
+	cmdutil.AddJsonFilenameFlag(cmd.Flags(), &flags.FilenameOptions.Filenames, "to use to exec into the resource")
+	// TODO support UID
+	cmdutil.AddContainerVarFlags(cmd, &flags.ContainerName, flags.ContainerName)
+
+	cmd.Flags().BoolVarP(&flags.Stdin, "stdin", "i", flags.Stdin, "Pass stdin to the container")
+	cmd.Flags().BoolVarP(&flags.TTY, "tty", "t", flags.TTY, "Stdin is a TTY")
+	cmd.Flags().BoolVarP(&flags.Quiet, "quiet", "q", flags.Quiet, "Only print output from the remote session")
 }
 
 // RemoteExecutor defines the interface accepted by the Exec command - provided for test stubbing
 type RemoteExecutor interface {
-	Execute(method string, url *url.URL, config *restclient.Config, stdin io.Reader, stdout, stderr io.Writer, tty bool, terminalSizeQueue remotecommand.TerminalSizeQueue) error
+	// Execute supports executing remote command in a pod.
+	Execute(url *url.URL, config *restclient.Config, stdin io.Reader, stdout, stderr io.Writer, tty bool, terminalSizeQueue remotecommand.TerminalSizeQueue) error
+
+	// ExecuteWithContext, in contrast to Execute, supports stopping the remote command via context cancellation.
+	ExecuteWithContext(ctx context.Context, url *url.URL, config *restclient.Config, stdin io.Reader, stdout, stderr io.Writer, tty bool, terminalSizeQueue remotecommand.TerminalSizeQueue) error
 }
 
 // DefaultRemoteExecutor is the standard implementation of remote command execution
 type DefaultRemoteExecutor struct{}
 
-func (*DefaultRemoteExecutor) Execute(method string, url *url.URL, config *restclient.Config, stdin io.Reader, stdout, stderr io.Writer, tty bool, terminalSizeQueue remotecommand.TerminalSizeQueue) error {
-	exec, err := remotecommand.NewSPDYExecutor(config, method, url)
+func (d *DefaultRemoteExecutor) Execute(url *url.URL, config *restclient.Config, stdin io.Reader, stdout, stderr io.Writer, tty bool, terminalSizeQueue remotecommand.TerminalSizeQueue) error {
+	return d.ExecuteWithContext(context.Background(), url, config, stdin, stdout, stderr, tty, terminalSizeQueue)
+}
+
+func (*DefaultRemoteExecutor) ExecuteWithContext(ctx context.Context, url *url.URL, config *restclient.Config, stdin io.Reader, stdout, stderr io.Writer, tty bool, terminalSizeQueue remotecommand.TerminalSizeQueue) error {
+	exec, err := createExecutor(url, config)
 	if err != nil {
 		return err
 	}
-	return exec.Stream(remotecommand.StreamOptions{
+	return exec.StreamWithContext(ctx, remotecommand.StreamOptions{
 		Stdin:             stdin,
 		Stdout:            stdout,
 		Stderr:            stderr,
 		Tty:               tty,
 		TerminalSizeQueue: terminalSizeQueue,
+	})
+}
+
+// createExecutor returns the Executor or an error if one occurred.
+func createExecutor(url *url.URL, config *restclient.Config) (remotecommand.Executor, error) {
+	exec, err := remotecommand.NewSPDYExecutor(config, "POST", url)
+	if err != nil {
+		return nil, err
+	}
+	// WebSockets is always attempted first, falling back to SPDY.
+	// WebSocketExecutor must be "GET" method as described in RFC 6455 Sec. 4.1 (page 17).
+	websocketExec, err := remotecommand.NewWebSocketExecutor(config, "GET", url.String())
+	if err != nil {
+		return nil, err
+	}
+	return remotecommand.NewFallbackExecutor(websocketExec, exec, func(err error) bool {
+		return httpstream.IsUpgradeFailure(err) || httpstream.IsHTTPSProxyError(err)
 	})
 }
 
@@ -135,7 +189,7 @@ type StreamOptions struct {
 	// InterruptParent, if set, is used to handle interrupts while attached
 	InterruptParent *interrupt.Handler
 
-	genericclioptions.IOStreams
+	genericiooptions.IOStreams
 
 	// for testing
 	overrideStreams func() (io.ReadCloser, io.Writer, io.Writer)
@@ -145,12 +199,11 @@ type StreamOptions struct {
 // ExecOptions declare the arguments accepted by the Exec command
 type ExecOptions struct {
 	StreamOptions
+	resource.FilenameOptions
 
-	ResourceName string
-	Command      []string
-
-	ParentCommandName       string
-	EnableSuggestedCmdUsage bool
+	ResourceName     string
+	Command          []string
+	EnforceNamespace bool
 
 	Builder          func() *resource.Builder
 	ExecutablePodFn  polymorphichelpers.AttachablePodForObjectFunc
@@ -163,59 +216,66 @@ type ExecOptions struct {
 	Config        *restclient.Config
 }
 
-// Complete verifies command line arguments and loads data from the command environment
-func (p *ExecOptions) Complete(f cmdutil.Factory, cmd *cobra.Command, argsIn []string, argsLenAtDash int) error {
-	// Let kubectl exec follow rules for `--`, see #13004 issue
-	if len(argsIn) == 0 || argsLenAtDash == 0 {
-		return cmdutil.UsageErrorf(cmd, execUsageStr)
+// ToOptions converts from CLI inputs to runtime inputs
+func (flags *ExecFlags) ToOptions(f cmdutil.Factory, cmd *cobra.Command, argsIn []string, argsLenAtDash int) (*ExecOptions, error) {
+	o := &ExecOptions{
+		StreamOptions: StreamOptions{
+			ContainerName: flags.ContainerName,
+			Stdin:         flags.Stdin,
+			TTY:           flags.TTY,
+			Quiet:         flags.Quiet,
+			IOStreams:     flags.IOStreams,
+		},
+		FilenameOptions: flags.FilenameOptions,
+
+		Executor: &DefaultRemoteExecutor{},
 	}
 
-	p.ResourceName = argsIn[0]
-	p.Command = argsIn[1:]
+	if len(argsIn) > 0 && argsLenAtDash != 0 {
+		o.ResourceName = argsIn[0]
+	}
+	// we expect exactly one arg (the pod/resource name) before the dash separator.
+	// pflag guarantees `argsLenAtDash <= len(args)`.
+	if argsLenAtDash == 0 || argsLenAtDash == 1 {
+		o.Command = argsIn[argsLenAtDash:]
+	} else if len(argsIn) > 1 || (len(argsIn) > 0 && len(flags.FilenameOptions.Filenames) != 0) {
+		return nil, fmt.Errorf("exec [POD] [COMMAND] is not supported anymore. Use exec [POD] -- [COMMAND] instead")
+	}
 
 	var err error
-
-	p.Namespace, _, err = f.ToRawKubeConfigLoader().Namespace()
+	o.Namespace, o.EnforceNamespace, err = f.ToRawKubeConfigLoader().Namespace()
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	p.ExecutablePodFn = polymorphichelpers.AttachablePodForObjectFn
+	o.ExecutablePodFn = polymorphichelpers.AttachablePodForObjectFn
 
-	p.GetPodTimeout, err = cmdutil.GetPodRunningTimeoutFlag(cmd)
+	o.GetPodTimeout, err = cmdutil.GetPodRunningTimeoutFlag(cmd)
 	if err != nil {
-		return cmdutil.UsageErrorf(cmd, err.Error())
+		return nil, err
 	}
 
-	p.Builder = f.NewBuilder
-	p.restClientGetter = f
+	o.Builder = f.NewBuilder
+	o.restClientGetter = f
 
-	cmdParent := cmd.Parent()
-	if cmdParent != nil {
-		p.ParentCommandName = cmdParent.CommandPath()
-	}
-	if len(p.ParentCommandName) > 0 && cmdutil.IsSiblingCommandExists(cmd, "describe") {
-		p.EnableSuggestedCmdUsage = true
-	}
-
-	p.Config, err = f.ToRESTConfig()
+	o.Config, err = f.ToRESTConfig()
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	clientset, err := f.KubernetesClientSet()
 	if err != nil {
-		return err
+		return nil, err
 	}
-	p.PodClient = clientset.CoreV1()
+	o.PodClient = clientset.CoreV1()
 
-	return nil
+	return o, nil
 }
 
 // Validate checks that the provided exec options are specified.
 func (p *ExecOptions) Validate() error {
-	if len(p.PodName) == 0 && len(p.ResourceName) == 0 {
-		return fmt.Errorf("pod or type/name must be specified")
+	if len(p.PodName) == 0 && len(p.ResourceName) == 0 && len(p.FilenameOptions.Filenames) == 0 {
+		return fmt.Errorf("pod, type/name or --filename must be specified")
 	}
 	if len(p.Command) == 0 {
 		return fmt.Errorf("you must specify at least one command for the container")
@@ -252,7 +312,7 @@ func (o *StreamOptions) SetupTTY() term.TTY {
 	if !o.isTerminalIn(t) {
 		o.TTY = false
 
-		if o.ErrOut != nil {
+		if !o.Quiet && o.ErrOut != nil {
 			fmt.Fprintln(o.ErrOut, "Unable to use a TTY - input is not a terminal or the right kind of file")
 		}
 
@@ -285,18 +345,26 @@ func (p *ExecOptions) Run() error {
 	// since there are any other command run this function by providing Podname with PodsGetter
 	// and without resource builder, eg: `kubectl cp`.
 	if len(p.PodName) != 0 {
-		p.Pod, err = p.PodClient.Pods(p.Namespace).Get(p.PodName, metav1.GetOptions{})
+		p.Pod, err = p.PodClient.Pods(p.Namespace).Get(context.TODO(), p.PodName, metav1.GetOptions{})
 		if err != nil {
 			return err
 		}
 	} else {
 		builder := p.Builder().
 			WithScheme(scheme.Scheme, scheme.Scheme.PrioritizedVersionsAllGroups()...).
-			NamespaceParam(p.Namespace).DefaultNamespace().ResourceNames("pods", p.ResourceName)
+			FilenameParam(p.EnforceNamespace, &p.FilenameOptions).
+			NamespaceParam(p.Namespace).DefaultNamespace()
+		if len(p.ResourceName) > 0 {
+			builder = builder.ResourceNames("pods", p.ResourceName)
+		}
 
 		obj, err := builder.Do().Object()
 		if err != nil {
 			return err
+		}
+
+		if meta.IsListType(obj) {
+			return fmt.Errorf("cannot exec into multiple objects at a time")
 		}
 
 		p.Pod, err = p.ExecutablePodFn(p.restClientGetter, obj, p.GetPodTimeout)
@@ -313,13 +381,16 @@ func (p *ExecOptions) Run() error {
 
 	containerName := p.ContainerName
 	if len(containerName) == 0 {
-		if len(pod.Spec.Containers) > 1 {
-			fmt.Fprintf(p.ErrOut, "Defaulting container name to %s.\n", pod.Spec.Containers[0].Name)
-			if p.EnableSuggestedCmdUsage {
-				fmt.Fprintf(p.ErrOut, "Use '%s describe pod/%s -n %s' to see all of the containers in this pod.\n", p.ParentCommandName, pod.Name, p.Namespace)
-			}
+		container, err := podcmd.FindOrDefaultContainerByName(pod, containerName, p.Quiet, p.ErrOut)
+		if err != nil {
+			return err
 		}
-		containerName = pod.Spec.Containers[0].Name
+		containerName = container.Name
+	} else {
+		container, _ := podcmd.FindContainerByName(pod, p.ContainerName)
+		if container == nil {
+			return fmt.Errorf("container %s is not valid for pod %s out of: %s", p.ContainerName, pod.Name, podcmd.AllContainerNames(pod))
+		}
 	}
 
 	// ensure we can recover the terminal while attached
@@ -328,7 +399,9 @@ func (p *ExecOptions) Run() error {
 	var sizeQueue remotecommand.TerminalSizeQueue
 	if t.Raw {
 		// this call spawns a goroutine to monitor/update the terminal size
-		sizeQueue = t.MonitorSize(t.GetSize())
+		sizeQueue = &terminalSizeQueueAdapter{
+			delegate: t.MonitorSize(t.GetSize()),
+		}
 
 		// unset p.Err if it was previously set because both stdout and stderr go over p.Out when tty is
 		// true
@@ -356,7 +429,7 @@ func (p *ExecOptions) Run() error {
 			TTY:       t.Raw,
 		}, scheme.ParameterCodec)
 
-		return p.Executor.Execute("POST", req.URL(), p.Config, p.In, p.Out, p.ErrOut, t.Raw, sizeQueue)
+		return p.Executor.Execute(req.URL(), p.Config, p.In, p.Out, p.ErrOut, t.Raw, sizeQueue)
 	}
 
 	if err := t.Safe(fn); err != nil {
@@ -364,4 +437,23 @@ func (p *ExecOptions) Run() error {
 	}
 
 	return nil
+}
+
+type terminalSizeQueueAdapter struct {
+	delegate term.TerminalSizeQueue
+}
+
+func (a *terminalSizeQueueAdapter) Next() *remotecommand.TerminalSize {
+	if a.delegate == nil {
+		return nil
+	}
+
+	next := a.delegate.Next()
+	if next == nil {
+		return nil
+	}
+	return &remotecommand.TerminalSize{
+		Width:  next.Width,
+		Height: next.Height,
+	}
 }

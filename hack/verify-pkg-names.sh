@@ -14,7 +14,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Verify whether codes follow golang convention.
+# This script verifies whether codes follow golang convention.
+# Usage: `hack/verify-pkg-names.sh`.
 
 set -o errexit
 set -o nounset
@@ -22,8 +23,6 @@ set -o pipefail
 
 KUBE_ROOT=$(dirname "${BASH_SOURCE[0]}")/..
 source "${KUBE_ROOT}/hack/lib/init.sh"
-
-kube::golang::verify_go_version
 
 cd "${KUBE_ROOT}"
 if git --no-pager grep -E $'^(import |\t)[a-z]+[A-Z_][a-zA-Z]* "[^"]+"$' -- '**/*.go' ':(exclude)vendor/*' ':(exclude)**/*.pb.go'; then

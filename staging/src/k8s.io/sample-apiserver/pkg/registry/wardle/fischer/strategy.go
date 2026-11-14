@@ -79,11 +79,14 @@ func (fischerStrategy) Validate(ctx context.Context, obj runtime.Object) field.E
 	return field.ErrorList{}
 }
 
-func (fischerStrategy) AllowCreateOnUpdate() bool {
+// WarningsOnCreate returns warnings for the creation of the given object.
+func (fischerStrategy) WarningsOnCreate(ctx context.Context, obj runtime.Object) []string { return nil }
+
+func (fischerStrategy) AllowCreateOnUpdate(ctx context.Context) bool {
 	return false
 }
 
-func (fischerStrategy) AllowUnconditionalUpdate() bool {
+func (fischerStrategy) AllowUnconditionalUpdate(ctx context.Context) bool {
 	return false
 }
 
@@ -92,4 +95,9 @@ func (fischerStrategy) Canonicalize(obj runtime.Object) {
 
 func (fischerStrategy) ValidateUpdate(ctx context.Context, obj, old runtime.Object) field.ErrorList {
 	return field.ErrorList{}
+}
+
+// WarningsOnUpdate returns warnings for the given update.
+func (fischerStrategy) WarningsOnUpdate(ctx context.Context, obj, old runtime.Object) []string {
+	return nil
 }

@@ -19,50 +19,55 @@ package statefulset
 import (
 	"context"
 
-	appsv1beta1 "k8s.io/api/apps/v1beta1"
-	appsv1beta2 "k8s.io/api/apps/v1beta2"
+	"sigs.k8s.io/structured-merge-diff/v7/fieldpath"
+
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/validation/field"
-	genericapirequest "k8s.io/apiserver/pkg/endpoints/request"
 	"k8s.io/apiserver/pkg/registry/rest"
 	"k8s.io/apiserver/pkg/storage/names"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/kubernetes/pkg/api/legacyscheme"
+	pvcutil "k8s.io/kubernetes/pkg/api/persistentvolumeclaim"
 	"k8s.io/kubernetes/pkg/api/pod"
 	"k8s.io/kubernetes/pkg/apis/apps"
 	"k8s.io/kubernetes/pkg/apis/apps/validation"
 	corevalidation "k8s.io/kubernetes/pkg/apis/core/validation"
+	"k8s.io/kubernetes/pkg/features"
 )
 
 // statefulSetStrategy implements verification logic for Replication StatefulSets.
 type statefulSetStrategy struct {
-	runtime.ObjectTyper
+	rest.DeclarativeValidation
 	names.NameGenerator
 }
 
 // Strategy is the default logic that applies when creating and updating Replication StatefulSet objects.
-var Strategy = statefulSetStrategy{legacyscheme.Scheme, names.SimpleNameGenerator}
+var Strategy = statefulSetStrategy{rest.DeclarativeValidation{Scheme: legacyscheme.Scheme}, names.SimpleNameGenerator}
 
-// DefaultGarbageCollectionPolicy returns OrphanDependents for apps/v1beta1 and apps/v1beta2 for backwards compatibility,
-// and DeleteDependents for all other versions.
+// Make sure we correctly implement the interface.
+var _ = rest.GarbageCollectionDeleteStrategy(Strategy)
+
+// DefaultGarbageCollectionPolicy returns DeleteDependents for all currently served versions.
 func (statefulSetStrategy) DefaultGarbageCollectionPolicy(ctx context.Context) rest.GarbageCollectionPolicy {
-	var groupVersion schema.GroupVersion
-	if requestInfo, found := genericapirequest.RequestInfoFrom(ctx); found {
-		groupVersion = schema.GroupVersion{Group: requestInfo.APIGroup, Version: requestInfo.APIVersion}
-	}
-	switch groupVersion {
-	case appsv1beta1.SchemeGroupVersion, appsv1beta2.SchemeGroupVersion:
-		// for back compatibility
-		return rest.OrphanDependents
-	default:
-		return rest.DeleteDependents
-	}
+	return rest.DeleteDependents
 }
 
 // NamespaceScoped returns true because all StatefulSet' need to be within a namespace.
 func (statefulSetStrategy) NamespaceScoped() bool {
 	return true
+}
+
+// GetResetFields returns the set of fields that get reset by the strategy
+// and should not be modified by the user.
+func (statefulSetStrategy) GetResetFields() map[fieldpath.APIVersion]*fieldpath.Set {
+	fields := map[fieldpath.APIVersion]*fieldpath.Set{
+		"apps/v1": fieldpath.NewSet(
+			fieldpath.MakePathOrDie("status"),
+		),
+	}
+
+	return fields
 }
 
 // PrepareForCreate clears the status of an StatefulSet before creation.
@@ -73,7 +78,20 @@ func (statefulSetStrategy) PrepareForCreate(ctx context.Context, obj runtime.Obj
 
 	statefulSet.Generation = 1
 
+	dropStatefulSetDisabledFields(statefulSet, nil)
 	pod.DropDisabledTemplateFields(&statefulSet.Spec.Template, nil)
+}
+
+// maxUnavailableInUse returns true if StatefulSet's maxUnavailable set(used)
+func maxUnavailableInUse(statefulset *apps.StatefulSet) bool {
+	if statefulset == nil {
+		return false
+	}
+	if statefulset.Spec.UpdateStrategy.RollingUpdate == nil {
+		return false
+	}
+
+	return statefulset.Spec.UpdateStrategy.RollingUpdate.MaxUnavailable != nil
 }
 
 // PrepareForUpdate clears fields that are not allowed to be set by end users on update.
@@ -83,6 +101,7 @@ func (statefulSetStrategy) PrepareForUpdate(ctx context.Context, obj, old runtim
 	// Update is not allowed to set status
 	newStatefulSet.Status = oldStatefulSet.Status
 
+	dropStatefulSetDisabledFields(newStatefulSet, oldStatefulSet)
 	pod.DropDisabledTemplateFields(&newStatefulSet.Spec.Template, &oldStatefulSet.Spec.Template)
 
 	// Any changes to the spec increment the generation number, any changes to the
@@ -91,15 +110,46 @@ func (statefulSetStrategy) PrepareForUpdate(ctx context.Context, obj, old runtim
 	if !apiequality.Semantic.DeepEqual(oldStatefulSet.Spec, newStatefulSet.Spec) {
 		newStatefulSet.Generation = oldStatefulSet.Generation + 1
 	}
+}
 
+// dropStatefulSetDisabledFields drops fields that are not used if their associated feature gates
+// are not enabled.
+// The typical pattern is:
+//
+//	if !utilfeature.DefaultFeatureGate.Enabled(features.MyFeature) && !myFeatureInUse(oldSvc) {
+//	    newSvc.Spec.MyFeature = nil
+//	}
+func dropStatefulSetDisabledFields(newSS *apps.StatefulSet, oldSS *apps.StatefulSet) {
+	if !utilfeature.DefaultFeatureGate.Enabled(features.MaxUnavailableStatefulSet) && !maxUnavailableInUse(oldSS) {
+		if newSS.Spec.UpdateStrategy.RollingUpdate != nil {
+			newSS.Spec.UpdateStrategy.RollingUpdate.MaxUnavailable = nil
+		}
+	}
 }
 
 // Validate validates a new StatefulSet.
 func (statefulSetStrategy) Validate(ctx context.Context, obj runtime.Object) field.ErrorList {
 	statefulSet := obj.(*apps.StatefulSet)
-	allErrs := validation.ValidateStatefulSet(statefulSet)
-	allErrs = append(allErrs, corevalidation.ValidateConditionalPodTemplate(&statefulSet.Spec.Template, nil, field.NewPath("spec.template"))...)
-	return allErrs
+	opts := corevalidation.GetValidationOptionsFromPodTemplate(&statefulSet.Spec.Template, nil)
+	setOpts := validation.StatefulSetValidationOptions{
+		AllowInvalidServiceName:          false, // require valid serviceNames in new StatefulSets
+		AllowStatefulSetRecreateStrategy: utilfeature.DefaultFeatureGate.Enabled(features.StatefulSetRecreateStrategy),
+	}
+	return validation.ValidateStatefulSet(statefulSet, setOpts, opts)
+}
+
+// WarningsOnCreate returns warnings for the creation of the given object.
+func (statefulSetStrategy) WarningsOnCreate(ctx context.Context, obj runtime.Object) []string {
+	newStatefulSet := obj.(*apps.StatefulSet)
+	warnings := pod.GetWarningsForPodTemplate(ctx, field.NewPath("spec", "template"), &newStatefulSet.Spec.Template, nil)
+	for i, pvc := range newStatefulSet.Spec.VolumeClaimTemplates {
+		warnings = append(warnings, pvcutil.GetWarningsForPersistentVolumeClaimSpec(field.NewPath("spec", "volumeClaimTemplates").Index(i), pvc.Spec)...)
+	}
+
+	if newStatefulSet.Spec.RevisionHistoryLimit != nil && *newStatefulSet.Spec.RevisionHistoryLimit < 0 {
+		warnings = append(warnings, "spec.revisionHistoryLimit: a negative value retains all historical revisions; a value >= 0 is recommended")
+	}
+	return warnings
 }
 
 // Canonicalize normalizes the object after validation.
@@ -107,7 +157,7 @@ func (statefulSetStrategy) Canonicalize(obj runtime.Object) {
 }
 
 // AllowCreateOnUpdate is false for StatefulSet; this means POST is needed to create one.
-func (statefulSetStrategy) AllowCreateOnUpdate() bool {
+func (statefulSetStrategy) AllowCreateOnUpdate(ctx context.Context) bool {
 	return false
 }
 
@@ -115,14 +165,36 @@ func (statefulSetStrategy) AllowCreateOnUpdate() bool {
 func (statefulSetStrategy) ValidateUpdate(ctx context.Context, obj, old runtime.Object) field.ErrorList {
 	newStatefulSet := obj.(*apps.StatefulSet)
 	oldStatefulSet := old.(*apps.StatefulSet)
-	validationErrorList := validation.ValidateStatefulSet(newStatefulSet)
-	updateErrorList := validation.ValidateStatefulSetUpdate(newStatefulSet, oldStatefulSet)
-	updateErrorList = append(updateErrorList, corevalidation.ValidateConditionalPodTemplate(&newStatefulSet.Spec.Template, &oldStatefulSet.Spec.Template, field.NewPath("spec.template"))...)
-	return append(validationErrorList, updateErrorList...)
+
+	setOpts := validation.StatefulSetValidationOptions{
+		AllowInvalidServiceName:          true, // serviceName is immutable, tolerate existing invalid names on update
+		SkipValidateVolumeClaimTemplates: true, // volumeClaimTemplates are immutable, tolerate previously persisted invalid values on update
+		AllowStatefulSetRecreateStrategy: utilfeature.DefaultFeatureGate.Enabled(features.StatefulSetRecreateStrategy) || oldStatefulSet.Spec.UpdateStrategy.Type == apps.RecreateStatefulSetStrategyType,
+	}
+	opts := corevalidation.GetValidationOptionsFromPodTemplate(&newStatefulSet.Spec.Template, &oldStatefulSet.Spec.Template)
+	return validation.ValidateStatefulSetUpdate(newStatefulSet, oldStatefulSet, setOpts, opts)
+}
+
+// WarningsOnUpdate returns warnings for the given update.
+func (statefulSetStrategy) WarningsOnUpdate(ctx context.Context, obj, old runtime.Object) []string {
+	var warnings []string
+	newStatefulSet := obj.(*apps.StatefulSet)
+	oldStatefulSet := old.(*apps.StatefulSet)
+	if newStatefulSet.Generation != oldStatefulSet.Generation {
+		warnings = pod.GetWarningsForPodTemplate(ctx, field.NewPath("spec", "template"), &newStatefulSet.Spec.Template, &oldStatefulSet.Spec.Template)
+	}
+	for i, pvc := range newStatefulSet.Spec.VolumeClaimTemplates {
+		warnings = append(warnings, pvcutil.GetWarningsForPersistentVolumeClaimSpec(field.NewPath("spec", "volumeClaimTemplates").Index(i).Child("Spec"), pvc.Spec)...)
+	}
+	if newStatefulSet.Spec.RevisionHistoryLimit != nil && *newStatefulSet.Spec.RevisionHistoryLimit < 0 {
+		warnings = append(warnings, "spec.revisionHistoryLimit: a negative value retains all historical revisions; a value >= 0 is recommended")
+	}
+
+	return warnings
 }
 
 // AllowUnconditionalUpdate is the default update policy for StatefulSet objects.
-func (statefulSetStrategy) AllowUnconditionalUpdate() bool {
+func (statefulSetStrategy) AllowUnconditionalUpdate(ctx context.Context) bool {
 	return true
 }
 
@@ -132,6 +204,16 @@ type statefulSetStatusStrategy struct {
 
 // StatusStrategy is the default logic invoked when updating object status.
 var StatusStrategy = statefulSetStatusStrategy{Strategy}
+
+// GetResetFields returns the set of fields that get reset by the strategy
+// and should not be modified by the user.
+func (statefulSetStatusStrategy) GetResetFields() map[fieldpath.APIVersion]*fieldpath.Set {
+	return map[fieldpath.APIVersion]*fieldpath.Set{
+		"apps/v1": fieldpath.NewSet(
+			fieldpath.MakePathOrDie("spec"),
+		),
+	}
+}
 
 // PrepareForUpdate clears fields that are not allowed to be set by end users on update of status
 func (statefulSetStatusStrategy) PrepareForUpdate(ctx context.Context, obj, old runtime.Object) {
@@ -145,4 +227,9 @@ func (statefulSetStatusStrategy) PrepareForUpdate(ctx context.Context, obj, old 
 func (statefulSetStatusStrategy) ValidateUpdate(ctx context.Context, obj, old runtime.Object) field.ErrorList {
 	// TODO: Validate status updates.
 	return validation.ValidateStatefulSetStatusUpdate(obj.(*apps.StatefulSet), old.(*apps.StatefulSet))
+}
+
+// WarningsOnUpdate returns warnings for the given update.
+func (statefulSetStatusStrategy) WarningsOnUpdate(ctx context.Context, obj, old runtime.Object) []string {
+	return nil
 }

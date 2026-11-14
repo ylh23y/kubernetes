@@ -19,32 +19,60 @@ limitations under the License.
 package token
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"math/rand"
 	"sync"
 	"time"
 
 	authenticationv1 "k8s.io/api/authentication/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/apimachinery/pkg/util/clock"
 	"k8s.io/apimachinery/pkg/util/wait"
 	clientset "k8s.io/client-go/kubernetes"
-	"k8s.io/klog"
+	"k8s.io/klog/v2"
+	"k8s.io/utils/clock"
 )
 
 const (
-	maxTTL   = 24 * time.Hour
-	gcPeriod = time.Minute
+	maxTTL    = 24 * time.Hour
+	gcPeriod  = time.Minute
+	maxJitter = 10 * time.Second
 )
 
 // NewManager returns a new token manager.
 func NewManager(c clientset.Interface) *Manager {
+	// check whether the server supports token requests so we can give a more helpful error message
+	supported := false
+	once := &sync.Once{}
+	tokenRequestsSupported := func() bool {
+		once.Do(func() {
+			resources, err := c.Discovery().ServerResourcesForGroupVersionWithContext(context.TODO(), ("v1"))
+			if err != nil {
+				return
+			}
+			for _, resource := range resources.APIResources {
+				if resource.Name == "serviceaccounts/token" {
+					supported = true
+					return
+				}
+			}
+		})
+		return supported
+	}
+
 	m := &Manager{
 		getToken: func(name, namespace string, tr *authenticationv1.TokenRequest) (*authenticationv1.TokenRequest, error) {
 			if c == nil {
 				return nil, errors.New("cannot use TokenManager when kubelet is in standalone mode")
 			}
-			return c.CoreV1().ServiceAccounts(namespace).CreateToken(name, tr)
+			tokenRequest, err := c.CoreV1().ServiceAccounts(namespace).CreateToken(context.TODO(), name, tr, metav1.CreateOptions{})
+			if apierrors.IsNotFound(err) && !tokenRequestsSupported() {
+				return nil, fmt.Errorf("the API server does not have TokenRequest endpoints enabled")
+			}
+			return tokenRequest, err
 		},
 		cache: make(map[string]*authenticationv1.TokenRequest),
 		clock: clock.RealClock{},
@@ -74,11 +102,13 @@ type Manager struct {
 // * If refresh fails and the old token is still valid, log an error and return the old token.
 // * If refresh fails and the old token is no longer valid, return an error
 func (m *Manager) GetServiceAccountToken(namespace, name string, tr *authenticationv1.TokenRequest) (*authenticationv1.TokenRequest, error) {
+	// TODO: pass ctx to GetServiceAccountToken after switching pkg/volume to contextual logging
+	ctx := context.TODO()
 	key := keyFunc(name, namespace, tr)
 
 	ctr, ok := m.get(key)
 
-	if ok && !m.requiresRefresh(ctr) {
+	if ok && !m.requiresRefresh(ctx, ctr) {
 		return ctr, nil
 	}
 
@@ -90,7 +120,8 @@ func (m *Manager) GetServiceAccountToken(namespace, name string, tr *authenticat
 		case m.expired(ctr):
 			return nil, fmt.Errorf("token %s expired and refresh failed: %v", key, err)
 		default:
-			klog.Errorf("couldn't update token %s: %v", key, err)
+			logger := klog.FromContext(ctx)
+			logger.Error(err, "Couldn't update token", "cacheKey", key)
 			return ctr, nil
 		}
 	}
@@ -140,20 +171,24 @@ func (m *Manager) expired(t *authenticationv1.TokenRequest) bool {
 
 // requiresRefresh returns true if the token is older than 80% of its total
 // ttl, or if the token is older than 24 hours.
-func (m *Manager) requiresRefresh(tr *authenticationv1.TokenRequest) bool {
+func (m *Manager) requiresRefresh(ctx context.Context, tr *authenticationv1.TokenRequest) bool {
 	if tr.Spec.ExpirationSeconds == nil {
-		klog.Errorf("expiration seconds was nil for tr: %#v", tr)
+		cpy := tr.DeepCopy()
+		cpy.Status.Token = ""
+		logger := klog.FromContext(ctx)
+		logger.Error(nil, "Expiration seconds was nil for token request", "tokenRequest", cpy)
 		return false
 	}
 	now := m.clock.Now()
 	exp := tr.Status.ExpirationTimestamp.Time
 	iat := exp.Add(-1 * time.Duration(*tr.Spec.ExpirationSeconds) * time.Second)
 
-	if now.After(iat.Add(maxTTL)) {
+	jitter := time.Duration(rand.Float64()*maxJitter.Seconds()) * time.Second
+	if now.After(iat.Add(maxTTL - jitter)) {
 		return true
 	}
-	// Require a refresh if within 20% of the TTL from the expiration time.
-	if now.After(exp.Add(-1 * time.Duration((*tr.Spec.ExpirationSeconds*20)/100) * time.Second)) {
+	// Require a refresh if within 20% of the TTL plus a jitter from the expiration time.
+	if now.After(exp.Add(-1*time.Duration((*tr.Spec.ExpirationSeconds*20)/100)*time.Second - jitter)) {
 		return true
 	}
 	return false
@@ -171,5 +206,14 @@ func keyFunc(name, namespace string, tr *authenticationv1.TokenRequest) string {
 		ref = *tr.Spec.BoundObjectRef
 	}
 
-	return fmt.Sprintf("%q/%q/%#v/%#v/%#v", name, namespace, tr.Spec.Audiences, exp, ref)
+	var uid types.UID
+	if len(tr.UID) > 0 {
+		// If UID is set in the token request it is used as a precondition
+		// to ensure that the token request is for the same service account.
+		// This is useful to prevent stale tokens from being returned after a service account
+		// is deleted and recreated with the same name.
+		uid = tr.UID
+	}
+
+	return fmt.Sprintf("%q/%q/%#v/%#v/%#v/%q", name, namespace, tr.Spec.Audiences, exp, ref, uid)
 }

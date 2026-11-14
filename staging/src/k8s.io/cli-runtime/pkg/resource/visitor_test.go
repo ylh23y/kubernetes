@@ -18,14 +18,21 @@ package resource
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
+	"io/fs"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
-	"github.com/davecgh/go-spew/spew"
 	"github.com/stretchr/testify/assert"
+	"k8s.io/apimachinery/pkg/api/meta"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/utils/dump"
 )
 
 func TestVisitorHttpGet(t *testing.T) {
@@ -70,7 +77,7 @@ func TestVisitorHttpGet(t *testing.T) {
 			httpRetries: func(url string) (int, string, io.ReadCloser, error) {
 				assert.Equal(t, "hello", url)
 				i++
-				return 501, "Status", nil, nil
+				return 501, "Status", io.NopCloser(new(bytes.Buffer)), nil
 			},
 			args: httpArgs{
 				duration: 0,
@@ -84,7 +91,7 @@ func TestVisitorHttpGet(t *testing.T) {
 			httpRetries: func(url string) (int, string, io.ReadCloser, error) {
 				assert.Equal(t, "hello", url)
 				i++
-				return 300, "Status", nil, nil
+				return 300, "Status", io.NopCloser(new(bytes.Buffer)), nil
 
 			},
 			args: httpArgs{
@@ -99,7 +106,7 @@ func TestVisitorHttpGet(t *testing.T) {
 			httpRetries: func(url string) (int, string, io.ReadCloser, error) {
 				assert.Equal(t, "hello", url)
 				i++
-				return 501, "Status", nil, nil
+				return 501, "Status", io.NopCloser(new(bytes.Buffer)), nil
 
 			},
 			args: httpArgs{
@@ -112,7 +119,7 @@ func TestVisitorHttpGet(t *testing.T) {
 		{
 			name: "Test attempts less than 1 results in an error",
 			httpRetries: func(url string) (int, string, io.ReadCloser, error) {
-				return 200, "Status", ioutil.NopCloser(new(bytes.Buffer)), nil
+				return 200, "Status", io.NopCloser(new(bytes.Buffer)), nil
 
 			},
 			args: httpArgs{
@@ -128,9 +135,9 @@ func TestVisitorHttpGet(t *testing.T) {
 				assert.Equal(t, "hello", url)
 				i++
 				if i > 1 {
-					return 200, "Status", ioutil.NopCloser(new(bytes.Buffer)), nil
+					return 200, "Status", io.NopCloser(new(bytes.Buffer)), nil
 				}
-				return 501, "Status", nil, nil
+				return 501, "Status", io.NopCloser(new(bytes.Buffer)), nil
 
 			},
 			args: httpArgs{
@@ -149,7 +156,7 @@ func TestVisitorHttpGet(t *testing.T) {
 			actualBytes, actualErr := readHttpWithRetries(tt.httpRetries, tt.args.duration, tt.args.u, tt.args.attempts)
 
 			if tt.isNotNil {
-				assert.Nil(t, actualErr)
+				assert.NoError(t, actualErr)
 				assert.NotNil(t, actualBytes)
 			} else {
 				if tt.expectedErr != nil {
@@ -177,6 +184,217 @@ func TestFlattenListVisitor(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(test.Infos) != 6 {
-		t.Fatal(spew.Sdump(test.Infos))
+		t.Fatal(dump.Pretty(test.Infos))
+	}
+}
+
+func TestFlattenListVisitorWithVisitorError(t *testing.T) {
+	b := newDefaultBuilder().
+		FilenameParam(false, &FilenameOptions{Recursive: false, Filenames: []string{"../../artifacts/deeply-nested.yaml"}}).
+		Flatten()
+
+	test := &testVisitor{InjectErr: errors.New("visitor error")}
+	err := b.Do().Visit(test.Handle)
+	if err == nil || !strings.Contains(err.Error(), "visitor error") {
+		t.Fatal(err)
+	}
+	if len(test.Infos) != 6 {
+		t.Fatal(dump.Pretty(test.Infos))
+	}
+}
+
+func TestInfoObjectName(t *testing.T) {
+	newObj := func(apiVersion, kind string) *unstructured.Unstructured {
+		obj := &unstructured.Unstructured{}
+		obj.SetAPIVersion(apiVersion)
+		obj.SetKind(kind)
+		obj.SetName("foo")
+		return obj
+	}
+	tests := []struct {
+		name string
+		info *Info
+		want string
+	}{
+		{
+			name: "with mapping",
+			info: &Info{
+				Name:    "foo",
+				Object:  newObj("apps/v1", "Deployment"),
+				Mapping: &meta.RESTMapping{Resource: schema.GroupVersionResource{Group: "apps", Version: "v1", Resource: "deployments"}},
+			},
+			want: "deployments/foo",
+		},
+		{
+			name: "no mapping, core group",
+			info: &Info{Name: "foo", Object: newObj("v1", "Pod")},
+			want: "pod/foo",
+		},
+		{
+			name: "no mapping, named group",
+			info: &Info{Name: "foo", Object: newObj("apps/v1", "Deployment")},
+			want: "deployment.apps/foo",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, tt.info.ObjectName())
+		})
+	}
+}
+
+func TestExpandPathsToFileVisitors(t *testing.T) {
+	// Define a directory structure that will be used for testing and create empty files
+	testDir := t.TempDir()
+	filePaths := []string{
+		filepath.Join(testDir, "0", "10.yaml"),
+		filepath.Join(testDir, "0", "a", "10.yaml"),
+		filepath.Join(testDir, "02.yaml"),
+		filepath.Join(testDir, "10.yaml"),
+		filepath.Join(testDir, "2.yaml"),
+		filepath.Join(testDir, "AB.yaml"),
+		filepath.Join(testDir, "a", "a.yaml"),
+		filepath.Join(testDir, "a", "b.json"),
+		filepath.Join(testDir, "a.yaml"),
+		filepath.Join(testDir, "aa.yaml"),
+		filepath.Join(testDir, "b.yml"),
+	}
+	for _, fp := range filePaths {
+		if err := os.MkdirAll(filepath.Dir(fp), 0700); err != nil {
+			t.Fatal(err)
+		}
+		func() {
+			f, err := os.Create(fp)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer f.Close()
+		}()
+	}
+
+	// Define and execute test cases
+	tests := []struct {
+		name            string
+		path            string
+		recursive       bool
+		fileExtensions  []string
+		expectedPaths   []string
+		expectPathError bool
+	}{
+		{
+			name:           "Recursive with default file extensions",
+			path:           testDir,
+			recursive:      true,
+			fileExtensions: FileExtensions,
+			expectedPaths: []string{
+				filepath.Join(testDir, "0", "10.yaml"),
+				filepath.Join(testDir, "0", "a", "10.yaml"),
+				filepath.Join(testDir, "02.yaml"),
+				filepath.Join(testDir, "10.yaml"),
+				filepath.Join(testDir, "2.yaml"),
+				filepath.Join(testDir, "AB.yaml"),
+				filepath.Join(testDir, "a", "a.yaml"),
+				filepath.Join(testDir, "a", "b.json"),
+				filepath.Join(testDir, "a.yaml"),
+				filepath.Join(testDir, "aa.yaml"),
+				filepath.Join(testDir, "b.yml"),
+			},
+		},
+		{
+			name:           "Non-recursive with default file extensions",
+			path:           testDir,
+			fileExtensions: FileExtensions,
+			expectedPaths: []string{
+				filepath.Join(testDir, "02.yaml"),
+				filepath.Join(testDir, "10.yaml"),
+				filepath.Join(testDir, "2.yaml"),
+				filepath.Join(testDir, "AB.yaml"),
+				filepath.Join(testDir, "a.yaml"),
+				filepath.Join(testDir, "aa.yaml"),
+				filepath.Join(testDir, "b.yml"),
+			},
+		},
+		{
+			name:           "Recursive with yaml file extension",
+			path:           testDir,
+			recursive:      true,
+			fileExtensions: []string{".yaml"},
+			expectedPaths: []string{
+				filepath.Join(testDir, "0", "10.yaml"),
+				filepath.Join(testDir, "0", "a", "10.yaml"),
+				filepath.Join(testDir, "02.yaml"),
+				filepath.Join(testDir, "10.yaml"),
+				filepath.Join(testDir, "2.yaml"),
+				filepath.Join(testDir, "AB.yaml"),
+				filepath.Join(testDir, "a", "a.yaml"),
+				filepath.Join(testDir, "a.yaml"),
+				filepath.Join(testDir, "aa.yaml"),
+			},
+		},
+		{
+			name:           "Recursive with json and yml file extensions",
+			path:           testDir,
+			recursive:      true,
+			fileExtensions: []string{".json", ".yml"},
+			expectedPaths: []string{
+				filepath.Join(testDir, "a", "b.json"),
+				filepath.Join(testDir, "b.yml"),
+			},
+		},
+		{
+			name:           "Non-recursive with json and yml file extensions",
+			path:           testDir,
+			fileExtensions: []string{".json", ".yml"},
+			expectedPaths: []string{
+				filepath.Join(testDir, "b.yml"),
+			},
+		},
+		{
+			name:           "Non-existent file extensions should return nothing",
+			path:           testDir,
+			recursive:      true,
+			fileExtensions: []string{".foo"},
+			expectedPaths:  []string{},
+		},
+		{
+			name:            "Non-existent path should return file not found error",
+			path:            filepath.Join(testDir, "does", "not", "exist"),
+			recursive:       true,
+			fileExtensions:  []string{".foo"},
+			expectedPaths:   []string{},
+			expectPathError: true,
+		},
+		{
+			name:           "Visitor for single file is returned even if extension does not match",
+			path:           filepath.Join(testDir, "a.yaml"),
+			recursive:      true,
+			fileExtensions: []string{"foo"},
+			expectedPaths: []string{
+				filepath.Join(testDir, "a.yaml"),
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			visitors, err := ExpandPathsToFileVisitors(nil, tt.path, tt.recursive, tt.fileExtensions, nil)
+			if err != nil {
+				switch e := err.(type) {
+				case *fs.PathError:
+					if tt.expectPathError {
+						// The other details of PathError are os-specific, so only assert that the error has the path
+						assert.Equal(t, tt.path, e.Path)
+						return
+					}
+				}
+				t.Fatal(err)
+			}
+
+			actualPaths := []string{}
+			for _, v := range visitors {
+				actualPaths = append(actualPaths, v.(*FileVisitor).Path)
+			}
+			assert.Equal(t, tt.expectedPaths, actualPaths)
+		})
 	}
 }

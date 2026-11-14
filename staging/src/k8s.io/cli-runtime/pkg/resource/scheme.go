@@ -41,7 +41,7 @@ func (dynamicCodec) Decode(data []byte, gvk *schema.GroupVersionKind, obj runtim
 		return nil, nil, err
 	}
 
-	if strings.ToLower(gvk.Kind) == "status" && gvk.Version == "v1" && (gvk.Group == "" || gvk.Group == "meta.k8s.io") {
+	if strings.EqualFold(gvk.Kind, "status") && gvk.Version == "v1" && (gvk.Group == "" || gvk.Group == "meta.k8s.io") {
 		if _, ok := obj.(*metav1.Status); !ok {
 			obj = &metav1.Status{}
 			err := json.Unmarshal(data, obj)
@@ -55,7 +55,14 @@ func (dynamicCodec) Decode(data []byte, gvk *schema.GroupVersionKind, obj runtim
 }
 
 func (dynamicCodec) Encode(obj runtime.Object, w io.Writer) error {
+	// There is no need to handle runtime.CacheableObject, as we only
+	// fallback to other encoders here.
 	return unstructured.UnstructuredJSONScheme.Encode(obj, w)
+}
+
+// Identifier implements runtime.Encoder interface.
+func (dynamicCodec) Identifier() runtime.Identifier {
+	return unstructured.UnstructuredJSONScheme.Identifier()
 }
 
 // UnstructuredPlusDefaultContentConfig returns a rest.ContentConfig for dynamic types.  It includes enough codecs to act as a "normal"

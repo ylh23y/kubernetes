@@ -18,19 +18,29 @@ package serviceaccount_test
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
 
+	jose "github.com/go-jose/go-jose/v4"
+
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apiserver/pkg/authentication/authenticator"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
+	typedv1core "k8s.io/client-go/kubernetes/typed/core/v1"
+	admissionregistrationv1listers "k8s.io/client-go/listers/admissionregistration/v1"
 	v1listers "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/keyutil"
+	featuregatetesting "k8s.io/component-base/featuregate/testing"
 	serviceaccountcontroller "k8s.io/kubernetes/pkg/controller/serviceaccount"
+	"k8s.io/kubernetes/pkg/features"
 	"k8s.io/kubernetes/pkg/serviceaccount"
 )
 
@@ -55,6 +65,14 @@ WwIDAQAB
 -----END PUBLIC KEY-----
 `
 
+// Obtained by:
+//
+//  1. Serializing rsaPublicKey as DER
+//  2. Taking the SHA256 of the DER bytes
+//  3. URLSafe Base64-encoding the sha bytes
+const rsaKeyID = "JHJehTTTZlsspKHT-GaJxK7Kd1NQgZJu3fyK6K_QDYU"
+
+// Fake value for testing.
 const rsaPrivateKey = `-----BEGIN RSA PRIVATE KEY-----
 MIIEowIBAAKCAQEA249XwEo9k4tM8fMxV7zxOhcrP+WvXn917koM5Qr2ZXs4vo26
 e4ytdlrV0bQ9SlcLpQVSYjIxNfhTZdDt+ecIzshKuv1gKIxbbLQMOuK1eA/4HALy
@@ -85,6 +103,7 @@ X024wzbiw1q07jFCyfQmODzURAx1VNT7QVUMdz/N8vy47/H40AZJ
 `
 
 // openssl ecparam -name prime256v1 -genkey -noout -out ecdsa256.pem
+// Fake value for testing.
 const ecdsaPrivateKey = `-----BEGIN EC PRIVATE KEY-----
 MHcCAQEEIEZmTmUhuanLjPA2CLquXivuwBDHTt5XYwgIr/kA1LtRoAoGCCqGSM49
 AwEHoUQDQgAEH6cuzP8XuD5wal6wf9M6xDljTOPLX2i8uIp/C/ASqiIGUeeKQtX0
@@ -97,15 +116,74 @@ MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEH6cuzP8XuD5wal6wf9M6xDljTOPL
 X2i8uIp/C/ASqiIGUeeKQtX0/IR3qCXyThP/dbCiHrF3v1cuhBOHY8CLVg==
 -----END PUBLIC KEY-----`
 
+// Obtained by:
+//
+//  1. Serializing ecdsaPublicKey as DER
+//  2. Taking the SHA256 of the DER bytes
+//  3. URLSafe Base64-encoding the sha bytes
+const ecdsaKeyID = "SoABiieYuNx4UdqYvZRVeuC6SihxgLrhLy9peHMHpTc"
+
+// openssl genpkey -algorithm ML-DSA-44 -provparam ml-dsa.output_formats=seed-only -out mldsa44-priv.pem
+const mldsa44PrivateKey = `-----BEGIN PRIVATE KEY-----
+MDQCAQAwCwYJYIZIAWUDBAMRBCKAIERz6p69gPaVMOBq4wlLM7B/ZKvGjkR3TPXR
+vh+K2OoE
+-----END PRIVATE KEY-----`
+
+// openssl pkey -in mldsa44-priv.pem -pubout -out mldsa44-public.pem
+const mldsa44PublicKey = `-----BEGIN PUBLIC KEY-----
+MIIFMjALBglghkgBZQMEAxEDggUhACd2RrSgGNuFoOXNXT3D7fZxUj+ks1cVspRx
+a1e4xXDX9Ki/nJ6AfGoqC2idkuVFa/ZjTYgXxXvCdNgLHFGpHZ2EvUhEI3qoudiC
+lRaT++szVlGeJePJZohgJ5sH8tl2bNg8ltKL0pDkA0HZvDxlTxgv/zBrlDx7merW
+OqX+zLKXxHtOZEY4yM9dKfgZY/d5M5T7EVpPldR5QLzhvlwXmQl5i+sYrFtoJXRd
+OTibV1AtfwgoHpL6CI0B7/pkmhKtMCL40lCh/j9bqilgrnfp1vI3d5Y2JHcvNLGQ
+zGJhdbJo2ddZaUzQCha1uLm8vkapfSV5i4Co1l9grqpUAERRskZLggzOjciCcGtM
+LysX+jHfTVxmQ2qVV0hbPo7IMdhVVVmK7Lc1mr1Q0Wq4nUBr/nd3HpO6/fcQcYK7
+04kXUmFSIIpGWEOi/vq5XSLBQpXpFtZBrY6o0MkqkXNjFTCcQ0H2x+N36bX6IolO
+kCYlbbcuFLKplDIW0bx6YIJiKSiAj5eugLPZLPwwNEiafG1Pn6SaNvd+gXo7iBOW
+HomUsh5auE6iWlIOvOepyDxWUECu1/pRxRqj1crTV7Kvz5q4oawVLzCHHg04pymW
+ZIQPFgVQN/X4y8lHhX8/9x8+W2yS4uaSzWTL+YfgjLEjGH5EMbVi/KP4zwyUG1Sa
+NE9pBcXN2e2EXEK/gE/zNOkAJMNi6N/5gocJ2KhT996h7XI/+Jnzc7IMTOoT9BHS
+9VnwLjPPx/qQ6oOSn+Pgdr+kknQ1XJE3rPn5haEnTKwwe8t5VdqNb82pypX+VHhk
+FK/tk79+5hnJzj+avD7dCVvbsjR0BafZv+fSZWH8wkmZYitBoN0wlc7F6n8bwKSV
+VJKE5RD6xMIjs5n+DA0HVDfLYGM+1Qn05V7AaAP0FXuABEP+v65rAqzB3OpfIsow
+EIrDbgloNz5nenrKEXFJYknONzn8M1eDBIej7RyWRgRtJOg1mNFP8WnbjBFqHfSA
+mdOSWgVPqA6Wx6NZBLdLTGPK//MVayH2q+ixcemp5LFwYyqMIKQRf3F81uzH9gW9
+3u5vANCVtCmZT/PIYCCRGy4RzluJHs4tEv3AwgKXMsFhkEU3r0QujAkbqiWgX7rh
+XDGMoEp/XVOaH+DAiEij3aDvmwfYeaXfOBLlhQgA8QEtv6Rl6Thaj2Cb3h2I2Kct
+wmqga71FHDUcF2PFmv+g3LIgD7nY0SdYxe7kDIQ5PJgEdzlZRhRvEgeoPCpjdcP6
+6P0+QHyKEOktwtT1atWlblDq/lrfFvcRgJBxq+CydL4CaHp0Dr9rxF8Y0PGvTEQp
+Z1987A7LJ2YcGIPsJZ28FSDUJ+rT2gNgv8Ja9+kqbW3pP2z4OVVlVog1TLU96Xbf
+VZefwnDzYWn9I4y5QMG1gbmN7SRpcYfpiSbKYf5Lsm4sIT6+JmKQ0pTie5BPOhmZ
+yc6j/aG3Aicq76O/BN75oRg+gSm7rPG6b5A5uTII9lI96ISXdIQ6MsHWEZbB/7ej
+T3tZ/s0sRQxzPOA9YzbdRh3+g6Hz2LKafI8ob0VgroJ+O0Ev7SCaudHYK3fnkJ/X
+YHAJEYoBiUxaoLpx3TeNRr8oiciSql7042vMi8cwdspnQ/bnyKrrJRtzMFvr4CCU
+6BXhb3ZRWBopzR1HW7sJWr5nzjcF6WpPzERogNUmZIcMCrsp3h01VGNGhZD7qQWB
+AqBiW3lpSxcS4S4TtrM/wCLB9cgtXXW7iYzJljI/VnJ7jN5NbJU=
+-----END PUBLIC KEY-----`
+
+// Obtained by:
+//
+//  1. Serializing ecdsaPublicKey as DER
+//  2. Taking the SHA256 of the DER bytes
+//  3. URLSafe Base64-encoding the sha bytes
+const mldsa44KeyID = "ujqYahCmg9pxpxdLGbGbhQyizN2vtd-lMTixkaKHggo"
+
 func getPrivateKey(data string) interface{} {
-	key, _ := keyutil.ParsePrivateKeyPEM([]byte(data))
+	key, err := keyutil.ParsePrivateKeyPEM([]byte(data))
+	if err != nil {
+		panic(fmt.Errorf("unexpected error parsing private key: %v", err))
+	}
 	return key
 }
 
 func getPublicKey(data string) interface{} {
-	keys, _ := keyutil.ParsePublicKeysPEM([]byte(data))
+	keys, err := keyutil.ParsePublicKeysPEM([]byte(data))
+	if err != nil {
+		panic(fmt.Errorf("unexpected error parsing public key: %v", err))
+	}
 	return keys[0]
 }
+
 func TestTokenGenerateAndValidate(t *testing.T) {
 	expectedUserName := "system:serviceaccount:test:my-service-account"
 	expectedUserUID := "12345"
@@ -124,9 +202,24 @@ func TestTokenGenerateAndValidate(t *testing.T) {
 			Namespace: "test",
 		},
 	}
+	invalidAutoSecret := &v1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "my-rsa-secret",
+			Namespace: "test",
+			Labels: map[string]string{
+				"kubernetes.io/legacy-token-invalid-since": "2022-12-20",
+			},
+		},
+	}
 	ecdsaSecret := &v1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "my-ecdsa-secret",
+			Namespace: "test",
+		},
+	}
+	mldsa44Secret := &v1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "my-mldsa44-secret",
 			Namespace: "test",
 		},
 	}
@@ -136,7 +229,8 @@ func TestTokenGenerateAndValidate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("error making generator: %v", err)
 	}
-	rsaToken, err := rsaGenerator.GenerateToken(serviceaccount.LegacyClaims(*serviceAccount, *rsaSecret))
+	c, pc := serviceaccount.LegacyClaims(*serviceAccount, *rsaSecret)
+	rsaToken, err := rsaGenerator.GenerateToken(context.TODO(), c, pc)
 	if err != nil {
 		t.Fatalf("error generating token: %v", err)
 	}
@@ -147,31 +241,66 @@ func TestTokenGenerateAndValidate(t *testing.T) {
 		"token": []byte(rsaToken),
 	}
 
-	// Generate the ECDSA token
-	ecdsaGenerator, err := serviceaccount.JWTTokenGenerator(serviceaccount.LegacyIssuer, getPrivateKey(ecdsaPrivateKey))
-	if err != nil {
-		t.Fatalf("error making generator: %v", err)
-	}
-	ecdsaToken, err := ecdsaGenerator.GenerateToken(serviceaccount.LegacyClaims(*serviceAccount, *ecdsaSecret))
+	checkJSONWebSignatureHasKeyID(t, rsaToken, rsaKeyID)
+
+	// Generate RSA token with invalidAutoSecret
+	c, pc = serviceaccount.LegacyClaims(*serviceAccount, *invalidAutoSecret)
+	invalidAutoSecretToken, err := rsaGenerator.GenerateToken(context.TODO(), c, pc)
 	if err != nil {
 		t.Fatalf("error generating token: %v", err)
 	}
-	if len(ecdsaToken) == 0 {
+	if len(invalidAutoSecretToken) == 0 {
 		t.Fatalf("no token generated")
 	}
+	invalidAutoSecret.Data = map[string][]byte{
+		"token": []byte(invalidAutoSecretToken),
+	}
+
+	checkJSONWebSignatureHasKeyID(t, invalidAutoSecretToken, rsaKeyID)
+
+	// Generate the ECDSA token
+	ecdsaToken := generateECDSAToken(t, serviceaccount.LegacyIssuer, serviceAccount, ecdsaSecret)
+
 	ecdsaSecret.Data = map[string][]byte{
 		"token": []byte(ecdsaToken),
 	}
 
-	// Generate signer with same keys as RSA signer but different issuer
+	checkJSONWebSignatureHasKeyID(t, ecdsaToken, ecdsaKeyID)
+
+	ecdsaTokenMalformedIss := generateECDSATokenWithMalformedIss(t, serviceAccount, ecdsaSecret)
+
+	// Generate signer with same keys as RSA signer but different unrecognized issuer
 	badIssuerGenerator, err := serviceaccount.JWTTokenGenerator("foo", getPrivateKey(rsaPrivateKey))
 	if err != nil {
 		t.Fatalf("error making generator: %v", err)
 	}
-	badIssuerToken, err := badIssuerGenerator.GenerateToken(serviceaccount.LegacyClaims(*serviceAccount, *rsaSecret))
+	c, pc = serviceaccount.LegacyClaims(*serviceAccount, *rsaSecret)
+	badIssuerToken, err := badIssuerGenerator.GenerateToken(context.TODO(), c, pc)
 	if err != nil {
 		t.Fatalf("error generating token: %v", err)
 	}
+
+	// Generate signer with same keys as RSA signer but different recognized issuer
+	differentIssuerGenerator, err := serviceaccount.JWTTokenGenerator("bar", getPrivateKey(rsaPrivateKey))
+	if err != nil {
+		t.Fatalf("error making generator: %v", err)
+	}
+	c, pc = serviceaccount.LegacyClaims(*serviceAccount, *rsaSecret)
+	differentIssuerToken, err := differentIssuerGenerator.GenerateToken(context.TODO(), c, pc)
+	if err != nil {
+		t.Fatalf("error generating token: %v", err)
+	}
+
+	featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ServiceAccountTokenMLDSA, true)
+
+	// Generate ML-DSA-44 token
+	mldsa44Token := generateMLDSA44Token(t, serviceaccount.LegacyIssuer, serviceAccount, mldsa44Secret)
+
+	mldsa44Secret.Data = map[string][]byte{
+		"token": []byte(mldsa44Token),
+	}
+
+	checkJSONWebSignatureHasKeyID(t, mldsa44Token, mldsa44KeyID)
 
 	testCases := map[string]struct {
 		Client clientset.Interface
@@ -188,7 +317,7 @@ func TestTokenGenerateAndValidate(t *testing.T) {
 			Token:       rsaToken,
 			Client:      nil,
 			Keys:        []interface{}{},
-			ExpectedErr: false,
+			ExpectedErr: true,
 			ExpectedOK:  false,
 		},
 		"invalid keys (rsa)": {
@@ -200,6 +329,13 @@ func TestTokenGenerateAndValidate(t *testing.T) {
 		},
 		"invalid keys (ecdsa)": {
 			Token:       ecdsaToken,
+			Client:      nil,
+			Keys:        []interface{}{getPublicKey(otherPublicKey), getPublicKey(rsaPublicKey)},
+			ExpectedErr: true,
+			ExpectedOK:  false,
+		},
+		"invalid keys (mldsa)": {
+			Token:       mldsa44Token,
 			Client:      nil,
 			Keys:        []interface{}{getPublicKey(otherPublicKey), getPublicKey(rsaPublicKey)},
 			ExpectedErr: true,
@@ -222,10 +358,30 @@ func TestTokenGenerateAndValidate(t *testing.T) {
 			ExpectedErr: false,
 			ExpectedOK:  false,
 		},
+		"valid key, different issuer (rsa)": {
+			Token:            differentIssuerToken,
+			Client:           nil,
+			Keys:             []interface{}{getPublicKey(rsaPublicKey)},
+			ExpectedErr:      false,
+			ExpectedOK:       true,
+			ExpectedUserName: expectedUserName,
+			ExpectedUserUID:  expectedUserUID,
+			ExpectedGroups:   []string{"system:serviceaccounts", "system:serviceaccounts:test"},
+		},
 		"valid key (ecdsa)": {
 			Token:            ecdsaToken,
 			Client:           nil,
 			Keys:             []interface{}{getPublicKey(ecdsaPublicKey)},
+			ExpectedErr:      false,
+			ExpectedOK:       true,
+			ExpectedUserName: expectedUserName,
+			ExpectedUserUID:  expectedUserUID,
+			ExpectedGroups:   []string{"system:serviceaccounts", "system:serviceaccounts:test"},
+		},
+		"valid key (mldsa)": {
+			Token:            mldsa44Token,
+			Client:           nil,
+			Keys:             []interface{}{getPublicKey(mldsa44PublicKey)},
 			ExpectedErr:      false,
 			ExpectedOK:       true,
 			ExpectedUserName: expectedUserName,
@@ -246,6 +402,16 @@ func TestTokenGenerateAndValidate(t *testing.T) {
 			Token:            ecdsaToken,
 			Client:           nil,
 			Keys:             []interface{}{getPublicKey(otherPublicKey), getPublicKey(rsaPublicKey), getPublicKey(ecdsaPublicKey)},
+			ExpectedErr:      false,
+			ExpectedOK:       true,
+			ExpectedUserName: expectedUserName,
+			ExpectedUserUID:  expectedUserUID,
+			ExpectedGroups:   []string{"system:serviceaccounts", "system:serviceaccounts:test"},
+		},
+		"rotated keys (mldsa)": {
+			Token:            mldsa44Token,
+			Client:           nil,
+			Keys:             []interface{}{getPublicKey(otherPublicKey), getPublicKey(rsaPublicKey), getPublicKey(mldsa44PublicKey)},
 			ExpectedErr:      false,
 			ExpectedOK:       true,
 			ExpectedUserName: expectedUserName,
@@ -276,6 +442,19 @@ func TestTokenGenerateAndValidate(t *testing.T) {
 			ExpectedErr: true,
 			ExpectedOK:  false,
 		},
+		"secret is marked as invalid": {
+			Token:       invalidAutoSecretToken,
+			Client:      fake.NewSimpleClientset(serviceAccount, invalidAutoSecret),
+			Keys:        []interface{}{getPublicKey(rsaPublicKey)},
+			ExpectedErr: true,
+		},
+		"malformed iss": {
+			Token:       ecdsaTokenMalformedIss,
+			Client:      nil,
+			Keys:        []interface{}{getPublicKey(ecdsaPublicKey)},
+			ExpectedErr: false,
+			ExpectedOK:  false,
+		},
 	}
 
 	for k, tc := range testCases {
@@ -283,22 +462,55 @@ func TestTokenGenerateAndValidate(t *testing.T) {
 		getter := serviceaccountcontroller.NewGetterFromClient(
 			tc.Client,
 			v1listers.NewSecretLister(newIndexer(func(namespace, name string) (interface{}, error) {
-				return tc.Client.CoreV1().Secrets(namespace).Get(name, metav1.GetOptions{})
+				return tc.Client.CoreV1().Secrets(namespace).Get(context.TODO(), name, metav1.GetOptions{})
 			})),
 			v1listers.NewServiceAccountLister(newIndexer(func(namespace, name string) (interface{}, error) {
-				return tc.Client.CoreV1().ServiceAccounts(namespace).Get(name, metav1.GetOptions{})
+				return tc.Client.CoreV1().ServiceAccounts(namespace).Get(context.TODO(), name, metav1.GetOptions{})
 			})),
 			v1listers.NewPodLister(newIndexer(func(namespace, name string) (interface{}, error) {
-				return tc.Client.CoreV1().Pods(namespace).Get(name, metav1.GetOptions{})
+				return tc.Client.CoreV1().Pods(namespace).Get(context.TODO(), name, metav1.GetOptions{})
+			})),
+			v1listers.NewNodeLister(newIndexer(func(_, name string) (interface{}, error) {
+				return tc.Client.CoreV1().Nodes().Get(context.TODO(), name, metav1.GetOptions{})
+			})),
+			admissionregistrationv1listers.NewValidatingWebhookConfigurationLister(newIndexer(func(_, name string) (interface{}, error) {
+				return tc.Client.AdmissionregistrationV1().ValidatingWebhookConfigurations().Get(context.TODO(), name, metav1.GetOptions{})
+			})),
+			admissionregistrationv1listers.NewMutatingWebhookConfigurationLister(newIndexer(func(_, name string) (interface{}, error) {
+				return tc.Client.AdmissionregistrationV1().MutatingWebhookConfigurations().Get(context.TODO(), name, metav1.GetOptions{})
 			})),
 		)
-		authn := serviceaccount.JWTTokenAuthenticator(serviceaccount.LegacyIssuer, tc.Keys, auds, serviceaccount.NewLegacyValidator(tc.Client != nil, getter))
+		var secretsWriter typedv1core.SecretsGetter
+		if tc.Client != nil {
+			secretsWriter = tc.Client.CoreV1()
+		}
+		validator, err := serviceaccount.NewLegacyValidator(tc.Client != nil, getter, secretsWriter)
+		if err != nil {
+			t.Fatalf("While creating legacy validator, err: %v", err)
+		}
+		staticKeysGetter, err := serviceaccount.StaticPublicKeysGetter(tc.Keys)
+		if err != nil {
+			t.Fatal(err)
+		}
+		keysGetter := &keyIDPrefixer{PublicKeysGetter: staticKeysGetter}
+
+		authn := serviceaccount.JWTTokenAuthenticator([]string{serviceaccount.LegacyIssuer, "bar"}, keysGetter, auds, validator)
 
 		// An invalid, non-JWT token should always fail
-		ctx := authenticator.WithAudiences(context.Background(), auds)
+		ctx := authenticator.WithAudiences(context.TODO(), auds)
 		if _, ok, err := authn.AuthenticateToken(ctx, "invalid token"); err != nil || ok {
 			t.Errorf("%s: Expected err=nil, ok=false for non-JWT token", k)
 			continue
+		}
+
+		if tc.ExpectedOK {
+			// if authentication is otherwise expected to succeed, demonstrate changing key ids makes it fail
+			keysGetter.keyIDPrefix = "bogus"
+			if _, ok, err := authn.AuthenticateToken(ctx, tc.Token); err == nil || !strings.Contains(err.Error(), "no keys found") || ok {
+				t.Errorf("%s: Expected err containing 'no keys found', ok=false when key lookup by ID fails", k)
+				continue
+			}
+			keysGetter.keyIDPrefix = ""
 		}
 
 		resp, ok, err := authn.AuthenticateToken(ctx, tc.Token)
@@ -331,6 +543,37 @@ func TestTokenGenerateAndValidate(t *testing.T) {
 	}
 }
 
+type keyIDPrefixer struct {
+	serviceaccount.PublicKeysGetter
+	keyIDPrefix string
+}
+
+func (k *keyIDPrefixer) GetPublicKeys(ctx context.Context, keyIDHint string) []serviceaccount.PublicKey {
+	if k.keyIDPrefix == "" {
+		return k.PublicKeysGetter.GetPublicKeys(context.TODO(), keyIDHint)
+	}
+	if keyIDHint != "" {
+		keyIDHint = k.keyIDPrefix + keyIDHint
+	}
+	var retval []serviceaccount.PublicKey
+	for _, key := range k.PublicKeysGetter.GetPublicKeys(context.TODO(), keyIDHint) {
+		key.KeyID = k.keyIDPrefix + key.KeyID
+		retval = append(retval, key)
+	}
+	return retval
+}
+
+func checkJSONWebSignatureHasKeyID(t *testing.T, jwsString string, expectedKeyID string) {
+	jws, err := jose.ParseSigned(jwsString, serviceaccount.AcceptableServiceAccountSignatureAlgorithms)
+	if err != nil {
+		t.Fatalf("Error checking for key ID: couldn't parse token: %v", err)
+	}
+
+	if jws.Signatures[0].Header.KeyID != expectedKeyID {
+		t.Errorf("Token %q has the wrong KeyID (got %q, want %q)", jwsString, jws.Signatures[0].Header.KeyID, expectedKeyID)
+	}
+}
+
 func newIndexer(get func(namespace, name string) (interface{}, error)) cache.Indexer {
 	return &fakeIndexer{get: get}
 }
@@ -344,9 +587,150 @@ func (f *fakeIndexer) GetByKey(key string) (interface{}, bool, error) {
 	parts := strings.SplitN(key, "/", 2)
 	namespace := parts[0]
 	name := ""
+	// implies the key does not contain a / (this is a cluster-scoped object)
+	if len(parts) == 1 {
+		name = parts[0]
+		namespace = ""
+	}
 	if len(parts) == 2 {
 		name = parts[1]
 	}
 	obj, err := f.get(namespace, name)
 	return obj, err == nil, err
+}
+
+func generateECDSAToken(t *testing.T, iss string, serviceAccount *v1.ServiceAccount, ecdsaSecret *v1.Secret) string {
+	t.Helper()
+
+	ecdsaGenerator, err := serviceaccount.JWTTokenGenerator(iss, getPrivateKey(ecdsaPrivateKey))
+	if err != nil {
+		t.Fatalf("error making generator: %v", err)
+	}
+	c, pc := serviceaccount.LegacyClaims(*serviceAccount, *ecdsaSecret)
+	ecdsaToken, err := ecdsaGenerator.GenerateToken(context.TODO(), c, pc)
+	if err != nil {
+		t.Fatalf("error generating token: %v", err)
+	}
+	if len(ecdsaToken) == 0 {
+		t.Fatalf("no token generated")
+	}
+
+	return ecdsaToken
+}
+
+func generateECDSATokenWithMalformedIss(t *testing.T, serviceAccount *v1.ServiceAccount, ecdsaSecret *v1.Secret) string {
+	t.Helper()
+
+	ecdsaToken := generateECDSAToken(t, "panda", serviceAccount, ecdsaSecret)
+
+	ecdsaTokenJWS, err := jose.ParseSigned(ecdsaToken, serviceaccount.AcceptableServiceAccountSignatureAlgorithms)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	dataFullSerialize := map[string]any{}
+	if err := json.Unmarshal([]byte(ecdsaTokenJWS.FullSerialize()), &dataFullSerialize); err != nil {
+		t.Fatal(err)
+	}
+
+	dataFullSerialize["malformed_iss"] = "." + base64.RawURLEncoding.EncodeToString([]byte(`{"iss":"bar"}`)) + "."
+
+	out, err := json.Marshal(dataFullSerialize)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	return string(out)
+}
+
+func generateMLDSA44Token(t *testing.T, iss string, serviceAccount *v1.ServiceAccount, mldsa44Secret *v1.Secret) string {
+	t.Helper()
+
+	mldsaGenerator, err := serviceaccount.JWTTokenGenerator(iss, getPrivateKey(mldsa44PrivateKey))
+	if err != nil {
+		t.Fatalf("error making generator: %v", err)
+	}
+	c, pc := serviceaccount.LegacyClaims(*serviceAccount, *mldsa44Secret)
+	mldsaToken, err := mldsaGenerator.GenerateToken(context.TODO(), c, pc)
+	if err != nil {
+		t.Fatalf("error generating token: %v", err)
+	}
+	if len(mldsaToken) == 0 {
+		t.Fatalf("no token generated")
+	}
+
+	return mldsaToken
+}
+
+func TestStaticPublicKeysGetter(t *testing.T) {
+	ecPrivate := getPrivateKey(ecdsaPrivateKey)
+	ecPublic := getPublicKey(ecdsaPublicKey)
+	rsaPublic := getPublicKey(rsaPublicKey)
+
+	testcases := []struct {
+		Name       string
+		Keys       []interface{}
+		ExpectErr  bool
+		ExpectKeys []serviceaccount.PublicKey
+	}{
+		{
+			Name:       "empty",
+			Keys:       nil,
+			ExpectKeys: []serviceaccount.PublicKey{},
+		},
+		{
+			Name: "simple",
+			Keys: []interface{}{ecPublic, rsaPublic},
+			ExpectKeys: []serviceaccount.PublicKey{
+				{KeyID: "SoABiieYuNx4UdqYvZRVeuC6SihxgLrhLy9peHMHpTc", PublicKey: ecPublic},
+				{KeyID: "JHJehTTTZlsspKHT-GaJxK7Kd1NQgZJu3fyK6K_QDYU", PublicKey: rsaPublic},
+			},
+		},
+		{
+			Name: "private --> public",
+			Keys: []interface{}{ecPrivate},
+			ExpectKeys: []serviceaccount.PublicKey{
+				{KeyID: "SoABiieYuNx4UdqYvZRVeuC6SihxgLrhLy9peHMHpTc", PublicKey: ecPublic},
+			},
+		},
+		{
+			Name:      "invalid",
+			Keys:      []interface{}{"bogus"},
+			ExpectErr: true,
+		},
+	}
+
+	for _, tc := range testcases {
+		t.Run(tc.Name, func(t *testing.T) {
+			getter, err := serviceaccount.StaticPublicKeysGetter(tc.Keys)
+			if tc.ExpectErr {
+				if err == nil {
+					t.Fatal("expected construction error, got none")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected construction error: %v", err)
+			}
+
+			bogusKeys := getter.GetPublicKeys(context.TODO(), "bogus")
+			if len(bogusKeys) != 0 {
+				t.Fatalf("unexpected bogus keys: %#v", bogusKeys)
+			}
+
+			allKeys := getter.GetPublicKeys(context.TODO(), "")
+			if !reflect.DeepEqual(tc.ExpectKeys, allKeys) {
+				t.Fatalf("unexpected keys: %#v", allKeys)
+			}
+			for _, key := range allKeys {
+				keysByID := getter.GetPublicKeys(context.TODO(), key.KeyID)
+				if len(keysByID) != 1 {
+					t.Fatalf("expected 1 key for id %s, got %d", key.KeyID, len(keysByID))
+				}
+				if !reflect.DeepEqual(key, keysByID[0]) {
+					t.Fatalf("unexpected key for id %s", key.KeyID)
+				}
+			}
+		})
+	}
 }

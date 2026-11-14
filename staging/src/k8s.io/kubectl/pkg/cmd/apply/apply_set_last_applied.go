@@ -27,6 +27,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/cli-runtime/pkg/genericclioptions"
+	"k8s.io/cli-runtime/pkg/genericiooptions"
 	"k8s.io/cli-runtime/pkg/printers"
 	"k8s.io/cli-runtime/pkg/resource"
 	cmdutil "k8s.io/kubectl/pkg/cmd/util"
@@ -49,14 +50,14 @@ type SetLastAppliedOptions struct {
 	infoList                     []*resource.Info
 	namespace                    string
 	enforceNamespace             bool
-	dryRun                       bool
+	dryRunStrategy               cmdutil.DryRunStrategy
 	shortOutput                  bool
 	output                       string
 	patchBufferList              []PatchBuffer
 	builder                      *resource.Builder
 	unstructuredClientForMapping func(mapping *meta.RESTMapping) (resource.RESTClient, error)
 
-	genericclioptions.IOStreams
+	genericiooptions.IOStreams
 }
 
 // PatchBuffer caches changes that are to be applied.
@@ -72,19 +73,19 @@ var (
 		without updating any other parts of the object.`))
 
 	applySetLastAppliedExample = templates.Examples(i18n.T(`
-		# Set the last-applied-configuration of a resource to match the contents of a file.
+		# Set the last-applied-configuration of a resource to match the contents of a file
 		kubectl apply set-last-applied -f deploy.yaml
 
-		# Execute set-last-applied against each configuration file in a directory.
+		# Execute set-last-applied against each configuration file in a directory
 		kubectl apply set-last-applied -f path/
 
-		# Set the last-applied-configuration of a resource to match the contents of a file, will create the annotation if it does not already exist.
+		# Set the last-applied-configuration of a resource to match the contents of a file; will create the annotation if it does not already exist
 		kubectl apply set-last-applied -f deploy.yaml --create-annotation=true
 		`))
 )
 
 // NewSetLastAppliedOptions takes option arguments from a CLI stream and returns it at SetLastAppliedOptions type.
-func NewSetLastAppliedOptions(ioStreams genericclioptions.IOStreams) *SetLastAppliedOptions {
+func NewSetLastAppliedOptions(ioStreams genericiooptions.IOStreams) *SetLastAppliedOptions {
 	return &SetLastAppliedOptions{
 		PrintFlags: genericclioptions.NewPrintFlags("configured").WithTypeSetter(scheme.Scheme),
 		IOStreams:  ioStreams,
@@ -92,12 +93,12 @@ func NewSetLastAppliedOptions(ioStreams genericclioptions.IOStreams) *SetLastApp
 }
 
 // NewCmdApplySetLastApplied creates the cobra CLI `apply` subcommand `set-last-applied`.`
-func NewCmdApplySetLastApplied(f cmdutil.Factory, ioStreams genericclioptions.IOStreams) *cobra.Command {
+func NewCmdApplySetLastApplied(f cmdutil.Factory, ioStreams genericiooptions.IOStreams) *cobra.Command {
 	o := NewSetLastAppliedOptions(ioStreams)
 	cmd := &cobra.Command{
 		Use:                   "set-last-applied -f FILENAME",
 		DisableFlagsInUseLine: true,
-		Short:                 i18n.T("Set the last-applied-configuration annotation on a live object to match the contents of a file."),
+		Short:                 i18n.T("Set the last-applied-configuration annotation on a live object to match the contents of a file"),
 		Long:                  applySetLastAppliedLong,
 		Example:               applySetLastAppliedExample,
 		Run: func(cmd *cobra.Command, args []string) {
@@ -118,11 +119,14 @@ func NewCmdApplySetLastApplied(f cmdutil.Factory, ioStreams genericclioptions.IO
 
 // Complete populates dry-run and output flag options.
 func (o *SetLastAppliedOptions) Complete(f cmdutil.Factory, cmd *cobra.Command) error {
-	o.dryRun = cmdutil.GetDryRunFlag(cmd)
+	var err error
+	o.dryRunStrategy, err = cmdutil.GetDryRunStrategy(cmd)
+	if err != nil {
+		return err
+	}
 	o.output = cmdutil.GetFlagString(cmd, "output")
 	o.shortOutput = o.output == "name"
 
-	var err error
 	o.namespace, o.enforceNamespace, err = f.ToRawKubeConfigLoader().Namespace()
 	if err != nil {
 		return err
@@ -130,13 +134,7 @@ func (o *SetLastAppliedOptions) Complete(f cmdutil.Factory, cmd *cobra.Command) 
 	o.builder = f.NewBuilder()
 	o.unstructuredClientForMapping = f.UnstructuredClientForMapping
 
-	if o.dryRun {
-		// TODO(juanvallejo): This can be cleaned up even further by creating
-		// a PrintFlags struct that binds the --dry-run flag, and whose
-		// ToPrinter method returns a printer that understands how to print
-		// this success message.
-		o.PrintFlags.Complete("%s (dry run)")
-	}
+	cmdutil.PrintFlagsWithDryRunStrategy(o.PrintFlags, o.dryRunStrategy)
 	printer, err := o.PrintFlags.ToPrinter()
 	if err != nil {
 		return err
@@ -199,14 +197,16 @@ func (o *SetLastAppliedOptions) RunSetLastApplied() error {
 		info := o.infoList[i]
 		finalObj := info.Object
 
-		if !o.dryRun {
+		if o.dryRunStrategy != cmdutil.DryRunClient {
 			mapping := info.ResourceMapping()
 			client, err := o.unstructuredClientForMapping(mapping)
 			if err != nil {
 				return err
 			}
-			helper := resource.NewHelper(client, mapping)
-			finalObj, err = helper.Patch(o.namespace, info.Name, patch.PatchType, patch.Patch, nil)
+			helper := resource.
+				NewHelper(client, mapping).
+				DryRun(o.dryRunStrategy == cmdutil.DryRunServer)
+			finalObj, err = helper.Patch(info.Namespace, info.Name, patch.PatchType, patch.Patch, nil)
 			if err != nil {
 				return err
 			}

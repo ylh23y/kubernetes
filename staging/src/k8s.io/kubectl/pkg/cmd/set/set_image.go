@@ -20,18 +20,21 @@ import (
 	"fmt"
 
 	"github.com/spf13/cobra"
-	"k8s.io/klog"
+	"k8s.io/klog/v2"
 
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/cli-runtime/pkg/genericclioptions"
+	"k8s.io/cli-runtime/pkg/genericiooptions"
 	"k8s.io/cli-runtime/pkg/printers"
 	"k8s.io/cli-runtime/pkg/resource"
+	"k8s.io/client-go/tools/clientcmd"
 	cmdutil "k8s.io/kubectl/pkg/cmd/util"
 	"k8s.io/kubectl/pkg/polymorphichelpers"
 	"k8s.io/kubectl/pkg/scheme"
+	"k8s.io/kubectl/pkg/util/completion"
 	"k8s.io/kubectl/pkg/util/i18n"
 	"k8s.io/kubectl/pkg/util/templates"
 )
@@ -44,13 +47,14 @@ type SetImageOptions struct {
 	PrintFlags  *genericclioptions.PrintFlags
 	RecordFlags *genericclioptions.RecordFlags
 
-	Infos        []*resource.Info
-	Selector     string
-	DryRun       bool
-	All          bool
-	Output       string
-	Local        bool
-	ResolveImage ImageResolver
+	Infos          []*resource.Info
+	Selector       string
+	DryRunStrategy cmdutil.DryRunStrategy
+	All            bool
+	Output         string
+	Local          bool
+	ResolveImage   ImageResolverFunc
+	fieldManager   string
 
 	PrintObj printers.ResourcePrinterFunc
 	Recorder genericclioptions.Recorder
@@ -59,21 +63,29 @@ type SetImageOptions struct {
 	Resources              []string
 	ContainerImages        map[string]string
 
-	genericclioptions.IOStreams
+	genericiooptions.IOStreams
 }
 
-var (
-	imageResources = `
-  	pod (po), replicationcontroller (rc), deployment (deploy), daemonset (ds), replicaset (rs)`
+// ImageResolver is a func that receives an image name, and
+// resolves it to an appropriate / compatible image name.
+// Adds flexibility for future image resolving methods.
+type ImageResolverFunc func(in string) (string, error)
 
-	imageLong = templates.LongDesc(`
+// ImageResolver to use.
+var ImageResolver = resolveImageFunc
+
+var (
+	imageResources = i18n.T(`
+  	pod (po), replicationcontroller (rc), deployment (deploy), daemonset (ds), statefulset (sts), cronjob (cj), replicaset (rs)`)
+
+	imageLong = templates.LongDesc(i18n.T(`
 		Update existing container image(s) of resources.
 
 		Possible resources include (case insensitive):
-		` + imageResources)
+		`) + imageResources)
 
 	imageExample = templates.Examples(`
-		# Set a deployment's nginx container image to 'nginx:1.9.1', and its busybox container image to 'busybox'.
+		# Set a deployment's nginx container image to 'nginx:1.9.1', and its busybox container image to 'busybox'
 		kubectl set image deployment/nginx busybox=busybox nginx=nginx:1.9.1
 
 		# Update all deployments' and rc's nginx container's image to 'nginx:1.9.1'
@@ -87,7 +99,7 @@ var (
 )
 
 // NewImageOptions returns an initialized SetImageOptions instance
-func NewImageOptions(streams genericclioptions.IOStreams) *SetImageOptions {
+func NewImageOptions(streams genericiooptions.IOStreams) *SetImageOptions {
 	return &SetImageOptions{
 		PrintFlags:  genericclioptions.NewPrintFlags("image updated").WithTypeSetter(scheme.Scheme),
 		RecordFlags: genericclioptions.NewRecordFlags(),
@@ -99,15 +111,17 @@ func NewImageOptions(streams genericclioptions.IOStreams) *SetImageOptions {
 }
 
 // NewCmdImage returns an initialized Command instance for the 'set image' sub command
-func NewCmdImage(f cmdutil.Factory, streams genericclioptions.IOStreams) *cobra.Command {
+func NewCmdImage(f cmdutil.Factory, streams genericiooptions.IOStreams) *cobra.Command {
 	o := NewImageOptions(streams)
+	validArgs := []string{"daemonsets", "deployments", "pods", "cronjobs", "replicasets", "replicationcontrollers", "statefulsets"}
 
 	cmd := &cobra.Command{
 		Use:                   "image (-f FILENAME | TYPE NAME) CONTAINER_NAME_1=CONTAINER_IMAGE_1 ... CONTAINER_NAME_N=CONTAINER_IMAGE_N",
 		DisableFlagsInUseLine: true,
-		Short:                 i18n.T("Update image of a pod template"),
+		Short:                 i18n.T("Update the image of a pod template"),
 		Long:                  imageLong,
 		Example:               imageExample,
+		ValidArgsFunction:     completion.SpecifiedResourceTypeAndNameNoRepeatCompletionFunc(f, validArgs),
 		Run: func(cmd *cobra.Command, args []string) {
 			cmdutil.CheckErr(o.Complete(f, cmd, args))
 			cmdutil.CheckErr(o.Validate())
@@ -120,11 +134,12 @@ func NewCmdImage(f cmdutil.Factory, streams genericclioptions.IOStreams) *cobra.
 
 	usage := "identifying the resource to get from a server."
 	cmdutil.AddFilenameOptionFlags(cmd, &o.FilenameOptions, usage)
-	cmd.Flags().BoolVar(&o.All, "all", o.All, "Select all resources, including uninitialized ones, in the namespace of the specified resource types")
-	cmd.Flags().StringVarP(&o.Selector, "selector", "l", o.Selector, "Selector (label query) to filter on, not including uninitialized ones, supports '=', '==', and '!='.(e.g. -l key1=value1,key2=value2)")
+	cmd.Flags().BoolVar(&o.All, "all", o.All, "Select all resources, in the namespace of the specified resource types")
 	cmd.Flags().BoolVar(&o.Local, "local", o.Local, "If true, set image will NOT contact api-server but run locally.")
 	cmdutil.AddDryRunFlag(cmd)
-	cmdutil.AddIncludeUninitializedFlag(cmd)
+	cmdutil.AddFieldManagerFlagVar(cmd, &o.fieldManager, "kubectl-set")
+	cmdutil.AddLabelSelectorFlagVar(cmd, &o.Selector)
+
 	return cmd
 }
 
@@ -139,13 +154,15 @@ func (o *SetImageOptions) Complete(f cmdutil.Factory, cmd *cobra.Command, args [
 	}
 
 	o.UpdatePodSpecForObject = polymorphichelpers.UpdatePodSpecForObjectFn
-	o.DryRun = cmdutil.GetDryRunFlag(cmd)
-	o.Output = cmdutil.GetFlagString(cmd, "output")
-	o.ResolveImage = resolveImageFunc
-
-	if o.DryRun {
-		o.PrintFlags.Complete("%s (dry run)")
+	o.DryRunStrategy, err = cmdutil.GetDryRunStrategy(cmd)
+	if err != nil {
+		return err
 	}
+
+	o.Output = cmdutil.GetFlagString(cmd, "output")
+	o.ResolveImage = ImageResolver
+
+	cmdutil.PrintFlagsWithDryRunStrategy(o.PrintFlags, o.DryRunStrategy)
 	printer, err := o.PrintFlags.ToPrinter()
 	if err != nil {
 		return err
@@ -154,7 +171,7 @@ func (o *SetImageOptions) Complete(f cmdutil.Factory, cmd *cobra.Command, args [
 	o.PrintObj = printer.PrintObj
 
 	cmdNamespace, enforceNamespace, err := f.ToRawKubeConfigLoader().Namespace()
-	if err != nil {
+	if err != nil && !(o.Local && clientcmd.IsEmptyConfig(err)) {
 		return err
 	}
 
@@ -205,6 +222,9 @@ func (o *SetImageOptions) Validate() error {
 		errors = append(errors, fmt.Errorf("at least one image update is required"))
 	} else if len(o.ContainerImages) > 1 && hasWildcardKey(o.ContainerImages) {
 		errors = append(errors, fmt.Errorf("all containers are already specified by *, but saw more than one container_name=container_image pairs"))
+	}
+	if o.Local && o.DryRunStrategy == cmdutil.DryRunServer {
+		errors = append(errors, fmt.Errorf("cannot specify --local and --dry-run=server - did you mean --dry-run=client?"))
 	}
 	return utilerrors.NewAggregate(errors)
 }
@@ -257,7 +277,7 @@ func (o *SetImageOptions) Run() error {
 			continue
 		}
 
-		if o.Local || o.DryRun {
+		if o.Local || o.DryRunStrategy == cmdutil.DryRunClient {
 			if err := o.PrintObj(info.Object, o.Out); err != nil {
 				allErrs = append(allErrs, err)
 			}
@@ -265,7 +285,11 @@ func (o *SetImageOptions) Run() error {
 		}
 
 		// patch the change
-		actual, err := resource.NewHelper(info.Client, info.Mapping).Patch(info.Namespace, info.Name, types.StrategicMergePatchType, patch.Patch, nil)
+		actual, err := resource.
+			NewHelper(info.Client, info.Mapping).
+			DryRun(o.DryRunStrategy == cmdutil.DryRunServer).
+			WithFieldManager(o.fieldManager).
+			Patch(info.Namespace, info.Name, types.StrategicMergePatchType, patch.Patch, nil)
 		if err != nil {
 			allErrs = append(allErrs, fmt.Errorf("failed to patch image update to pod template: %v", err))
 			continue
@@ -305,11 +329,6 @@ func hasWildcardKey(containerImages map[string]string) bool {
 	_, ok := containerImages["*"]
 	return ok
 }
-
-// ImageResolver is a func that receives an image name, and
-// resolves it to an appropriate / compatible image name.
-// Adds flexibility for future image resolving methods.
-type ImageResolver func(in string) (string, error)
 
 // implements ImageResolver
 func resolveImageFunc(in string) (string, error) {

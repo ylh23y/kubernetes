@@ -15,7 +15,7 @@
 # limitations under the License.
 
 # Build Kubernetes release images. This will build the server target binaries,
-# and create wrap them in Docker images, see `make release` for full releases
+# and wrap them in Docker images, see `make release` for full releases
 
 set -o errexit
 set -o nounset
@@ -26,17 +26,15 @@ source "${KUBE_ROOT}/build/common.sh"
 source "${KUBE_ROOT}/build/lib/release.sh"
 
 CMD_TARGETS="${KUBE_SERVER_IMAGE_TARGETS[*]}"
-if [[ "${KUBE_BUILD_HYPERKUBE}" =~ [yY] ]]; then
-    CMD_TARGETS="${CMD_TARGETS} cmd/hyperkube"
-fi
 if [[ "${KUBE_BUILD_CONFORMANCE}" =~ [yY] ]]; then
     CMD_TARGETS="${CMD_TARGETS} ${KUBE_CONFORMANCE_IMAGE_TARGETS[*]}"
 fi
+# include extra WHAT if specified so you can build docker images + binaries
+# in one call with a single pass of syncing to the container + generating code
+if [[ -n "${KUBE_EXTRA_WHAT:-}" ]]; then
+    CMD_TARGETS="${CMD_TARGETS} ${KUBE_EXTRA_WHAT}"
+fi
 
 kube::build::verify_prereqs
-kube::build::build_image
-kube::build::run_build_command make all WHAT="${CMD_TARGETS}" KUBE_BUILD_PLATFORMS="${KUBE_SERVER_PLATFORMS[*]}"
-
-kube::build::copy_output
-
+kube::build::run_build_command make all WHAT="${CMD_TARGETS}" KUBE_BUILD_PLATFORMS="${KUBE_SERVER_PLATFORMS[*]}" DBG="${DBG:-}"
 kube::release::build_server_images

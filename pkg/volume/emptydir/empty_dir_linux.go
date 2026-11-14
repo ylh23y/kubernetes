@@ -1,4 +1,4 @@
-// +build linux
+//go:build linux
 
 /*
 Copyright 2015 The Kubernetes Authors.
@@ -20,18 +20,18 @@ package emptydir
 
 import (
 	"fmt"
+	"os"
+	"slices"
+	"strings"
 
 	"golang.org/x/sys/unix"
-	"k8s.io/klog"
+	"k8s.io/apimachinery/pkg/api/resource"
+	"k8s.io/klog/v2"
+	"k8s.io/mount-utils"
 
-	"k8s.io/api/core/v1"
-	"k8s.io/kubernetes/pkg/util/mount"
-)
-
-// Defined by Linux - the type number for tmpfs mounts.
-const (
-	linuxTmpfsMagic     = 0x01021994
-	linuxHugetlbfsMagic = 0x958458f6
+	v1 "k8s.io/api/core/v1"
+	"k8s.io/kubernetes/pkg/kubelet/util/swap"
+	"k8s.io/kubernetes/pkg/volume"
 )
 
 // realMountDetector implements mountDetector in terms of syscalls.
@@ -39,22 +39,118 @@ type realMountDetector struct {
 	mounter mount.Interface
 }
 
-func (m *realMountDetector) GetMountMedium(path string) (v1.StorageMedium, bool, error) {
+// getPageSize obtains page size from the 'pagesize' mount option of the
+// mounted volume
+func getPageSize(path string, mounter mount.Interface) (*resource.Quantity, error) {
+	// Get mount point data for the path
+	mountPoints, err := mounter.List()
+	if err != nil {
+		return nil, fmt.Errorf("error listing mount points: %v", err)
+	}
+	// Find mount point for the path
+	mountPoint, err := func(mps []mount.MountPoint, mpPath string) (*mount.MountPoint, error) {
+		for _, mp := range mps {
+			if mp.Path == mpPath {
+				return &mp, nil
+			}
+		}
+		return nil, fmt.Errorf("mount point for %s not found", mpPath)
+	}(mountPoints, path)
+	if err != nil {
+		return nil, err
+	}
+	// Get page size from the 'pagesize' option value
+	for _, opt := range mountPoint.Opts {
+		opt = strings.TrimSpace(opt)
+		prefix := "pagesize="
+		if strings.HasPrefix(opt, prefix) {
+			// NOTE: Adding suffix 'i' as result should be comparable with a medium size.
+			// pagesize mount option is specified without a suffix,
+			// e.g. pagesize=2M or pagesize=1024M for x86 CPUs
+			trimmedOpt := strings.TrimPrefix(opt, prefix)
+			if !strings.HasSuffix(trimmedOpt, "i") {
+				trimmedOpt = trimmedOpt + "i"
+			}
+			pageSize, err := resource.ParseQuantity(trimmedOpt)
+			if err != nil {
+				return nil, fmt.Errorf("error getting page size from '%s' mount option: %v", opt, err)
+			}
+			return &pageSize, nil
+		}
+	}
+	return nil, fmt.Errorf("no pagesize option specified for %s mount", mountPoint.Path)
+}
+
+func (m *realMountDetector) GetMountMedium(path string, requestedMedium v1.StorageMedium) (v1.StorageMedium, bool, *resource.Quantity, error) {
 	klog.V(5).Infof("Determining mount medium of %v", path)
 	notMnt, err := m.mounter.IsLikelyNotMountPoint(path)
 	if err != nil {
-		return v1.StorageMediumDefault, false, fmt.Errorf("IsLikelyNotMountPoint(%q): %v", path, err)
-	}
-	buf := unix.Statfs_t{}
-	if err := unix.Statfs(path, &buf); err != nil {
-		return v1.StorageMediumDefault, false, fmt.Errorf("statfs(%q): %v", path, err)
+		return v1.StorageMediumDefault, false, nil, fmt.Errorf("IsLikelyNotMountPoint(%q): %v", path, err)
 	}
 
-	klog.V(5).Infof("Statfs_t of %v: %+v", path, buf)
-	if buf.Type == linuxTmpfsMagic {
-		return v1.StorageMediumMemory, !notMnt, nil
-	} else if int64(buf.Type) == linuxHugetlbfsMagic {
-		return v1.StorageMediumHugePages, !notMnt, nil
+	buf := unix.Statfs_t{}
+	if err := unix.Statfs(path, &buf); err != nil {
+		return v1.StorageMediumDefault, false, nil, fmt.Errorf("statfs(%q): %v", path, err)
 	}
-	return v1.StorageMediumDefault, !notMnt, nil
+
+	klog.V(3).Infof("Statfs_t of %v: %+v", path, buf)
+
+	if buf.Type == unix.TMPFS_MAGIC {
+		return v1.StorageMediumMemory, !notMnt, nil, nil
+	} else if int64(buf.Type) == unix.HUGETLBFS_MAGIC {
+		// Skip page size detection if requested medium doesn't have size specified
+		if requestedMedium == v1.StorageMediumHugePages {
+			return v1.StorageMediumHugePages, !notMnt, nil, nil
+		}
+		// Get page size for the volume mount
+		pageSize, err := getPageSize(path, m.mounter)
+		if err != nil {
+			return v1.StorageMediumHugePages, !notMnt, nil, err
+		}
+		return v1.StorageMediumHugePages, !notMnt, pageSize, nil
+	}
+	return v1.StorageMediumDefault, !notMnt, nil, nil
+}
+
+// ResizeEphemeralVolume resizes the volume on the node.
+func (plugin *emptyDirPlugin) ResizeEphemeralVolume(spec *volume.Spec, pod *v1.Pod) error {
+	desiredSize, err := plugin.EffectiveEphemeralVolumeLimit(spec, pod)
+	if err != nil {
+		return err
+	}
+
+	dir := getPath(pod.UID, spec.Name(), plugin.host)
+	mounter := plugin.host.GetMounter()
+
+	var isNotMnt bool
+	if _, err := os.Stat(dir); os.IsNotExist(err) {
+		isNotMnt = true
+	} else {
+		var err error
+		isNotMnt, err = mounter.IsLikelyNotMountPoint(dir)
+		if err != nil {
+			return err
+		}
+	}
+
+	if isNotMnt {
+		return fmt.Errorf("volume %s is not yet mounted; deferring resize", spec.Name())
+	}
+
+	options := []string{"remount", fmt.Sprintf("size=%d", desiredSize.Value())}
+	// Kernels before 6.12.60 and 6.6.118 reject a remount that drops noswap,
+	// and every kernel rejects a remount that adds it.
+	mountPoints, err := mounter.List()
+	if err != nil {
+		return fmt.Errorf("error listing mount points: %w", err)
+	}
+	for _, mp := range mountPoints {
+		if mp.Path == dir && slices.Contains(mp.Opts, swap.TmpfsNoswapOption) {
+			options = append(options, swap.TmpfsNoswapOption)
+			break
+		}
+	}
+
+	klog.V(2).InfoS("Resizing emptyDir volume", "pod", klog.KObj(pod), "volume", spec.Name(), "desiredSize", desiredSize)
+	return mounter.MountSensitiveWithoutSystemd("tmpfs", dir, "tmpfs", options, nil)
 }

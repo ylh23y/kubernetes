@@ -1,4 +1,4 @@
-// +build linux
+//go:build linux
 
 /*
 Copyright 2015 The Kubernetes Authors.
@@ -19,49 +19,80 @@ limitations under the License.
 package oom
 
 import (
+	"context"
+	"fmt"
+
 	v1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/client-go/tools/record"
-	"k8s.io/klog"
-
-	"github.com/google/cadvisor/utils/oomparser"
+	"k8s.io/klog/v2"
+	"k8s.io/kubernetes/third_party/forked/cadvisor/oomparser"
 )
 
+type streamer interface {
+	StreamOoms(ctx context.Context, outStream chan<- *oomparser.OomInstance)
+}
+
+var _ streamer = &oomparser.OomParser{}
+
 type realWatcher struct {
-	recorder record.EventRecorder
+	recorder    record.EventRecorderLogger
+	oomStreamer streamer
 }
 
 var _ Watcher = &realWatcher{}
 
-// NewWatcher creates and initializes a OOMWatcher based on parameters.
-func NewWatcher(recorder record.EventRecorder) Watcher {
-	return &realWatcher{
-		recorder: recorder,
+// NewWatcher creates and initializes an OOMWatcher backed by the kernel log
+// (/dev/kmsg) oom streamer.
+func NewWatcher(recorder record.EventRecorderLogger) (Watcher, error) {
+	// for test purpose
+	_, ok := recorder.(*record.FakeRecorder)
+	if ok {
+		return nil, nil
 	}
+
+	oomStreamer, err := oomparser.New()
+	if err != nil {
+		return nil, err
+	}
+
+	watcher := &realWatcher{
+		recorder:    recorder,
+		oomStreamer: oomStreamer,
+	}
+
+	return watcher, nil
 }
 
-const systemOOMEvent = "SystemOOM"
+const (
+	systemOOMEvent           = "SystemOOM"
+	recordEventContainerName = "/"
+)
 
 // Start watches for system oom's and records an event for every system oom encountered.
-func (ow *realWatcher) Start(ref *v1.ObjectReference) error {
-	oomLog, err := oomparser.New()
-	if err != nil {
-		return err
-	}
+func (ow *realWatcher) Start(ctx context.Context, ref *v1.ObjectReference) error {
 	outStream := make(chan *oomparser.OomInstance, 10)
-	go oomLog.StreamOoms(outStream)
+	go ow.oomStreamer.StreamOoms(ctx, outStream)
 
 	go func() {
-		defer runtime.HandleCrash()
+		logger := klog.FromContext(ctx)
+		defer runtime.HandleCrashWithContext(ctx)
 
 		for event := range outStream {
-			if event.ContainerName == "/" {
-				klog.V(1).Infof("Got sys oom event: %v", event)
-				ow.recorder.PastEventf(ref, metav1.Time{Time: event.TimeOfDeath}, v1.EventTypeWarning, systemOOMEvent, "System OOM encountered")
+			// Count every OOM kill per container to back the
+			// container_oom_events_total metric.
+			recordOOMKill(event.ContainerName)
+
+			if event.VictimContainerName == recordEventContainerName {
+				logger.V(1).Info("Got sys oom event", "event", event)
+				eventMsg := "System OOM encountered"
+				if event.ProcessName != "" && event.Pid != 0 {
+					eventMsg = fmt.Sprintf("%s, victim process: %s, pid: %d", eventMsg, event.ProcessName, event.Pid)
+				}
+				ow.recorder.WithLogger(logger).Eventf(ref, v1.EventTypeWarning, systemOOMEvent, "%s", eventMsg)
 			}
 		}
-		klog.Errorf("Unexpectedly stopped receiving OOM notifications")
+		logger.Error(nil, "Unexpectedly stopped receiving OOM notifications")
 	}()
 	return nil
 }

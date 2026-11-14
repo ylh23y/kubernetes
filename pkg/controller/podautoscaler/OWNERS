@@ -1,17 +1,17 @@
 # See the OWNERS docs at https://go.k8s.io/owners
 
 reviewers:
-- fgrzadkowski
-- josephburnet
-- jszczepkowski
-- MaciekPytel
-- mwielgus
-- piosz
+  - adrianmoisey
+  - gjtempleton
+  - mwielgus
+  - omerap12
+  - raywainman
 approvers:
-- josephburnett
-- jszczepkowski
-- MaciekPytel
-- mwielgus
-- piosz
+  - mwielgus
+emeritus_approvers:
+  - jszczepkowski
+  - piosz
+  - MaciekPytel
+  - josephburnett
 labels:
-- sig/autoscaling
+  - sig/autoscaling

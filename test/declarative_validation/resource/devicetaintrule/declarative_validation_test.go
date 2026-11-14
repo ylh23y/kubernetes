@@ -1,0 +1,238 @@
+/*
+Copyright 2025 The Kubernetes Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package devicetaintrule
+
+import (
+	"testing"
+
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/validation/field"
+	genericapirequest "k8s.io/apiserver/pkg/endpoints/request"
+	apitesting "k8s.io/kubernetes/pkg/api/testing"
+	"k8s.io/kubernetes/pkg/apis/resource"
+	registry "k8s.io/kubernetes/pkg/registry/resource/devicetaintrule"
+	"k8s.io/kubernetes/test/declarative_validation/meta"
+)
+
+func TestDeclarativeValidate(t *testing.T) {
+	for _, apiVersion := range apiVersions {
+		t.Run(apiVersion, func(t *testing.T) {
+			testDeclarativeValidate(t, apiVersion)
+		})
+	}
+}
+
+func testDeclarativeValidate(t *testing.T, apiVersion string) {
+	ctx := genericapirequest.WithRequestInfo(genericapirequest.NewDefaultContext(), &genericapirequest.RequestInfo{
+		APIGroup:          "resource.k8s.io",
+		APIVersion:        apiVersion,
+		Resource:          "devicetaintrules",
+		IsResourceRequest: true,
+		Verb:              "create",
+	})
+
+	testCases := map[string]struct {
+		input        resource.DeviceTaintRule
+		expectedErrs field.ErrorList
+	}{
+		"valid": {
+			input: mkValidDeviceTaintRule(),
+		},
+		"missing taint.effect": {
+			input: mkValidDeviceTaintRule(tweakTaintEffect("")),
+			expectedErrs: field.ErrorList{
+				field.Required(field.NewPath("spec", "taint", "effect"), "").MarkBeta(),
+			},
+		},
+		"invalid taint.effect": {
+			input: mkValidDeviceTaintRule(tweakTaintEffect("BadEffect")),
+			expectedErrs: field.ErrorList{
+				field.NotSupported(field.NewPath("spec", "taint", "effect"), resource.DeviceTaintEffect("BadEffect"), []resource.DeviceTaintEffect{}).MarkBeta(),
+			},
+		},
+		"valid all: true": {
+			input: mkValidDeviceTaintRule(tweakDeviceSelector(&resource.DeviceTaintSelector{All: new(true)})),
+		},
+		"all: false": {
+			input: mkValidDeviceTaintRule(tweakDeviceSelector(&resource.DeviceTaintSelector{All: new(false)})),
+			expectedErrs: field.ErrorList{
+				field.Invalid(field.NewPath("spec", "deviceSelector", "all"), false, "").WithOrigin("neq"),
+			},
+		},
+		"all: true with driver": {
+			input: mkValidDeviceTaintRule(tweakDeviceSelector(&resource.DeviceTaintSelector{All: new(true), Driver: new("example.com")})),
+			expectedErrs: field.ErrorList{
+				field.Forbidden(field.NewPath("spec", "deviceSelector", "driver"), "").WithOrigin("dependentForbidden"),
+			},
+		},
+		"all: true with pool": {
+			input: mkValidDeviceTaintRule(tweakDeviceSelector(&resource.DeviceTaintSelector{All: new(true), Pool: new("pool-a")})),
+			expectedErrs: field.ErrorList{
+				field.Forbidden(field.NewPath("spec", "deviceSelector", "pool"), "").WithOrigin("dependentForbidden"),
+			},
+		},
+		"all: true with device": {
+			input: mkValidDeviceTaintRule(tweakDeviceSelector(&resource.DeviceTaintSelector{All: new(true), Device: new("device-a")})),
+			expectedErrs: field.ErrorList{
+				field.Forbidden(field.NewPath("spec", "deviceSelector", "device"), "").WithOrigin("dependentForbidden"),
+			},
+		},
+		"all: true with driver, pool and device": {
+			input: mkValidDeviceTaintRule(tweakDeviceSelector(&resource.DeviceTaintSelector{All: new(true), Driver: new("example.com"), Pool: new("pool-a"), Device: new("device-a")})),
+			expectedErrs: field.ErrorList{
+				field.Forbidden(field.NewPath("spec", "deviceSelector", "driver"), "").WithOrigin("dependentForbidden"),
+				field.Forbidden(field.NewPath("spec", "deviceSelector", "pool"), "").WithOrigin("dependentForbidden"),
+				field.Forbidden(field.NewPath("spec", "deviceSelector", "device"), "").WithOrigin("dependentForbidden"),
+			},
+		},
+		"all: true with empty-string driver": {
+			input: mkValidDeviceTaintRule(tweakDeviceSelector(&resource.DeviceTaintSelector{All: new(true), Driver: new("")})),
+			expectedErrs: field.ErrorList{
+				field.Required(field.NewPath("spec", "deviceSelector", "driver"), "").MarkFromImperative(),
+				field.Forbidden(field.NewPath("spec", "deviceSelector", "driver"), "").WithOrigin("dependentForbidden"),
+			},
+		},
+		"all: false with driver": {
+			input: mkValidDeviceTaintRule(tweakDeviceSelector(&resource.DeviceTaintSelector{All: new(false), Driver: new("example.com")})),
+			expectedErrs: field.ErrorList{
+				field.Invalid(field.NewPath("spec", "deviceSelector", "all"), false, "").WithOrigin("neq"),
+				field.Forbidden(field.NewPath("spec", "deviceSelector", "driver"), "").WithOrigin("dependentForbidden"),
+			},
+		},
+		// TODO: Add more test cases
+	}
+
+	for name, tc := range testCases {
+		t.Run(name, func(t *testing.T) {
+			apitesting.VerifyValidationEquivalence(t, ctx, &tc.input, registry.Strategy, tc.expectedErrs)
+		})
+	}
+
+	obj := mkValidDeviceTaintRule()
+	meta.RunObjectMetaTestCases(t, ctx, &obj, registry.Strategy, meta.WithStringentFinalizerValidation())
+
+	meta.RunConditionTestCases(t, ctx, field.NewPath("status", "conditions"), &resource.DeviceTaintRule{}, registry.StatusStrategy, func(obj *resource.DeviceTaintRule, c []metav1.Condition) {
+		*obj = mkValidDeviceTaintRule(func(r *resource.DeviceTaintRule) { r.Status.Conditions = c })
+	})
+}
+
+func TestDeclarativeValidateUpdate(t *testing.T) {
+	for _, apiVersion := range apiVersions {
+		t.Run(apiVersion, func(t *testing.T) {
+			testDeclarativeValidateUpdate(t, apiVersion)
+		})
+	}
+}
+
+func testDeclarativeValidateUpdate(t *testing.T, apiVersion string) {
+	ctx := genericapirequest.WithRequestInfo(genericapirequest.NewDefaultContext(), &genericapirequest.RequestInfo{
+		APIGroup:          "resource.k8s.io",
+		APIVersion:        apiVersion,
+		Resource:          "devicetaintrules",
+		IsResourceRequest: true,
+		Verb:              "update",
+	})
+
+	testCases := map[string]struct {
+		old          resource.DeviceTaintRule
+		update       resource.DeviceTaintRule
+		expectedErrs field.ErrorList
+	}{
+		"valid update (no spec change)": {
+			old:    mkValidDeviceTaintRule(),
+			update: mkValidDeviceTaintRule(),
+		},
+		"valid update changing effect": {
+			old:    mkValidDeviceTaintRule(),
+			update: mkValidDeviceTaintRule(tweakTaintEffect(resource.DeviceTaintEffectNoSchedule)),
+		},
+		"invalid update clearing effect": {
+			old:    mkValidDeviceTaintRule(),
+			update: mkValidDeviceTaintRule(tweakTaintEffect("")),
+			expectedErrs: field.ErrorList{
+				field.Required(field.NewPath("spec", "taint", "effect"), "").MarkBeta(),
+			},
+		},
+		"invalid update with unsupported effect": {
+			old:    mkValidDeviceTaintRule(),
+			update: mkValidDeviceTaintRule(tweakTaintEffect("some-other-effect")),
+			expectedErrs: field.ErrorList{
+				field.NotSupported(field.NewPath("spec", "taint", "effect"), resource.DeviceTaintEffect("some-other-effect"), []resource.DeviceTaintEffect{resource.DeviceTaintEffectNoExecute, resource.DeviceTaintEffectNoSchedule, resource.DeviceTaintEffectNone}).MarkBeta(),
+			},
+		},
+		"valid update setting all: true": {
+			old:    mkValidDeviceTaintRule(tweakDeviceSelector(&resource.DeviceTaintSelector{Driver: new("example.com")})),
+			update: mkValidDeviceTaintRule(tweakDeviceSelector(&resource.DeviceTaintSelector{All: new(true)})),
+		},
+		"invalid update setting all: true next to driver": {
+			old:    mkValidDeviceTaintRule(tweakDeviceSelector(&resource.DeviceTaintSelector{Driver: new("example.com")})),
+			update: mkValidDeviceTaintRule(tweakDeviceSelector(&resource.DeviceTaintSelector{All: new(true), Driver: new("example.com")})),
+			expectedErrs: field.ErrorList{
+				field.Forbidden(field.NewPath("spec", "deviceSelector", "driver"), "").WithOrigin("dependentForbidden"),
+			},
+		},
+		"invalid update setting all: false": {
+			old:    mkValidDeviceTaintRule(),
+			update: mkValidDeviceTaintRule(tweakDeviceSelector(&resource.DeviceTaintSelector{All: new(false)})),
+			expectedErrs: field.ErrorList{
+				field.Invalid(field.NewPath("spec", "deviceSelector", "all"), false, "").WithOrigin("neq"),
+			},
+		},
+		// TODO: Add more test cases
+	}
+
+	for name, tc := range testCases {
+		t.Run(name, func(t *testing.T) {
+			tc.old.ResourceVersion = "1"
+			tc.update.ResourceVersion = "2"
+			apitesting.VerifyUpdateValidationEquivalence(t, ctx, &tc.update, &tc.old, registry.Strategy, tc.expectedErrs)
+		})
+	}
+
+	updateObj := mkValidDeviceTaintRule()
+	meta.RunObjectMetaUpdateTestCases(t, ctx, &updateObj, registry.Strategy, meta.WithStringentFinalizerValidation())
+}
+
+func mkValidDeviceTaintRule(tweaks ...func(*resource.DeviceTaintRule)) resource.DeviceTaintRule {
+	rule := resource.DeviceTaintRule{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "valid-rule",
+		},
+		Spec: resource.DeviceTaintRuleSpec{
+			Taint: resource.DeviceTaint{
+				Key:    "example.com/tainted",
+				Effect: resource.DeviceTaintEffectNoExecute,
+			},
+		},
+	}
+	for _, tweak := range tweaks {
+		tweak(&rule)
+	}
+	return rule
+}
+
+func tweakDeviceSelector(selector *resource.DeviceTaintSelector) func(*resource.DeviceTaintRule) {
+	return func(r *resource.DeviceTaintRule) {
+		r.Spec.DeviceSelector = selector
+	}
+}
+
+func tweakTaintEffect(effect resource.DeviceTaintEffect) func(*resource.DeviceTaintRule) {
+	return func(r *resource.DeviceTaintRule) {
+		r.Spec.Taint.Effect = effect
+	}
+}

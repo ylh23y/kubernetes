@@ -19,20 +19,19 @@ package genericclioptions
 import (
 	"bytes"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"sort"
 	"strings"
 	"testing"
 
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 func TestPrinterSupportsExpectedJSONPathFormats(t *testing.T) {
 	testObject := &v1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "foo"}}
 
-	jsonpathFile, err := ioutil.TempFile("", "printers_jsonpath_flags")
+	jsonpathFile, err := os.CreateTemp("", "printers_jsonpath_flags")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -65,6 +64,22 @@ func TestPrinterSupportsExpectedJSONPathFormats(t *testing.T) {
 		{
 			name:           "valid output format and --template argument succeeds",
 			outputFormat:   "jsonpath",
+			templateArg:    "{ .metadata.name }",
+			expectedOutput: "foo",
+		},
+		{
+			name:           "valid jsonpath-as-json output format also containing argument succeeds",
+			outputFormat:   "jsonpath-as-json={ .metadata.name }",
+			expectedOutput: "foo",
+		},
+		{
+			name:          "valid jsonpath-as-json output format and no --template argument results in an error",
+			outputFormat:  "jsonpath-as-json",
+			expectedError: "template format specified but no template given",
+		},
+		{
+			name:           "valid jsonpath-as-json output format and --template argument succeeds",
+			outputFormat:   "jsonpath-as-json",
 			templateArg:    "{ .metadata.name }",
 			expectedOutput: "foo",
 		},

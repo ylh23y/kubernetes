@@ -19,14 +19,13 @@ package testing
 import (
 	"testing"
 
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	"k8s.io/kubernetes/pkg/api/testing/compat"
 	api "k8s.io/kubernetes/pkg/apis/core"
-	"k8s.io/kubernetes/pkg/apis/core/validation"
-
 	_ "k8s.io/kubernetes/pkg/apis/core/install"
+	"k8s.io/kubernetes/pkg/apis/core/validation"
 )
 
 func TestCompatibility_v1_PodSecurityContext(t *testing.T) {
@@ -159,7 +158,8 @@ func TestCompatibility_v1_PodSecurityContext(t *testing.T) {
 	}
 
 	validator := func(obj runtime.Object) field.ErrorList {
-		return validation.ValidatePodSpec(&(obj.(*api.Pod).Spec), field.NewPath("spec"))
+		opts := validation.GetValidationOptionsFromPodSpecAndMeta(&(obj.(*api.Pod).Spec), nil, &(obj.(*api.Pod).ObjectMeta), nil)
+		return validation.ValidatePodSpec(&(obj.(*api.Pod).Spec), &(obj.(*api.Pod).ObjectMeta), field.NewPath("spec"), opts)
 	}
 
 	for _, tc := range cases {

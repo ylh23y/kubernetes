@@ -2,13 +2,11 @@
 
 reviewers:
   - liggitt
-  - mikedanese
-  - smarterclayton
   - sttts
   - tallclair
 approvers:
   - liggitt
-  - mikedanese
-  - smarterclayton
   - sttts
   - tallclair
+labels:
+  - sig/auth

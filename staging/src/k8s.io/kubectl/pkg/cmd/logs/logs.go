@@ -18,25 +18,31 @@ package logs
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"fmt"
 	"io"
-	"os"
+	"regexp"
 	"sync"
 	"time"
 
 	"github.com/spf13/cobra"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/cli-runtime/pkg/genericclioptions"
+	"k8s.io/cli-runtime/pkg/genericiooptions"
 	"k8s.io/client-go/rest"
 	cmdutil "k8s.io/kubectl/pkg/cmd/util"
 	"k8s.io/kubectl/pkg/polymorphichelpers"
 	"k8s.io/kubectl/pkg/scheme"
 	"k8s.io/kubectl/pkg/util"
+	"k8s.io/kubectl/pkg/util/completion"
 	"k8s.io/kubectl/pkg/util/i18n"
+	"k8s.io/kubectl/pkg/util/interrupt"
 	"k8s.io/kubectl/pkg/util/templates"
 )
 
@@ -45,30 +51,58 @@ const (
 )
 
 var (
+	logsLong = templates.LongDesc(i18n.T(`
+		Print the logs for a container in a pod or specified resource. 
+		If the pod has only one container, the container name is optional.`))
+
 	logsExample = templates.Examples(i18n.T(`
 		# Return snapshot logs from pod nginx with only one container
 		kubectl logs nginx
 
+  		# Return snapshot logs from pod nginx, prefixing each line with the source pod and container name
+		kubectl logs nginx --prefix 
+  
+		# Return snapshot logs from pod nginx, limiting output to 500 bytes
+   		kubectl logs nginx --limit-bytes=500
+
+		# Return snapshot logs from pod nginx, waiting up to 20 seconds for it to start running.
+  		kubectl logs nginx --pod-running-timeout=20s
+    
 		# Return snapshot logs from pod nginx with multi containers
 		kubectl logs nginx --all-containers=true
 
+		# Return snapshot logs from all pods in the deployment nginx
+		kubectl logs deployment/nginx --all-pods=true
+
 		# Return snapshot logs from all containers in pods defined by label app=nginx
-		kubectl logs -lapp=nginx --all-containers=true
+		kubectl logs -l app=nginx --all-containers=true
+
+  		# Return snapshot logs from all pods defined by label app=nginx, limiting concurrent log requests to 10 pods
+    		kubectl logs -l app=nginx --max-log-requests=10
 
 		# Return snapshot of previous terminated ruby container logs from pod web-1
 		kubectl logs -p -c ruby web-1
 
+		# Begin streaming the logs from pod nginx, continuing even if errors occur
+  		kubectl logs nginx -f --ignore-errors=true
+    
 		# Begin streaming the logs of the ruby container in pod web-1
 		kubectl logs -f -c ruby web-1
 
 		# Begin streaming the logs from all containers in pods defined by label app=nginx
-		kubectl logs -f -lapp=nginx --all-containers=true
+		kubectl logs -f -l app=nginx --all-containers=true
 
 		# Display only the most recent 20 lines of output in pod nginx
 		kubectl logs --tail=20 nginx
 
 		# Show all logs from pod nginx written in the last hour
 		kubectl logs --since=1h nginx
+		
+  		# Show all logs with timestamps from pod nginx starting from August 30, 2024, at 06:00:00 UTC
+  		kubectl logs nginx --since-time=2024-08-30T06:00:00Z --timestamps=true
+
+		# Show logs from a kubelet with an expired serving certificate
+		kubectl logs --insecure-skip-tls-verify-backend nginx
 
 		# Return snapshot logs from first container of a job named hello
 		kubectl logs job/hello
@@ -88,68 +122,76 @@ type LogsOptions struct {
 	Namespace     string
 	ResourceArg   string
 	AllContainers bool
+	AllPods       bool
 	Options       runtime.Object
 	Resources     []string
 
-	ConsumeRequestFn func(rest.ResponseWrapper, io.Writer) error
+	ConsumeRequestFn func(context.Context, rest.ResponseWrapper, io.Writer) error
 
 	// PodLogOptions
-	SinceTime       string
-	SinceSeconds    time.Duration
-	Follow          bool
-	Previous        bool
-	Timestamps      bool
-	IgnoreLogErrors bool
-	LimitBytes      int64
-	Tail            int64
-	Container       string
+	SinceTime                    string
+	SinceSeconds                 time.Duration
+	Follow                       bool
+	Previous                     bool
+	Timestamps                   bool
+	IgnoreLogErrors              bool
+	LimitBytes                   int64
+	Tail                         int64
+	Container                    string
+	InsecureSkipTLSVerifyBackend bool
 
 	// whether or not a container name was given via --container
 	ContainerNameSpecified bool
 	Selector               string
 	MaxFollowConcurrency   int
+	Prefix                 bool
 
-	Object           runtime.Object
-	GetPodTimeout    time.Duration
-	RESTClientGetter genericclioptions.RESTClientGetter
-	LogsForObject    polymorphichelpers.LogsForObjectFunc
+	Object              runtime.Object
+	GetPodTimeout       time.Duration
+	RESTClientGetter    genericclioptions.RESTClientGetter
+	LogsForObject       polymorphichelpers.LogsForObjectFunc
+	AllPodLogsForObject polymorphichelpers.AllPodLogsForObjectFunc
 
-	genericclioptions.IOStreams
+	genericiooptions.IOStreams
 
 	TailSpecified bool
+
+	containerNameFromRefSpecRegexp *regexp.Regexp
 }
 
-func NewLogsOptions(streams genericclioptions.IOStreams, allContainers bool) *LogsOptions {
+func NewLogsOptions(streams genericiooptions.IOStreams) *LogsOptions {
 	return &LogsOptions{
 		IOStreams:            streams,
-		AllContainers:        allContainers,
 		Tail:                 -1,
 		MaxFollowConcurrency: 5,
+
+		containerNameFromRefSpecRegexp: regexp.MustCompile(`spec\.(?:initContainers|containers|ephemeralContainers){(.+)}`),
 	}
 }
 
 // NewCmdLogs creates a new pod logs command
-func NewCmdLogs(f cmdutil.Factory, streams genericclioptions.IOStreams) *cobra.Command {
-	o := NewLogsOptions(streams, false)
+func NewCmdLogs(f cmdutil.Factory, streams genericiooptions.IOStreams) *cobra.Command {
+	o := NewLogsOptions(streams)
 
 	cmd := &cobra.Command{
 		Use:                   logsUsageStr,
 		DisableFlagsInUseLine: true,
 		Short:                 i18n.T("Print the logs for a container in a pod"),
-		Long:                  "Print the logs for a container in a pod or specified resource. If the pod has only one container, the container name is optional.",
+		Long:                  logsLong,
 		Example:               logsExample,
-		PreRun: func(cmd *cobra.Command, args []string) {
-			if len(os.Args) > 1 && os.Args[1] == "log" {
-				fmt.Fprintf(o.ErrOut, "%s is DEPRECATED and will be removed in a future version. Use %s instead.\n", "log", "logs")
-			}
-		},
+		ValidArgsFunction:     completion.PodResourceNameAndContainerCompletionFunc(f),
 		Run: func(cmd *cobra.Command, args []string) {
 			cmdutil.CheckErr(o.Complete(f, cmd, args))
 			cmdutil.CheckErr(o.Validate())
-			cmdutil.CheckErr(o.RunLogs())
+			cmdutil.CheckErr(o.RunLogsContext(cmd.Context()))
 		},
-		Aliases: []string{"log"},
 	}
+	o.AddFlags(cmd)
+	return cmd
+}
+
+func (o *LogsOptions) AddFlags(cmd *cobra.Command) {
+	cmd.Flags().BoolVar(&o.AllPods, "all-pods", o.AllPods, "Get logs from all pod(s). Sets prefix to true.")
 	cmd.Flags().BoolVar(&o.AllContainers, "all-containers", o.AllContainers, "Get all containers' logs in the pod(s).")
 	cmd.Flags().BoolVarP(&o.Follow, "follow", "f", o.Follow, "Specify if the logs should be streamed.")
 	cmd.Flags().BoolVar(&o.Timestamps, "timestamps", o.Timestamps, "Include timestamps on each line in the log output")
@@ -160,18 +202,21 @@ func NewCmdLogs(f cmdutil.Factory, streams genericclioptions.IOStreams) *cobra.C
 	cmd.Flags().StringVar(&o.SinceTime, "since-time", o.SinceTime, i18n.T("Only return logs after a specific date (RFC3339). Defaults to all logs. Only one of since-time / since may be used."))
 	cmd.Flags().DurationVar(&o.SinceSeconds, "since", o.SinceSeconds, "Only return logs newer than a relative duration like 5s, 2m, or 3h. Defaults to all logs. Only one of since-time / since may be used.")
 	cmd.Flags().StringVarP(&o.Container, "container", "c", o.Container, "Print the logs of this container")
+	cmd.Flags().BoolVar(&o.InsecureSkipTLSVerifyBackend, "insecure-skip-tls-verify-backend", o.InsecureSkipTLSVerifyBackend,
+		"Skip verifying the identity of the kubelet that logs are requested from.  In theory, an attacker could provide invalid log content back. You might want to use this if your kubelet serving certificates have expired.")
 	cmdutil.AddPodRunningTimeoutFlag(cmd, defaultPodLogsTimeout)
-	cmd.Flags().StringVarP(&o.Selector, "selector", "l", o.Selector, "Selector (label query) to filter on.")
+	cmdutil.AddLabelSelectorFlagVar(cmd, &o.Selector)
 	cmd.Flags().IntVar(&o.MaxFollowConcurrency, "max-log-requests", o.MaxFollowConcurrency, "Specify maximum number of concurrent logs to follow when using by a selector. Defaults to 5.")
-	return cmd
+	cmd.Flags().BoolVar(&o.Prefix, "prefix", o.Prefix, "Prefix each log line with the log source (pod name and container name)")
 }
 
 func (o *LogsOptions) ToLogOptions() (*corev1.PodLogOptions, error) {
 	logOptions := &corev1.PodLogOptions{
-		Container:  o.Container,
-		Follow:     o.Follow,
-		Previous:   o.Previous,
-		Timestamps: o.Timestamps,
+		Container:                    o.Container,
+		Follow:                       o.Follow,
+		Previous:                     o.Previous,
+		Timestamps:                   o.Timestamps,
+		InsecureSkipTLSVerifyBackend: o.InsecureSkipTLSVerifyBackend,
 	}
 
 	if len(o.SinceTime) > 0 {
@@ -223,6 +268,11 @@ func (o *LogsOptions) Complete(f cmdutil.Factory, cmd *cobra.Command, args []str
 	default:
 		return cmdutil.UsageErrorf(cmd, "%s", logsUsageErrStr)
 	}
+
+	if o.AllPods {
+		o.Prefix = true
+	}
+
 	var err error
 	o.Namespace, _, err = f.ToRawKubeConfigLoader().Namespace()
 	if err != nil {
@@ -243,6 +293,7 @@ func (o *LogsOptions) Complete(f cmdutil.Factory, cmd *cobra.Command, args []str
 
 	o.RESTClientGetter = f
 	o.LogsForObject = polymorphichelpers.LogsForObjectFn
+	o.AllPodLogsForObject = polymorphichelpers.AllPodLogsForObjectFn
 
 	if o.Object == nil {
 		builder := f.NewBuilder().
@@ -257,12 +308,18 @@ func (o *LogsOptions) Complete(f cmdutil.Factory, cmd *cobra.Command, args []str
 		}
 		infos, err := builder.Do().Infos()
 		if err != nil {
+			if apierrors.IsNotFound(err) {
+				err = fmt.Errorf("error from server (NotFound): %w in namespace %q", err, o.Namespace)
+			}
 			return err
 		}
 		if o.Selector == "" && len(infos) != 1 {
 			return errors.New("expected a resource")
 		}
 		o.Object = infos[0].Object
+		if o.Selector != "" && len(o.Object.(*corev1.PodList).Items) == 0 {
+			fmt.Fprintf(o.ErrOut, "No resources found in %s namespace.\n", o.Namespace)
+		}
 	}
 
 	return nil
@@ -300,46 +357,60 @@ func (o LogsOptions) Validate() error {
 	return nil
 }
 
-// RunLogs retrieves a pod log
+// Deprecated: Use RunLogsContext instead which allows cancelling.
 func (o LogsOptions) RunLogs() error {
-	requests, err := o.LogsForObject(o.RESTClientGetter, o.Object, o.Options, o.GetPodTimeout, o.AllContainers)
-	if err != nil {
-		return err
-	}
-
-	if o.Follow && len(requests) > 1 {
-		if len(requests) > o.MaxFollowConcurrency {
-			return fmt.Errorf(
-				"you are attempting to follow %d log streams, but maximum allowed concurrency is %d, use --max-log-requests to increase the limit",
-				len(requests), o.MaxFollowConcurrency,
-			)
-		}
-
-		return o.parallelConsumeRequest(requests)
-	}
-
-	return o.sequentialConsumeRequest(requests)
+	return o.RunLogsContext(context.Background())
 }
 
-func (o LogsOptions) parallelConsumeRequest(requests []rest.ResponseWrapper) error {
+// RunLogsContext retrieves a pod log.
+//
+// When a signal is received, streaming is stopped, then followed by os.Exit(1).
+func (o LogsOptions) RunLogsContext(ctx context.Context) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	intr := interrupt.New(nil, cancel)
+	return intr.Run(func() error {
+		var requests map[corev1.ObjectReference]rest.ResponseWrapper
+		var err error
+		if o.AllPods {
+			requests, err = o.AllPodLogsForObject(o.RESTClientGetter, o.Object, o.Options, o.GetPodTimeout, o.AllContainers)
+		} else {
+			requests, err = o.LogsForObject(o.RESTClientGetter, o.Object, o.Options, o.GetPodTimeout, o.AllContainers)
+		}
+		if err != nil {
+			return err
+		}
+
+		if o.Follow && len(requests) > 1 {
+			if len(requests) > o.MaxFollowConcurrency {
+				return fmt.Errorf(
+					"you are attempting to follow %d log streams, but maximum allowed concurrency is %d, use --max-log-requests to increase the limit",
+					len(requests), o.MaxFollowConcurrency,
+				)
+			}
+		}
+
+		if o.Follow && len(requests) > 1 {
+			return o.parallelConsumeRequest(ctx, requests)
+		}
+		return o.sequentialConsumeRequest(ctx, requests)
+	})
+}
+
+func (o LogsOptions) parallelConsumeRequest(ctx context.Context, requests map[corev1.ObjectReference]rest.ResponseWrapper) error {
 	reader, writer := io.Pipe()
 	wg := &sync.WaitGroup{}
 	wg.Add(len(requests))
-	for _, request := range requests {
-		go func(request rest.ResponseWrapper) {
+	for objRef, request := range requests {
+		go func(objRef corev1.ObjectReference, request rest.ResponseWrapper) {
 			defer wg.Done()
-			if err := o.ConsumeRequestFn(request, writer); err != nil {
-				if !o.IgnoreLogErrors {
-					writer.CloseWithError(err)
-
-					// It's important to return here to propagate the error via the pipe
-					return
-				}
-
-				fmt.Fprintf(writer, "error: %v\n", err)
+			out := o.addPrefixIfNeeded(objRef, writer)
+			if err := o.consumeWithRetry(ctx, request, out, writer); err != nil {
+				writer.CloseWithError(err)
+				// It's important to return here to propagate the error via the pipe
+				return
 			}
-
-		}(request)
+		}(objRef, request)
 	}
 
 	go func() {
@@ -351,14 +422,67 @@ func (o LogsOptions) parallelConsumeRequest(requests []rest.ResponseWrapper) err
 	return err
 }
 
-func (o LogsOptions) sequentialConsumeRequest(requests []rest.ResponseWrapper) error {
-	for _, request := range requests {
-		if err := o.ConsumeRequestFn(request, o.Out); err != nil {
+func (o LogsOptions) sequentialConsumeRequest(ctx context.Context, requests map[corev1.ObjectReference]rest.ResponseWrapper) error {
+	for objRef, request := range requests {
+		out := o.addPrefixIfNeeded(objRef, o.Out)
+		if err := o.consumeWithRetry(ctx, request, out, o.Out); err != nil {
 			return err
 		}
 	}
 
 	return nil
+}
+
+func (o LogsOptions) consumeWithRetry(ctx context.Context, request rest.ResponseWrapper, out io.Writer, internalErrOut io.Writer) error {
+	if !o.Follow {
+		err := o.ConsumeRequestFn(ctx, request, out)
+		if err != nil && o.IgnoreLogErrors {
+			_, _ = fmt.Fprint(internalErrOut, "error: "+err.Error()+"\n")
+			return nil
+		}
+		return err
+	}
+
+	return wait.PollUntilContextTimeout(ctx, 1*time.Second, o.GetPodTimeout, true, func(_ context.Context) (bool, error) {
+		err := o.ConsumeRequestFn(ctx, request, out)
+		if err == nil {
+			return true, nil
+		}
+
+		if o.IgnoreLogErrors {
+			_, _ = fmt.Fprint(internalErrOut, "error: "+err.Error()+"\n")
+			return true, nil
+		}
+
+		_, _ = o.ErrOut.Write([]byte(err.Error() + "\n"))
+
+		if _, ok := err.(apierrors.APIStatus); ok {
+			return false, nil
+		}
+
+		return false, err
+	})
+}
+
+func (o LogsOptions) addPrefixIfNeeded(ref corev1.ObjectReference, writer io.Writer) io.Writer {
+	if !o.Prefix || ref.FieldPath == "" || ref.Name == "" {
+		return writer
+	}
+
+	// We rely on ref.FieldPath to contain a reference to a container
+	// including a container name (not an index) so we can get a container name
+	// without making an extra API request.
+	var containerName string
+	containerNameMatches := o.containerNameFromRefSpecRegexp.FindStringSubmatch(ref.FieldPath)
+	if len(containerNameMatches) == 2 {
+		containerName = containerNameMatches[1]
+	}
+
+	prefix := fmt.Sprintf("[pod/%s/%s] ", ref.Name, containerName)
+	return &prefixingWriter{
+		prefix: []byte(prefix),
+		writer: writer,
+	}
 }
 
 // DefaultConsumeRequest reads the data from request and writes into
@@ -369,8 +493,8 @@ func (o LogsOptions) sequentialConsumeRequest(requests []rest.ResponseWrapper) e
 // A successful read returns err == nil, not err == io.EOF.
 // Because the function is defined to read from request until io.EOF, it does
 // not treat an io.EOF as an error to be reported.
-func DefaultConsumeRequest(request rest.ResponseWrapper, out io.Writer) error {
-	readCloser, err := request.Stream()
+func DefaultConsumeRequest(ctx context.Context, request rest.ResponseWrapper, out io.Writer) error {
+	readCloser, err := request.Stream(ctx)
 	if err != nil {
 		return err
 	}
@@ -390,4 +514,26 @@ func DefaultConsumeRequest(request rest.ResponseWrapper, out io.Writer) error {
 			return nil
 		}
 	}
+}
+
+type prefixingWriter struct {
+	prefix []byte
+	writer io.Writer
+}
+
+func (pw *prefixingWriter) Write(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+
+	// Perform an "atomic" write of a prefix and p to make sure that it doesn't interleave
+	// sub-line when used concurrently with io.PipeWrite.
+	n, err := pw.writer.Write(append(pw.prefix, p...))
+	if n > len(p) {
+		// To comply with the io.Writer interface requirements we must
+		// return a number of bytes written from p (0 <= n <= len(p)),
+		// so we are ignoring the length of the prefix here.
+		return len(p), err
+	}
+	return n, err
 }

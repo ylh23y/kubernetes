@@ -2,65 +2,104 @@
 
 module k8s.io/kubectl
 
-go 1.12
+go 1.27.0
+
+godebug default=go1.27
 
 require (
-	github.com/Azure/go-ansiterm v0.0.0-20170929234023-d6e3b3328b78 // indirect
-	github.com/MakeNowJust/heredoc v0.0.0-20170808103936-bb23615498cd
-	github.com/chai2010/gettext-go v0.0.0-20160711120539-c6fed771bfd5
-	github.com/davecgh/go-spew v1.1.1
-	github.com/daviddengcn/go-colortext v0.0.0-20160507010035-511bcaf42ccd
-	github.com/docker/distribution v2.7.1+incompatible
-	github.com/docker/docker v0.7.3-0.20190327010347-be7ac8be2ae0
-	github.com/evanphx/json-patch v4.2.0+incompatible
-	github.com/exponent-io/jsonpath v0.0.0-20151013193312-d6023ce2651d
+	github.com/MakeNowJust/heredoc v1.0.0
+	github.com/chai2010/gettext-go v1.0.3
+	github.com/distribution/reference v0.6.0
+	github.com/exponent-io/jsonpath v0.0.0-20210407135951-1de76d718b3f
 	github.com/fatih/camelcase v1.0.0
-	github.com/go-openapi/spec v0.19.2
-	github.com/golangplus/bytes v0.0.0-20160111154220-45c989fe5450 // indirect
-	github.com/golangplus/fmt v0.0.0-20150411045040-2a5d6d7d2995 // indirect
-	github.com/golangplus/testing v0.0.0-20180327235837-af21d9c3145e // indirect
-	github.com/googleapis/gnostic v0.0.0-20170729233727-0c5108395e2d
-	github.com/jonboulle/clockwork v0.1.0
+	github.com/go-openapi/jsonreference v1.0.2
+	github.com/google/gnostic-models v0.7.1
+	github.com/google/go-cmp v0.7.0
+	github.com/jonboulle/clockwork v0.5.0
 	github.com/liggitt/tabwriter v0.0.0-20181228230101-89fcab3d43de
 	github.com/lithammer/dedent v1.1.0
-	github.com/mitchellh/go-wordwrap v1.0.0
-	github.com/onsi/ginkgo v1.8.0
-	github.com/onsi/gomega v1.5.0
-	github.com/opencontainers/go-digest v1.0.0-rc1 // indirect
-	github.com/russross/blackfriday v1.5.2
-	github.com/sirupsen/logrus v1.4.2 // indirect
-	github.com/spf13/cobra v0.0.4
-	github.com/spf13/pflag v1.0.3
-	github.com/stretchr/testify v1.3.0
-	golang.org/x/sys v0.0.0-20190616124812-15dcb6c0061f
-	gopkg.in/yaml.v2 v2.2.2
-	gotest.tools v2.2.0+incompatible // indirect
+	github.com/mitchellh/go-wordwrap v1.0.1
+	github.com/moby/term v0.5.2
+	github.com/onsi/ginkgo/v2 v2.33.0
+	github.com/onsi/gomega v1.44.0
+	github.com/russross/blackfriday/v2 v2.1.0
+	github.com/spf13/cobra v1.10.2
+	github.com/spf13/pflag v1.0.10
+	github.com/stretchr/testify v1.12.1
+	go.yaml.in/yaml/v2 v2.4.4
+	golang.org/x/sys v0.49.0
+	golang.org/x/text v0.43.0
+	gopkg.in/evanphx/json-patch.v4 v4.13.0
 	k8s.io/api v0.0.0
 	k8s.io/apimachinery v0.0.0
 	k8s.io/cli-runtime v0.0.0
 	k8s.io/client-go v0.0.0
 	k8s.io/component-base v0.0.0
-	k8s.io/klog v0.3.1
-	k8s.io/kube-openapi v0.0.0-20190709113604-33be087ad058
+	k8s.io/component-helpers v0.0.0
+	k8s.io/klog/v2 v2.140.0
+	k8s.io/kube-openapi v0.0.0-20261014044854-ca3452a79603
 	k8s.io/metrics v0.0.0
-	k8s.io/utils v0.0.0-20190607212802-c55fbcfc754a
-	sigs.k8s.io/kustomize v2.0.3+incompatible
-	sigs.k8s.io/yaml v1.1.0
+	k8s.io/streaming v0.0.0
+	k8s.io/utils v0.0.0-20260626114624-be93311217bd
+	sigs.k8s.io/json v0.0.0-20250730193827-2d320260d730
+	sigs.k8s.io/kustomize/kustomize/v5 v5.8.3
+	sigs.k8s.io/kustomize/kyaml v0.21.3
+	sigs.k8s.io/randfill v1.0.0
+	sigs.k8s.io/structured-merge-diff/v7 v7.0.1
+	sigs.k8s.io/yaml v1.6.0
+)
+
+require (
+	github.com/Azure/go-ansiterm v0.0.0-20250102033503-faa5f7b0171c // indirect
+	github.com/Masterminds/semver/v3 v3.4.0 // indirect
+	github.com/blang/semver/v4 v4.0.0 // indirect
+	github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc // indirect
+	github.com/fxamacker/cbor/v2 v2.9.4 // indirect
+	github.com/go-errors/errors v1.5.1 // indirect
+	github.com/go-logr/logr v1.4.4 // indirect
+	github.com/go-openapi/jsonpointer v1.0.2 // indirect
+	github.com/go-openapi/swag/conv v0.29.2 // indirect
+	github.com/go-openapi/swag/jsonutils v0.29.2 // indirect
+	github.com/go-openapi/swag/pools v0.29.2 // indirect
+	github.com/go-openapi/swag/typeutils v0.29.2 // indirect
+	github.com/go-task/slim-sprig/v3 v3.0.0 // indirect
+	github.com/google/btree v1.1.3 // indirect
+	github.com/google/pprof v0.0.0-20260402051712-545e8a4df936 // indirect
+	github.com/google/uuid v1.6.0 // indirect
+	github.com/gorilla/websocket v1.5.4-0.20250319132907-e064f32e3674 // indirect
+	github.com/inconshreveable/mousetrap v1.1.0 // indirect
+	github.com/moby/spdystream v0.5.1 // indirect
+	github.com/monochromegane/go-gitignore v0.0.0-20200626010858-205db1a8cc00 // indirect
+	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
+	github.com/mxk/go-flowrate v0.0.0-20140419014527-cca7078d478f // indirect
+	github.com/opencontainers/go-digest v1.0.0 // indirect
+	github.com/peterbourgon/diskv/v3 v3.0.1 // indirect
+	github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2 // indirect
+	github.com/rogpeppe/go-internal v1.14.1 // indirect
+	github.com/x448/float16 v0.8.4 // indirect
+	github.com/xlab/treeprint v1.2.0 // indirect
+	go.yaml.in/yaml/v3 v3.0.5 // indirect
+	golang.org/x/mod v0.41.0 // indirect
+	golang.org/x/net v0.62.0 // indirect
+	golang.org/x/oauth2 v0.37.0 // indirect
+	golang.org/x/sync v0.24.0 // indirect
+	golang.org/x/term v0.47.0 // indirect
+	golang.org/x/time v0.16.0 // indirect
+	golang.org/x/tools v0.51.0 // indirect
+	google.golang.org/protobuf v1.36.12 // indirect
+	gopkg.in/inf.v0 v0.9.1 // indirect
+	sigs.k8s.io/kustomize/api v0.21.3 // indirect
 )
 
 replace (
-	golang.org/x/crypto => golang.org/x/crypto v0.0.0-20181025213731-e84da0312774
-	golang.org/x/net => golang.org/x/net v0.0.0-20190206173232-65e2d4e15006
-	golang.org/x/sync => golang.org/x/sync v0.0.0-20181108010431-42b317875d0f
-	golang.org/x/sys => golang.org/x/sys v0.0.0-20190209173611-3b5209105503
-	golang.org/x/text => golang.org/x/text v0.3.1-0.20181227161524-e6919f6577db
-	golang.org/x/tools => golang.org/x/tools v0.0.0-20190313210603-aa82965741a9
 	k8s.io/api => ../api
 	k8s.io/apimachinery => ../apimachinery
 	k8s.io/cli-runtime => ../cli-runtime
 	k8s.io/client-go => ../client-go
 	k8s.io/code-generator => ../code-generator
 	k8s.io/component-base => ../component-base
-	k8s.io/kubectl => ../kubectl
+	k8s.io/component-helpers => ../component-helpers
+	k8s.io/ktesting => ../ktesting
 	k8s.io/metrics => ../metrics
+	k8s.io/streaming => ../streaming
 )

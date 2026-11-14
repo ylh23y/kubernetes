@@ -21,21 +21,21 @@ import (
 
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/validation/field"
+	"k8s.io/apiserver/pkg/registry/rest"
 	"k8s.io/apiserver/pkg/storage/names"
 	"k8s.io/kubernetes/pkg/api/legacyscheme"
 	"k8s.io/kubernetes/pkg/apis/scheduling"
-	schedulingutil "k8s.io/kubernetes/pkg/apis/scheduling/util"
 	"k8s.io/kubernetes/pkg/apis/scheduling/validation"
 )
 
 // priorityClassStrategy implements verification logic for PriorityClass.
 type priorityClassStrategy struct {
-	runtime.ObjectTyper
+	rest.DeclarativeValidation
 	names.NameGenerator
 }
 
 // Strategy is the default logic that applies when creating and updating PriorityClass objects.
-var Strategy = priorityClassStrategy{legacyscheme.Scheme, names.SimpleNameGenerator}
+var Strategy = priorityClassStrategy{rest.DeclarativeValidation{Scheme: legacyscheme.Scheme}, names.SimpleNameGenerator}
 
 // NamespaceScoped returns false because all PriorityClasses are global.
 func (priorityClassStrategy) NamespaceScoped() bool {
@@ -46,16 +46,10 @@ func (priorityClassStrategy) NamespaceScoped() bool {
 func (priorityClassStrategy) PrepareForCreate(ctx context.Context, obj runtime.Object) {
 	pc := obj.(*scheduling.PriorityClass)
 	pc.Generation = 1
-	schedulingutil.DropDisabledFields(pc, nil)
 }
 
 // PrepareForUpdate clears fields that are not allowed to be set by end users on update.
-func (priorityClassStrategy) PrepareForUpdate(ctx context.Context, obj, old runtime.Object) {
-	newClass := obj.(*scheduling.PriorityClass)
-	oldClass := old.(*scheduling.PriorityClass)
-
-	schedulingutil.DropDisabledFields(newClass, oldClass)
-}
+func (priorityClassStrategy) PrepareForUpdate(ctx context.Context, obj, old runtime.Object) {}
 
 // Validate validates a new PriorityClass.
 func (priorityClassStrategy) Validate(ctx context.Context, obj runtime.Object) field.ErrorList {
@@ -63,11 +57,16 @@ func (priorityClassStrategy) Validate(ctx context.Context, obj runtime.Object) f
 	return validation.ValidatePriorityClass(pc)
 }
 
+// WarningsOnCreate returns warnings for the creation of the given object.
+func (priorityClassStrategy) WarningsOnCreate(ctx context.Context, obj runtime.Object) []string {
+	return nil
+}
+
 // Canonicalize normalizes the object after validation.
 func (priorityClassStrategy) Canonicalize(obj runtime.Object) {}
 
 // AllowCreateOnUpdate is false for PriorityClass; this means POST is needed to create one.
-func (priorityClassStrategy) AllowCreateOnUpdate() bool {
+func (priorityClassStrategy) AllowCreateOnUpdate(ctx context.Context) bool {
 	return false
 }
 
@@ -76,7 +75,12 @@ func (priorityClassStrategy) ValidateUpdate(ctx context.Context, obj, old runtim
 	return validation.ValidatePriorityClassUpdate(obj.(*scheduling.PriorityClass), old.(*scheduling.PriorityClass))
 }
 
+// WarningsOnUpdate returns warnings for the given update.
+func (priorityClassStrategy) WarningsOnUpdate(ctx context.Context, obj, old runtime.Object) []string {
+	return nil
+}
+
 // AllowUnconditionalUpdate is the default update policy for PriorityClass objects.
-func (priorityClassStrategy) AllowUnconditionalUpdate() bool {
+func (priorityClassStrategy) AllowUnconditionalUpdate(ctx context.Context) bool {
 	return true
 }

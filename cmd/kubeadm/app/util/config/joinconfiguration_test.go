@@ -17,98 +17,184 @@ limitations under the License.
 package config
 
 import (
-	"bytes"
-	"io/ioutil"
+	"fmt"
+	"os"
+	"path/filepath"
 	"testing"
 
-	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm"
-	"k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm/scheme"
-	kubeadmapiv1beta1 "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm/v1beta1"
-	kubeadmapiv1beta2 "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm/v1beta2"
-	kubeadmutil "k8s.io/kubernetes/cmd/kubeadm/app/util"
+	"github.com/google/go-cmp/cmp"
+	"github.com/google/go-cmp/cmp/cmpopts"
+	"github.com/lithammer/dedent"
+
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/utils/ptr"
+
+	kubeadmapi "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm"
+	kubeadmapiv1 "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm/v1beta4"
+	"k8s.io/kubernetes/cmd/kubeadm/app/constants"
 )
 
-const (
-	nodeV1beta1YAML    = "testdata/conversion/node/v1beta1.yaml"
-	nodeV1beta2YAML    = "testdata/conversion/node/v1beta2.yaml"
-	nodeInternalYAML   = "testdata/conversion/node/internal.yaml"
-	nodeIncompleteYAML = "testdata/defaulting/node/incomplete.yaml"
-	nodeDefaultedYAML  = "testdata/defaulting/node/defaulted.yaml"
-	nodeInvalidYAML    = "testdata/validation/invalid_nodecfg.yaml"
-)
+func TestBytesToJoinConfiguration(t *testing.T) {
+	options := LoadOrDefaultConfigurationOptions{}
 
-func TestLoadJoinConfigurationFromFile(t *testing.T) {
-	var tests = []struct {
-		name, in, out string
-		groupVersion  schema.GroupVersion
-		expectedErr   bool
+	tests := []struct {
+		name string
+		cfg  *kubeadmapiv1.JoinConfiguration
+		want *kubeadmapi.JoinConfiguration
 	}{
-		// These tests are reading one file, loading it using LoadJoinConfigurationFromFile that all of kubeadm is using for unmarshal of our API types,
-		// and then marshals the internal object to the expected groupVersion
-		{ // v1beta1 -> internal
-			name:         "v1beta1ToInternal",
-			in:           nodeV1beta1YAML,
-			out:          nodeInternalYAML,
-			groupVersion: kubeadm.SchemeGroupVersion,
+		{
+			name: "Normal configuration",
+			cfg: &kubeadmapiv1.JoinConfiguration{
+				TypeMeta: metav1.TypeMeta{
+					APIVersion: kubeadmapiv1.SchemeGroupVersion.String(),
+					Kind:       constants.JoinConfigurationKind,
+				},
+				NodeRegistration: kubeadmapiv1.NodeRegistrationOptions{
+					Name:      "node-1",
+					CRISocket: "unix:///var/run/crio/crio.sock",
+				},
+				CACertPath: "/some/cert.crt",
+				Discovery: kubeadmapiv1.Discovery{
+					BootstrapToken: &kubeadmapiv1.BootstrapTokenDiscovery{
+						Token:             "abcdef.1234567890123456",
+						APIServerEndpoint: "1.2.3.4:6443",
+						CACertHashes:      []string{"aaaa"},
+					},
+					TLSBootstrapToken: "abcdef.1234567890123456",
+				},
+			},
+			want: &kubeadmapi.JoinConfiguration{
+				NodeRegistration: kubeadmapi.NodeRegistrationOptions{
+					Name:            "node-1",
+					CRISocket:       "unix:///var/run/crio/crio.sock",
+					ImagePullPolicy: "IfNotPresent",
+					ImagePullSerial: ptr.To(true),
+				},
+				CACertPath: "/some/cert.crt",
+				Discovery: kubeadmapi.Discovery{
+					BootstrapToken: &kubeadmapi.BootstrapTokenDiscovery{
+						Token:             "abcdef.1234567890123456",
+						APIServerEndpoint: "1.2.3.4:6443",
+						CACertHashes:      []string{"aaaa"},
+					},
+					TLSBootstrapToken: "abcdef.1234567890123456",
+				},
+				ControlPlane: nil,
+			},
 		},
-		{ // v1beta1 -> internal -> v1beta1
-			name:         "v1beta1Tov1beta1",
-			in:           nodeV1beta1YAML,
-			out:          nodeV1beta1YAML,
-			groupVersion: kubeadmapiv1beta1.SchemeGroupVersion,
-		},
-		{ // v1beta2 -> internal
-			name:         "v1beta2ToInternal",
-			in:           nodeV1beta2YAML,
-			out:          nodeInternalYAML,
-			groupVersion: kubeadm.SchemeGroupVersion,
-		},
-		{ // v1beta2 -> internal -> v1beta2
-			name:         "v1beta2Tov1beta2",
-			in:           nodeV1beta2YAML,
-			out:          nodeV1beta2YAML,
-			groupVersion: kubeadmapiv1beta2.SchemeGroupVersion,
-		},
-		// These tests are reading one file that has only a subset of the fields populated, loading it using LoadJoinConfigurationFromFile,
-		// and then marshals the internal object to the expected groupVersion
-		{ // v1beta2 -> default -> validate -> internal -> v1beta2
-			name:         "incompleteYAMLToDefaultedv1beta2",
-			in:           nodeIncompleteYAML,
-			out:          nodeDefaultedYAML,
-			groupVersion: kubeadmapiv1beta2.SchemeGroupVersion,
-		},
-		{ // v1beta2 -> validation should fail
-			name:        "invalidYAMLShouldFail",
-			in:          nodeInvalidYAML,
-			expectedErr: true,
+		{
+			name: "Only contains Discovery configuration",
+			cfg: &kubeadmapiv1.JoinConfiguration{
+				TypeMeta: metav1.TypeMeta{
+					APIVersion: kubeadmapiv1.SchemeGroupVersion.String(),
+					Kind:       constants.JoinConfigurationKind,
+				},
+				Discovery: kubeadmapiv1.Discovery{
+					BootstrapToken: &kubeadmapiv1.BootstrapTokenDiscovery{
+						Token:             "abcdef.1234567890123456",
+						APIServerEndpoint: "1.2.3.4:6443",
+						CACertHashes:      []string{"aaaa"},
+					},
+					TLSBootstrapToken: "abcdef.1234567890123456",
+				},
+			},
+			want: &kubeadmapi.JoinConfiguration{
+				NodeRegistration: kubeadmapi.NodeRegistrationOptions{
+					CRISocket:       "unix:///var/run/containerd/containerd.sock",
+					ImagePullPolicy: "IfNotPresent",
+					ImagePullSerial: ptr.To(true),
+				},
+				CACertPath: "/etc/kubernetes/pki/ca.crt",
+				Discovery: kubeadmapi.Discovery{
+					BootstrapToken: &kubeadmapi.BootstrapTokenDiscovery{
+						Token:             "abcdef.1234567890123456",
+						APIServerEndpoint: "1.2.3.4:6443",
+						CACertHashes:      []string{"aaaa"},
+					},
+					TLSBootstrapToken: "abcdef.1234567890123456",
+				},
+				ControlPlane: nil,
+			},
 		},
 	}
 
-	for _, rt := range tests {
-		t.Run(rt.name, func(t2 *testing.T) {
-
-			internalcfg, err := LoadJoinConfigurationFromFile(rt.in)
-			if err != nil {
-				if rt.expectedErr {
-					return
+	for _, tt := range tests {
+		for _, format := range formats {
+			t.Run(fmt.Sprintf("%s_%s", tt.name, format.name), func(t *testing.T) {
+				bytes, err := format.marshal(tt.cfg)
+				if err != nil {
+					t.Fatalf("Could not marshal test config: %v", err)
 				}
-				t2.Fatalf("couldn't unmarshal test data: %v", err)
+
+				got, _ := BytesToJoinConfiguration(bytes, options)
+				if diff := cmp.Diff(got, tt.want, cmpopts.IgnoreFields(kubeadmapi.JoinConfiguration{}, "Timeouts"),
+					cmpopts.IgnoreFields(kubeadmapi.NodeRegistrationOptions{}, "Name")); diff != "" {
+					t.Errorf("LoadJoinConfigurationFromFile returned unexpected diff (-want,+got):\n%s", diff)
+				}
+			})
+		}
+	}
+}
+
+func TestLoadJoinConfigurationFromFile(t *testing.T) {
+	// Create temp folder for the test case
+	tmpdir, err := os.MkdirTemp("", "")
+	if err != nil {
+		t.Fatalf("Couldn't create tmpdir: %v", err)
+	}
+	defer func() {
+		if err := os.RemoveAll(tmpdir); err != nil {
+			t.Fatalf("Couldn't remove tmpdir: %v", err)
+		}
+	}()
+	filename := "kubeadmConfig"
+	filePath := filepath.Join(tmpdir, filename)
+	options := LoadOrDefaultConfigurationOptions{}
+
+	tests := []struct {
+		name         string
+		cfgPath      string
+		fileContents string
+		wantErr      bool
+	}{
+		{
+			name:    "Config file does not exists",
+			cfgPath: "tmp",
+			wantErr: true,
+		},
+		{
+			name:    "Valid kubeadm config",
+			cfgPath: filePath,
+			fileContents: dedent.Dedent(`
+apiVersion: kubeadm.k8s.io/v1beta4
+discovery:
+  bootstrapToken:
+    apiServerEndpoint: 1.2.3.4:6443
+    caCertHashes:
+    - aaaa
+    token: abcdef.1234567890123456
+  tlsBootstrapToken: abcdef.1234567890123456
+kind: JoinConfiguration`),
+			wantErr: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.cfgPath == filePath {
+				err = os.WriteFile(tt.cfgPath, []byte(tt.fileContents), 0644)
+				if err != nil {
+					t.Fatalf("Couldn't write content to file: %v", err)
+				}
+				defer func() {
+					if err := os.RemoveAll(filePath); err != nil {
+						t.Fatalf("Couldn't remove filePath: %v", err)
+					}
+				}()
 			}
 
-			actual, err := kubeadmutil.MarshalToYamlForCodecs(internalcfg, rt.groupVersion, scheme.Codecs)
-			if err != nil {
-				t2.Fatalf("couldn't marshal internal object: %v", err)
-			}
-
-			expected, err := ioutil.ReadFile(rt.out)
-			if err != nil {
-				t2.Fatalf("couldn't read test data: %v", err)
-			}
-
-			if !bytes.Equal(expected, actual) {
-				t2.Errorf("the expected and actual output differs.\n\tin: %s\n\tout: %s\n\tgroupversion: %s\n\tdiff: \n%s\n",
-					rt.in, rt.out, rt.groupVersion.String(), diff(expected, actual))
+			_, err = LoadJoinConfigurationFromFile(tt.cfgPath, options)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("LoadJoinConfigurationFromFile() error = %v, wantErr %v", err, tt.wantErr)
 			}
 		})
 	}

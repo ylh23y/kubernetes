@@ -1,4 +1,4 @@
-// +build linux
+//go:build linux
 
 /*
 Copyright 2015 The Kubernetes Authors.
@@ -22,7 +22,6 @@ import (
 	"bytes"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"path"
 	"path/filepath"
@@ -33,14 +32,11 @@ import (
 	"unicode"
 
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
-	"k8s.io/klog"
+	"k8s.io/klog/v2"
 )
 
+// ProcFS provides a helper for getting container name via pid.
 type ProcFS struct{}
-
-func NewProcFS() ProcFSInterface {
-	return &ProcFS{}
-}
 
 func containerNameFromProcCgroup(content string) (string, error) {
 	lines := strings.Split(content, "\n")
@@ -53,12 +49,12 @@ func containerNameFromProcCgroup(content string) (string, error) {
 	return "", fmt.Errorf("could not find devices cgroup location")
 }
 
-// getFullContainerName gets the container name given the root process id of the container.
+// GetFullContainerName gets the container name given the root process id of the container.
 // E.g. if the devices cgroup for the container is stored in /sys/fs/cgroup/devices/docker/nginx,
 // return docker/nginx. Assumes that the process is part of exactly one cgroup hierarchy.
 func (pfs *ProcFS) GetFullContainerName(pid int) (string, error) {
 	filePath := path.Join("/proc", strconv.Itoa(pid), "cgroup")
-	content, err := ioutil.ReadFile(filePath)
+	content, err := os.ReadFile(filePath)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return "", os.ErrNotExist
@@ -68,8 +64,8 @@ func (pfs *ProcFS) GetFullContainerName(pid int) (string, error) {
 	return containerNameFromProcCgroup(string(content))
 }
 
-// Find process(es) using a regular expression and send a specified
-// signal to each process
+// PKill finds process(es) using a regular expression and send a specified
+// signal to each process.
 func PKill(name string, sig syscall.Signal) error {
 	if len(name) == 0 {
 		return fmt.Errorf("name should not be empty")
@@ -91,8 +87,8 @@ func PKill(name string, sig syscall.Signal) error {
 	return utilerrors.NewAggregate(errList)
 }
 
-// Find process(es) with a specified name (regexp match)
-// and return their pid(s)
+// PidOf finds process(es) with a specified name (regexp match)
+// and return their pid(s).
 func PidOf(name string) ([]int, error) {
 	if len(name) == 0 {
 		return []int{}, fmt.Errorf("name should not be empty")
@@ -135,7 +131,7 @@ func getPids(re *regexp.Regexp) []int {
 				continue
 			}
 
-			cmdline, err := ioutil.ReadFile(filepath.Join("/proc", entry.Name(), "cmdline"))
+			cmdline, err := os.ReadFile(filepath.Join("/proc", entry.Name(), "cmdline"))
 			if err != nil {
 				klog.V(4).Infof("Error reading file %s: %+v", filepath.Join("/proc", entry.Name(), "cmdline"), err)
 				continue

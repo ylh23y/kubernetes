@@ -24,7 +24,6 @@ import (
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
-	genericapirequest "k8s.io/apiserver/pkg/endpoints/request"
 	"k8s.io/apiserver/pkg/registry/generic"
 	genericregistrytest "k8s.io/apiserver/pkg/registry/generic/testing"
 	"k8s.io/apiserver/pkg/registry/rest"
@@ -37,7 +36,10 @@ import (
 func newStorage(t *testing.T) (*REST, *etcd3testing.EtcdTestServer) {
 	etcdStorage, server := registrytest.NewEtcdStorage(t, "")
 	restOptions := generic.RESTOptions{StorageConfig: etcdStorage, Decorator: generic.UndecoratedStorage, DeleteCollectionWorkers: 1, ResourcePrefix: "namespaces"}
-	namespaceStorage, _, _ := NewREST(restOptions)
+	namespaceStorage, _, _, err := NewREST(restOptions)
+	if err != nil {
+		t.Fatalf("unexpected error from REST storage: %v", err)
+	}
 	return namespaceStorage, server
 }
 
@@ -71,7 +73,7 @@ func TestCreateSetsFields(t *testing.T) {
 	defer server.Terminate(t)
 	defer storage.store.DestroyFunc()
 	namespace := validNewNamespace()
-	ctx := genericapirequest.NewContext()
+	ctx := genericregistrytest.NewClusterScopeContext(storage.store)
 	_, err := storage.Create(ctx, namespace, rest.ValidateAllObjectFunc, &metav1.CreateOptions{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -106,6 +108,8 @@ func TestGet(t *testing.T) {
 	defer server.Terminate(t)
 	defer storage.store.DestroyFunc()
 	test := genericregistrytest.New(t, storage.store).ClusterScope()
+
+	// note that this ultimately may call validation
 	test.TestGet(validNewNamespace())
 }
 
@@ -146,8 +150,8 @@ func TestDeleteNamespaceWithIncompleteFinalizers(t *testing.T) {
 	storage, server := newStorage(t)
 	defer server.Terminate(t)
 	defer storage.store.DestroyFunc()
-	key := "namespaces/foo"
-	ctx := genericapirequest.NewContext()
+	key := "/namespaces/foo"
+	ctx := genericregistrytest.NewClusterScopeContext(storage.store)
 	now := metav1.Now()
 	namespace := &api.Namespace{
 		ObjectMeta: metav1.ObjectMeta{
@@ -162,12 +166,19 @@ func TestDeleteNamespaceWithIncompleteFinalizers(t *testing.T) {
 	if err := storage.store.Storage.Create(ctx, key, namespace, nil, 0, false); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if _, _, err := storage.Delete(ctx, "foo", rest.ValidateAllObjectFunc, nil); err == nil {
-		t.Errorf("unexpected no error")
+	ctx = genericregistrytest.NewNamespaceScopeContext(storage.store, namespace.Name)
+	obj, immediate, err := storage.Delete(ctx, "foo", rest.ValidateAllObjectFunc, nil)
+	if err != nil {
+		t.Fatalf("unexpected error")
+	}
+	if immediate {
+		t.Fatalf("unexpected immediate flag")
+	}
+	if ns, ok := obj.(*api.Namespace); !ok || obj == nil || ns == nil || ns.Name != namespace.Name {
+		t.Fatalf("object not returned by delete")
 	}
 	// should still exist
-	_, err := storage.Get(ctx, "foo", &metav1.GetOptions{})
-	if err != nil {
+	if _, err := storage.Get(ctx, "foo", &metav1.GetOptions{}); err != nil {
 		t.Errorf("unexpected error: %v", err)
 	}
 }
@@ -176,8 +187,8 @@ func TestUpdateDeletingNamespaceWithIncompleteMetadataFinalizers(t *testing.T) {
 	storage, server := newStorage(t)
 	defer server.Terminate(t)
 	defer storage.store.DestroyFunc()
-	key := "namespaces/foo"
-	ctx := genericapirequest.NewContext()
+	key := "/namespaces/foo"
+	ctx := genericregistrytest.NewClusterScopeContext(storage.store)
 	now := metav1.Now()
 	namespace := &api.Namespace{
 		ObjectMeta: metav1.ObjectMeta{
@@ -193,6 +204,7 @@ func TestUpdateDeletingNamespaceWithIncompleteMetadataFinalizers(t *testing.T) {
 	if err := storage.store.Storage.Create(ctx, key, namespace, nil, 0, false); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
+	ctx = genericregistrytest.NewNamespaceScopeContext(storage.store, namespace.Name)
 	ns, err := storage.Get(ctx, "foo", &metav1.GetOptions{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -211,8 +223,8 @@ func TestUpdateDeletingNamespaceWithIncompleteSpecFinalizers(t *testing.T) {
 	storage, server := newStorage(t)
 	defer server.Terminate(t)
 	defer storage.store.DestroyFunc()
-	key := "namespaces/foo"
-	ctx := genericapirequest.NewContext()
+	key := "/namespaces/foo"
+	ctx := genericregistrytest.NewClusterScopeContext(storage.store)
 	now := metav1.Now()
 	namespace := &api.Namespace{
 		ObjectMeta: metav1.ObjectMeta{
@@ -231,6 +243,7 @@ func TestUpdateDeletingNamespaceWithIncompleteSpecFinalizers(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
+	ctx = genericregistrytest.NewNamespaceScopeContext(storage.store, namespace.Name)
 	if _, _, err = storage.Update(ctx, "foo", rest.DefaultUpdatedObjectInfo(ns), rest.ValidateAllObjectFunc, rest.ValidateAllObjectUpdateFunc, false, &metav1.UpdateOptions{}); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -245,8 +258,8 @@ func TestUpdateDeletingNamespaceWithCompleteFinalizers(t *testing.T) {
 	storage, server := newStorage(t)
 	defer server.Terminate(t)
 	defer storage.store.DestroyFunc()
-	key := "namespaces/foo"
-	ctx := genericapirequest.NewContext()
+	key := "/namespaces/foo"
+	ctx := genericregistrytest.NewClusterScopeContext(storage.store)
 	now := metav1.Now()
 	namespace := &api.Namespace{
 		ObjectMeta: metav1.ObjectMeta{
@@ -264,6 +277,7 @@ func TestUpdateDeletingNamespaceWithCompleteFinalizers(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	ns.(*api.Namespace).Finalizers = nil
+	ctx = genericregistrytest.NewNamespaceScopeContext(storage.store, namespace.Name)
 	if _, _, err = storage.Update(ctx, "foo", rest.DefaultUpdatedObjectInfo(ns), rest.ValidateAllObjectFunc, rest.ValidateAllObjectUpdateFunc, false, &metav1.UpdateOptions{}); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -278,13 +292,16 @@ func TestFinalizeDeletingNamespaceWithCompleteFinalizers(t *testing.T) {
 	// get finalize storage
 	etcdStorage, server := registrytest.NewEtcdStorage(t, "")
 	restOptions := generic.RESTOptions{StorageConfig: etcdStorage, Decorator: generic.UndecoratedStorage, DeleteCollectionWorkers: 1, ResourcePrefix: "namespaces"}
-	storage, _, finalizeStorage := NewREST(restOptions)
+	storage, _, finalizeStorage, err := NewREST(restOptions)
+	if err != nil {
+		t.Fatalf("unexpected error from REST storage: %v", err)
+	}
 
 	defer server.Terminate(t)
 	defer storage.store.DestroyFunc()
 	defer finalizeStorage.store.DestroyFunc()
-	key := "namespaces/foo"
-	ctx := genericapirequest.NewContext()
+	key := "/namespaces/foo"
+	ctx := genericregistrytest.NewClusterScopeContext(storage.store)
 	now := metav1.Now()
 	namespace := &api.Namespace{
 		ObjectMeta: metav1.ObjectMeta{
@@ -304,6 +321,7 @@ func TestFinalizeDeletingNamespaceWithCompleteFinalizers(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	ns.(*api.Namespace).Spec.Finalizers = nil
+	ctx = genericregistrytest.NewNamespaceScopeContext(storage.store, namespace.Name)
 	if _, _, err = finalizeStorage.Update(ctx, "foo", rest.DefaultUpdatedObjectInfo(ns), rest.ValidateAllObjectFunc, rest.ValidateAllObjectUpdateFunc, false, &metav1.UpdateOptions{}); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -318,13 +336,16 @@ func TestFinalizeDeletingNamespaceWithIncompleteMetadataFinalizers(t *testing.T)
 	// get finalize storage
 	etcdStorage, server := registrytest.NewEtcdStorage(t, "")
 	restOptions := generic.RESTOptions{StorageConfig: etcdStorage, Decorator: generic.UndecoratedStorage, DeleteCollectionWorkers: 1, ResourcePrefix: "namespaces"}
-	storage, _, finalizeStorage := NewREST(restOptions)
+	storage, _, finalizeStorage, err := NewREST(restOptions)
+	if err != nil {
+		t.Fatalf("unexpected error from REST storage: %v", err)
+	}
 
 	defer server.Terminate(t)
 	defer storage.store.DestroyFunc()
 	defer finalizeStorage.store.DestroyFunc()
-	key := "namespaces/foo"
-	ctx := genericapirequest.NewContext()
+	key := "/namespaces/foo"
+	ctx := genericregistrytest.NewClusterScopeContext(storage.store)
 	now := metav1.Now()
 	namespace := &api.Namespace{
 		ObjectMeta: metav1.ObjectMeta{
@@ -345,6 +366,7 @@ func TestFinalizeDeletingNamespaceWithIncompleteMetadataFinalizers(t *testing.T)
 		t.Fatalf("unexpected error: %v", err)
 	}
 	ns.(*api.Namespace).Spec.Finalizers = nil
+	ctx = genericregistrytest.NewNamespaceScopeContext(storage.store, namespace.Name)
 	if _, _, err = finalizeStorage.Update(ctx, "foo", rest.DefaultUpdatedObjectInfo(ns), rest.ValidateAllObjectFunc, rest.ValidateAllObjectUpdateFunc, false, &metav1.UpdateOptions{}); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -359,8 +381,8 @@ func TestDeleteNamespaceWithCompleteFinalizers(t *testing.T) {
 	storage, server := newStorage(t)
 	defer server.Terminate(t)
 	defer storage.store.DestroyFunc()
-	key := "namespaces/foo"
-	ctx := genericapirequest.NewContext()
+	key := "/namespaces/foo"
+	ctx := genericregistrytest.NewClusterScopeContext(storage.store)
 	now := metav1.Now()
 	namespace := &api.Namespace{
 		ObjectMeta: metav1.ObjectMeta{
@@ -375,6 +397,7 @@ func TestDeleteNamespaceWithCompleteFinalizers(t *testing.T) {
 	if err := storage.store.Storage.Create(ctx, key, namespace, nil, 0, false); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
+	ctx = genericregistrytest.NewNamespaceScopeContext(storage.store, namespace.Name)
 	if _, _, err := storage.Delete(ctx, "foo", rest.ValidateAllObjectFunc, nil); err != nil {
 		t.Errorf("unexpected error: %v", err)
 	}
@@ -561,8 +584,8 @@ func TestDeleteWithGCFinalizers(t *testing.T) {
 	}
 
 	for _, test := range tests {
-		key := "namespaces/" + test.name
-		ctx := genericapirequest.NewContext()
+		key := "/namespaces/" + test.name
+		ctx := genericregistrytest.NewClusterScopeContext(storage.store)
 		namespace := &api.Namespace{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:       test.name,
@@ -578,6 +601,7 @@ func TestDeleteWithGCFinalizers(t *testing.T) {
 		}
 		var obj runtime.Object
 		var err error
+		ctx = genericregistrytest.NewNamespaceScopeContext(storage.store, namespace.Name)
 		if obj, _, err = storage.Delete(ctx, test.name, rest.ValidateAllObjectFunc, test.deleteOptions); err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}

@@ -1,4 +1,4 @@
-// +build !windows
+//go:build !windows
 
 /*
 Copyright 2018 The Kubernetes Authors.
@@ -19,14 +19,19 @@ limitations under the License.
 package stats
 
 import (
-	"k8s.io/klog"
+	"context"
+	"errors"
 
+	"k8s.io/klog/v2"
+
+	cadvisormemory "github.com/google/cadvisor/lib/cache/memory"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	statsapi "k8s.io/kubernetes/pkg/kubelet/apis/stats/v1alpha1"
+	statsapi "k8s.io/kubelet/pkg/apis/stats/v1alpha1"
 	"k8s.io/kubernetes/pkg/kubelet/cm"
 )
 
-func (sp *summaryProviderImpl) GetSystemContainersStats(nodeConfig cm.NodeConfig, podStats []statsapi.PodStats, updateStats bool) (stats []statsapi.ContainerStats) {
+func (sp *summaryProviderImpl) GetSystemContainersStats(ctx context.Context, nodeConfig cm.NodeConfig, podStats []statsapi.PodStats, updateStats bool) (stats []statsapi.ContainerStats) {
+	logger := klog.FromContext(ctx)
 	systemContainers := map[string]struct {
 		name             string
 		forceStatsUpdate bool
@@ -42,9 +47,9 @@ func (sp *summaryProviderImpl) GetSystemContainersStats(nodeConfig cm.NodeConfig
 		if cont.name == "" {
 			continue
 		}
-		s, _, err := sp.provider.GetCgroupStats(cont.name, cont.forceStatsUpdate)
+		s, _, err := sp.provider.GetCgroupStats(ctx, cont.name, cont.forceStatsUpdate)
 		if err != nil {
-			klog.Errorf("Failed to get system container stats for %q: %v", cont.name, err)
+			logger.Error(err, "Failed to get system container stats", "containerName", cont.name)
 			continue
 		}
 		// System containers don't have a filesystem associated with them.
@@ -61,7 +66,8 @@ func (sp *summaryProviderImpl) GetSystemContainersStats(nodeConfig cm.NodeConfig
 	return stats
 }
 
-func (sp *summaryProviderImpl) GetSystemContainersCPUAndMemoryStats(nodeConfig cm.NodeConfig, podStats []statsapi.PodStats, updateStats bool) (stats []statsapi.ContainerStats) {
+func (sp *summaryProviderImpl) GetSystemContainersCPUAndMemoryStats(ctx context.Context, nodeConfig cm.NodeConfig, podStats []statsapi.PodStats, updateStats bool) (stats []statsapi.ContainerStats) {
+	logger := klog.FromContext(ctx)
 	systemContainers := map[string]struct {
 		name             string
 		forceStatsUpdate bool
@@ -79,7 +85,11 @@ func (sp *summaryProviderImpl) GetSystemContainersCPUAndMemoryStats(nodeConfig c
 		}
 		s, err := sp.provider.GetCgroupCPUAndMemoryStats(cont.name, cont.forceStatsUpdate)
 		if err != nil {
-			klog.Errorf("Failed to get system container stats for %q: %v", cont.name, err)
+			if errors.Is(err, cadvisormemory.ErrDataNotFound) {
+				logger.V(4).Info("cgroup stats not found in memory cache", "containerName", cont.name)
+			} else {
+				logger.Error(err, "Failed to get system container stats", "containerName", cont.name)
+			}
 			continue
 		}
 		s.Name = sys

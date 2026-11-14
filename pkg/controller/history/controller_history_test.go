@@ -18,17 +18,21 @@ package history
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"reflect"
 	"testing"
+	"time"
 
 	apps "k8s.io/api/apps/v1"
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes/fake"
+	clientscheme "k8s.io/client-go/kubernetes/scheme"
+	core "k8s.io/client-go/testing"
+	"k8s.io/ktesting"
 	"k8s.io/kubernetes/pkg/api/legacyscheme"
-	"k8s.io/kubernetes/pkg/api/testapi"
 	"k8s.io/kubernetes/pkg/controller"
 
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -38,9 +42,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/strategicpatch"
-
-	core "k8s.io/client-go/testing"
-	"time"
+	"k8s.io/utils/ptr"
 )
 
 func TestRealHistory_ListControllerRevisions(t *testing.T) {
@@ -51,30 +53,32 @@ func TestRealHistory_ListControllerRevisions(t *testing.T) {
 		revisions []*apps.ControllerRevision
 		want      map[string]bool
 	}
-	testFn := func(test *testcase, t *testing.T) {
+	testFn := func(tCtx ktesting.TContext, test *testcase) {
 		client := fake.NewSimpleClientset()
 		informerFactory := informers.NewSharedInformerFactory(client, controller.NoResyncPeriodFunc())
 
-		stop := make(chan struct{})
-		defer close(stop)
-		informerFactory.Start(stop)
+		informerFactory.StartWithContext(tCtx)
+		tCtx.Cleanup(func() {
+			informerFactory.Shutdown()
+		})
 		informer := informerFactory.Apps().V1().ControllerRevisions()
-		informerFactory.WaitForCacheSync(stop)
+		if err := AddControllerRevisionControllerIndexer(informer.Informer()); err != nil {
+			tCtx.Fatalf("failed to add indexer: %v", err)
+		}
+		informerFactory.WaitForCacheSyncWithContext(tCtx)
 		for i := range test.revisions {
 			informer.Informer().GetIndexer().Add(test.revisions[i])
 		}
 
-		history := NewHistory(client, informer.Lister())
-		revisions, err := history.ListControllerRevisions(test.parent, test.selector)
-		if err != nil {
-			t.Errorf("%s: %s", test.name, err)
-		}
+		history := NewHistory(client, informer.Lister(), informer.Informer().GetIndexer())
+		revisions, err := history.ListControllerRevisions(test.parent, parentKind, test.selector)
+		tCtx.ExpectNoError(err, "list controller revisions")
 		got := make(map[string]bool)
 		for i := range revisions {
 			got[revisions[i].Name] = true
 		}
 		if !reflect.DeepEqual(test.want, got) {
-			t.Errorf("%s: want %v got %v", test.name, test.want, got)
+			tCtx.Errorf("want %v got %v", test.want, got)
 		}
 	}
 	ss1 := newStatefulSet(3, "ss1", types.UID("ss1"), map[string]string{"foo": "bar"})
@@ -136,7 +140,9 @@ func TestRealHistory_ListControllerRevisions(t *testing.T) {
 		},
 	}
 	for i := range tests {
-		testFn(&tests[i], t)
+		t.Run(tests[i].name, func(t *testing.T) {
+			testFn(ktesting.Init(t), &tests[i])
+		})
 	}
 }
 
@@ -148,30 +154,34 @@ func TestFakeHistory_ListControllerRevisions(t *testing.T) {
 		revisions []*apps.ControllerRevision
 		want      map[string]bool
 	}
-	testFn := func(test *testcase, t *testing.T) {
+	testFn := func(tCtx ktesting.TContext, test *testcase) {
 		client := fake.NewSimpleClientset()
 		informerFactory := informers.NewSharedInformerFactory(client, controller.NoResyncPeriodFunc())
 
-		stop := make(chan struct{})
-		defer close(stop)
-		informerFactory.Start(stop)
+		informerFactory.StartWithContext(tCtx)
+		tCtx.Cleanup(func() {
+			informerFactory.Shutdown()
+		})
 		informer := informerFactory.Apps().V1().ControllerRevisions()
-		informerFactory.WaitForCacheSync(stop)
+		if err := AddControllerRevisionControllerIndexer(informer.Informer()); err != nil {
+			tCtx.Fatalf("failed to add indexer: %v", err)
+		}
+		informerFactory.WaitForCacheSyncWithContext(tCtx)
 		for i := range test.revisions {
 			informer.Informer().GetIndexer().Add(test.revisions[i])
 		}
 
 		history := NewFakeHistory(informer)
-		revisions, err := history.ListControllerRevisions(test.parent, test.selector)
+		revisions, err := history.ListControllerRevisions(test.parent, parentKind, test.selector)
 		if err != nil {
-			t.Errorf("%s: %s", test.name, err)
+			tCtx.Errorf("%s", err)
 		}
 		got := make(map[string]bool)
 		for i := range revisions {
 			got[revisions[i].Name] = true
 		}
 		if !reflect.DeepEqual(test.want, got) {
-			t.Errorf("%s: want %v got %v", test.name, test.want, got)
+			tCtx.Errorf("want %v got %v", test.want, got)
 		}
 	}
 	ss1 := newStatefulSet(3, "ss1", types.UID("ss1"), map[string]string{"foo": "bar"})
@@ -233,7 +243,9 @@ func TestFakeHistory_ListControllerRevisions(t *testing.T) {
 		},
 	}
 	for i := range tests {
-		testFn(&tests[i], t)
+		t.Run(tests[i].name, func(t *testing.T) {
+			testFn(ktesting.Init(t), &tests[i])
+		})
 	}
 }
 
@@ -248,50 +260,54 @@ func TestRealHistory_CreateControllerRevision(t *testing.T) {
 		}
 		rename bool
 	}
-	testFn := func(test *testcase, t *testing.T) {
+	testFn := func(tCtx ktesting.TContext, test *testcase) {
 		client := fake.NewSimpleClientset()
 		informerFactory := informers.NewSharedInformerFactory(client, controller.NoResyncPeriodFunc())
-		stop := make(chan struct{})
-		defer close(stop)
-		informerFactory.Start(stop)
+		informerFactory.StartWithContext(tCtx)
+		tCtx.Cleanup(func() {
+			informerFactory.Shutdown()
+		})
 		informer := informerFactory.Apps().V1().ControllerRevisions()
-		informerFactory.WaitForCacheSync(stop)
-		history := NewHistory(client, informer.Lister())
+		if err := AddControllerRevisionControllerIndexer(informer.Informer()); err != nil {
+			tCtx.Fatalf("failed to add indexer: %v", err)
+		}
+		informerFactory.WaitForCacheSyncWithContext(tCtx)
+		history := NewHistory(client, informer.Lister(), informer.Informer().GetIndexer())
 
 		var collisionCount int32
 		for _, item := range test.existing {
-			_, err := client.AppsV1().ControllerRevisions(item.parent.GetNamespace()).Create(item.revision)
+			_, err := client.AppsV1().ControllerRevisions(item.parent.GetNamespace()).Create(context.TODO(), item.revision, metav1.CreateOptions{})
 			if err != nil {
-				t.Fatal(err)
+				tCtx.Fatal(err)
 			}
 		}
 		// Clear collisionCount before creating the test revision
 		collisionCount = 0
 		created, err := history.CreateControllerRevision(test.parent, test.revision, &collisionCount)
 		if err != nil {
-			t.Errorf("%s: %s", test.name, err)
+			tCtx.Errorf("%s", err)
 		}
 
 		if test.rename {
 			if created.Name == test.revision.Name {
-				t.Errorf("%s: wanted rename got %s %s", test.name, created.Name, test.revision.Name)
+				tCtx.Errorf("wanted rename got %s %s", created.Name, test.revision.Name)
 			}
 			expectedName := ControllerRevisionName(test.parent.GetName(), HashControllerRevision(test.revision, &collisionCount))
 			if created.Name != expectedName {
-				t.Errorf("%s: on name collision wanted new name %s got %s", test.name, expectedName, created.Name)
+				tCtx.Errorf("on name collision wanted new name %s got %s", expectedName, created.Name)
 			}
 
 			// Second name collision will be caused by an identical revision, so no need to do anything
 			_, err = history.CreateControllerRevision(test.parent, test.revision, &collisionCount)
 			if err != nil {
-				t.Errorf("%s: %s", test.name, err)
+				tCtx.Errorf("%s", err)
 			}
 			if collisionCount != 1 {
-				t.Errorf("%s: on second name collision wanted collisionCount 1 got %d", test.name, collisionCount)
+				tCtx.Errorf("on second name collision wanted collisionCount 1 got %d", collisionCount)
 			}
 		}
 		if !test.rename && created.Name != test.revision.Name {
-			t.Errorf("%s: wanted %s got %s", test.name, test.revision.Name, created.Name)
+			tCtx.Errorf("wanted %s got %s", test.revision.Name, created.Name)
 		}
 	}
 	ss1 := newStatefulSet(3, "ss1", types.UID("ss1"), map[string]string{"foo": "bar"})
@@ -364,7 +380,9 @@ func TestRealHistory_CreateControllerRevision(t *testing.T) {
 		},
 	}
 	for i := range tests {
-		testFn(&tests[i], t)
+		t.Run(tests[i].name, func(t *testing.T) {
+			testFn(ktesting.Init(t), &tests[i])
+		})
 	}
 }
 
@@ -379,51 +397,55 @@ func TestFakeHistory_CreateControllerRevision(t *testing.T) {
 		}
 		rename bool
 	}
-	testFn := func(test *testcase, t *testing.T) {
+	testFn := func(tCtx ktesting.TContext, test *testcase) {
 		client := fake.NewSimpleClientset()
 		informerFactory := informers.NewSharedInformerFactory(client, controller.NoResyncPeriodFunc())
 
-		stop := make(chan struct{})
-		defer close(stop)
-		informerFactory.Start(stop)
+		informerFactory.StartWithContext(tCtx)
+		tCtx.Cleanup(func() {
+			informerFactory.Shutdown()
+		})
 		informer := informerFactory.Apps().V1().ControllerRevisions()
-		informerFactory.WaitForCacheSync(stop)
+		if err := AddControllerRevisionControllerIndexer(informer.Informer()); err != nil {
+			tCtx.Fatalf("failed to add indexer: %v", err)
+		}
+		informerFactory.WaitForCacheSyncWithContext(tCtx)
 		history := NewFakeHistory(informer)
 
 		var collisionCount int32
 		for i := range test.existing {
 			_, err := history.CreateControllerRevision(test.existing[i].parent, test.existing[i].revision, &collisionCount)
 			if err != nil {
-				t.Fatal(err)
+				tCtx.Fatal(err)
 			}
 		}
 		// Clear collisionCount before creating the test revision
 		collisionCount = 0
 		created, err := history.CreateControllerRevision(test.parent, test.revision, &collisionCount)
 		if err != nil {
-			t.Errorf("%s: %s", test.name, err)
+			tCtx.Errorf("%s", err)
 		}
 
 		if test.rename {
 			if created.Name == test.revision.Name {
-				t.Errorf("%s: wanted rename got %s %s", test.name, created.Name, test.revision.Name)
+				tCtx.Errorf("wanted rename got %s %s", created.Name, test.revision.Name)
 			}
 			expectedName := ControllerRevisionName(test.parent.GetName(), HashControllerRevision(test.revision, &collisionCount))
 			if created.Name != expectedName {
-				t.Errorf("%s: on name collision wanted new name %s got %s", test.name, expectedName, created.Name)
+				tCtx.Errorf("on name collision wanted new name %s got %s", expectedName, created.Name)
 			}
 
 			// Second name collision should have incremented collisionCount to 2
 			_, err = history.CreateControllerRevision(test.parent, test.revision, &collisionCount)
 			if err != nil {
-				t.Errorf("%s: %s", test.name, err)
+				tCtx.Errorf("%s", err)
 			}
 			if collisionCount != 2 {
-				t.Errorf("%s: on second name collision wanted collisionCount 1 got %d", test.name, collisionCount)
+				tCtx.Errorf("on second name collision wanted collisionCount 1 got %d", collisionCount)
 			}
 		}
 		if !test.rename && created.Name != test.revision.Name {
-			t.Errorf("%s: wanted %s got %s", test.name, test.revision.Name, created.Name)
+			tCtx.Errorf("wanted %s got %s", test.revision.Name, created.Name)
 		}
 	}
 	ss1 := newStatefulSet(3, "ss1", types.UID("ss1"), map[string]string{"foo": "bar"})
@@ -487,7 +509,9 @@ func TestFakeHistory_CreateControllerRevision(t *testing.T) {
 		},
 	}
 	for i := range tests {
-		testFn(&tests[i], t)
+		t.Run(tests[i].name, func(t *testing.T) {
+			testFn(ktesting.Init(t), &tests[i])
+		})
 	}
 }
 
@@ -529,21 +553,25 @@ func TestRealHistory_UpdateControllerRevision(t *testing.T) {
 		}
 	}
 
-	testFn := func(test *testcase, t *testing.T) {
+	testFn := func(tCtx ktesting.TContext, test *testcase) {
 		client := fake.NewSimpleClientset()
 
 		informerFactory := informers.NewSharedInformerFactory(client, controller.NoResyncPeriodFunc())
-		stop := make(chan struct{})
-		defer close(stop)
-		informerFactory.Start(stop)
+		informerFactory.StartWithContext(tCtx)
+		tCtx.Cleanup(func() {
+			informerFactory.Shutdown()
+		})
 		informer := informerFactory.Apps().V1().ControllerRevisions()
-		informerFactory.WaitForCacheSync(stop)
-		history := NewHistory(client, informer.Lister())
+		if err := AddControllerRevisionControllerIndexer(informer.Informer()); err != nil {
+			tCtx.Fatalf("failed to add indexer: %v", err)
+		}
+		informerFactory.WaitForCacheSyncWithContext(tCtx)
+		history := NewHistory(client, informer.Lister(), informer.Informer().GetIndexer())
 		var collisionCount int32
 		for i := range test.existing {
 			_, err := history.CreateControllerRevision(test.existing[i].parent, test.existing[i].revision, &collisionCount)
 			if err != nil {
-				t.Fatal(err)
+				tCtx.Fatal(err)
 			}
 		}
 		if test.reactor != nil {
@@ -551,13 +579,13 @@ func TestRealHistory_UpdateControllerRevision(t *testing.T) {
 		}
 		updated, err := history.UpdateControllerRevision(test.revision, test.newRevision)
 		if !test.err && err != nil {
-			t.Errorf("%s: %s", test.name, err)
+			tCtx.Errorf("%s", err)
 		}
 		if !test.err && updated.Revision != test.newRevision {
-			t.Errorf("%s: got %d want %d", test.name, updated.Revision, test.newRevision)
+			tCtx.Errorf("got %d want %d", updated.Revision, test.newRevision)
 		}
 		if test.err && err == nil {
-			t.Errorf("%s: expected error", test.name)
+			tCtx.Errorf("expected error")
 		}
 	}
 	ss1 := newStatefulSet(3, "ss1", types.UID("ss1"), map[string]string{"foo": "bar"})
@@ -640,7 +668,9 @@ func TestRealHistory_UpdateControllerRevision(t *testing.T) {
 	}
 	for i := range tests {
 		conflictAttempts = 0
-		testFn(&tests[i], t)
+		t.Run(tests[i].name, func(t *testing.T) {
+			testFn(ktesting.Init(t), &tests[i])
+		})
 	}
 }
 
@@ -656,32 +686,36 @@ func TestFakeHistory_UpdateControllerRevision(t *testing.T) {
 		err bool
 	}
 
-	testFn := func(test *testcase, t *testing.T) {
+	testFn := func(tCtx ktesting.TContext, test *testcase) {
 		client := fake.NewSimpleClientset()
 
 		informerFactory := informers.NewSharedInformerFactory(client, controller.NoResyncPeriodFunc())
-		stop := make(chan struct{})
-		defer close(stop)
-		informerFactory.Start(stop)
+		informerFactory.StartWithContext(tCtx)
+		tCtx.Cleanup(func() {
+			informerFactory.Shutdown()
+		})
 		informer := informerFactory.Apps().V1().ControllerRevisions()
-		informerFactory.WaitForCacheSync(stop)
+		if err := AddControllerRevisionControllerIndexer(informer.Informer()); err != nil {
+			tCtx.Fatalf("failed to add indexer: %v", err)
+		}
+		informerFactory.WaitForCacheSyncWithContext(tCtx)
 		history := NewFakeHistory(informer)
 		var collisionCount int32
 		for i := range test.existing {
 			_, err := history.CreateControllerRevision(test.existing[i].parent, test.existing[i].revision, &collisionCount)
 			if err != nil {
-				t.Fatal(err)
+				tCtx.Fatal(err)
 			}
 		}
 		updated, err := history.UpdateControllerRevision(test.revision, test.newRevision)
 		if !test.err && err != nil {
-			t.Errorf("%s: %s", test.name, err)
+			tCtx.Errorf("%s", err)
 		}
 		if !test.err && updated.Revision != test.newRevision {
-			t.Errorf("%s: got %d want %d", test.name, updated.Revision, test.newRevision)
+			tCtx.Errorf("got %d want %d", updated.Revision, test.newRevision)
 		}
 		if test.err && err == nil {
-			t.Errorf("%s: expected error", test.name)
+			tCtx.Errorf("expected error")
 		}
 	}
 	ss1 := newStatefulSet(3, "ss1", types.UID("ss1"), map[string]string{"foo": "bar"})
@@ -730,7 +764,9 @@ func TestFakeHistory_UpdateControllerRevision(t *testing.T) {
 		},
 	}
 	for i := range tests {
-		testFn(&tests[i], t)
+		t.Run(tests[i].name, func(t *testing.T) {
+			testFn(ktesting.Init(t), &tests[i])
+		})
 	}
 }
 
@@ -744,29 +780,33 @@ func TestRealHistory_DeleteControllerRevision(t *testing.T) {
 		}
 		err bool
 	}
-	testFn := func(test *testcase, t *testing.T) {
+	testFn := func(tCtx ktesting.TContext, test *testcase) {
 		client := fake.NewSimpleClientset()
 		informerFactory := informers.NewSharedInformerFactory(client, controller.NoResyncPeriodFunc())
 
-		stop := make(chan struct{})
-		defer close(stop)
-		informerFactory.Start(stop)
+		informerFactory.StartWithContext(tCtx)
+		tCtx.Cleanup(func() {
+			informerFactory.Shutdown()
+		})
 		informer := informerFactory.Apps().V1().ControllerRevisions()
-		informerFactory.WaitForCacheSync(stop)
-		history := NewHistory(client, informer.Lister())
+		if err := AddControllerRevisionControllerIndexer(informer.Informer()); err != nil {
+			tCtx.Fatalf("failed to add indexer: %v", err)
+		}
+		informerFactory.WaitForCacheSyncWithContext(tCtx)
+		history := NewHistory(client, informer.Lister(), informer.Informer().GetIndexer())
 		var collisionCount int32
 		for i := range test.existing {
 			_, err := history.CreateControllerRevision(test.existing[i].parent, test.existing[i].revision, &collisionCount)
 			if err != nil {
-				t.Fatal(err)
+				tCtx.Fatal(err)
 			}
 		}
 		err := history.DeleteControllerRevision(test.revision)
 		if !test.err && err != nil {
-			t.Errorf("%s: %s", test.name, err)
+			tCtx.Errorf("%s", err)
 		}
 		if test.err && err == nil {
-			t.Errorf("%s: expected error", test.name)
+			tCtx.Errorf("expected error")
 		}
 	}
 	ss1 := newStatefulSet(3, "ss1", types.UID("ss1"), map[string]string{"foo": "bar"})
@@ -833,7 +873,9 @@ func TestRealHistory_DeleteControllerRevision(t *testing.T) {
 		},
 	}
 	for i := range tests {
-		testFn(&tests[i], t)
+		t.Run(tests[i].name, func(t *testing.T) {
+			testFn(ktesting.Init(t), &tests[i])
+		})
 	}
 }
 
@@ -847,29 +889,33 @@ func TestFakeHistory_DeleteControllerRevision(t *testing.T) {
 		}
 		err bool
 	}
-	testFn := func(test *testcase, t *testing.T) {
+	testFn := func(tCtx ktesting.TContext, test *testcase) {
 		client := fake.NewSimpleClientset()
 		informerFactory := informers.NewSharedInformerFactory(client, controller.NoResyncPeriodFunc())
 
-		stop := make(chan struct{})
-		defer close(stop)
-		informerFactory.Start(stop)
+		informerFactory.StartWithContext(tCtx)
+		tCtx.Cleanup(func() {
+			informerFactory.Shutdown()
+		})
 		informer := informerFactory.Apps().V1().ControllerRevisions()
-		informerFactory.WaitForCacheSync(stop)
+		if err := AddControllerRevisionControllerIndexer(informer.Informer()); err != nil {
+			tCtx.Fatalf("failed to add indexer: %v", err)
+		}
+		informerFactory.WaitForCacheSyncWithContext(tCtx)
 		history := NewFakeHistory(informer)
 		var collisionCount int32
 		for i := range test.existing {
 			_, err := history.CreateControllerRevision(test.existing[i].parent, test.existing[i].revision, &collisionCount)
 			if err != nil {
-				t.Fatal(err)
+				tCtx.Fatal(err)
 			}
 		}
 		err := history.DeleteControllerRevision(test.revision)
 		if !test.err && err != nil {
-			t.Errorf("%s: %s", test.name, err)
+			tCtx.Errorf("%s", err)
 		}
 		if test.err && err == nil {
-			t.Errorf("%s: expected error", test.name)
+			tCtx.Errorf("expected error")
 		}
 	}
 	ss1 := newStatefulSet(3, "ss1", types.UID("ss1"), map[string]string{"foo": "bar"})
@@ -936,7 +982,9 @@ func TestFakeHistory_DeleteControllerRevision(t *testing.T) {
 		},
 	}
 	for i := range tests {
-		testFn(&tests[i], t)
+		t.Run(tests[i].name, func(t *testing.T) {
+			testFn(ktesting.Init(t), &tests[i])
+		})
 	}
 }
 
@@ -951,7 +999,7 @@ func TestRealHistory_AdoptControllerRevision(t *testing.T) {
 		}
 		err bool
 	}
-	testFn := func(test *testcase, t *testing.T) {
+	testFn := func(tCtx ktesting.TContext, test *testcase) {
 		client := fake.NewSimpleClientset()
 		client.AddReactor("*", "*", func(action core.Action) (bool, runtime.Object, error) {
 			switch action := action.(type) {
@@ -968,12 +1016,12 @@ func TestRealHistory_AdoptControllerRevision(t *testing.T) {
 					return true, nil, errors.NewNotFound(apps.Resource("controllerrevisions"), test.revision.Name)
 				}
 				b, err := strategicpatch.StrategicMergePatch(
-					[]byte(runtime.EncodeOrDie(testapi.Apps.Codec(), test.revision)),
+					[]byte(runtime.EncodeOrDie(clientscheme.Codecs.LegacyCodec(apps.SchemeGroupVersion), test.revision)),
 					action.GetPatch(), test.revision)
 				if err != nil {
 					return true, nil, err
 				}
-				obj, err := runtime.Decode(testapi.Apps.Codec(), b)
+				obj, err := runtime.Decode(clientscheme.Codecs.LegacyCodec(apps.SchemeGroupVersion), b)
 				if err != nil {
 					return true, nil, err
 				}
@@ -988,29 +1036,33 @@ func TestRealHistory_AdoptControllerRevision(t *testing.T) {
 
 		})
 		informerFactory := informers.NewSharedInformerFactory(client, controller.NoResyncPeriodFunc())
-		stop := make(chan struct{})
-		defer close(stop)
-		informerFactory.Start(stop)
+		informerFactory.StartWithContext(tCtx)
+		tCtx.Cleanup(func() {
+			informerFactory.Shutdown()
+		})
 		informer := informerFactory.Apps().V1().ControllerRevisions()
-		informerFactory.WaitForCacheSync(stop)
+		if err := AddControllerRevisionControllerIndexer(informer.Informer()); err != nil {
+			tCtx.Fatalf("failed to add indexer: %v", err)
+		}
+		informerFactory.WaitForCacheSyncWithContext(tCtx)
 
-		history := NewHistory(client, informer.Lister())
+		history := NewHistory(client, informer.Lister(), informer.Informer().GetIndexer())
 		var collisionCount int32
 		for i := range test.existing {
 			_, err := history.CreateControllerRevision(test.existing[i].parent, test.existing[i].revision, &collisionCount)
 			if err != nil {
-				t.Fatal(err)
+				tCtx.Fatal(err)
 			}
 		}
 		adopted, err := history.AdoptControllerRevision(test.parent, parentKind, test.revision)
 		if !test.err && err != nil {
-			t.Errorf("%s: %s", test.name, err)
+			tCtx.Errorf("%s", err)
 		}
 		if !test.err && !metav1.IsControlledBy(adopted, test.parent) {
-			t.Errorf("%s: adoption failed", test.name)
+			tCtx.Errorf("adoption failed")
 		}
 		if test.err && err == nil {
-			t.Errorf("%s: expected error", test.name)
+			tCtx.Errorf("expected error")
 		}
 	}
 
@@ -1074,7 +1126,9 @@ func TestRealHistory_AdoptControllerRevision(t *testing.T) {
 		},
 	}
 	for i := range tests {
-		testFn(&tests[i], t)
+		t.Run(tests[i].name, func(t *testing.T) {
+			testFn(ktesting.Init(t), &tests[i])
+		})
 	}
 }
 
@@ -1090,33 +1144,37 @@ func TestFakeHistory_AdoptControllerRevision(t *testing.T) {
 		}
 		err bool
 	}
-	testFn := func(test *testcase, t *testing.T) {
+	testFn := func(tCtx ktesting.TContext, test *testcase) {
 		client := fake.NewSimpleClientset()
 
 		informerFactory := informers.NewSharedInformerFactory(client, controller.NoResyncPeriodFunc())
-		stop := make(chan struct{})
-		defer close(stop)
-		informerFactory.Start(stop)
+		informerFactory.StartWithContext(tCtx)
+		tCtx.Cleanup(func() {
+			informerFactory.Shutdown()
+		})
 		informer := informerFactory.Apps().V1().ControllerRevisions()
-		informerFactory.WaitForCacheSync(stop)
+		if err := AddControllerRevisionControllerIndexer(informer.Informer()); err != nil {
+			tCtx.Fatalf("failed to add indexer: %v", err)
+		}
+		informerFactory.WaitForCacheSyncWithContext(tCtx)
 
 		history := NewFakeHistory(informer)
 		var collisionCount int32
 		for i := range test.existing {
 			_, err := history.CreateControllerRevision(test.existing[i].parent, test.existing[i].revision, &collisionCount)
 			if err != nil {
-				t.Fatal(err)
+				tCtx.Fatal(err)
 			}
 		}
 		adopted, err := history.AdoptControllerRevision(test.parent, parentKind, test.revision)
 		if !test.err && err != nil {
-			t.Errorf("%s: %s", test.name, err)
+			tCtx.Errorf("%s", err)
 		}
 		if !test.err && !metav1.IsControlledBy(adopted, test.parent) {
-			t.Errorf("%s: adoption failed", test.name)
+			tCtx.Errorf("adoption failed")
 		}
 		if test.err && err == nil {
-			t.Errorf("%s: expected error", test.name)
+			tCtx.Errorf("expected error")
 		}
 	}
 
@@ -1183,7 +1241,9 @@ func TestFakeHistory_AdoptControllerRevision(t *testing.T) {
 		},
 	}
 	for i := range tests {
-		testFn(&tests[i], t)
+		t.Run(tests[i].name, func(t *testing.T) {
+			testFn(ktesting.Init(t), &tests[i])
+		})
 	}
 }
 
@@ -1198,7 +1258,7 @@ func TestRealHistory_ReleaseControllerRevision(t *testing.T) {
 		}
 		err bool
 	}
-	testFn := func(test *testcase, t *testing.T) {
+	testFn := func(tCtx ktesting.TContext, test *testcase) {
 		client := fake.NewSimpleClientset()
 		client.AddReactor("*", "*", func(action core.Action) (bool, runtime.Object, error) {
 			switch action := action.(type) {
@@ -1219,12 +1279,12 @@ func TestRealHistory_ReleaseControllerRevision(t *testing.T) {
 						test.revision.GroupVersionKind().GroupKind(), test.revision.Name, nil)
 				}
 				b, err := strategicpatch.StrategicMergePatch(
-					[]byte(runtime.EncodeOrDie(testapi.Apps.Codec(), test.revision)),
+					[]byte(runtime.EncodeOrDie(clientscheme.Codecs.LegacyCodec(apps.SchemeGroupVersion), test.revision)),
 					action.GetPatch(), test.revision)
 				if err != nil {
 					return true, nil, err
 				}
-				obj, err := runtime.Decode(testapi.Apps.Codec(), b)
+				obj, err := runtime.Decode(clientscheme.Codecs.LegacyCodec(apps.SchemeGroupVersion), b)
 				if err != nil {
 					return true, nil, err
 				}
@@ -1239,34 +1299,38 @@ func TestRealHistory_ReleaseControllerRevision(t *testing.T) {
 
 		})
 		informerFactory := informers.NewSharedInformerFactory(client, controller.NoResyncPeriodFunc())
-		stop := make(chan struct{})
-		defer close(stop)
-		informerFactory.Start(stop)
+		informerFactory.StartWithContext(tCtx)
+		tCtx.Cleanup(func() {
+			informerFactory.Shutdown()
+		})
 		informer := informerFactory.Apps().V1().ControllerRevisions()
-		informerFactory.WaitForCacheSync(stop)
+		if err := AddControllerRevisionControllerIndexer(informer.Informer()); err != nil {
+			tCtx.Fatalf("failed to add indexer: %v", err)
+		}
+		informerFactory.WaitForCacheSyncWithContext(tCtx)
 
-		history := NewHistory(client, informer.Lister())
+		history := NewHistory(client, informer.Lister(), informer.Informer().GetIndexer())
 		var collisionCount int32
 		for i := range test.existing {
 			_, err := history.CreateControllerRevision(test.existing[i].parent, test.existing[i].revision, &collisionCount)
 			if err != nil {
-				t.Fatal(err)
+				tCtx.Fatal(err)
 			}
 		}
 		adopted, err := history.ReleaseControllerRevision(test.parent, test.revision)
 		if !test.err {
 			if err != nil {
-				t.Errorf("%s: %s", test.name, err)
+				tCtx.Errorf("%s", err)
 			}
 			if adopted == nil {
 				return
 			}
 			if metav1.IsControlledBy(adopted, test.parent) {
-				t.Errorf("%s: release failed", test.name)
+				tCtx.Errorf("release failed")
 			}
 		}
 		if test.err && err == nil {
-			t.Errorf("%s: expected error", test.name)
+			tCtx.Errorf("expected error")
 		}
 	}
 
@@ -1343,7 +1407,9 @@ func TestRealHistory_ReleaseControllerRevision(t *testing.T) {
 		},
 	}
 	for i := range tests {
-		testFn(&tests[i], t)
+		t.Run(tests[i].name, func(t *testing.T) {
+			testFn(ktesting.Init(t), &tests[i])
+		})
 	}
 }
 
@@ -1358,36 +1424,40 @@ func TestFakeHistory_ReleaseControllerRevision(t *testing.T) {
 		}
 		err bool
 	}
-	testFn := func(test *testcase, t *testing.T) {
+	testFn := func(tCtx ktesting.TContext, test *testcase) {
 		client := fake.NewSimpleClientset()
 		informerFactory := informers.NewSharedInformerFactory(client, controller.NoResyncPeriodFunc())
-		stop := make(chan struct{})
-		defer close(stop)
-		informerFactory.Start(stop)
+		informerFactory.StartWithContext(tCtx)
+		tCtx.Cleanup(func() {
+			informerFactory.Shutdown()
+		})
 		informer := informerFactory.Apps().V1().ControllerRevisions()
-		informerFactory.WaitForCacheSync(stop)
+		if err := AddControllerRevisionControllerIndexer(informer.Informer()); err != nil {
+			tCtx.Fatalf("failed to add indexer: %v", err)
+		}
+		informerFactory.WaitForCacheSyncWithContext(tCtx)
 		history := NewFakeHistory(informer)
 		var collisionCount int32
 		for i := range test.existing {
 			_, err := history.CreateControllerRevision(test.existing[i].parent, test.existing[i].revision, &collisionCount)
 			if err != nil {
-				t.Fatal(err)
+				tCtx.Fatal(err)
 			}
 		}
 		adopted, err := history.ReleaseControllerRevision(test.parent, test.revision)
 		if !test.err {
 			if err != nil {
-				t.Errorf("%s: %s", test.name, err)
+				tCtx.Errorf("%s", err)
 			}
 			if adopted == nil {
 				return
 			}
 			if metav1.IsControlledBy(adopted, test.parent) {
-				t.Errorf("%s: release failed", test.name)
+				tCtx.Errorf("release failed")
 			}
 		}
 		if test.err && err == nil {
-			t.Errorf("%s: expected error", test.name)
+			tCtx.Errorf("expected error")
 		}
 	}
 
@@ -1466,7 +1536,9 @@ func TestFakeHistory_ReleaseControllerRevision(t *testing.T) {
 		},
 	}
 	for i := range tests {
-		testFn(&tests[i], t)
+		t.Run(tests[i].name, func(t *testing.T) {
+			testFn(ktesting.Init(t), &tests[i])
+		})
 	}
 }
 
@@ -1477,14 +1549,14 @@ func TestFindEqualRevisions(t *testing.T) {
 		revisions []*apps.ControllerRevision
 		want      map[string]bool
 	}
-	testFn := func(test *testcase, t *testing.T) {
+	testFn := func(tCtx ktesting.TContext, test *testcase) {
 		found := FindEqualRevisions(test.revisions, test.revision)
 		if len(found) != len(test.want) {
-			t.Errorf("%s: want %d revisions found %d", test.name, len(test.want), len(found))
+			tCtx.Errorf("want %d revisions found %d", len(test.want), len(found))
 		}
 		for i := range found {
 			if !test.want[found[i].Name] {
-				t.Errorf("%s: wanted %s not found", test.name, found[i].Name)
+				tCtx.Errorf("wanted %s not found", found[i].Name)
 			}
 
 		}
@@ -1535,7 +1607,9 @@ func TestFindEqualRevisions(t *testing.T) {
 		},
 	}
 	for i := range tests {
-		testFn(&tests[i], t)
+		t.Run(tests[i].name, func(t *testing.T) {
+			testFn(ktesting.Init(t), &tests[i])
+		})
 	}
 }
 
@@ -1545,15 +1619,13 @@ func TestSortControllerRevisions(t *testing.T) {
 		revisions []*apps.ControllerRevision
 		want      []string
 	}
-	testFn := func(test *testcase, t *testing.T) {
-		t.Run(test.name, func(t *testing.T) {
-			SortControllerRevisions(test.revisions)
-			for i := range test.revisions {
-				if test.revisions[i].Name != test.want[i] {
-					t.Errorf("%s: want %s at %d got %s", test.name, test.want[i], i, test.revisions[i].Name)
-				}
+	testFn := func(tCtx ktesting.TContext, test *testcase) {
+		SortControllerRevisions(test.revisions)
+		for i := range test.revisions {
+			if test.revisions[i].Name != test.want[i] {
+				tCtx.Errorf("want %s at %d got %s", test.want[i], i, test.revisions[i].Name)
 			}
-		})
+		}
 	}
 	ss1 := newStatefulSet(3, "ss1", types.UID("ss1"), map[string]string{"foo": "bar"})
 	ss1.Status.CollisionCount = new(int32)
@@ -1617,7 +1689,9 @@ func TestSortControllerRevisions(t *testing.T) {
 		},
 	}
 	for i := range tests {
-		testFn(&tests[i], t)
+		t.Run(tests[i].name, func(t *testing.T) {
+			testFn(ktesting.Init(t), &tests[i])
+		})
 	}
 }
 
@@ -1649,7 +1723,7 @@ func newStatefulSet(replicas int, name string, uid types.UID, labels map[string]
 				MatchLabels:      nil,
 				MatchExpressions: testMatchExpressions,
 			},
-			Replicas: func() *int32 { i := int32(replicas); return &i }(),
+			Replicas: ptr.To[int32](int32(replicas)),
 			Template: v1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
 					Labels: labels,
@@ -1678,7 +1752,7 @@ func newStatefulSet(replicas int, name string, uid types.UID, labels map[string]
 				{
 					ObjectMeta: metav1.ObjectMeta{Name: "datadir"},
 					Spec: v1.PersistentVolumeClaimSpec{
-						Resources: v1.ResourceRequirements{
+						Resources: v1.VolumeResourceRequirements{
 							Requests: v1.ResourceList{
 								v1.ResourceStorage: *resource.NewQuantity(1, resource.BinarySI),
 							},

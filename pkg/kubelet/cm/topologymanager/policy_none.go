@@ -16,9 +16,7 @@ limitations under the License.
 
 package topologymanager
 
-import (
-	"k8s.io/kubernetes/pkg/kubelet/lifecycle"
-)
+import "k8s.io/klog/v2"
 
 type nonePolicy struct{}
 
@@ -36,8 +34,16 @@ func (p *nonePolicy) Name() string {
 	return PolicyNone
 }
 
-func (p *nonePolicy) CanAdmitPodResult(admit bool) lifecycle.PodAdmitResult {
-	return lifecycle.PodAdmitResult{
-		Admit: true,
-	}
+// UsesHintScores is always false: the none policy does not select between
+// hints, so nothing would read a score.
+func (p *nonePolicy) UsesHintScores() bool {
+	return false
+}
+
+func (p *nonePolicy) canAdmitPodResult(_ *TopologyHint) bool {
+	return true
+}
+
+func (p *nonePolicy) Merge(_ klog.Logger, _ []map[string][]TopologyHint) (TopologyHint, bool) {
+	return TopologyHint{}, p.canAdmitPodResult(nil)
 }

@@ -19,6 +19,8 @@ package storage
 import (
 	"context"
 
+	"sigs.k8s.io/structured-merge-diff/v7/fieldpath"
+
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apiserver/pkg/registry/generic"
@@ -37,26 +39,29 @@ type REST struct {
 }
 
 // NewREST returns a RESTStorage object that will work against replication controllers.
-func NewREST(optsGetter generic.RESTOptionsGetter) (*REST, *StatusREST) {
+func NewREST(optsGetter generic.RESTOptionsGetter) (*REST, *StatusREST, error) {
 	store := &genericregistry.Store{
-		NewFunc:                  func() runtime.Object { return &networking.Ingress{} },
-		NewListFunc:              func() runtime.Object { return &networking.IngressList{} },
-		DefaultQualifiedResource: networking.Resource("ingresses"),
+		NewFunc:                   func() runtime.Object { return &networking.Ingress{} },
+		NewListFunc:               func() runtime.Object { return &networking.IngressList{} },
+		DefaultQualifiedResource:  networking.Resource("ingresses"),
+		SingularQualifiedResource: networking.Resource("ingress"),
 
-		CreateStrategy: ingress.Strategy,
-		UpdateStrategy: ingress.Strategy,
-		DeleteStrategy: ingress.Strategy,
+		CreateStrategy:      ingress.Strategy,
+		UpdateStrategy:      ingress.Strategy,
+		DeleteStrategy:      ingress.Strategy,
+		ResetFieldsStrategy: ingress.Strategy,
 
 		TableConvertor: printerstorage.TableConvertor{TableGenerator: printers.NewTableGenerator().With(printersinternal.AddHandlers)},
 	}
 	options := &generic.StoreOptions{RESTOptions: optsGetter}
 	if err := store.CompleteWithOptions(options); err != nil {
-		panic(err) // TODO: Propagate error up
+		return nil, nil, err
 	}
 
 	statusStore := *store
 	statusStore.UpdateStrategy = ingress.StatusStrategy
-	return &REST{store}, &StatusREST{store: &statusStore}
+	statusStore.ResetFieldsStrategy = ingress.StatusStrategy
+	return &REST{store}, &StatusREST{store: &statusStore}, nil
 }
 
 // Implement ShortNamesProvider
@@ -77,6 +82,12 @@ func (r *StatusREST) New() runtime.Object {
 	return &networking.Ingress{}
 }
 
+// Destroy cleans up resources on shutdown.
+func (r *StatusREST) Destroy() {
+	// Given that underlying store is shared with REST,
+	// we don't destroy it here explicitly.
+}
+
 // Get retrieves the object from the storage. It is required to support Patch.
 func (r *StatusREST) Get(ctx context.Context, name string, options *metav1.GetOptions) (runtime.Object, error) {
 	return r.store.Get(ctx, name, options)
@@ -87,4 +98,13 @@ func (r *StatusREST) Update(ctx context.Context, name string, objInfo rest.Updat
 	// We are explicitly setting forceAllowCreate to false in the call to the underlying storage because
 	// subresources should never allow create on update.
 	return r.store.Update(ctx, name, objInfo, createValidation, updateValidation, false, options)
+}
+
+// GetResetFields implements rest.ResetFieldsStrategy
+func (r *StatusREST) GetResetFields() map[fieldpath.APIVersion]*fieldpath.Set {
+	return r.store.GetResetFields()
+}
+
+func (r *StatusREST) ConvertToTable(ctx context.Context, object runtime.Object, tableOptions runtime.Object) (*metav1.Table, error) {
+	return r.store.ConvertToTable(ctx, object, tableOptions)
 }

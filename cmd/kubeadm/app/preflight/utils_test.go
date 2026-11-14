@@ -19,10 +19,10 @@ package preflight
 import (
 	"testing"
 
-	"github.com/pkg/errors"
-
 	utilsexec "k8s.io/utils/exec"
 	fakeexec "k8s.io/utils/exec/testing"
+
+	"k8s.io/kubernetes/cmd/kubeadm/app/util/errors"
 )
 
 func TestGetKubeletVersion(t *testing.T) {
@@ -34,6 +34,9 @@ func TestGetKubeletVersion(t *testing.T) {
 	}{
 		{"Kubernetes v1.7.0", "1.7.0", nil, true},
 		{"Kubernetes v1.8.0-alpha.2.1231+afabd012389d53a", "1.8.0-alpha.2.1231+afabd012389d53a", nil, true},
+		{"Kubernetes v1.8.0-alpha.2.1231+afabd012389d53a ", "1.8.0-alpha.2.1231+afabd012389d53a", nil, true},
+		{" Kubernetes v1.8.0-alpha.2.1231+afabd012389d53a", "1.8.0-alpha.2.1231+afabd012389d53a", nil, true},
+		{"Kubernetes  v1.8.0-alpha.2.1231+afabd012389d53a", "", nil, false},
 		{"something-invalid", "", nil, false},
 		{"command not found", "", errors.New("kubelet not found"), false},
 		{"", "", nil, false},
@@ -42,8 +45,8 @@ func TestGetKubeletVersion(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.output, func(t *testing.T) {
 			fcmd := fakeexec.FakeCmd{
-				CombinedOutputScript: []fakeexec.FakeCombinedOutputAction{
-					func() ([]byte, error) { return []byte(tc.output), tc.err },
+				OutputScript: []fakeexec.FakeAction{
+					func() ([]byte, []byte, error) { return []byte(tc.output), nil, tc.err },
 				},
 			}
 			fexec := &fakeexec.FakeExec{

@@ -17,12 +17,14 @@ limitations under the License.
 package http
 
 import (
+	"bytes"
 	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -30,55 +32,37 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/net/http2"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/kubernetes/pkg/probe"
 )
 
 const FailureCode int = -1
 
-func setEnv(key, value string) func() {
-	originalValue := os.Getenv(key)
-	os.Setenv(key, value)
-	if len(originalValue) > 0 {
-		return func() {
-			os.Setenv(key, originalValue)
-		}
+func unsetEnv(t testing.TB, key string) {
+	if originalValue, ok := os.LookupEnv(key); ok {
+		t.Cleanup(func() { os.Setenv(key, originalValue) })
+		os.Unsetenv(key)
 	}
-	return func() {}
-}
-
-func unsetEnv(key string) func() {
-	originalValue := os.Getenv(key)
-	os.Unsetenv(key)
-	if len(originalValue) > 0 {
-		return func() {
-			os.Setenv(key, originalValue)
-		}
-	}
-	return func() {}
 }
 
 func TestHTTPProbeProxy(t *testing.T) {
 	res := "welcome to http probe proxy"
-	localProxy := "http://127.0.0.1:9098/"
 
-	defer setEnv("http_proxy", localProxy)()
-	defer setEnv("HTTP_PROXY", localProxy)()
-	defer unsetEnv("no_proxy")()
-	defer unsetEnv("NO_PROXY")()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, res)
+	}))
+	defer server.Close()
+
+	localProxy := server.URL
+
+	t.Setenv("http_proxy", localProxy)
+	t.Setenv("HTTP_PROXY", localProxy)
+	unsetEnv(t, "no_proxy")
+	unsetEnv(t, "NO_PROXY")
 
 	followNonLocalRedirects := true
 	prober := New(followNonLocalRedirects)
-
-	go func() {
-		http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-			fmt.Fprintf(w, res)
-		})
-		err := http.ListenAndServe(":9098", nil)
-		if err != nil {
-			t.Errorf("Failed to start foo server: localhost:9098")
-		}
-	}()
 
 	// take some time to wait server boot
 	time.Sleep(2 * time.Second)
@@ -86,7 +70,13 @@ func TestHTTPProbeProxy(t *testing.T) {
 	if err != nil {
 		t.Errorf("proxy test unexpected error: %v", err)
 	}
-	_, response, _ := prober.Probe(url, http.Header{}, time.Second*3)
+
+	req, err := NewProbeRequest(url, http.Header{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, response, _ := prober.Probe(req, time.Second*3)
 
 	if response == res {
 		t.Errorf("proxy test unexpected error: the probe is using proxy")
@@ -113,12 +103,41 @@ func TestHTTPProbeChecker(t *testing.T) {
 		w.Write([]byte(output))
 	}
 
+	// Handler that returns the number of request headers in the body
+	headerCounterHandler := func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+		w.Write([]byte(strconv.Itoa(len(r.Header))))
+	}
+
+	// Handler that returns the keys of request headers in the body
+	headerKeysNamesHandler := func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+		keys := make([]string, 0, len(r.Header))
+		for k := range r.Header {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+
+		w.Write([]byte(strings.Join(keys, "\n")))
+	}
+
 	redirectHandler := func(s int, bad bool) func(w http.ResponseWriter, r *http.Request) {
 		return func(w http.ResponseWriter, r *http.Request) {
 			if r.URL.Path == "/" {
 				http.Redirect(w, r, "/new", s)
 			} else if bad && r.URL.Path == "/new" {
 				http.Error(w, "", http.StatusInternalServerError)
+			}
+		}
+	}
+
+	redirectHandlerWithBody := func(s int, body string) func(w http.ResponseWriter, r *http.Request) {
+		return func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/" {
+				http.Redirect(w, r, "/new", s)
+			} else if r.URL.Path == "/new" {
+				w.WriteHeader(s)
+				w.Write([]byte(body))
 			}
 		}
 	}
@@ -137,6 +156,42 @@ func TestHTTPProbeChecker(t *testing.T) {
 			handler: handleReq(http.StatusOK, "ok body"),
 			health:  probe.Success,
 			accBody: "ok body",
+		},
+		{
+			handler:    headerCounterHandler,
+			reqHeaders: http.Header{},
+			health:     probe.Success,
+			accBody:    "3",
+		},
+		{
+			handler:    headerKeysNamesHandler,
+			reqHeaders: http.Header{},
+			health:     probe.Success,
+			accBody:    "Accept\nConnection\nUser-Agent",
+		},
+		{
+			handler: headerEchoHandler,
+			reqHeaders: http.Header{
+				"Accept-Encoding": {"gzip"},
+			},
+			health:  probe.Success,
+			accBody: "Accept-Encoding: gzip",
+		},
+		{
+			handler: headerEchoHandler,
+			reqHeaders: http.Header{
+				"Accept-Encoding": {"foo"},
+			},
+			health:  probe.Success,
+			accBody: "Accept-Encoding: foo",
+		},
+		{
+			handler: headerEchoHandler,
+			reqHeaders: http.Header{
+				"Accept-Encoding": {""},
+			},
+			health:  probe.Success,
+			accBody: "Accept-Encoding: \n",
 		},
 		{
 			handler: headerEchoHandler,
@@ -167,6 +222,64 @@ func TestHTTPProbeChecker(t *testing.T) {
 			reqHeaders: http.Header{},
 			health:     probe.Success,
 			accBody:    "User-Agent: kube-probe/",
+		},
+		{
+			handler: headerEchoHandler,
+			reqHeaders: http.Header{
+				"User-Agent": {"foo/1.0"},
+				"Accept":     {"text/html"},
+			},
+			health:  probe.Success,
+			accBody: "Accept: text/html",
+		},
+		{
+			handler: headerEchoHandler,
+			reqHeaders: http.Header{
+				"User-Agent": {"foo/1.0"},
+				"Accept":     {"foo/*"},
+			},
+			health:  probe.Success,
+			accBody: "User-Agent: foo/1.0",
+		},
+		{
+			handler: headerEchoHandler,
+			reqHeaders: http.Header{
+				"X-Muffins-Or-Cupcakes": {"muffins"},
+				"Accept":                {"foo/*"},
+			},
+			health:  probe.Success,
+			accBody: "X-Muffins-Or-Cupcakes: muffins",
+		},
+		{
+			handler: headerEchoHandler,
+			reqHeaders: http.Header{
+				"Accept": {"foo/*"},
+			},
+			health:  probe.Success,
+			accBody: "Accept: foo/*",
+		},
+		{
+			handler: headerEchoHandler,
+			reqHeaders: http.Header{
+				"Accept": {""},
+			},
+			health:  probe.Success,
+			notBody: "Accept:",
+		},
+		{
+			handler: headerEchoHandler,
+			reqHeaders: http.Header{
+				"User-Agent": {"foo/1.0"},
+				"Accept":     {""},
+			},
+			health:  probe.Success,
+			notBody: "Accept:",
+		},
+		{
+			handler:    headerEchoHandler,
+			reqHeaders: http.Header{},
+			health:     probe.Success,
+			accBody:    "Accept: */*",
 		},
 		{
 			// Echo handler that returns the contents of Host in the body
@@ -226,6 +339,16 @@ func TestHTTPProbeChecker(t *testing.T) {
 			handler: redirectHandler(http.StatusPermanentRedirect, true), // 308
 			health:  probe.Failure,
 		},
+		{
+			handler: redirectHandlerWithBody(http.StatusPermanentRedirect, ""), // redirect with empty body
+			health:  probe.Warning,
+			accBody: "Probe terminated redirects, Response body:",
+		},
+		{
+			handler: redirectHandlerWithBody(http.StatusPermanentRedirect, "ok body"), // redirect with body
+			health:  probe.Warning,
+			accBody: "Probe terminated redirects, Response body: ok body",
+		},
 	}
 	for i, test := range testCases {
 		t.Run(fmt.Sprintf("case-%2d", i), func(t *testing.T) {
@@ -245,7 +368,11 @@ func TestHTTPProbeChecker(t *testing.T) {
 			if err != nil {
 				t.Errorf("case %d: unexpected error: %v", i, err)
 			}
-			health, output, err := prober.Probe(u, test.reqHeaders, 1*time.Second)
+			req, err := NewProbeRequest(u, test.reqHeaders)
+			if err != nil {
+				t.Fatal(err)
+			}
+			health, output, err := prober.Probe(req, 1*time.Second)
 			if test.health == probe.Unknown && err == nil {
 				t.Errorf("case %d: expected error", i)
 			}
@@ -305,7 +432,9 @@ func TestHTTPProbeChecker_NonLocalRedirects(t *testing.T) {
 			prober := New(followNonLocalRedirects)
 			target, err := url.Parse(server.URL + "/redirect?loc=" + url.QueryEscape(test.redirect))
 			require.NoError(t, err)
-			result, _, _ := prober.Probe(target, nil, wait.ForeverTestTimeout)
+			req, err := NewProbeRequest(target, nil)
+			require.NoError(t, err)
+			result, _, _ := prober.Probe(req, wait.ForeverTestTimeout)
 			assert.Equal(t, test.expectLocalResult, result)
 		})
 		t.Run(desc+"-nonlocal", func(t *testing.T) {
@@ -313,7 +442,9 @@ func TestHTTPProbeChecker_NonLocalRedirects(t *testing.T) {
 			prober := New(followNonLocalRedirects)
 			target, err := url.Parse(server.URL + "/redirect?loc=" + url.QueryEscape(test.redirect))
 			require.NoError(t, err)
-			result, _, _ := prober.Probe(target, nil, wait.ForeverTestTimeout)
+			req, err := NewProbeRequest(target, nil)
+			require.NoError(t, err)
+			result, _, _ := prober.Probe(req, wait.ForeverTestTimeout)
 			assert.Equal(t, test.expectNonLocalResult, result)
 		})
 	}
@@ -355,7 +486,9 @@ func TestHTTPProbeChecker_HostHeaderPreservedAfterRedirect(t *testing.T) {
 			prober := New(followNonLocalRedirects)
 			target, err := url.Parse(server.URL + "/redirect")
 			require.NoError(t, err)
-			result, _, _ := prober.Probe(target, headers, wait.ForeverTestTimeout)
+			req, err := NewProbeRequest(target, headers)
+			require.NoError(t, err)
+			result, _, _ := prober.Probe(req, wait.ForeverTestTimeout)
 			assert.Equal(t, test.expectedResult, result)
 		})
 		t.Run(desc+"nonlocal", func(t *testing.T) {
@@ -363,8 +496,161 @@ func TestHTTPProbeChecker_HostHeaderPreservedAfterRedirect(t *testing.T) {
 			prober := New(followNonLocalRedirects)
 			target, err := url.Parse(server.URL + "/redirect")
 			require.NoError(t, err)
-			result, _, _ := prober.Probe(target, headers, wait.ForeverTestTimeout)
+			req, err := NewProbeRequest(target, headers)
+			require.NoError(t, err)
+			result, _, _ := prober.Probe(req, wait.ForeverTestTimeout)
 			assert.Equal(t, test.expectedResult, result)
 		})
 	}
+}
+
+func TestHTTPProbeChecker_PayloadTruncated(t *testing.T) {
+	successHostHeader := "www.success.com"
+	oversizePayload := bytes.Repeat([]byte("a"), maxRespBodyLength+1)
+	truncatedPayload := bytes.Repeat([]byte("a"), maxRespBodyLength)
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/success":
+			if r.Host == successHostHeader {
+				w.WriteHeader(http.StatusOK)
+				w.Write(oversizePayload)
+			} else {
+				http.Error(w, "", http.StatusBadRequest)
+			}
+		default:
+			http.Error(w, "", http.StatusInternalServerError)
+		}
+	})
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	headers := http.Header{}
+	headers.Add("Host", successHostHeader)
+	t.Run("truncated payload", func(t *testing.T) {
+		prober := New(false)
+		target, err := url.Parse(server.URL + "/success")
+		require.NoError(t, err)
+		req, err := NewProbeRequest(target, headers)
+		require.NoError(t, err)
+		result, body, err := prober.Probe(req, wait.ForeverTestTimeout)
+		assert.NoError(t, err)
+		assert.Equal(t, probe.Success, result)
+		assert.Equal(t, string(truncatedPayload), body)
+	})
+}
+
+func TestHTTPProbeChecker_PayloadNormal(t *testing.T) {
+	successHostHeader := "www.success.com"
+	normalPayload := bytes.Repeat([]byte("a"), maxRespBodyLength-1)
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/success":
+			if r.Host == successHostHeader {
+				w.WriteHeader(http.StatusOK)
+				w.Write(normalPayload)
+			} else {
+				http.Error(w, "", http.StatusBadRequest)
+			}
+		default:
+			http.Error(w, "", http.StatusInternalServerError)
+		}
+	})
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	headers := http.Header{}
+	headers.Add("Host", successHostHeader)
+	t.Run("normal payload", func(t *testing.T) {
+		prober := New(false)
+		target, err := url.Parse(server.URL + "/success")
+		require.NoError(t, err)
+		req, err := NewProbeRequest(target, headers)
+		require.NoError(t, err)
+		result, body, err := prober.Probe(req, wait.ForeverTestTimeout)
+		assert.NoError(t, err)
+		assert.Equal(t, probe.Success, result)
+		assert.Equal(t, string(normalPayload), body)
+	})
+}
+
+// startH2CServer serves HTTP/2 in cleartext (h2c / prior knowledge) by accepting
+// raw TCP connections and handing them directly to http2.Server.ServeConn.
+func startH2CServer(t *testing.T, handler http.Handler) (addr string, cleanup func()) {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	h2s := &http2.Server{}
+	base := &http.Server{Handler: handler}
+	go func() {
+		for {
+			c, err := l.Accept()
+			if err != nil {
+				return
+			}
+			go h2s.ServeConn(c, &http2.ServeConnOpts{
+				Handler:    handler,
+				BaseConfig: base,
+			})
+		}
+	}()
+	return l.Addr().String(), func() { _ = l.Close() }
+}
+
+func TestProbeH2C_H2C_Success(t *testing.T) {
+	addr, cleanup := startH2CServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("h2c ok"))
+	}))
+	defer cleanup()
+	time.Sleep(100 * time.Millisecond)
+
+	prober := New(false)
+	target, err := url.Parse("http://" + addr + "/health")
+	require.NoError(t, err)
+	req, err := NewProbeRequest(target, nil)
+	require.NoError(t, err)
+
+	result, body, err := prober.ProbeH2C(req, wait.ForeverTestTimeout)
+	require.NoError(t, err)
+	assert.Equal(t, probe.Success, result)
+	assert.Equal(t, "h2c ok", body)
+}
+
+func TestProbeH2C_H2C_Failure(t *testing.T) {
+	addr, cleanup := startH2CServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte("h2c error"))
+	}))
+	defer cleanup()
+	time.Sleep(100 * time.Millisecond)
+
+	prober := New(false)
+	target, err := url.Parse("http://" + addr + "/health")
+	require.NoError(t, err)
+	req, err := NewProbeRequest(target, nil)
+	require.NoError(t, err)
+
+	result, _, err := prober.ProbeH2C(req, wait.ForeverTestTimeout)
+	require.NoError(t, err)
+	assert.Equal(t, probe.Failure, result)
+}
+
+func TestProbeH2C_H2C_Timeout(t *testing.T) {
+	addr, cleanup := startH2CServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(5 * time.Second)
+	}))
+	defer cleanup()
+	time.Sleep(100 * time.Millisecond)
+
+	prober := New(false)
+	target, err := url.Parse("http://" + addr + "/health")
+	require.NoError(t, err)
+	req, err := NewProbeRequest(target, nil)
+	require.NoError(t, err)
+
+	result, _, err := prober.ProbeH2C(req, 1*time.Second)
+	require.NoError(t, err)
+	assert.Equal(t, probe.Failure, result)
 }

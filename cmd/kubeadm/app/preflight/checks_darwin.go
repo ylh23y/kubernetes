@@ -1,4 +1,4 @@
-// +build darwin
+//go:build darwin
 
 /*
 Copyright 2019 The Kubernetes Authors.
@@ -18,16 +18,18 @@ limitations under the License.
 
 package preflight
 
+import utilsexec "k8s.io/utils/exec"
+
 // This is a MacOS stub
 
-// Check validates if Docker is setup to use systemd as the cgroup driver.
+// Check number of memory required by kubeadm
 // No-op for Darwin (MacOS).
-func (idsc IsDockerSystemdCheck) Check() (warnings, errorList []error) {
+func (mc MemCheck) Check() (warnings, errorList []error) {
 	return nil, nil
 }
 
-// Check determines if IPVS proxier can be used or not
-// No-op for for Darwin (MacOS).
-func (ipvspc IPVSProxierCheck) Check() (warnings, errors []error) {
-	return nil, nil
+// addExecChecks adds checks that verify if certain binaries are in PATH
+// No-op for Darwin (MacOS).
+func addExecChecks(checks []Checker, _ utilsexec.Interface, _ string) []Checker {
+	return checks
 }

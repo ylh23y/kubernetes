@@ -21,14 +21,52 @@ set -o pipefail
 SCRIPT_ROOT=$(dirname "${BASH_SOURCE[0]}")/..
 CODEGEN_PKG=${CODEGEN_PKG:-$(cd "${SCRIPT_ROOT}"; ls -d -1 ./vendor/k8s.io/code-generator 2>/dev/null || echo ../code-generator)}
 
-# generate the code with:
-# --output-base    because this script should also be able to run inside the vendor dir of
-#                  k8s.io/kubernetes. The output-base is needed for the generators to output into the vendor dir
-#                  instead of the $GOPATH directly. For normal projects this can be dropped.
-CLIENTSET_NAME_VERSIONED=clientset \
-CLIENTSET_NAME_INTERNAL=internalclientset \
-bash "${CODEGEN_PKG}/generate-internal-groups.sh" deepcopy,client,lister,informer,conversion \
-  k8s.io/apiextensions-apiserver/pkg/client k8s.io/apiextensions-apiserver/pkg/apis k8s.io/apiextensions-apiserver/pkg/apis \
-  "apiextensions:v1beta1" \
-  --output-base "$(dirname "${BASH_SOURCE[0]}")/../../.." \
-  --go-header-file "${SCRIPT_ROOT}/hack/boilerplate.go.txt"
+source "${CODEGEN_PKG}/kube_codegen.sh"
+
+THIS_PKG="k8s.io/apiextensions-apiserver"
+
+# The external API types and their clients live in the k8s.io/apiextensions-api
+# staging module; their OpenAPI definitions and conversions live here.
+TYPES_ROOT="${SCRIPT_ROOT}/../apiextensions-api"
+TYPES_PKG="k8s.io/apiextensions-api"
+
+kube::codegen::gen_helpers \
+    --boilerplate "${SCRIPT_ROOT}/hack/boilerplate.go.txt" \
+    --lint-rules known-tags-only,require-explicit-disablement \
+    "${TYPES_ROOT}/pkg"
+
+kube::codegen::gen_helpers \
+    --boilerplate "${SCRIPT_ROOT}/hack/boilerplate.go.txt" \
+    --lint-rules known-tags-only,require-explicit-disablement \
+    "${SCRIPT_ROOT}/pkg"
+
+if [[ -n "${API_KNOWN_VIOLATIONS_DIR:-}" ]]; then
+    report_filename="${API_KNOWN_VIOLATIONS_DIR}/apiextensions_violation_exceptions.list"
+    if [[ "${UPDATE_API_KNOWN_VIOLATIONS:-}" == "true" ]]; then
+        update_report="--update-report"
+    fi
+fi
+
+kube::codegen::gen_openapi \
+    --extra-pkgs k8s.io/api/autoscaling/v1 `# needed for Scale type` \
+    --extra-pkgs "${TYPES_PKG}/pkg/apis/apiextensions/v1" \
+    --extra-pkgs "${TYPES_PKG}/pkg/apis/apiextensions/v1beta1" \
+    --output-dir "${SCRIPT_ROOT}/pkg/generated/openapi" \
+    --output-pkg "${THIS_PKG}/pkg/generated/openapi" \
+    --report-filename "${report_filename:-"/dev/null"}" \
+    --output-model-name-file "zz_generated.model_name.go" \
+    ${update_report:+"${update_report}"} \
+    --boilerplate "${SCRIPT_ROOT}/hack/boilerplate.go.txt" \
+    "${SCRIPT_ROOT}/pkg"
+
+kube::codegen::gen_client \
+    --with-watch \
+    --with-applyconfig \
+    --applyconfig-openapi-schema <(go run k8s.io/apiextensions-apiserver/pkg/generated/openapi/cmd/models-schema) \
+    --output-dir "${TYPES_ROOT}/pkg/client" \
+    --output-pkg "${TYPES_PKG}/pkg/client" \
+    --versioned-name "clientset" \
+    --boilerplate "${SCRIPT_ROOT}/hack/boilerplate.go.txt" \
+    --prefers-protobuf \
+    --lint-rules known-tags-only,require-explicit-disablement \
+    "${TYPES_ROOT}/pkg/apis"

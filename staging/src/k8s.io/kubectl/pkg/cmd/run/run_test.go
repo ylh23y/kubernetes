@@ -17,30 +17,15 @@ limitations under the License.
 package run
 
 import (
-	"bytes"
-	"fmt"
-	"io/ioutil"
-	"net/http"
-	"os"
 	"reflect"
 	"strings"
 	"testing"
 
-	"github.com/spf13/cobra"
-
 	corev1 "k8s.io/api/core/v1"
-	apiequality "k8s.io/apimachinery/pkg/api/equality"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/util/intstr"
-	"k8s.io/cli-runtime/pkg/genericclioptions"
-	restclient "k8s.io/client-go/rest"
-	"k8s.io/client-go/rest/fake"
-	"k8s.io/kubectl/pkg/cmd/delete"
+	"k8s.io/cli-runtime/pkg/genericiooptions"
+
 	cmdtesting "k8s.io/kubectl/pkg/cmd/testing"
 	cmdutil "k8s.io/kubectl/pkg/cmd/util"
-	"k8s.io/kubectl/pkg/scheme"
-	"k8s.io/kubectl/pkg/util/i18n"
 )
 
 func TestGetRestartPolicy(t *testing.T) {
@@ -83,10 +68,7 @@ func TestGetRestartPolicy(t *testing.T) {
 		},
 	}
 	for _, test := range tests {
-		cmd := &cobra.Command{}
-		cmd.Flags().String("restart", "", i18n.T("dummy restart flag)"))
-		cmd.Flags().Lookup("restart").Value.Set(test.input)
-		policy, err := getRestartPolicy(cmd, test.interactive)
+		policy, err := getRestartPolicy(test.input, test.interactive)
 		if test.expectErr && err == nil {
 			t.Error("unexpected non-error")
 		}
@@ -99,32 +81,33 @@ func TestGetRestartPolicy(t *testing.T) {
 	}
 }
 
-func TestGetEnv(t *testing.T) {
-	test := struct {
-		input    []string
-		expected []string
-	}{
-		input:    []string{"a=b", "c=d"},
-		expected: []string{"a=b", "c=d"},
+func TestGetRestartPolicyErrorListsValidValues(t *testing.T) {
+	_, err := getRestartPolicy("never", false)
+	if err == nil {
+		t.Fatal("expected error for lowercase 'never'")
 	}
-	cmd := &cobra.Command{}
-	cmd.Flags().StringSlice("env", test.input, "")
+	errMsg := err.Error()
+	for _, policy := range []corev1.RestartPolicy{corev1.RestartPolicyAlways, corev1.RestartPolicyOnFailure, corev1.RestartPolicyNever} {
+		if !strings.Contains(errMsg, string(policy)) {
+			t.Errorf("error message %q does not contain valid value %q", errMsg, policy)
+		}
+	}
+}
 
-	envStrings := cmdutil.GetFlagStringSlice(cmd, "env")
-	if len(envStrings) != 2 || !reflect.DeepEqual(envStrings, test.expected) {
-		t.Errorf("expected: %s, saw: %s", test.expected, envStrings)
+func TestGetImagePullPolicyErrorListsValidValues(t *testing.T) {
+	_, err := getImagePullPolicy("always")
+	if err == nil {
+		t.Fatal("expected error for lowercase 'always'")
+	}
+	errMsg := err.Error()
+	for _, policy := range []corev1.PullPolicy{corev1.PullAlways, corev1.PullIfNotPresent, corev1.PullNever} {
+		if !strings.Contains(errMsg, string(policy)) {
+			t.Errorf("error message %q does not contain valid value %q", errMsg, policy)
+		}
 	}
 }
 
 func TestRunArgsFollowDashRules(t *testing.T) {
-	one := int32(1)
-	rc := &corev1.ReplicationController{
-		ObjectMeta: metav1.ObjectMeta{Name: "rc1", Namespace: "test", ResourceVersion: "18"},
-		Spec: corev1.ReplicationControllerSpec{
-			Replicas: &one,
-		},
-	}
-
 	tests := []struct {
 		args          []string
 		argsLenAtDash int
@@ -164,58 +147,12 @@ func TestRunArgsFollowDashRules(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			tf := cmdtesting.NewTestFactory().WithNamespace("test")
-			defer tf.Cleanup()
-
-			codec := scheme.Codecs.LegacyCodec(scheme.Scheme.PrioritizedVersionsAllGroups()...)
-			ns := scheme.Codecs
-
-			tf.Client = &fake.RESTClient{
-				GroupVersion:         corev1.SchemeGroupVersion,
-				NegotiatedSerializer: ns,
-				Client: fake.CreateHTTPClient(func(req *http.Request) (*http.Response, error) {
-					if req.URL.Path == "/namespaces/test/replicationcontrollers" {
-						return &http.Response{StatusCode: 201, Header: cmdtesting.DefaultHeader(), Body: cmdtesting.ObjBody(codec, rc)}, nil
-					}
-					return &http.Response{
-						StatusCode: http.StatusOK,
-						Body:       ioutil.NopCloser(bytes.NewBuffer([]byte("{}"))),
-					}, nil
-				}),
-			}
-
-			tf.ClientConfigVal = &restclient.Config{}
-
-			cmd := NewCmdRun(tf, genericclioptions.NewTestIOStreamsDiscard())
-			cmd.Flags().Set("image", "nginx")
-			cmd.Flags().Set("generator", "run/v1")
-
-			printFlags := genericclioptions.NewPrintFlags("created").WithTypeSetter(scheme.Scheme)
-			printer, err := printFlags.ToPrinter()
-			if err != nil {
-				t.Errorf("unexpected error: %v", err)
-				return
-			}
-
-			deleteFlags := delete.NewDeleteFlags("to use to replace the resource.")
 			opts := &RunOptions{
-				PrintFlags:    printFlags,
-				DeleteOptions: deleteFlags.ToOptions(nil, genericclioptions.NewTestIOStreamsDiscard()),
-
-				IOStreams: genericclioptions.NewTestIOStreamsDiscard(),
-
-				Image:     "nginx",
-				Generator: "run/v1",
-
-				PrintObj: func(obj runtime.Object) error {
-					return printer.PrintObj(obj, os.Stdout)
-				},
-				Recorder: genericclioptions.NoopRecorder{},
-
+				Image:         "nginx",
 				ArgsLenAtDash: test.argsLenAtDash,
 			}
 
-			err = opts.Run(tf, cmd, test.args)
+			err := opts.Validate(test.args)
 			if test.expectError && err == nil {
 				t.Errorf("unexpected non-error (%s)", test.name)
 			}
@@ -226,190 +163,207 @@ func TestRunArgsFollowDashRules(t *testing.T) {
 	}
 }
 
-func TestGenerateService(t *testing.T) {
+func TestExpose(t *testing.T) {
 	tests := []struct {
-		name             string
-		port             string
-		args             []string
-		serviceGenerator string
-		params           map[string]interface{}
-		expectErr        bool
-		service          corev1.Service
-		expectPOST       bool
+		name           string
+		args           []string
+		command        bool
+		imageName      string
+		labels         string
+		port           string
+		expectedOutput string
 	}{
 		{
-			name:             "basic",
-			port:             "80",
-			args:             []string{"foo"},
-			serviceGenerator: "service/v2",
-			params: map[string]interface{}{
-				"name": "foo",
-			},
-			expectErr: false,
-			service: corev1.Service{
-				TypeMeta: metav1.TypeMeta{
-					Kind:       "Service",
-					APIVersion: "v1",
-				},
-				ObjectMeta: metav1.ObjectMeta{
-					Name: "foo",
-				},
-				Spec: corev1.ServiceSpec{
-					Ports: []corev1.ServicePort{
-						{
-							Port:       80,
-							Protocol:   "TCP",
-							TargetPort: intstr.FromInt(80),
-						},
-					},
-					Selector: map[string]string{
-						"run": "foo",
-					},
-				},
-			},
-			expectPOST: true,
+			name:      "basic",
+			args:      []string{"test-pod"},
+			imageName: "test-image",
+			port:      "80",
+			expectedOutput: `apiVersion: v1
+kind: Pod
+metadata:
+  labels:
+    run: test-pod
+  name: test-pod
+  namespace: ns
+spec:
+  containers:
+  - image: test-image
+    name: test-pod
+    ports:
+    - containerPort: 80
+    resources: {}
+  dnsPolicy: ClusterFirst
+  restartPolicy: Always
+status: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: test-pod
+  namespace: ns
+spec:
+  ports:
+  - port: 80
+    protocol: TCP
+    targetPort: 80
+  selector:
+    run: test-pod
+status:
+  loadBalancer: {}
+`,
 		},
 		{
-			name:             "custom labels",
-			port:             "80",
-			args:             []string{"foo"},
-			serviceGenerator: "service/v2",
-			params: map[string]interface{}{
-				"name":   "foo",
-				"labels": "app=bar",
-			},
-			expectErr: false,
-			service: corev1.Service{
-				TypeMeta: metav1.TypeMeta{
-					Kind:       "Service",
-					APIVersion: "v1",
-				},
-				ObjectMeta: metav1.ObjectMeta{
-					Name:   "foo",
-					Labels: map[string]string{"app": "bar"},
-				},
-				Spec: corev1.ServiceSpec{
-					Ports: []corev1.ServicePort{
-						{
-							Port:       80,
-							Protocol:   "TCP",
-							TargetPort: intstr.FromInt(80),
-						},
-					},
-					Selector: map[string]string{
-						"app": "bar",
-					},
-				},
-			},
-			expectPOST: true,
+			name:      "custom labels",
+			args:      []string{"test-pod"},
+			imageName: "test-image",
+			labels:    "color=red,shape=square",
+			port:      "80",
+			expectedOutput: `apiVersion: v1
+kind: Pod
+metadata:
+  labels:
+    color: red
+    shape: square
+  name: test-pod
+  namespace: ns
+spec:
+  containers:
+  - image: test-image
+    name: test-pod
+    ports:
+    - containerPort: 80
+    resources: {}
+  dnsPolicy: ClusterFirst
+  restartPolicy: Always
+status: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    color: red
+    shape: square
+  name: test-pod
+  namespace: ns
+spec:
+  ports:
+  - port: 80
+    protocol: TCP
+    targetPort: 80
+  selector:
+    color: red
+    shape: square
+status:
+  loadBalancer: {}
+`,
 		},
 		{
-			expectErr:  true,
-			name:       "missing port",
-			expectPOST: false,
+			name:      "with args",
+			args:      []string{"test-pod", "run-cmd", "args"},
+			imageName: "test-image",
+			port:      "80",
+			expectedOutput: `apiVersion: v1
+kind: Pod
+metadata:
+  labels:
+    run: test-pod
+  name: test-pod
+  namespace: ns
+spec:
+  containers:
+  - args:
+    - run-cmd
+    - args
+    image: test-image
+    name: test-pod
+    ports:
+    - containerPort: 80
+    resources: {}
+  dnsPolicy: ClusterFirst
+  restartPolicy: Always
+status: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: test-pod
+  namespace: ns
+spec:
+  ports:
+  - port: 80
+    protocol: TCP
+    targetPort: 80
+  selector:
+    run: test-pod
+status:
+  loadBalancer: {}
+`,
 		},
 		{
-			name:             "dry-run",
-			port:             "80",
-			args:             []string{"foo"},
-			serviceGenerator: "service/v2",
-			params: map[string]interface{}{
-				"name": "foo",
-			},
-			expectErr:  false,
-			expectPOST: false,
+			name:      "with args and command",
+			args:      []string{"test-pod", "run-cmd", "args"},
+			command:   true,
+			imageName: "test-image",
+			port:      "80",
+			expectedOutput: `apiVersion: v1
+kind: Pod
+metadata:
+  labels:
+    run: test-pod
+  name: test-pod
+  namespace: ns
+spec:
+  containers:
+  - command:
+    - run-cmd
+    - args
+    image: test-image
+    name: test-pod
+    ports:
+    - containerPort: 80
+    resources: {}
+  dnsPolicy: ClusterFirst
+  restartPolicy: Always
+status: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: test-pod
+  namespace: ns
+spec:
+  ports:
+  - port: 80
+    protocol: TCP
+    targetPort: 80
+  selector:
+    run: test-pod
+status:
+  loadBalancer: {}
+`,
 		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			sawPOST := false
-			tf := cmdtesting.NewTestFactory()
+			tf := cmdtesting.NewTestFactory().WithNamespace("ns")
 			defer tf.Cleanup()
 
-			codec := scheme.Codecs.LegacyCodec(scheme.Scheme.PrioritizedVersionsAllGroups()...)
-			ns := scheme.Codecs
+			streams, _, bufOut, _ := genericiooptions.NewTestIOStreams()
 
-			tf.ClientConfigVal = cmdtesting.DefaultClientConfig()
-			tf.Client = &fake.RESTClient{
-				GroupVersion:         corev1.SchemeGroupVersion,
-				NegotiatedSerializer: ns,
-				Client: fake.CreateHTTPClient(func(req *http.Request) (*http.Response, error) {
-					switch p, m := req.URL.Path, req.Method; {
-					case test.expectPOST && m == "POST" && p == "/namespaces/test/services":
-						sawPOST = true
-						body := cmdtesting.ObjBody(codec, &test.service)
-						data, err := ioutil.ReadAll(req.Body)
-						if err != nil {
-							t.Fatalf("unexpected error: %v", err)
-						}
-						defer req.Body.Close()
-						svc := &corev1.Service{}
-						if err := runtime.DecodeInto(codec, data, svc); err != nil {
-							t.Fatalf("unexpected error: %v", err)
-						}
-						// Copy things that are defaulted by the system
-						test.service.Annotations = svc.Annotations
-
-						if !apiequality.Semantic.DeepEqual(&test.service, svc) {
-							t.Errorf("expected:\n%v\nsaw:\n%v\n", &test.service, svc)
-						}
-						return &http.Response{StatusCode: 200, Header: cmdtesting.DefaultHeader(), Body: body}, nil
-					default:
-						t.Errorf("%s: unexpected request: %s %#v\n%#v", test.name, req.Method, req.URL, req)
-						return nil, fmt.Errorf("unexpected request")
-					}
-				}),
+			cmd := NewCmdRun(tf, streams)
+			cmd.Flags().Set("dry-run", "client")     // nolint:errcheck
+			cmd.Flags().Set("output", "yaml")        // nolint:errcheck
+			cmd.Flags().Set("image", test.imageName) // nolint:errcheck
+			cmd.Flags().Set("labels", test.labels)   // nolint:errcheck
+			cmd.Flags().Set("expose", "true")        // nolint:errcheck
+			cmd.Flags().Set("port", test.port)       // nolint:errcheck
+			if test.command {
+				cmd.Flags().Set("command", "true") // nolint:errcheck
 			}
-
-			printFlags := genericclioptions.NewPrintFlags("created").WithTypeSetter(scheme.Scheme)
-			printer, err := printFlags.ToPrinter()
-			if err != nil {
-				t.Errorf("unexpected error: %v", err)
-				return
-			}
-
-			ioStreams, _, buff, _ := genericclioptions.NewTestIOStreams()
-			deleteFlags := delete.NewDeleteFlags("to use to replace the resource.")
-			opts := &RunOptions{
-				PrintFlags:    printFlags,
-				DeleteOptions: deleteFlags.ToOptions(nil, genericclioptions.NewTestIOStreamsDiscard()),
-
-				IOStreams: ioStreams,
-
-				Port:     test.port,
-				Recorder: genericclioptions.NoopRecorder{},
-
-				PrintObj: func(obj runtime.Object) error {
-					return printer.PrintObj(obj, buff)
-				},
-			}
-
-			cmd := &cobra.Command{}
-			cmd.Flags().Bool(cmdutil.ApplyAnnotationsFlag, false, "")
-			cmd.Flags().Bool("record", false, "Record current kubectl command in the resource annotation. If set to false, do not record the command. If set to true, record the command. If not set, default to updating the existing annotation value only if one already exists.")
-			addRunFlags(cmd, opts)
-
-			if !test.expectPOST {
-				opts.DryRun = true
-			}
-
-			if len(test.port) > 0 {
-				cmd.Flags().Set("port", test.port)
-				test.params["port"] = test.port
-			}
-
-			_, err = opts.generateService(tf, cmd, test.serviceGenerator, test.params, "test")
-			if test.expectErr {
-				if err == nil {
-					t.Error("unexpected non-error")
-				}
-				return
-			}
-			if err != nil {
-				t.Errorf("unexpected error: %v", err)
-			}
-			if test.expectPOST != sawPOST {
-				t.Errorf("expectPost: %v, sawPost: %v", test.expectPOST, sawPOST)
+			cmd.Run(cmd, test.args)
+			actualOutput := bufOut.String()
+			if actualOutput != test.expectedOutput {
+				t.Errorf("unexpected output.\n\nExpected:\n%v\nActual:\n%v", test.expectedOutput, actualOutput)
 			}
 		})
 	}
@@ -419,7 +373,12 @@ func TestRunValidations(t *testing.T) {
 	tests := []struct {
 		name        string
 		args        []string
-		flags       map[string]string
+		image       string
+		rm          bool
+		attach      bool
+		stdin       bool
+		tty         bool
+		dryRun      cmdutil.DryRunStrategy
 		expectedErr string
 	}{
 		{
@@ -432,100 +391,63 @@ func TestRunValidations(t *testing.T) {
 			expectedErr: "--image is required",
 		},
 		{
-			name: "test invalid image name error",
-			args: []string{"test"},
-			flags: map[string]string{
-				"image": "#",
-			},
-			expectedErr: "Invalid image name",
+			name:        "test invalid image name error",
+			args:        []string{"test"},
+			image:       "#",
+			expectedErr: "invalid image name",
 		},
 		{
-			name: "test stdin replicas value",
-			args: []string{"test"},
-			flags: map[string]string{
-				"image":    "busybox",
-				"stdin":    "true",
-				"replicas": "2",
-			},
-			expectedErr: "stdin requires that replicas is 1",
-		},
-		{
-			name: "test rm errors when used on non-attached containers",
-			args: []string{"test"},
-			flags: map[string]string{
-				"image": "busybox",
-				"rm":    "true",
-			},
+			name:        "test rm errors when used on non-attached containers",
+			args:        []string{"test"},
+			image:       "busybox",
+			rm:          true,
 			expectedErr: "rm should only be used for attached containers",
 		},
 		{
-			name: "test error on attached containers options",
-			args: []string{"test"},
-			flags: map[string]string{
-				"image":   "busybox",
-				"attach":  "true",
-				"dry-run": "true",
-			},
+			name:        "test error on attached containers options",
+			args:        []string{"test"},
+			image:       "busybox",
+			attach:      true,
+			dryRun:      cmdutil.DryRunClient,
 			expectedErr: "can't be used with attached containers options",
 		},
 		{
-			name: "test error on attached containers options, with value from stdin",
-			args: []string{"test"},
-			flags: map[string]string{
-				"image":   "busybox",
-				"stdin":   "true",
-				"dry-run": "true",
-			},
+			name:        "test error on attached containers options, with value from stdin",
+			args:        []string{"test"},
+			image:       "busybox",
+			stdin:       true,
+			dryRun:      cmdutil.DryRunClient,
 			expectedErr: "can't be used with attached containers options",
 		},
 		{
-			name: "test error on attached containers options, with value from stdin and tty",
-			args: []string{"test"},
-			flags: map[string]string{
-				"image":   "busybox",
-				"tty":     "true",
-				"stdin":   "true",
-				"dry-run": "true",
-			},
+			name:        "test error on attached containers options, with value from stdin and tty",
+			args:        []string{"test"},
+			image:       "busybox",
+			tty:         true,
+			stdin:       true,
+			dryRun:      cmdutil.DryRunClient,
 			expectedErr: "can't be used with attached containers options",
 		},
 		{
-			name: "test error when tty=true and no stdin provided",
-			args: []string{"test"},
-			flags: map[string]string{
-				"image": "busybox",
-				"tty":   "true",
-			},
+			name:        "test error when tty=true and no stdin provided",
+			args:        []string{"test"},
+			image:       "busybox",
+			tty:         true,
 			expectedErr: "stdin is required for containers with -t/--tty",
 		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			tf := cmdtesting.NewTestFactory().WithNamespace("test")
-			defer tf.Cleanup()
-
-			_, _, codec := cmdtesting.NewExternalScheme()
-			tf.Client = &fake.RESTClient{
-				NegotiatedSerializer: scheme.Codecs,
-				Resp:                 &http.Response{StatusCode: 200, Header: cmdtesting.DefaultHeader(), Body: cmdtesting.ObjBody(codec, cmdtesting.NewInternalType("", "", ""))},
+			opts := &RunOptions{
+				Image:          test.image,
+				Remove:         test.rm,
+				Attach:         test.attach,
+				Interactive:    test.stdin,
+				TTY:            test.tty,
+				DryRunStrategy: test.dryRun,
+				ArgsLenAtDash:  1,
 			}
-			tf.ClientConfigVal = cmdtesting.DefaultClientConfig()
-
-			streams, _, _, bufErr := genericclioptions.NewTestIOStreams()
-			cmdutil.BehaviorOnFatal(func(str string, code int) {
-				bufErr.Write([]byte(str))
-			})
-
-			cmd := NewCmdRun(tf, streams)
-			for flagName, flagValue := range test.flags {
-				cmd.Flags().Set(flagName, flagValue)
-			}
-			cmd.Run(cmd, test.args)
-
-			var err error
-			if bufErr.Len() > 0 {
-				err = fmt.Errorf("%v", bufErr.String())
-			}
+			err := opts.Validate(test.args)
 			if err != nil && len(test.expectedErr) > 0 {
 				if !strings.Contains(err.Error(), test.expectedErr) {
 					t.Errorf("unexpected error: %v", err)
@@ -533,5 +455,292 @@ func TestRunValidations(t *testing.T) {
 			}
 		})
 	}
+}
 
+func TestOverride(t *testing.T) {
+	tests := []struct {
+		name           string
+		podName        string
+		imageName      string
+		overrides      string
+		overrideType   string
+		expectedOutput string
+	}{
+		{
+			name:         "run with merge override type should replace spec",
+			podName:      "test",
+			imageName:    "busybox",
+			overrides:    `{"spec":{"containers":[{"name":"test","resources":{"limits":{"cpu":"200m"}}}]}}`,
+			overrideType: "merge",
+			expectedOutput: `apiVersion: v1
+kind: Pod
+metadata:
+  labels:
+    run: test
+  name: test
+  namespace: ns
+spec:
+  containers:
+  - name: test
+    resources:
+      limits:
+        cpu: 200m
+  dnsPolicy: ClusterFirst
+  restartPolicy: Always
+status: {}
+`,
+		},
+		{
+			name:         "run with no override type specified, should perform an RFC7396 JSON Merge Patch",
+			podName:      "test",
+			imageName:    "busybox",
+			overrides:    `{"spec":{"containers":[{"name":"test","resources":{"limits":{"cpu":"200m"}}}]}}`,
+			overrideType: "",
+			expectedOutput: `apiVersion: v1
+kind: Pod
+metadata:
+  labels:
+    run: test
+  name: test
+  namespace: ns
+spec:
+  containers:
+  - name: test
+    resources:
+      limits:
+        cpu: 200m
+  dnsPolicy: ClusterFirst
+  restartPolicy: Always
+status: {}
+`,
+		},
+		{
+			name:         "run with strategic override type should merge spec, preserving container image",
+			podName:      "test",
+			imageName:    "busybox",
+			overrides:    `{"spec":{"containers":[{"name":"test","resources":{"limits":{"cpu":"200m"}}}]}}`,
+			overrideType: "strategic",
+			expectedOutput: `apiVersion: v1
+kind: Pod
+metadata:
+  labels:
+    run: test
+  name: test
+  namespace: ns
+spec:
+  containers:
+  - image: busybox
+    name: test
+    resources:
+      limits:
+        cpu: 200m
+  dnsPolicy: ClusterFirst
+  restartPolicy: Always
+status: {}
+`,
+		},
+		{
+			name:      "run with json override type should perform add, replace, and remove operations",
+			podName:   "test",
+			imageName: "busybox",
+			overrides: `[
+						{"op": "add", "path": "/metadata/labels/foo", "value": "bar"},
+						{"op": "replace", "path": "/spec/containers/0/resources", "value": {"limits": {"cpu": "200m"}}},
+						{"op": "remove", "path": "/spec/dnsPolicy"}
+					]`,
+			overrideType: "json",
+			expectedOutput: `apiVersion: v1
+kind: Pod
+metadata:
+  labels:
+    foo: bar
+    run: test
+  name: test
+  namespace: ns
+spec:
+  containers:
+  - image: busybox
+    name: test
+    resources:
+      limits:
+        cpu: 200m
+  restartPolicy: Always
+status: {}
+`,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			tf := cmdtesting.NewTestFactory().WithNamespace("ns")
+			defer tf.Cleanup()
+
+			streams, _, bufOut, _ := genericiooptions.NewTestIOStreams()
+
+			cmd := NewCmdRun(tf, streams)
+			cmd.Flags().Set("dry-run", "client")                // nolint:errcheck
+			cmd.Flags().Set("output", "yaml")                   // nolint:errcheck
+			cmd.Flags().Set("image", test.imageName)            // nolint:errcheck
+			cmd.Flags().Set("overrides", test.overrides)        // nolint:errcheck
+			cmd.Flags().Set("override-type", test.overrideType) // nolint:errcheck
+			cmd.Run(cmd, []string{test.podName})
+			actualOutput := bufOut.String()
+			if actualOutput != test.expectedOutput {
+				t.Errorf("unexpected output.\n\nExpected:\n%v\nActual:\n%v", test.expectedOutput, actualOutput)
+			}
+		})
+	}
+}
+
+func TestParseLabels(t *testing.T) {
+	successCases := []struct {
+		name     string
+		labels   string
+		expected map[string]string
+	}{
+		{
+			name:   "test1",
+			labels: "foo=false",
+			expected: map[string]string{
+				"foo": "false",
+			},
+		},
+		{
+			name:   "test2",
+			labels: "foo=true,bar=123",
+			expected: map[string]string{
+				"foo": "true",
+				"bar": "123",
+			},
+		},
+	}
+	for _, tt := range successCases {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := parseLabels(tt.labels)
+			if err != nil {
+				t.Errorf("unexpected error :%v", err)
+			}
+			if !reflect.DeepEqual(tt.expected, got) {
+				t.Errorf("\nexpected:\n%v\ngot:\n%v", tt.expected, got)
+			}
+		})
+	}
+
+	errorCases := []struct {
+		name   string
+		labels string
+	}{
+		{
+			name:   "error format",
+			labels: "abc=456;bcd=789",
+		},
+		{
+			name:   "error format",
+			labels: "abc=456.bcd=789",
+		},
+		{
+			name:   "error format",
+			labels: "abc,789",
+		},
+		{
+			name:   "error format",
+			labels: "abc",
+		},
+		{
+			name:   "error format",
+			labels: "=abc",
+		},
+	}
+	for _, test := range errorCases {
+		_, err := parseLabels(test.labels)
+		if err == nil {
+			t.Errorf("labels %s expect error, reason: %s, got nil", test.labels, test.name)
+		}
+	}
+}
+
+func TestParseEnv(t *testing.T) {
+	tests := []struct {
+		name      string
+		envArray  []string
+		expected  []corev1.EnvVar
+		expectErr bool
+		test      string
+	}{
+		{
+			name: "test1",
+			envArray: []string{
+				"THIS_ENV=isOK",
+				"this.dotted.env=isOKToo",
+				"HAS_COMMAS=foo,bar",
+				"HAS_EQUALS=jJnro54iUu75xNy==",
+			},
+			expected: []corev1.EnvVar{
+				{
+					Name:  "THIS_ENV",
+					Value: "isOK",
+				},
+				{
+					Name:  "this.dotted.env",
+					Value: "isOKToo",
+				},
+				{
+					Name:  "HAS_COMMAS",
+					Value: "foo,bar",
+				},
+				{
+					Name:  "HAS_EQUALS",
+					Value: "jJnro54iUu75xNy==",
+				},
+			},
+			expectErr: false,
+			test:      "test case 1",
+		},
+		{
+			name: "test2",
+			envArray: []string{
+				"WITH_OUT_EQUALS",
+			},
+			expected:  []corev1.EnvVar{},
+			expectErr: true,
+			test:      "test case 2",
+		},
+		{
+			name: "test3",
+			envArray: []string{
+				"WITH_OUT_VALUES=",
+			},
+			expected: []corev1.EnvVar{
+				{
+					Name:  "WITH_OUT_VALUES",
+					Value: "",
+				},
+			},
+			expectErr: false,
+			test:      "test case 3",
+		},
+		{
+			name: "test4",
+			envArray: []string{
+				"=WITH_OUT_NAME",
+			},
+			expected:  []corev1.EnvVar{},
+			expectErr: true,
+			test:      "test case 4",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			envs, err := parseEnvs(tt.envArray)
+			if !tt.expectErr && err != nil {
+				t.Errorf("unexpected error: %v (%s)", err, tt.test)
+			}
+			if tt.expectErr && err != nil {
+				return
+			}
+			if !reflect.DeepEqual(envs, tt.expected) {
+				t.Errorf("\nexpected:\n%#v\nsaw:\n%#v (%s)", tt.expected, envs, tt.test)
+			}
+		})
+	}
 }

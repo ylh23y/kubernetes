@@ -17,16 +17,17 @@ limitations under the License.
 package apiserver
 
 import (
-	"io/ioutil"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/http/httputil"
 	"testing"
 
+	"github.com/google/go-cmp/cmp"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/util/diff"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/client-go/tools/cache"
 
 	apiregistration "k8s.io/kube-aggregator/pkg/apis/apiregistration/v1"
@@ -37,21 +38,35 @@ import (
 func TestAPIs(t *testing.T) {
 	tests := []struct {
 		name        string
+		enabled     sets.String
 		apiservices []*apiregistration.APIService
 		expected    *metav1.APIGroupList
 	}{
 		{
 			name:        "empty",
+			enabled:     sets.NewString("v1", "v1beta1"),
 			apiservices: []*apiregistration.APIService{},
 			expected: &metav1.APIGroupList{
 				TypeMeta: metav1.TypeMeta{Kind: "APIGroupList", APIVersion: "v1"},
 				Groups: []metav1.APIGroup{
-					discoveryGroup,
+					discoveryGroup(sets.NewString("v1", "v1beta1")),
 				},
 			},
 		},
 		{
-			name: "simple add",
+			name:        "v1 only",
+			enabled:     sets.NewString("v1"),
+			apiservices: []*apiregistration.APIService{},
+			expected: &metav1.APIGroupList{
+				TypeMeta: metav1.TypeMeta{Kind: "APIGroupList", APIVersion: "v1"},
+				Groups: []metav1.APIGroup{
+					discoveryGroup(sets.NewString("v1")),
+				},
+			},
+		},
+		{
+			name:    "simple add",
+			enabled: sets.NewString("v1", "v1beta1"),
 			apiservices: []*apiregistration.APIService{
 				{
 					ObjectMeta: metav1.ObjectMeta{Name: "v1.foo"},
@@ -91,7 +106,7 @@ func TestAPIs(t *testing.T) {
 			expected: &metav1.APIGroupList{
 				TypeMeta: metav1.TypeMeta{Kind: "APIGroupList", APIVersion: "v1"},
 				Groups: []metav1.APIGroup{
-					discoveryGroup,
+					discoveryGroup(sets.NewString("v1", "v1beta1")),
 					{
 						Name: "foo",
 						Versions: []metav1.GroupVersionForDiscovery{
@@ -122,7 +137,8 @@ func TestAPIs(t *testing.T) {
 			},
 		},
 		{
-			name: "sorting",
+			name:    "sorting",
+			enabled: sets.NewString("v1", "v1beta1"),
 			apiservices: []*apiregistration.APIService{
 				{
 					ObjectMeta: metav1.ObjectMeta{Name: "v1.foo"},
@@ -198,7 +214,7 @@ func TestAPIs(t *testing.T) {
 			expected: &metav1.APIGroupList{
 				TypeMeta: metav1.TypeMeta{Kind: "APIGroupList", APIVersion: "v1"},
 				Groups: []metav1.APIGroup{
-					discoveryGroup,
+					discoveryGroup(sets.NewString("v1", "v1beta1")),
 					{
 						Name: "foo",
 						Versions: []metav1.GroupVersionForDiscovery{
@@ -237,7 +253,8 @@ func TestAPIs(t *testing.T) {
 			},
 		},
 		{
-			name: "unavailable service",
+			name:    "unavailable service",
+			enabled: sets.NewString("v1", "v1beta1"),
 			apiservices: []*apiregistration.APIService{
 				{
 					ObjectMeta: metav1.ObjectMeta{Name: "v1.foo"},
@@ -260,7 +277,7 @@ func TestAPIs(t *testing.T) {
 			expected: &metav1.APIGroupList{
 				TypeMeta: metav1.TypeMeta{Kind: "APIGroupList", APIVersion: "v1"},
 				Groups: []metav1.APIGroup{
-					discoveryGroup,
+					discoveryGroup(sets.NewString("v1", "v1beta1")),
 					{
 						Name: "foo",
 						Versions: []metav1.GroupVersionForDiscovery{
@@ -282,8 +299,9 @@ func TestAPIs(t *testing.T) {
 	for _, tc := range tests {
 		indexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc})
 		handler := &apisHandler{
-			codecs: aggregatorscheme.Codecs,
-			lister: listers.NewAPIServiceLister(indexer),
+			codecs:         aggregatorscheme.Codecs,
+			lister:         listers.NewAPIServiceLister(indexer),
+			discoveryGroup: discoveryGroup(tc.enabled),
 		}
 		for _, o := range tc.apiservices {
 			indexer.Add(o)
@@ -297,7 +315,7 @@ func TestAPIs(t *testing.T) {
 			t.Errorf("%s: %v", tc.name, err)
 			continue
 		}
-		bytes, err := ioutil.ReadAll(resp.Body)
+		bytes, err := io.ReadAll(resp.Body)
 		if err != nil {
 			t.Errorf("%s: %v", tc.name, err)
 			continue
@@ -309,7 +327,7 @@ func TestAPIs(t *testing.T) {
 			continue
 		}
 		if !apiequality.Semantic.DeepEqual(tc.expected, actual) {
-			t.Errorf("%s: %v", tc.name, diff.ObjectDiff(tc.expected, actual))
+			t.Errorf("%s: %v", tc.name, cmp.Diff(tc.expected, actual))
 			continue
 		}
 	}
@@ -484,7 +502,7 @@ func TestAPIGroup(t *testing.T) {
 			t.Errorf("%s: %v", tc.name, string(response))
 			continue
 		}
-		bytes, err := ioutil.ReadAll(resp.Body)
+		bytes, err := io.ReadAll(resp.Body)
 		if err != nil {
 			t.Errorf("%s: %v", tc.name, err)
 			continue
@@ -496,7 +514,7 @@ func TestAPIGroup(t *testing.T) {
 			continue
 		}
 		if !apiequality.Semantic.DeepEqual(tc.expected, actual) {
-			t.Errorf("%s: %v", tc.name, diff.ObjectDiff(tc.expected, actual))
+			t.Errorf("%s: %v", tc.name, cmp.Diff(tc.expected, actual))
 			continue
 		}
 	}

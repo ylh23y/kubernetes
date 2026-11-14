@@ -26,10 +26,15 @@ import (
 // RESTCreateUpdateStrategy is a union of RESTUpdateStrategy and RESTCreateStrategy,
 // and it defines the minimum validation, accepted input, and name generation
 // behavior to create and update an object that follows Kubernetes API conventions.
+//
+// The context that is passed to these methods can be used to retrieve
+// information about the request with request.RequestInfoFrom(ctx) and
+// to return different responses depending on the APIVersion in the
+// request.
 type RESTCreateUpdateStrategy interface {
 	RESTCreateStrategy
 	// AllowCreateOnUpdate returns true if the object can be created by a PUT.
-	AllowCreateOnUpdate() bool
+	AllowCreateOnUpdate(ctx context.Context) bool
 	// PrepareForUpdate is invoked on update before validation to normalize
 	// the object.  For example: remove fields that are not to be persisted,
 	// sort order-insensitive list fields, etc.  This should not remove fields
@@ -39,10 +44,30 @@ type RESTCreateUpdateStrategy interface {
 	// filled in before the object is persisted.  This method should not mutate
 	// the object.
 	ValidateUpdate(ctx context.Context, obj, old runtime.Object) field.ErrorList
+	// WarningsOnUpdate returns warnings to the client performing the update.
+	// WarningsOnUpdate is invoked after default fields in the object have been filled in
+	// and after ValidateUpdate has passed, before Canonicalize is called, and before the object is persisted.
+	// This method must not mutate either object.
+	//
+	// Be brief; limit warnings to 120 characters if possible.
+	// Don't include a "Warning:" prefix in the message (that is added by clients on output).
+	// Warnings returned about a specific field should be formatted as "path.to.field: message".
+	// For example: `spec.imagePullSecrets[0].name: invalid empty name ""`
+	//
+	// Use warning messages to describe problems the client making the API request should correct or be aware of.
+	// For example:
+	// - use of deprecated fields/labels/annotations that will stop working in a future release
+	// - use of obsolete fields/labels/annotations that are non-functional
+	// - malformed or invalid specifications that prevent successful handling of the submitted object,
+	//   but are not rejected by validation for compatibility reasons
+	//
+	// Warnings should not be returned for fields which cannot be resolved by the caller.
+	// For example, do not warn about spec fields in a status update.
+	WarningsOnUpdate(ctx context.Context, obj, old runtime.Object) []string
 	// AllowUnconditionalUpdate returns true if the object can be updated
 	// unconditionally (irrespective of the latest resource version), when
 	// there is no resource version specified in the object.
-	AllowUnconditionalUpdate() bool
+	AllowUnconditionalUpdate(ctx context.Context) bool
 }
 
 // Ensure that RESTCreateUpdateStrategy extends RESTCreateStrategy

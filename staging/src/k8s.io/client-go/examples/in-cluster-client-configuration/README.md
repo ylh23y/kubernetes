@@ -37,7 +37,7 @@ kubectl create clusterrolebinding default-view --clusterrole=view --serviceaccou
 
 Then, run the image in a Pod with a single instance Deployment:
 
-    kubectl run --rm -i demo --image=in-cluster --image-pull-policy=Never
+    kubectl run --rm -i demo --image=in-cluster
 
     There are 4 pods in the cluster
     There are 4 pods in the cluster
@@ -54,5 +54,5 @@ the `kubectl run` command and then run:
 
     kubectl delete deployment demo
 
-[sa]: https://kubernetes.io/docs/admin/authentication/#service-account-tokens
+[sa]: https://kubernetes.io/docs/reference/access-authn-authz/authentication/#service-account-tokens
 [mk]: https://kubernetes.io/docs/getting-started-guides/minikube/

@@ -17,222 +17,115 @@ limitations under the License.
 package config
 
 import (
-	"bytes"
-	"io/ioutil"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
 
-	"github.com/pmezard/go-difflib/difflib"
+	"github.com/google/go-cmp/cmp"
+	"github.com/google/go-cmp/cmp/cmpopts"
+	"github.com/lithammer/dedent"
 
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	kubeadmapiv1beta2 "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm/v1beta2"
+	"k8s.io/utils/ptr"
+
+	kubeadmapi "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm"
+	kubeadmapiv1 "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm/v1beta4"
 	"k8s.io/kubernetes/cmd/kubeadm/app/constants"
-	"sigs.k8s.io/yaml"
 )
 
-func diff(expected, actual []byte) string {
-	// Write out the diff
-	var diffBytes bytes.Buffer
-	difflib.WriteUnifiedDiff(&diffBytes, difflib.UnifiedDiff{
-		A:        difflib.SplitLines(string(expected)),
-		B:        difflib.SplitLines(string(actual)),
-		FromFile: "expected",
-		ToFile:   "actual",
-		Context:  3,
-	})
-	return diffBytes.String()
-}
-
 func TestLoadInitConfigurationFromFile(t *testing.T) {
-	// Create temp folder for the test case
-	tmpdir, err := ioutil.TempDir("", "")
+	tmpdir, err := os.MkdirTemp("", "")
 	if err != nil {
-		t.Fatalf("Couldn't create tmpdir")
+		t.Fatalf("Couldn't create tmpdir: %v", err)
 	}
-	defer os.RemoveAll(tmpdir)
+	defer func() {
+		if err := os.RemoveAll(tmpdir); err != nil {
+			t.Fatalf("Couldn't remove tmpdir: %v", err)
+		}
+	}()
+	filename := "kubeadmConfig"
+	filePath := filepath.Join(tmpdir, filename)
+	options := LoadOrDefaultConfigurationOptions{}
 
-	// cfgFiles is in cluster_test.go
-	var tests = []struct {
+	tests := []struct {
 		name         string
-		fileContents []byte
-		expectErr    bool
+		cfgPath      string
+		fileContents string
+		wantErr      bool
 	}{
 		{
-			name:         "v1beta1.partial1",
-			fileContents: cfgFiles["InitConfiguration_v1beta1"],
+			name:    "Config file does not exists",
+			cfgPath: "tmp",
+			wantErr: true,
 		},
 		{
-			name:         "v1beta1.partial2",
-			fileContents: cfgFiles["ClusterConfiguration_v1beta1"],
-		},
-		{
-			name: "v1beta1.full",
-			fileContents: bytes.Join([][]byte{
-				cfgFiles["InitConfiguration_v1beta1"],
-				cfgFiles["ClusterConfiguration_v1beta1"],
-				cfgFiles["Kube-proxy_componentconfig"],
-				cfgFiles["Kubelet_componentconfig"],
-			}, []byte(constants.YAMLDocumentSeparator)),
-		},
-		{
-			name:         "v1beta2.partial1",
-			fileContents: cfgFiles["InitConfiguration_v1beta2"],
-		},
-		{
-			name:         "v1beta2.partial2",
-			fileContents: cfgFiles["ClusterConfiguration_v1beta2"],
-		},
-		{
-			name: "v1beta2.full",
-			fileContents: bytes.Join([][]byte{
-				cfgFiles["InitConfiguration_v1beta2"],
-				cfgFiles["ClusterConfiguration_v1beta2"],
-				cfgFiles["Kube-proxy_componentconfig"],
-				cfgFiles["Kubelet_componentconfig"],
-			}, []byte(constants.YAMLDocumentSeparator)),
+			name:    "Valid kubeadm config",
+			cfgPath: filePath,
+			fileContents: dedent.Dedent(`
+				apiVersion: kubeadm.k8s.io/v1beta4
+				kind: InitConfiguration
+		`),
+			wantErr: false,
 		},
 	}
-
-	for _, rt := range tests {
-		t.Run(rt.name, func(t2 *testing.T) {
-			cfgPath := filepath.Join(tmpdir, rt.name)
-			err := ioutil.WriteFile(cfgPath, rt.fileContents, 0644)
-			if err != nil {
-				t.Errorf("Couldn't create file")
-				return
-			}
-
-			obj, err := LoadInitConfigurationFromFile(cfgPath)
-			if rt.expectErr {
-				if err == nil {
-					t.Error("Unexpected success")
-				}
-			} else {
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.cfgPath == filePath {
+				err = os.WriteFile(tt.cfgPath, []byte(tt.fileContents), 0644)
 				if err != nil {
-					t.Errorf("Error reading file: %v", err)
-					return
+					t.Fatalf("Couldn't write content to file: %v", err)
 				}
+				defer func() {
+					if err := os.RemoveAll(filePath); err != nil {
+						t.Fatalf("Couldn't remove filePath: %v", err)
+					}
+				}()
+			}
 
-				if obj == nil {
-					t.Errorf("Unexpected nil return value")
-				}
+			_, err = LoadInitConfigurationFromFile(tt.cfgPath, options)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("LoadInitConfigurationFromFile() error = %v, wantErr %v", err, tt.wantErr)
 			}
 		})
 	}
 }
-
-/*
-func TestInitConfigurationMarshallingFromFile(t *testing.T) {
-	controlPlaneV1beta1YAMLAbstracted := controlPlaneV1beta1YAML
-	controlPlaneInternalYAMLAbstracted := controlPlaneInternalYAML
-	controlPlaneDefaultedYAMLAbstracted := controlPlaneDefaultedYAML
-	if runtime.GOOS != "linux" {
-		controlPlaneV1beta1YAMLAbstracted = controlPlaneV1beta1YAMLNonLinux
-		controlPlaneInternalYAMLAbstracted = controlPlaneInternalYAMLNonLinux
-		controlPlaneDefaultedYAMLAbstracted = controlPlaneDefaultedYAMLNonLinux
-	}
-
-	var tests = []struct {
-		name, in, out string
-		groupVersion  schema.GroupVersion
-		expectedErr   bool
-	}{
-		// These tests are reading one file, loading it using LoadInitConfigurationFromFile that all of kubeadm is using for unmarshal of our API types,
-		// and then marshals the internal object to the expected groupVersion
-		//{ // v1beta1 -> internal NB. test commented after changes required for upgrading to go v1.12
-		//	name:         "v1beta1ToInternal",
-		//	in:           controlPlaneV1beta1YAMLAbstracted,
-		//	out:          controlPlaneInternalYAMLAbstracted,
-		//	groupVersion: kubeadm.SchemeGroupVersion,
-		//},
-		{ // v1beta1 -> internal -> v1beta1
-			name:         "v1beta1Tov1beta1",
-			in:           controlPlaneV1beta1YAMLAbstracted,
-			out:          controlPlaneV1beta1YAMLAbstracted,
-			groupVersion: kubeadmapiv1beta1.SchemeGroupVersion,
-		},
-		// These tests are reading one file that has only a subset of the fields populated, loading it using LoadInitConfigurationFromFile,
-		// and then marshals the internal object to the expected groupVersion
-		{ // v1beta1 -> default -> validate -> internal -> v1beta1
-			name:         "incompleteYAMLToDefaultedv1beta1",
-			in:           controlPlaneIncompleteYAML,
-			out:          controlPlaneDefaultedYAMLAbstracted,
-			groupVersion: kubeadmapiv1beta1.SchemeGroupVersion,
-		},
-		{ // v1beta1 -> validation should fail
-			name:        "invalidYAMLShouldFail",
-			in:          controlPlaneInvalidYAML,
-			expectedErr: true,
-		},
-	}
-
-	for _, rt := range tests {
-		t.Run(rt.name, func(t2 *testing.T) {
-
-			internalcfg, err := LoadInitConfigurationFromFile(rt.in)
-			if err != nil {
-				if rt.expectedErr {
-					return
-				}
-				t2.Fatalf("couldn't unmarshal test data: %v", err)
-			}
-
-			actual, err := MarshalInitConfigurationToBytes(internalcfg, rt.groupVersion)
-			if err != nil {
-				t2.Fatalf("couldn't marshal internal object: %v", err)
-			}
-
-			expected, err := ioutil.ReadFile(rt.out)
-			if err != nil {
-				t2.Fatalf("couldn't read test data: %v", err)
-			}
-
-			if !bytes.Equal(expected, actual) {
-				t2.Errorf("the expected and actual output differs.\n\tin: %s\n\tout: %s\n\tgroupversion: %s\n\tdiff: \n%s\n",
-					rt.in, rt.out, rt.groupVersion.String(), diff(expected, actual))
-			}
-		})
-	}
-}
-*/
 
 func TestDefaultTaintsMarshaling(t *testing.T) {
 	tests := []struct {
 		desc             string
-		cfg              kubeadmapiv1beta2.InitConfiguration
+		cfg              kubeadmapiv1.InitConfiguration
 		expectedTaintCnt int
 	}{
 		{
-			desc: "Uninitialized nodeRegistration field produces a single taint (the master one)",
-			cfg: kubeadmapiv1beta2.InitConfiguration{
+			desc: "Uninitialized nodeRegistration field produces expected taints",
+			cfg: kubeadmapiv1.InitConfiguration{
 				TypeMeta: metav1.TypeMeta{
-					APIVersion: "kubeadm.k8s.io/v1beta2",
+					APIVersion: kubeadmapiv1.SchemeGroupVersion.String(),
 					Kind:       constants.InitConfigurationKind,
 				},
 			},
 			expectedTaintCnt: 1,
 		},
 		{
-			desc: "Uninitialized taints field produces a single taint (the master one)",
-			cfg: kubeadmapiv1beta2.InitConfiguration{
+			desc: "Uninitialized taints field produces expected taints",
+			cfg: kubeadmapiv1.InitConfiguration{
 				TypeMeta: metav1.TypeMeta{
-					APIVersion: "kubeadm.k8s.io/v1beta2",
+					APIVersion: kubeadmapiv1.SchemeGroupVersion.String(),
 					Kind:       constants.InitConfigurationKind,
 				},
-				NodeRegistration: kubeadmapiv1beta2.NodeRegistrationOptions{},
 			},
 			expectedTaintCnt: 1,
 		},
 		{
 			desc: "Forsing taints to an empty slice produces no taints",
-			cfg: kubeadmapiv1beta2.InitConfiguration{
+			cfg: kubeadmapiv1.InitConfiguration{
 				TypeMeta: metav1.TypeMeta{
-					APIVersion: "kubeadm.k8s.io/v1beta2",
+					APIVersion: kubeadmapiv1.SchemeGroupVersion.String(),
 					Kind:       constants.InitConfigurationKind,
 				},
-				NodeRegistration: kubeadmapiv1beta2.NodeRegistrationOptions{
+				NodeRegistration: kubeadmapiv1.NodeRegistrationOptions{
 					Taints: []v1.Taint{},
 				},
 			},
@@ -240,12 +133,12 @@ func TestDefaultTaintsMarshaling(t *testing.T) {
 		},
 		{
 			desc: "Custom taints are used",
-			cfg: kubeadmapiv1beta2.InitConfiguration{
+			cfg: kubeadmapiv1.InitConfiguration{
 				TypeMeta: metav1.TypeMeta{
-					APIVersion: "kubeadm.k8s.io/v1beta2",
+					APIVersion: kubeadmapiv1.SchemeGroupVersion.String(),
 					Kind:       constants.InitConfigurationKind,
 				},
-				NodeRegistration: kubeadmapiv1beta2.NodeRegistrationOptions{
+				NodeRegistration: kubeadmapiv1.NodeRegistrationOptions{
 					Taints: []v1.Taint{
 						{Key: "taint1"},
 						{Key: "taint2"},
@@ -257,19 +150,218 @@ func TestDefaultTaintsMarshaling(t *testing.T) {
 	}
 
 	for _, tc := range tests {
-		t.Run(tc.desc, func(t *testing.T) {
-			b, err := yaml.Marshal(tc.cfg)
-			if err != nil {
-				t.Fatalf("unexpected error while marshalling to YAML: %v", err)
+		for _, format := range formats {
+			t.Run(fmt.Sprintf("%s_%s", tc.desc, format.name), func(t *testing.T) {
+				b, err := format.marshal(tc.cfg)
+				if err != nil {
+					t.Fatalf("unexpected error while marshalling to %s: %v", format.name, err)
+				}
+
+				cfg, err := BytesToInitConfiguration(b, true)
+				if err != nil {
+					t.Fatalf("unexpected error of BytesToInitConfiguration: %v\nconfig: %s", err, string(b))
+				}
+
+				if tc.expectedTaintCnt != len(cfg.NodeRegistration.Taints) {
+					t.Fatalf("unexpected taints count\nexpected: %d\ngot: %d\ntaints: %v", tc.expectedTaintCnt, len(cfg.NodeRegistration.Taints), cfg.NodeRegistration.Taints)
+				}
+			})
+		}
+	}
+}
+
+func TestBytesToInitConfiguration(t *testing.T) {
+	tests := []struct {
+		name          string
+		cfg           interface{}
+		expectedCfg   kubeadmapi.InitConfiguration
+		expectedError bool
+		skipCRIDetect bool
+	}{
+		{
+			name: "default config is set correctly",
+			cfg: kubeadmapiv1.InitConfiguration{
+				TypeMeta: metav1.TypeMeta{
+					APIVersion: kubeadmapiv1.SchemeGroupVersion.String(),
+					Kind:       constants.InitConfigurationKind,
+				},
+			},
+			expectedCfg: kubeadmapi.InitConfiguration{
+				LocalAPIEndpoint: kubeadmapi.APIEndpoint{
+					AdvertiseAddress: "",
+					BindPort:         0,
+				},
+				NodeRegistration: kubeadmapi.NodeRegistrationOptions{
+					CRISocket: "unix:///var/run/containerd/containerd.sock",
+					Name:      "",
+					Taints: []v1.Taint{
+						{
+							Key:    "node-role.kubernetes.io/control-plane",
+							Effect: "NoSchedule",
+						},
+					},
+					ImagePullPolicy: "IfNotPresent",
+					ImagePullSerial: ptr.To(true),
+				},
+				ClusterConfiguration: kubeadmapi.ClusterConfiguration{
+					Etcd: kubeadmapi.Etcd{
+						Local: &kubeadmapi.LocalEtcd{
+							DataDir: "/var/lib/etcd",
+						},
+					},
+					KubernetesVersion:   "stable-1",
+					ImageRepository:     kubeadmapiv1.DefaultImageRepository,
+					ClusterName:         kubeadmapiv1.DefaultClusterName,
+					EncryptionAlgorithm: kubeadmapi.EncryptionAlgorithmType(kubeadmapiv1.DefaultEncryptionAlgorithm),
+					Networking: kubeadmapi.Networking{
+						ServiceSubnet: "10.96.0.0/12",
+						DNSDomain:     "cluster.local",
+					},
+					CertificatesDir: "/etc/kubernetes/pki",
+				},
+			},
+			skipCRIDetect: true,
+		},
+		{
+			name: "partial config with custom values",
+			cfg: kubeadmapiv1.InitConfiguration{
+				TypeMeta: metav1.TypeMeta{
+					APIVersion: kubeadmapiv1.SchemeGroupVersion.String(),
+					Kind:       constants.InitConfigurationKind,
+				},
+				NodeRegistration: kubeadmapiv1.NodeRegistrationOptions{
+					Name:      "test-node",
+					CRISocket: "unix:///var/run/containerd/containerd.sock",
+				},
+			},
+			expectedCfg: kubeadmapi.InitConfiguration{
+				LocalAPIEndpoint: kubeadmapi.APIEndpoint{
+					AdvertiseAddress: "",
+					BindPort:         0,
+				},
+				NodeRegistration: kubeadmapi.NodeRegistrationOptions{
+					CRISocket: "unix:///var/run/containerd/containerd.sock",
+					Name:      "test-node",
+					Taints: []v1.Taint{
+						{
+							Key:    "node-role.kubernetes.io/control-plane",
+							Effect: "NoSchedule",
+						},
+					},
+					ImagePullPolicy: "IfNotPresent",
+					ImagePullSerial: ptr.To(true),
+				},
+				ClusterConfiguration: kubeadmapi.ClusterConfiguration{
+					Etcd: kubeadmapi.Etcd{
+						Local: &kubeadmapi.LocalEtcd{
+							DataDir: "/var/lib/etcd",
+						},
+					},
+					KubernetesVersion:   "stable-1",
+					ImageRepository:     kubeadmapiv1.DefaultImageRepository,
+					ClusterName:         kubeadmapiv1.DefaultClusterName,
+					EncryptionAlgorithm: kubeadmapi.EncryptionAlgorithmType(kubeadmapiv1.DefaultEncryptionAlgorithm),
+					Networking: kubeadmapi.Networking{
+						ServiceSubnet: "10.96.0.0/12",
+						DNSDomain:     "cluster.local",
+					},
+					CertificatesDir: "/etc/kubernetes/pki",
+				},
+			},
+			skipCRIDetect: true,
+		},
+		{
+			name: "invalid configuration type",
+			cfg: kubeadmapiv1.UpgradeConfiguration{
+				TypeMeta: metav1.TypeMeta{
+					APIVersion: kubeadmapiv1.SchemeGroupVersion.String(),
+					Kind:       constants.UpgradeConfigurationKind,
+				},
+			},
+			expectedError: true,
+			skipCRIDetect: true,
+		},
+	}
+
+	for _, tc := range tests {
+		for _, format := range formats {
+			t.Run(fmt.Sprintf("%s_%s", tc.name, format.name), func(t *testing.T) {
+				b, err := format.marshal(tc.cfg)
+				if err != nil {
+					t.Fatalf("unexpected error marshaling %s: %v", format.name, err)
+				}
+
+				cfg, err := BytesToInitConfiguration(b, tc.skipCRIDetect)
+				if (err != nil) != tc.expectedError {
+					t.Fatalf("expected error: %v, got error: %v\nError: %v", tc.expectedError, err != nil, err)
+				}
+
+				if !tc.expectedError {
+					// Ignore dynamic fields that may be set during defaulting
+					diffOpts := []cmp.Option{
+						cmpopts.IgnoreFields(kubeadmapi.NodeRegistrationOptions{}, "Name"),
+						cmpopts.IgnoreFields(kubeadmapi.InitConfiguration{}, "Timeouts", "BootstrapTokens", "LocalAPIEndpoint"),
+						cmpopts.IgnoreFields(kubeadmapi.ClusterConfiguration{}, "ComponentConfigs", "KubernetesVersion",
+							"CertificateValidityPeriod", "CACertificateValidityPeriod"),
+					}
+
+					if diff := cmp.Diff(*cfg, tc.expectedCfg, diffOpts...); diff != "" {
+						t.Fatalf("unexpected configuration difference (-want +got):\n%s", diff)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestSetInitDynamicDefaultsSkipAPIEndpoint(t *testing.T) {
+	// "not-an-ip" is a sentinel that would cause SetAPIEndpointDynamicDefaults to return
+	// an error if invoked. With skipAPIEndpoint=true, the value must be left untouched.
+	const sentinel = "not-an-ip"
+
+	tests := []struct {
+		name            string
+		skipAPIEndpoint bool
+		expectErr       bool
+		expectAdvertise string
+	}{
+		{
+			name:            "skip leaves AdvertiseAddress untouched",
+			skipAPIEndpoint: true,
+			expectErr:       false,
+			expectAdvertise: sentinel,
+		},
+		{
+			name:            "no skip surfaces invalid AdvertiseAddress error",
+			skipAPIEndpoint: false,
+			expectErr:       true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := &kubeadmapi.InitConfiguration{
+				ClusterConfiguration: kubeadmapi.ClusterConfiguration{
+					KubernetesVersion: constants.CurrentKubernetesVersion.String(),
+				},
+				LocalAPIEndpoint: kubeadmapi.APIEndpoint{
+					AdvertiseAddress: sentinel,
+				},
 			}
 
-			cfg, err := BytesToInitConfiguration(b)
-			if err != nil {
-				t.Fatalf("unexpected error of BytesToInitConfiguration: %v\nconfig: %s", err, string(b))
+			err := SetInitDynamicDefaults(cfg, true /* skipCRIDetect */, tc.skipAPIEndpoint)
+			if tc.expectErr {
+				if err == nil {
+					t.Fatalf("expected error, got nil")
+				}
+				return
 			}
-
-			if tc.expectedTaintCnt != len(cfg.NodeRegistration.Taints) {
-				t.Fatalf("unexpected taints count\nexpected: %d\ngot: %d\ntaints: %v", tc.expectedTaintCnt, len(cfg.NodeRegistration.Taints), cfg.NodeRegistration.Taints)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if cfg.LocalAPIEndpoint.AdvertiseAddress != tc.expectAdvertise {
+				t.Errorf("AdvertiseAddress = %q, want %q",
+					cfg.LocalAPIEndpoint.AdvertiseAddress, tc.expectAdvertise)
 			}
 		})
 	}

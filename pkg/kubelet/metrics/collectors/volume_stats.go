@@ -17,58 +17,70 @@ limitations under the License.
 package collectors
 
 import (
-	"github.com/prometheus/client_golang/prometheus"
+	"context"
+
 	"k8s.io/apimachinery/pkg/util/sets"
-	"k8s.io/klog"
-	stats "k8s.io/kubernetes/pkg/kubelet/apis/stats/v1alpha1"
-	"k8s.io/kubernetes/pkg/kubelet/metrics"
+	"k8s.io/component-base/metrics"
+	stats "k8s.io/kubelet/pkg/apis/stats/v1alpha1"
+	kubeletmetrics "k8s.io/kubernetes/pkg/kubelet/metrics"
 	serverstats "k8s.io/kubernetes/pkg/kubelet/server/stats"
 )
 
 var (
-	volumeStatsCapacityBytesDesc = prometheus.NewDesc(
-		prometheus.BuildFQName("", metrics.KubeletSubsystem, metrics.VolumeStatsCapacityBytesKey),
+	volumeStatsCapacityBytesDesc = metrics.NewDesc(
+		metrics.BuildFQName("", kubeletmetrics.KubeletSubsystem, kubeletmetrics.VolumeStatsCapacityBytesKey),
 		"Capacity in bytes of the volume",
 		[]string{"namespace", "persistentvolumeclaim"}, nil,
+		metrics.ALPHA, "",
 	)
-	volumeStatsAvailableBytesDesc = prometheus.NewDesc(
-		prometheus.BuildFQName("", metrics.KubeletSubsystem, metrics.VolumeStatsAvailableBytesKey),
+	volumeStatsAvailableBytesDesc = metrics.NewDesc(
+		metrics.BuildFQName("", kubeletmetrics.KubeletSubsystem, kubeletmetrics.VolumeStatsAvailableBytesKey),
 		"Number of available bytes in the volume",
 		[]string{"namespace", "persistentvolumeclaim"}, nil,
+		metrics.ALPHA, "",
 	)
-	volumeStatsUsedBytesDesc = prometheus.NewDesc(
-		prometheus.BuildFQName("", metrics.KubeletSubsystem, metrics.VolumeStatsUsedBytesKey),
+	volumeStatsUsedBytesDesc = metrics.NewDesc(
+		metrics.BuildFQName("", kubeletmetrics.KubeletSubsystem, kubeletmetrics.VolumeStatsUsedBytesKey),
 		"Number of used bytes in the volume",
 		[]string{"namespace", "persistentvolumeclaim"}, nil,
+		metrics.ALPHA, "",
 	)
-	volumeStatsInodesDesc = prometheus.NewDesc(
-		prometheus.BuildFQName("", metrics.KubeletSubsystem, metrics.VolumeStatsInodesKey),
+	volumeStatsInodesDesc = metrics.NewDesc(
+		metrics.BuildFQName("", kubeletmetrics.KubeletSubsystem, kubeletmetrics.VolumeStatsInodesKey),
 		"Maximum number of inodes in the volume",
 		[]string{"namespace", "persistentvolumeclaim"}, nil,
+		metrics.ALPHA, "",
 	)
-	volumeStatsInodesFreeDesc = prometheus.NewDesc(
-		prometheus.BuildFQName("", metrics.KubeletSubsystem, metrics.VolumeStatsInodesFreeKey),
+	volumeStatsInodesFreeDesc = metrics.NewDesc(
+		metrics.BuildFQName("", kubeletmetrics.KubeletSubsystem, kubeletmetrics.VolumeStatsInodesFreeKey),
 		"Number of free inodes in the volume",
 		[]string{"namespace", "persistentvolumeclaim"}, nil,
+		metrics.ALPHA, "",
 	)
-	volumeStatsInodesUsedDesc = prometheus.NewDesc(
-		prometheus.BuildFQName("", metrics.KubeletSubsystem, metrics.VolumeStatsInodesUsedKey),
+	volumeStatsInodesUsedDesc = metrics.NewDesc(
+		metrics.BuildFQName("", kubeletmetrics.KubeletSubsystem, kubeletmetrics.VolumeStatsInodesUsedKey),
 		"Number of used inodes in the volume",
 		[]string{"namespace", "persistentvolumeclaim"}, nil,
+		metrics.ALPHA, "",
 	)
 )
 
 type volumeStatsCollector struct {
+	metrics.BaseStableCollector
+
 	statsProvider serverstats.Provider
 }
 
-// NewVolumeStatsCollector creates a volume stats prometheus collector.
-func NewVolumeStatsCollector(statsProvider serverstats.Provider) prometheus.Collector {
+// Check if volumeStatsCollector implements necessary interface
+var _ metrics.StableCollector = &volumeStatsCollector{}
+
+// NewVolumeStatsCollector creates a volume stats metrics.StableCollector.
+func NewVolumeStatsCollector(statsProvider serverstats.Provider) metrics.StableCollector {
 	return &volumeStatsCollector{statsProvider: statsProvider}
 }
 
-// Describe implements the prometheus.Collector interface.
-func (collector *volumeStatsCollector) Describe(ch chan<- *prometheus.Desc) {
+// DescribeWithStability implements the metrics.StableCollector interface.
+func (collector *volumeStatsCollector) DescribeWithStability(ch chan<- *metrics.Desc) {
 	ch <- volumeStatsCapacityBytesDesc
 	ch <- volumeStatsAvailableBytesDesc
 	ch <- volumeStatsUsedBytesDesc
@@ -77,22 +89,20 @@ func (collector *volumeStatsCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- volumeStatsInodesUsedDesc
 }
 
-// Collect implements the prometheus.Collector interface.
-func (collector *volumeStatsCollector) Collect(ch chan<- prometheus.Metric) {
-	podStats, err := collector.statsProvider.ListPodStats()
+// CollectWithStability implements the metrics.StableCollector interface.
+func (collector *volumeStatsCollector) CollectWithStability(ch chan<- metrics.Metric) {
+	// Use context.TODO() because we currently do not have a proper context to pass in.
+	// Replace this with an appropriate context when refactoring this function to accept a context parameter.
+	ctx := context.TODO()
+	podStats, err := collector.statsProvider.ListPodStats(ctx)
 	if err != nil {
 		return
 	}
-	addGauge := func(desc *prometheus.Desc, pvcRef *stats.PVCReference, v float64, lv ...string) {
+	addGauge := func(desc *metrics.Desc, pvcRef *stats.PVCReference, v float64, lv ...string) {
 		lv = append([]string{pvcRef.Namespace, pvcRef.Name}, lv...)
-		metric, err := prometheus.NewConstMetric(desc, prometheus.GaugeValue, v, lv...)
-		if err != nil {
-			klog.Warningf("Failed to generate metric: %v", err)
-			return
-		}
-		ch <- metric
+		ch <- metrics.NewLazyConstMetric(desc, metrics.GaugeValue, v, lv...)
 	}
-	allPVCs := sets.String{}
+	allPVCs := sets.Set[stats.PVCReference]{}
 	for _, podStat := range podStats {
 		if podStat.VolumeStats == nil {
 			continue
@@ -103,8 +113,7 @@ func (collector *volumeStatsCollector) Collect(ch chan<- prometheus.Metric) {
 				// ignore if no PVC reference
 				continue
 			}
-			pvcUniqStr := pvcRef.Namespace + "/" + pvcRef.Name
-			if allPVCs.Has(pvcUniqStr) {
+			if allPVCs.Has(*pvcRef) {
 				// ignore if already collected
 				continue
 			}
@@ -114,7 +123,7 @@ func (collector *volumeStatsCollector) Collect(ch chan<- prometheus.Metric) {
 			addGauge(volumeStatsInodesDesc, pvcRef, float64(*volumeStat.Inodes))
 			addGauge(volumeStatsInodesFreeDesc, pvcRef, float64(*volumeStat.InodesFree))
 			addGauge(volumeStatsInodesUsedDesc, pvcRef, float64(*volumeStat.InodesUsed))
-			allPVCs.Insert(pvcUniqStr)
+			allPVCs.Insert(*pvcRef)
 		}
 	}
 }

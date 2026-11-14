@@ -19,6 +19,8 @@ package server
 import (
 	"net"
 	"testing"
+
+	netutils "k8s.io/utils/net"
 )
 
 func TestLoopbackHostPortIPv4(t *testing.T) {
@@ -45,7 +47,7 @@ func TestLoopbackHostPortIPv4(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if ip := net.ParseIP(host); ip == nil || !ip.IsLoopback() {
+	if ip := netutils.ParseIPSloppy(host); ip == nil || !ip.IsLoopback() {
 		t.Fatalf("expected host to be loopback, got %q", host)
 	}
 	if port != "443" {
@@ -58,7 +60,7 @@ func TestLoopbackHostPortIPv6(t *testing.T) {
 		t.Fatalf("fail to enumerate network interface, %s", err)
 	}
 	if !ipv6 {
-		t.Fatalf("no ipv6 loopback interface")
+		t.Skip("no ipv6 loopback interface")
 	}
 
 	host, port, err := LoopbackHostPort("[ff06:0:0:0:0:0:0:c3]:443")
@@ -76,7 +78,7 @@ func TestLoopbackHostPortIPv6(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if ip := net.ParseIP(host); ip == nil || !ip.IsLoopback() || ip.To4() != nil {
+	if ip := netutils.ParseIPSloppy(host); ip == nil || !ip.IsLoopback() || ip.To4() != nil {
 		t.Fatalf("expected IPv6 host to be loopback, got %q", host)
 	}
 	if port != "443" {
@@ -95,7 +97,7 @@ func isIPv6LoopbackSupported() (ipv6 bool, ipv6only bool, err error) {
 		if !ok || !ipnet.IP.IsLoopback() {
 			continue
 		}
-		if ipnet.IP.To4() == nil {
+		if netutils.IsIPv6(ipnet.IP) {
 			ipv6 = true
 			continue
 		}

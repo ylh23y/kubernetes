@@ -17,30 +17,28 @@ limitations under the License.
 package bootstrap
 
 import (
+	"context"
 	"testing"
 	"time"
 
-	"github.com/davecgh/go-spew/spew"
-
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/informers"
 	coreinformers "k8s.io/client-go/informers/core/v1"
 	"k8s.io/client-go/kubernetes/fake"
 	core "k8s.io/client-go/testing"
+	"k8s.io/ktesting"
 	api "k8s.io/kubernetes/pkg/apis/core"
 )
 
-func init() {
-	spew.Config.DisableMethods = true
-}
-
-func newTokenCleaner() (*TokenCleaner, *fake.Clientset, coreinformers.SecretInformer, error) {
+func newTokenCleaner(t *testing.T) (*TokenCleaner, *fake.Clientset, coreinformers.SecretInformer, error) {
+	tCtx := ktesting.Init(t)
 	options := DefaultTokenCleanerOptions()
 	cl := fake.NewSimpleClientset()
 	informerFactory := informers.NewSharedInformerFactory(cl, options.SecretResync)
 	secrets := informerFactory.Core().V1().Secrets()
-	tcc, err := NewTokenCleaner(cl, secrets, options)
+	tcc, err := NewTokenCleaner(tCtx, cl, secrets, options)
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -48,7 +46,7 @@ func newTokenCleaner() (*TokenCleaner, *fake.Clientset, coreinformers.SecretInfo
 }
 
 func TestCleanerNoExpiration(t *testing.T) {
-	cleaner, cl, secrets, err := newTokenCleaner()
+	cleaner, cl, secrets, err := newTokenCleaner(t)
 	if err != nil {
 		t.Fatalf("error creating TokenCleaner: %v", err)
 	}
@@ -56,7 +54,7 @@ func TestCleanerNoExpiration(t *testing.T) {
 	secret := newTokenSecret("tokenID", "tokenSecret")
 	secrets.Informer().GetIndexer().Add(secret)
 
-	cleaner.evalSecret(secret)
+	cleaner.evalSecret(context.TODO(), secret)
 
 	expected := []core.Action{}
 
@@ -64,7 +62,7 @@ func TestCleanerNoExpiration(t *testing.T) {
 }
 
 func TestCleanerExpired(t *testing.T) {
-	cleaner, cl, secrets, err := newTokenCleaner()
+	cleaner, cl, secrets, err := newTokenCleaner(t)
 	if err != nil {
 		t.Fatalf("error creating TokenCleaner: %v", err)
 	}
@@ -73,20 +71,23 @@ func TestCleanerExpired(t *testing.T) {
 	addSecretExpiration(secret, timeString(-time.Hour))
 	secrets.Informer().GetIndexer().Add(secret)
 
-	cleaner.evalSecret(secret)
+	cleaner.evalSecret(context.TODO(), secret)
 
 	expected := []core.Action{
-		core.NewDeleteAction(
+		core.NewDeleteActionWithOptions(
 			schema.GroupVersionResource{Version: "v1", Resource: "secrets"},
 			api.NamespaceSystem,
-			secret.ObjectMeta.Name),
+			secret.ObjectMeta.Name,
+			metav1.DeleteOptions{
+				Preconditions: metav1.NewUIDPreconditions(string(secret.UID)),
+			}),
 	}
 
 	verifyActions(t, expected, cl.Actions())
 }
 
 func TestCleanerNotExpired(t *testing.T) {
-	cleaner, cl, secrets, err := newTokenCleaner()
+	cleaner, cl, secrets, err := newTokenCleaner(t)
 	if err != nil {
 		t.Fatalf("error creating TokenCleaner: %v", err)
 	}
@@ -95,7 +96,7 @@ func TestCleanerNotExpired(t *testing.T) {
 	addSecretExpiration(secret, timeString(time.Hour))
 	secrets.Informer().GetIndexer().Add(secret)
 
-	cleaner.evalSecret(secret)
+	cleaner.evalSecret(context.TODO(), secret)
 
 	expected := []core.Action{}
 
@@ -103,17 +104,18 @@ func TestCleanerNotExpired(t *testing.T) {
 }
 
 func TestCleanerExpiredAt(t *testing.T) {
-	cleaner, cl, secrets, err := newTokenCleaner()
+	cleaner, cl, secrets, err := newTokenCleaner(t)
 	if err != nil {
 		t.Fatalf("error creating TokenCleaner: %v", err)
 	}
 
 	secret := newTokenSecret("tokenID", "tokenSecret")
 	addSecretExpiration(secret, timeString(2*time.Second))
+	secrets.Informer().GetIndexer().Add(secret)
+	cleaner.enqueueSecrets(secret)
 	expected := []core.Action{}
 	verifyFunc := func() {
-		secrets.Informer().GetIndexer().Add(secret)
-		cleaner.evalSecret(secret)
+		cleaner.processNextWorkItem(context.TODO())
 		verifyActions(t, expected, cl.Actions())
 	}
 	// token has not expired currently
@@ -137,10 +139,13 @@ func TestCleanerExpiredAt(t *testing.T) {
 
 	// secret was eventually deleted
 	expected = []core.Action{
-		core.NewDeleteAction(
+		core.NewDeleteActionWithOptions(
 			schema.GroupVersionResource{Version: "v1", Resource: "secrets"},
 			api.NamespaceSystem,
-			secret.ObjectMeta.Name),
+			secret.ObjectMeta.Name,
+			metav1.DeleteOptions{
+				Preconditions: metav1.NewUIDPreconditions(string(secret.UID)),
+			}),
 	}
 	verifyFunc()
 }

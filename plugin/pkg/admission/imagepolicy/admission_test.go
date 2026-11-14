@@ -17,6 +17,7 @@ limitations under the License.
 package imagepolicy
 
 import (
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
@@ -28,6 +29,8 @@ import (
 	"testing"
 	"time"
 
+	utiltesting "k8s.io/client-go/util/testing"
+
 	"k8s.io/api/imagepolicy/v1alpha1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apiserver/pkg/admission"
@@ -36,7 +39,6 @@ import (
 	api "k8s.io/kubernetes/pkg/apis/core"
 
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"text/template"
@@ -66,7 +68,7 @@ imagePolicy:
 `
 
 func TestNewFromConfig(t *testing.T) {
-	dir, err := ioutil.TempDir("", "")
+	dir, err := os.MkdirTemp("", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -91,7 +93,7 @@ func TestNewFromConfig(t *testing.T) {
 		{data.Key, clientKey},
 	}
 	for _, file := range files {
-		if err := ioutil.WriteFile(file.name, file.data, 0400); err != nil {
+		if err := os.WriteFile(file.name, file.data, 0400); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -195,12 +197,12 @@ current-context: default
 		// Use a closure so defer statements trigger between loop iterations.
 		t.Run(tt.msg, func(t *testing.T) {
 			err := func() error {
-				tempfile, err := ioutil.TempFile("", "")
+				tempfile, err := os.CreateTemp("", "")
 				if err != nil {
 					return err
 				}
 				p := tempfile.Name()
-				defer os.Remove(p)
+				defer utiltesting.CloseAndRemove(t, tempfile)
 
 				tmpl, err := template.New("test").Parse(tt.kubeConfigTmpl)
 				if err != nil {
@@ -210,12 +212,12 @@ current-context: default
 					return fmt.Errorf("failed to execute test template: %v", err)
 				}
 
-				tempconfigfile, err := ioutil.TempFile("", "")
+				tempconfigfile, err := os.CreateTemp("", "")
 				if err != nil {
 					return err
 				}
 				pc := tempconfigfile.Name()
-				defer os.Remove(pc)
+				defer utiltesting.CloseAndRemove(t, tempconfigfile)
 
 				configTmpl, err := template.New("testconfig").Parse(defaultConfigTmplJSON)
 				if err != nil {
@@ -358,7 +360,7 @@ func (m *mockService) HTTPStatusCode() int { return m.statusCode }
 // newImagePolicyWebhook creates a temporary kubeconfig file from the provided arguments and attempts to load
 // a new newImagePolicyWebhook from it.
 func newImagePolicyWebhook(callbackURL string, clientCert, clientKey, ca []byte, cacheTime time.Duration, defaultAllow bool) (*Plugin, error) {
-	tempfile, err := ioutil.TempFile("", "")
+	tempfile, err := os.CreateTemp("", "")
 	if err != nil {
 		return nil, err
 	}
@@ -380,7 +382,7 @@ func newImagePolicyWebhook(callbackURL string, clientCert, clientKey, ca []byte,
 		return nil, err
 	}
 
-	tempconfigfile, err := ioutil.TempFile("", "")
+	tempconfigfile, err := os.CreateTemp("", "")
 	if err != nil {
 		return nil, err
 	}
@@ -488,7 +490,7 @@ func TestTLSConfig(t *testing.T) {
 			// Allow all and see if we get an error.
 			service.Allow()
 
-			err = wh.Validate(attr, nil)
+			err = wh.Validate(context.TODO(), attr, nil)
 			if tt.wantAllowed {
 				if err != nil {
 					t.Errorf("expected successful admission")
@@ -510,7 +512,7 @@ func TestTLSConfig(t *testing.T) {
 			}
 
 			service.Deny()
-			if err := wh.Validate(attr, nil); err == nil {
+			if err := wh.Validate(context.TODO(), attr, nil); err == nil {
 				t.Errorf("%s: incorrectly admitted with DenyAll policy", tt.test)
 			}
 		})
@@ -527,7 +529,7 @@ type webhookCacheTestCase struct {
 func testWebhookCacheCases(t *testing.T, serv *mockService, wh *Plugin, attr admission.Attributes, tests []webhookCacheTestCase) {
 	for _, test := range tests {
 		serv.statusCode = test.statusCode
-		err := wh.Validate(attr, nil)
+		err := wh.Validate(context.TODO(), attr, nil)
 		authorized := err == nil
 
 		if test.expectedErr && err == nil {
@@ -594,17 +596,23 @@ func TestContainerCombinations(t *testing.T) {
 		test                 string
 		pod                  *api.Pod
 		wantAllowed, wantErr bool
+		subresource          string
+		operation            admission.Operation
 	}{
 		{
 			test:        "Single container allowed",
 			pod:         goodPod("good"),
 			wantAllowed: true,
+			subresource: "",
+			operation:   admission.Create,
 		},
 		{
 			test:        "Single container denied",
 			pod:         goodPod("bad"),
 			wantAllowed: false,
 			wantErr:     true,
+			subresource: "",
+			operation:   admission.Create,
 		},
 		{
 			test: "One good container, one bad",
@@ -626,6 +634,8 @@ func TestContainerCombinations(t *testing.T) {
 			},
 			wantAllowed: false,
 			wantErr:     true,
+			subresource: "",
+			operation:   admission.Create,
 		},
 		{
 			test: "Multiple good containers",
@@ -647,6 +657,8 @@ func TestContainerCombinations(t *testing.T) {
 			},
 			wantAllowed: true,
 			wantErr:     false,
+			subresource: "",
+			operation:   admission.Create,
 		},
 		{
 			test: "Multiple bad containers",
@@ -668,6 +680,8 @@ func TestContainerCombinations(t *testing.T) {
 			},
 			wantAllowed: false,
 			wantErr:     true,
+			subresource: "",
+			operation:   admission.Create,
 		},
 		{
 			test: "Good container, bad init container",
@@ -691,6 +705,8 @@ func TestContainerCombinations(t *testing.T) {
 			},
 			wantAllowed: false,
 			wantErr:     true,
+			subresource: "",
+			operation:   admission.Create,
 		},
 		{
 			test: "Bad container, good init container",
@@ -714,6 +730,8 @@ func TestContainerCombinations(t *testing.T) {
 			},
 			wantAllowed: false,
 			wantErr:     true,
+			subresource: "",
+			operation:   admission.Create,
 		},
 		{
 			test: "Good container, good init container",
@@ -737,6 +755,173 @@ func TestContainerCombinations(t *testing.T) {
 			},
 			wantAllowed: true,
 			wantErr:     false,
+			subresource: "",
+			operation:   admission.Create,
+		},
+		{
+			test: "Good container, good init container, bad ephemeral container when updating ephemeralcontainers subresource",
+			pod: &api.Pod{
+				Spec: api.PodSpec{
+					ServiceAccountName: "default",
+					SecurityContext:    &api.PodSecurityContext{},
+					Containers: []api.Container{
+						{
+							Image:           "good",
+							SecurityContext: &api.SecurityContext{},
+						},
+					},
+					InitContainers: []api.Container{
+						{
+							Image:           "good",
+							SecurityContext: &api.SecurityContext{},
+						},
+					},
+					EphemeralContainers: []api.EphemeralContainer{
+						{
+							EphemeralContainerCommon: api.EphemeralContainerCommon{
+								Image:           "bad",
+								SecurityContext: &api.SecurityContext{},
+							},
+						},
+					},
+				},
+			},
+			wantAllowed: false,
+			wantErr:     true,
+			subresource: "ephemeralcontainers",
+			operation:   admission.Update,
+		},
+		{
+			test: "Good container, good init container, bad ephemeral container when updating subresource=='' which sets initContainer and container only",
+			pod: &api.Pod{
+				Spec: api.PodSpec{
+					ServiceAccountName: "default",
+					SecurityContext:    &api.PodSecurityContext{},
+					Containers: []api.Container{
+						{
+							Image:           "good",
+							SecurityContext: &api.SecurityContext{},
+						},
+					},
+					InitContainers: []api.Container{
+						{
+							Image:           "good",
+							SecurityContext: &api.SecurityContext{},
+						},
+					},
+					EphemeralContainers: []api.EphemeralContainer{
+						{
+							EphemeralContainerCommon: api.EphemeralContainerCommon{
+								Image:           "bad",
+								SecurityContext: &api.SecurityContext{},
+							},
+						},
+					},
+				},
+			},
+			wantAllowed: true,
+			wantErr:     false,
+			subresource: "",
+			operation:   admission.Update,
+		},
+
+		{
+			test: "Bad container, good ephemeral container when updating subresource=='ephemeralcontainers' which sets ephemeralcontainers only",
+			pod: &api.Pod{
+				Spec: api.PodSpec{
+					ServiceAccountName: "default",
+					SecurityContext:    &api.PodSecurityContext{},
+					Containers: []api.Container{
+						{
+							Image:           "bad",
+							SecurityContext: &api.SecurityContext{},
+						},
+					},
+					EphemeralContainers: []api.EphemeralContainer{
+						{
+							EphemeralContainerCommon: api.EphemeralContainerCommon{
+								Image:           "good",
+								SecurityContext: &api.SecurityContext{},
+							},
+						},
+					},
+				},
+			},
+			wantAllowed: true,
+			wantErr:     false,
+			subresource: "ephemeralcontainers",
+			operation:   admission.Update,
+		},
+		{
+			test: "Good ephemeral container",
+			pod: &api.Pod{
+				Spec: api.PodSpec{
+					ServiceAccountName: "default",
+					SecurityContext:    &api.PodSecurityContext{},
+					EphemeralContainers: []api.EphemeralContainer{
+						{
+							EphemeralContainerCommon: api.EphemeralContainerCommon{
+								Image:           "good",
+								SecurityContext: &api.SecurityContext{},
+							},
+						},
+					},
+				},
+			},
+			wantAllowed: true,
+			wantErr:     false,
+			subresource: "ephemeralcontainers",
+			operation:   admission.Update,
+		},
+		{
+			test: "Good container, bad added container when updating dynamic subresource",
+			pod: &api.Pod{
+				Spec: api.PodSpec{
+					ServiceAccountName: "default",
+					SecurityContext:    &api.PodSecurityContext{},
+					Containers: []api.Container{
+						{
+							Name:            "existing",
+							Image:           "good",
+							SecurityContext: &api.SecurityContext{},
+						},
+						{
+							Name:            "added",
+							Image:           "bad",
+							SecurityContext: &api.SecurityContext{},
+						},
+					},
+				},
+			},
+			wantAllowed: false,
+			wantErr:     true,
+			subresource: "dynamic",
+			operation:   admission.Update,
+		},
+		{
+			test: "Good containers when updating dynamic subresource",
+			pod: &api.Pod{
+				Spec: api.PodSpec{
+					ServiceAccountName: "default",
+					SecurityContext:    &api.PodSecurityContext{},
+					Containers: []api.Container{
+						{
+							Name:            "existing",
+							Image:           "good",
+							SecurityContext: &api.SecurityContext{},
+						},
+						{
+							Name:            "added",
+							Image:           "good",
+							SecurityContext: &api.SecurityContext{},
+						},
+					},
+				},
+			},
+			wantAllowed: true,
+			wantErr:     false,
+			subresource: "dynamic",
+			operation:   admission.Update,
 		},
 	}
 	for _, tt := range tests {
@@ -758,9 +943,9 @@ func TestContainerCombinations(t *testing.T) {
 				return
 			}
 
-			attr := admission.NewAttributesRecord(tt.pod, nil, api.Kind("Pod").WithVersion("version"), "namespace", "", api.Resource("pods").WithVersion("version"), "", admission.Create, &metav1.CreateOptions{}, false, &user.DefaultInfo{})
+			attr := admission.NewAttributesRecord(tt.pod, nil, api.Kind("Pod").WithVersion("version"), "namespace", "", api.Resource("pods").WithVersion("version"), tt.subresource, tt.operation, &metav1.CreateOptions{}, false, &user.DefaultInfo{})
 
-			err = wh.Validate(attr, nil)
+			err = wh.Validate(context.TODO(), attr, nil)
 			if tt.wantAllowed {
 				if err != nil {
 					t.Errorf("expected successful admission: %s", tt.test)
@@ -856,7 +1041,7 @@ func TestDefaultAllow(t *testing.T) {
 			annotations := make(map[string]string)
 			attr = &fakeAttributes{attr, annotations}
 
-			err = wh.Validate(attr, nil)
+			err = wh.Validate(context.TODO(), attr, nil)
 			if tt.wantAllowed {
 				if err != nil {
 					t.Errorf("expected successful admission")
@@ -964,7 +1149,7 @@ func TestAnnotationFiltering(t *testing.T) {
 
 			attr := admission.NewAttributesRecord(pod, nil, api.Kind("Pod").WithVersion("version"), "namespace", "", api.Resource("pods").WithVersion("version"), "", admission.Create, &metav1.CreateOptions{}, false, &user.DefaultInfo{})
 
-			err = wh.Validate(attr, nil)
+			err = wh.Validate(context.TODO(), attr, nil)
 			if err != nil {
 				t.Errorf("expected successful admission")
 			}
@@ -983,6 +1168,7 @@ func TestReturnedAnnotationAdd(t *testing.T) {
 		pod                 *api.Pod
 		verifierAnnotations map[string]string
 		expectedAnnotations map[string]string
+		wantErr             bool
 	}{
 		{
 			test: "Add valid response annotations",
@@ -1028,6 +1214,7 @@ func TestReturnedAnnotationAdd(t *testing.T) {
 			expectedAnnotations: map[string]string{
 				"imagepolicywebhook.image-policy.k8s.io/foo-test": "false",
 			},
+			wantErr: true,
 		},
 	}
 	for _, tt := range tests {
@@ -1056,7 +1243,15 @@ func TestReturnedAnnotationAdd(t *testing.T) {
 			annotations := make(map[string]string)
 			attr = &fakeAttributes{attr, annotations}
 
-			err = wh.Validate(attr, nil)
+			err = wh.Validate(context.TODO(), attr, nil)
+			if tt.wantErr {
+				if err == nil {
+					t.Errorf("%s: expected error making admission request: %v", tt.test, err)
+				}
+			} else if err != nil {
+				t.Errorf("%s: failed to admit: %v", tt.test, err)
+			}
+
 			if !reflect.DeepEqual(annotations, tt.expectedAnnotations) {
 				t.Errorf("got audit annotations: %v; want: %v", annotations, tt.expectedAnnotations)
 			}

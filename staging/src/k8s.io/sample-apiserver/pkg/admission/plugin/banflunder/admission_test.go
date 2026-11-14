@@ -17,12 +17,14 @@ limitations under the License.
 package banflunder_test
 
 import (
+	"context"
 	"testing"
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/apiserver/pkg/admission"
 	clienttesting "k8s.io/client-go/testing"
 	"k8s.io/sample-apiserver/pkg/admission/plugin/banflunder"
@@ -123,11 +125,12 @@ func TestBanflunderAdmissionPlugin(t *testing.T) {
 
 			stop := make(chan struct{})
 			defer close(stop)
-			informersFactory.Start(stop)
-			informersFactory.WaitForCacheSync(stop)
+			ctx := wait.ContextForChannel(stop)
+			informersFactory.StartWithContext(ctx)
+			informersFactory.WaitForCacheSyncWithContext(ctx)
 
 			// act
-			err = target.Admit(admission.NewAttributesRecord(
+			err = target.Admit(context.TODO(), admission.NewAttributesRecord(
 				&scenario.admissionInput,
 				nil,
 				scenario.admissionInputKind,

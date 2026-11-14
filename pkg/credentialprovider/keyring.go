@@ -17,38 +17,90 @@ limitations under the License.
 package credentialprovider
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"net"
 	"net/url"
 	"path/filepath"
 	"sort"
 	"strings"
 
-	"k8s.io/klog"
-
 	"k8s.io/apimachinery/pkg/util/sets"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	"k8s.io/klog/v2"
+	"k8s.io/kubernetes/pkg/features"
 )
 
 // DockerKeyring tracks a set of docker registry credentials, maintaining a
 // reverse index across the registry endpoints. A registry endpoint is made
 // up of a host (e.g. registry.example.com), but it may also contain a path
 // (e.g. registry.example.com/foo) This index is important for two reasons:
-// - registry endpoints may overlap, and when this happens we must find the
-//   most specific match for a given image
-// - iterating a map does not yield predictable results
+//   - registry endpoints may overlap, and when this happens we must find the
+//     most specific match for a given image
+//   - iterating a map does not yield predictable results
 type DockerKeyring interface {
-	Lookup(image string) ([]AuthConfig, bool)
+	Lookup(image string) ([]TrackedAuthConfig, bool)
 }
 
 // BasicDockerKeyring is a trivial map-backed implementation of DockerKeyring
 type BasicDockerKeyring struct {
 	index []string
-	creds map[string][]AuthConfig
+	creds map[string][]TrackedAuthConfig
 }
 
 // providersDockerKeyring is an implementation of DockerKeyring that
 // materializes its dockercfg based on a set of dockerConfigProviders.
 type providersDockerKeyring struct {
 	Providers []DockerConfigProvider
+}
+
+// TrackedAuthConfig wraps the AuthConfig and adds information about the source
+// of the credentials.
+type TrackedAuthConfig struct {
+	AuthConfig
+	AuthConfigHash string
+
+	Source *CredentialSource
+}
+
+// NewTrackedAuthConfig initializes the TrackedAuthConfig structure by adding
+// the source information to the supplied AuthConfig. It also counts a hash of the
+// AuthConfig and keeps it in the returned structure.
+//
+// The supplied CredentialSource is only used when the "KubeletEnsureSecretPulledImages"
+// is enabled, the same applies for counting the hash.
+func NewTrackedAuthConfig(c *AuthConfig, src *CredentialSource) *TrackedAuthConfig {
+	if c == nil {
+		panic("cannot construct TrackedAuthConfig with a nil AuthConfig")
+	}
+
+	authConfig := &TrackedAuthConfig{
+		AuthConfig: *c,
+	}
+
+	if utilfeature.DefaultFeatureGate.Enabled(features.KubeletEnsureSecretPulledImages) {
+		authConfig.Source = src
+		authConfig.AuthConfigHash = hashAuthConfig(c)
+	}
+	return authConfig
+}
+
+type CredentialSource struct {
+	Secret         *SecretCoordinates
+	ServiceAccount *ServiceAccountCoordinates
+}
+
+type SecretCoordinates struct {
+	UID       string
+	Namespace string
+	Name      string
+}
+
+type ServiceAccountCoordinates struct {
+	UID       string
+	Namespace string
+	Name      string
 }
 
 // AuthConfig contains authorization information for connecting to a Registry
@@ -73,25 +125,27 @@ type AuthConfig struct {
 	RegistryToken string `json:"registrytoken,omitempty"`
 }
 
-func (dk *BasicDockerKeyring) Add(cfg DockerConfig) {
+// Add inserts the docker config `cfg` into the basic docker keyring. It attaches
+// the `src` information that describes where the docker config `cfg` comes from.
+// `src` is nil if the docker config is globally available on the node.
+func (dk *BasicDockerKeyring) Add(src *CredentialSource, cfgs DockerConfig) {
 	if dk.index == nil {
 		dk.index = make([]string, 0)
-		dk.creds = make(map[string][]AuthConfig)
+		dk.creds = make(map[string][]TrackedAuthConfig)
 	}
-	for loc, ident := range cfg {
+	for repository, dockerAuthCfg := range cfgs {
 		creds := AuthConfig{
-			Username: ident.Username,
-			Password: ident.Password,
-			Email:    ident.Email,
+			Username: dockerAuthCfg.Username,
+			Password: dockerAuthCfg.Password,
+			Email:    dockerAuthCfg.Email,
 		}
 
-		value := loc
-		if !strings.HasPrefix(value, "https://") && !strings.HasPrefix(value, "http://") {
-			value = "https://" + value
+		if !strings.HasPrefix(repository, "https://") && !strings.HasPrefix(repository, "http://") {
+			repository = "https://" + repository
 		}
-		parsed, err := url.Parse(value)
+		parsed, err := url.Parse(repository)
 		if err != nil {
-			klog.Errorf("Entry %q in dockercfg invalid (%v), ignoring", loc, err)
+			klog.Errorf("Entry %q in dockercfg invalid (%v), ignoring", repository, err)
 			continue
 		}
 
@@ -111,7 +165,9 @@ func (dk *BasicDockerKeyring) Add(cfg DockerConfig) {
 		} else {
 			key = parsed.Host
 		}
-		dk.creds[key] = append(dk.creds[key], creds)
+		trackedCreds := NewTrackedAuthConfig(&creds, src)
+
+		dk.creds[key] = append(dk.creds[key], *trackedCreds)
 		dk.index = append(dk.index, key)
 	}
 
@@ -120,7 +176,7 @@ func (dk *BasicDockerKeyring) Add(cfg DockerConfig) {
 
 	// Update the index used to identify which credentials to use for a given
 	// image. The index is reverse-sorted so more specific paths are matched
-	// first. For example, if for the given image "quay.io/coreos/etcd",
+	// first. For example, if for the given image "gcr.io/etcd-development/etcd",
 	// credentials for "quay.io/coreos" should match before "quay.io".
 	sort.Sort(sort.Reverse(sort.StringSlice(dk.index)))
 }
@@ -157,10 +213,11 @@ func isDefaultRegistryMatch(image string) bool {
 	return !strings.ContainsAny(parts[0], ".:")
 }
 
+// ParseSchemelessURL parses a schemeless url and returns a url.URL
 // url.Parse require a scheme, but ours don't have schemes.  Adding a
 // scheme to make url.Parse happy, then clear out the resulting scheme.
-func parseSchemelessUrl(schemelessUrl string) (*url.URL, error) {
-	parsed, err := url.Parse("https://" + schemelessUrl)
+func ParseSchemelessURL(schemelessURL string) (*url.URL, error) {
+	parsed, err := url.Parse("https://" + schemelessURL)
 	if err != nil {
 		return nil, err
 	}
@@ -169,8 +226,8 @@ func parseSchemelessUrl(schemelessUrl string) (*url.URL, error) {
 	return parsed, nil
 }
 
-// split the host name into parts, as well as the port
-func splitUrl(url *url.URL) (parts []string, port string) {
+// SplitURL splits the host name into parts, as well as the port
+func SplitURL(url *url.URL) (parts []string, port string) {
 	host, port, err := net.SplitHostPort(url.Host)
 	if err != nil {
 		// could not parse port
@@ -179,45 +236,46 @@ func splitUrl(url *url.URL) (parts []string, port string) {
 	return strings.Split(host, "."), port
 }
 
-// overloaded version of urlsMatch, operating on strings instead of URLs.
-func urlsMatchStr(glob string, target string) (bool, error) {
-	globUrl, err := parseSchemelessUrl(glob)
+// URLsMatchStr is wrapper for URLsMatch, operating on strings instead of URLs.
+func URLsMatchStr(glob string, target string) (bool, error) {
+	globURL, err := ParseSchemelessURL(glob)
 	if err != nil {
 		return false, err
 	}
-	targetUrl, err := parseSchemelessUrl(target)
+	targetURL, err := ParseSchemelessURL(target)
 	if err != nil {
 		return false, err
 	}
-	return urlsMatch(globUrl, targetUrl)
+	return URLsMatch(globURL, targetURL)
 }
 
-// check whether the given target url matches the glob url, which may have
+// URLsMatch checks whether the given target url matches the glob url, which may have
 // glob wild cards in the host name.
 //
 // Examples:
-//    globUrl=*.docker.io, targetUrl=blah.docker.io => match
-//    globUrl=*.docker.io, targetUrl=not.right.io   => no match
+//
+//	globURL=*.docker.io, targetURL=blah.docker.io => match
+//	globURL=*.docker.io, targetURL=not.right.io   => no match
 //
 // Note that we don't support wildcards in ports and paths yet.
-func urlsMatch(globUrl *url.URL, targetUrl *url.URL) (bool, error) {
-	globUrlParts, globPort := splitUrl(globUrl)
-	targetUrlParts, targetPort := splitUrl(targetUrl)
+func URLsMatch(globURL *url.URL, targetURL *url.URL) (bool, error) {
+	globURLParts, globPort := SplitURL(globURL)
+	targetURLParts, targetPort := SplitURL(targetURL)
 	if globPort != targetPort {
 		// port doesn't match
 		return false, nil
 	}
-	if len(globUrlParts) != len(targetUrlParts) {
+	if len(globURLParts) != len(targetURLParts) {
 		// host name does not have the same number of parts
 		return false, nil
 	}
-	if !strings.HasPrefix(targetUrl.Path, globUrl.Path) {
+	if !strings.HasPrefix(targetURL.Path, globURL.Path) {
 		// the path of the credential must be a prefix
 		return false, nil
 	}
-	for k, globUrlPart := range globUrlParts {
-		targetUrlPart := targetUrlParts[k]
-		matched, err := filepath.Match(globUrlPart, targetUrlPart)
+	for k, globURLPart := range globURLParts {
+		targetURLPart := targetURLParts[k]
+		matched, err := filepath.Match(globURLPart, targetURLPart)
 		if err != nil {
 			return false, err
 		}
@@ -233,13 +291,13 @@ func urlsMatch(globUrl *url.URL, targetUrl *url.URL) (bool, error) {
 // Lookup implements the DockerKeyring method for fetching credentials based on image name.
 // Multiple credentials may be returned if there are multiple potentially valid credentials
 // available.  This allows for rotation.
-func (dk *BasicDockerKeyring) Lookup(image string) ([]AuthConfig, bool) {
+func (dk *BasicDockerKeyring) Lookup(image string) ([]TrackedAuthConfig, bool) {
 	// range over the index as iterating over a map does not provide a predictable ordering
-	ret := []AuthConfig{}
+	ret := []TrackedAuthConfig{}
 	for _, k := range dk.index {
 		// both k and image are schemeless URLs because even though schemes are allowed
 		// in the credential configurations, we remove them in Add.
-		if matched, _ := urlsMatchStr(k, image); matched {
+		if matched, _ := URLsMatchStr(k, image); matched {
 			ret = append(ret, dk.creds[k]...)
 		}
 	}
@@ -255,35 +313,40 @@ func (dk *BasicDockerKeyring) Lookup(image string) ([]AuthConfig, bool) {
 		}
 	}
 
-	return []AuthConfig{}, false
+	return []TrackedAuthConfig{}, false
 }
 
 // Lookup implements the DockerKeyring method for fetching credentials
 // based on image name.
-func (dk *providersDockerKeyring) Lookup(image string) ([]AuthConfig, bool) {
+func (dk *providersDockerKeyring) Lookup(image string) ([]TrackedAuthConfig, bool) {
 	keyring := &BasicDockerKeyring{}
 
 	for _, p := range dk.Providers {
-		keyring.Add(p.Provide(image))
+		keyring.Add(nil, p.Provide(image))
 	}
 
 	return keyring.Lookup(image)
 }
 
+// FakeKeyring a fake config credentials
 type FakeKeyring struct {
-	auth []AuthConfig
+	auth []TrackedAuthConfig
 	ok   bool
 }
 
-func (f *FakeKeyring) Lookup(image string) ([]AuthConfig, bool) {
+// Lookup implements the DockerKeyring method for fetching credentials based on image name
+// return fake auth and ok
+func (f *FakeKeyring) Lookup(image string) ([]TrackedAuthConfig, bool) {
 	return f.auth, f.ok
 }
 
 // UnionDockerKeyring delegates to a set of keyrings.
 type UnionDockerKeyring []DockerKeyring
 
-func (k UnionDockerKeyring) Lookup(image string) ([]AuthConfig, bool) {
-	authConfigs := []AuthConfig{}
+// Lookup implements the DockerKeyring method for fetching credentials based on image name.
+// return each credentials
+func (k UnionDockerKeyring) Lookup(image string) ([]TrackedAuthConfig, bool) {
+	authConfigs := []TrackedAuthConfig{}
 	for _, subKeyring := range k {
 		if subKeyring == nil {
 			continue
@@ -294,4 +357,15 @@ func (k UnionDockerKeyring) Lookup(image string) ([]AuthConfig, bool) {
 	}
 
 	return authConfigs, (len(authConfigs) > 0)
+}
+
+func hashAuthConfig(creds *AuthConfig) string {
+	credBytes, err := json.Marshal(creds)
+	if err != nil {
+		return ""
+	}
+
+	hash := sha256.New()
+	hash.Write([]byte(credBytes))
+	return hex.EncodeToString(hash.Sum(nil))
 }

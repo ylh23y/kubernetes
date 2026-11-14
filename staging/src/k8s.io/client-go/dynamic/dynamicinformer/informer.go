@@ -17,6 +17,7 @@ limitations under the License.
 package dynamicinformer
 
 import (
+	"context"
 	"sync"
 	"time"
 
@@ -24,12 +25,25 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/sharding"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/dynamic/dynamiclister"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/tools/cache"
 )
+
+// DynamicSharedInformerOption defines the functional option type for dynamicSharedInformerFactory.
+type DynamicSharedInformerOption func(*dynamicSharedInformerFactory) *dynamicSharedInformerFactory
+
+// WithShardSelector sets a shard selector on all informers.
+func WithShardSelector(shardSelector sharding.Selector) DynamicSharedInformerOption {
+	return func(factory *dynamicSharedInformerFactory) *dynamicSharedInformerFactory {
+		factory.shardSelector = shardSelector
+		return factory
+	}
+}
 
 // NewDynamicSharedInformerFactory constructs a new instance of dynamicSharedInformerFactory for all namespaces.
 func NewDynamicSharedInformerFactory(client dynamic.Interface, defaultResync time.Duration) DynamicSharedInformerFactory {
@@ -49,10 +63,28 @@ func NewFilteredDynamicSharedInformerFactory(client dynamic.Interface, defaultRe
 	}
 }
 
+// NewDynamicSharedInformerFactoryWithOptions constructs a new instance of dynamicSharedInformerFactory with additional options.
+func NewDynamicSharedInformerFactoryWithOptions(client dynamic.Interface, defaultResync time.Duration, options ...DynamicSharedInformerOption) DynamicSharedInformerFactory {
+	factory := &dynamicSharedInformerFactory{
+		client:           client,
+		defaultResync:    defaultResync,
+		namespace:        metav1.NamespaceAll,
+		informers:        map[schema.GroupVersionResource]informers.GenericInformer{},
+		startedInformers: make(map[schema.GroupVersionResource]bool),
+	}
+
+	for _, opt := range options {
+		factory = opt(factory)
+	}
+
+	return factory
+}
+
 type dynamicSharedInformerFactory struct {
 	client        dynamic.Interface
 	defaultResync time.Duration
 	namespace     string
+	shardSelector sharding.Selector
 
 	lock      sync.Mutex
 	informers map[schema.GroupVersionResource]informers.GenericInformer
@@ -60,6 +92,12 @@ type dynamicSharedInformerFactory struct {
 	// This allows Start() to be called multiple times safely.
 	startedInformers map[schema.GroupVersionResource]bool
 	tweakListOptions TweakListOptionsFunc
+
+	// wg tracks how many goroutines were started.
+	wg sync.WaitGroup
+	// shuttingDown is true when Shutdown has been called. It may still be running
+	// because it needs to wait for goroutines.
+	shuttingDown bool
 }
 
 var _ DynamicSharedInformerFactory = &dynamicSharedInformerFactory{}
@@ -75,26 +113,56 @@ func (f *dynamicSharedInformerFactory) ForResource(gvr schema.GroupVersionResour
 	}
 
 	informer = NewFilteredDynamicInformer(f.client, gvr, f.namespace, f.defaultResync, cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc}, f.tweakListOptions)
+	if f.shardSelector != nil {
+		_ = informer.Informer().SetShardSelector(f.shardSelector)
+	}
 	f.informers[key] = informer
 
 	return informer
 }
 
 // Start initializes all requested informers.
+//
+// Contextual logging: StartWithContext should be used instead of Start in code which supports contextual logging.
 func (f *dynamicSharedInformerFactory) Start(stopCh <-chan struct{}) {
+	f.StartWithContext(wait.ContextForChannel(stopCh))
+}
+
+// StartWithContext initializes all requested informers.
+func (f *dynamicSharedInformerFactory) StartWithContext(ctx context.Context) {
 	f.lock.Lock()
 	defer f.lock.Unlock()
 
+	if f.shuttingDown {
+		return
+	}
+
 	for informerType, informer := range f.informers {
 		if !f.startedInformers[informerType] {
-			go informer.Informer().Run(stopCh)
+			f.wg.Add(1)
+			// We need a new variable in each loop iteration,
+			// otherwise the goroutine would use the loop variable
+			// and that keeps changing.
+			informer := informer.Informer()
+			go func() {
+				defer f.wg.Done()
+				informer.RunWithContext(ctx)
+			}()
 			f.startedInformers[informerType] = true
 		}
 	}
 }
 
 // WaitForCacheSync waits for all started informers' cache were synced.
+//
+//logcheck:context // WaitForCacheSyncWithContext should be used instead of WaitForCacheSync in code which supports contextual logging.
 func (f *dynamicSharedInformerFactory) WaitForCacheSync(stopCh <-chan struct{}) map[schema.GroupVersionResource]bool {
+	return f.WaitForCacheSyncWithContext(wait.ContextForChannel(stopCh)).Synced
+}
+
+// WaitForCacheSyncWithContext waits for all started informers' caches to be
+// synced or the context to be canceled.
+func (f *dynamicSharedInformerFactory) WaitForCacheSyncWithContext(ctx context.Context) cache.GVRSyncResult {
 	informers := func() map[schema.GroupVersionResource]cache.SharedIndexInformer {
 		f.lock.Lock()
 		defer f.lock.Unlock()
@@ -108,35 +176,77 @@ func (f *dynamicSharedInformerFactory) WaitForCacheSync(stopCh <-chan struct{}) 
 		return informers
 	}()
 
-	res := map[schema.GroupVersionResource]bool{}
+	// Wait for informers to sync, without polling.
+	cacheSyncs := make([]cache.DoneChecker, 0, len(informers))
+	for _, informer := range informers {
+		cacheSyncs = append(cacheSyncs, informer.HasSyncedChecker())
+	}
+	cache.WaitFor(ctx, "" /* no logging */, cacheSyncs...)
+
+	res := cache.GVRSyncResult{
+		Synced: make(map[schema.GroupVersionResource]bool, len(informers)),
+	}
+	failed := false
 	for informType, informer := range informers {
-		res[informType] = cache.WaitForCacheSync(stopCh, informer.HasSynced)
+		hasSynced := informer.HasSynced()
+		if !hasSynced {
+			failed = true
+		}
+		res.Synced[informType] = hasSynced
+	}
+	if failed {
+		// Non-nil, otherwise WaitFor wouldn't have stopped prematurely.
+		res.Err = context.Cause(ctx)
 	}
 	return res
+}
+
+func (f *dynamicSharedInformerFactory) Shutdown() {
+	// Will return immediately if there is nothing to wait for.
+	defer f.wg.Wait()
+
+	f.lock.Lock()
+	defer f.lock.Unlock()
+	f.shuttingDown = true
 }
 
 // NewFilteredDynamicInformer constructs a new informer for a dynamic type.
 func NewFilteredDynamicInformer(client dynamic.Interface, gvr schema.GroupVersionResource, namespace string, resyncPeriod time.Duration, indexers cache.Indexers, tweakListOptions TweakListOptionsFunc) informers.GenericInformer {
 	return &dynamicInformer{
 		gvr: gvr,
-		informer: cache.NewSharedIndexInformer(
-			&cache.ListWatch{
+		informer: cache.NewSharedIndexInformerWithOptions(
+			cache.ToListWatcherWithWatchListSemantics(&cache.ListWatch{
 				ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
 					if tweakListOptions != nil {
 						tweakListOptions(&options)
 					}
-					return client.Resource(gvr).Namespace(namespace).List(options)
+					return client.Resource(gvr).Namespace(namespace).List(context.Background(), options)
 				},
 				WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
 					if tweakListOptions != nil {
 						tweakListOptions(&options)
 					}
-					return client.Resource(gvr).Namespace(namespace).Watch(options)
+					return client.Resource(gvr).Namespace(namespace).Watch(context.Background(), options)
 				},
-			},
+				ListWithContextFunc: func(ctx context.Context, options metav1.ListOptions) (runtime.Object, error) {
+					if tweakListOptions != nil {
+						tweakListOptions(&options)
+					}
+					return client.Resource(gvr).Namespace(namespace).List(ctx, options)
+				},
+				WatchFuncWithContext: func(ctx context.Context, options metav1.ListOptions) (watch.Interface, error) {
+					if tweakListOptions != nil {
+						tweakListOptions(&options)
+					}
+					return client.Resource(gvr).Namespace(namespace).Watch(ctx, options)
+				},
+			}, client),
 			&unstructured.Unstructured{},
-			resyncPeriod,
-			indexers,
+			cache.SharedIndexInformerOptions{
+				ResyncPeriod:      resyncPeriod,
+				Indexers:          indexers,
+				ObjectDescription: gvr.String(),
+			},
 		),
 	}
 }

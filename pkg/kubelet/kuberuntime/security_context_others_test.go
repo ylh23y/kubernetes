@@ -1,0 +1,348 @@
+//go:build !windows
+
+/*
+Copyright 2020 The Kubernetes Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package kuberuntime
+
+import (
+	"math"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	v1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	featuregatetesting "k8s.io/component-base/featuregate/testing"
+	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1"
+	"k8s.io/ktesting"
+	"k8s.io/kubernetes/pkg/features"
+	"k8s.io/kubernetes/pkg/kubelet/cm"
+)
+
+func TestVerifyRunAsNonRoot(t *testing.T) {
+	tCtx := ktesting.Init(t)
+	pod := &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			UID:       "12345678",
+			Name:      "bar",
+			Namespace: "new",
+		},
+		Spec: v1.PodSpec{
+			Containers: []v1.Container{
+				{
+					Name:            "foo",
+					Image:           "busybox",
+					ImagePullPolicy: v1.PullIfNotPresent,
+					Command:         []string{"testCommand"},
+					WorkingDir:      "testWorkingDir",
+				},
+			},
+		},
+	}
+
+	rootUser := int64(0)
+	anyUser := int64(1000)
+	invalidUser := int64(2147483648)
+	negativeUser := int64(-1000)
+	maxInt32User := int64(math.MaxInt32)
+	runAsNonRootTrue := true
+	runAsNonRootFalse := false
+	for _, test := range []struct {
+		desc     string
+		sc       *v1.SecurityContext
+		uid      *int64
+		username string
+		fail     bool
+	}{
+		{
+			desc: "Pass if SecurityContext is not set",
+			sc:   nil,
+			uid:  &rootUser,
+			fail: false,
+		},
+		{
+			desc: "Pass if RunAsUser is non-root and RunAsNonRoot is true",
+			sc: &v1.SecurityContext{
+				RunAsNonRoot: &runAsNonRootTrue,
+				RunAsUser:    &anyUser,
+			},
+			fail: false,
+		},
+		{
+			desc: "Pass if RunAsNonRoot is not set",
+			sc: &v1.SecurityContext{
+				RunAsUser: &rootUser,
+			},
+			uid:  &rootUser,
+			fail: false,
+		},
+		{
+			desc: "Pass if RunAsNonRoot is false (image user is root)",
+			sc: &v1.SecurityContext{
+				RunAsNonRoot: &runAsNonRootFalse,
+			},
+			uid:  &rootUser,
+			fail: false,
+		},
+		{
+			desc: "Pass if RunAsNonRoot is false (RunAsUser is root)",
+			sc: &v1.SecurityContext{
+				RunAsNonRoot: &runAsNonRootFalse,
+				RunAsUser:    &rootUser,
+			},
+			uid:  &rootUser,
+			fail: false,
+		},
+		{
+			desc: "Fail if container's RunAsUser is root and RunAsNonRoot is true",
+			sc: &v1.SecurityContext{
+				RunAsNonRoot: &runAsNonRootTrue,
+				RunAsUser:    &rootUser,
+			},
+			uid:  &rootUser,
+			fail: true,
+		},
+		{
+			desc: "Fail if image's user is root and RunAsNonRoot is true",
+			sc: &v1.SecurityContext{
+				RunAsNonRoot: &runAsNonRootTrue,
+			},
+			uid:  &rootUser,
+			fail: true,
+		},
+		{
+			desc: "Fail if image's username is set and RunAsNonRoot is true",
+			sc: &v1.SecurityContext{
+				RunAsNonRoot: &runAsNonRootTrue,
+			},
+			username: "test",
+			fail:     true,
+		},
+		{
+			desc: "Pass if image's user is non-root and RunAsNonRoot is true",
+			sc: &v1.SecurityContext{
+				RunAsNonRoot: &runAsNonRootTrue,
+			},
+			uid:  &anyUser,
+			fail: false,
+		},
+		{
+			desc: "Pass if container's user and image's user aren't set and RunAsNonRoot is true",
+			sc: &v1.SecurityContext{
+				RunAsNonRoot: &runAsNonRootTrue,
+			},
+			fail: false,
+		},
+		{
+			desc: "Fail if image's user is invalid and RunAsNonRoot is true",
+			sc: &v1.SecurityContext{
+				RunAsNonRoot: &runAsNonRootTrue,
+			},
+			uid:  &invalidUser,
+			fail: true,
+		},
+		{
+			desc: "Fail if image's user is negative and RunAsNonRoot is true",
+			sc: &v1.SecurityContext{
+				RunAsNonRoot: &runAsNonRootTrue,
+			},
+			uid:  &negativeUser,
+			fail: true,
+		},
+		{
+			desc: "Pass if image's user is math.MaxInt32 and RunAsNonRoot is true",
+			sc: &v1.SecurityContext{
+				RunAsNonRoot: &runAsNonRootTrue,
+			},
+			uid:  &maxInt32User,
+			fail: false,
+		},
+	} {
+		pod.Spec.Containers[0].SecurityContext = test.sc
+		err := verifyRunAsNonRoot(tCtx, pod, &pod.Spec.Containers[0], test.uid, test.username)
+		if test.fail {
+			assert.Error(t, err, test.desc)
+		} else {
+			assert.NoError(t, err, test.desc)
+		}
+	}
+}
+
+func TestDetermineEffectiveSecurityContextCgroupOptions(t *testing.T) {
+	readWrite := v1.CgroupMountModeReadWrite
+	readOnly := v1.CgroupMountModeReadOnly
+	unknown := v1.CgroupMountMode("Unknown")
+
+	testCases := []struct {
+		desc                    string
+		cgroupOptionsGate       bool
+		cgroupV1                bool
+		noNsdelegate            bool
+		noCgroupsPerQOS         bool
+		podSc                   *v1.PodSecurityContext
+		sc                      *v1.SecurityContext
+		expectedCgroupMountMode runtimeapi.CgroupMountMode
+		expectedErr             string
+	}{
+		{
+			desc:                    "nil SecurityContext",
+			cgroupOptionsGate:       true,
+			sc:                      nil,
+			expectedCgroupMountMode: runtimeapi.CgroupMountMode_CGROUP_MOUNT_MODE_UNSPECIFIED,
+		},
+		{
+			desc:                    "no CgroupOptions",
+			cgroupOptionsGate:       true,
+			sc:                      &v1.SecurityContext{},
+			expectedCgroupMountMode: runtimeapi.CgroupMountMode_CGROUP_MOUNT_MODE_UNSPECIFIED,
+		},
+		{
+			desc:              "CgroupOptions with nil MountMode",
+			cgroupOptionsGate: true,
+			sc: &v1.SecurityContext{
+				CgroupOptions: &v1.CgroupOptions{},
+			},
+			expectedCgroupMountMode: runtimeapi.CgroupMountMode_CGROUP_MOUNT_MODE_UNSPECIFIED,
+		},
+		{
+			desc:              "CgroupOptions ReadWrite",
+			cgroupOptionsGate: true,
+			sc: &v1.SecurityContext{
+				CgroupOptions: &v1.CgroupOptions{MountMode: &readWrite},
+			},
+			expectedCgroupMountMode: runtimeapi.CgroupMountMode_CGROUP_MOUNT_MODE_READ_WRITE,
+		},
+		{
+			desc:              "CgroupOptions ReadOnly",
+			cgroupOptionsGate: true,
+			sc: &v1.SecurityContext{
+				CgroupOptions: &v1.CgroupOptions{MountMode: &readOnly},
+			},
+			expectedCgroupMountMode: runtimeapi.CgroupMountMode_CGROUP_MOUNT_MODE_READ_ONLY,
+		},
+		{
+			desc:              "CgroupOptions ReadWrite with a pod-level security context",
+			cgroupOptionsGate: true,
+			podSc:             &v1.PodSecurityContext{RunAsNonRoot: new(true)},
+			sc: &v1.SecurityContext{
+				CgroupOptions: &v1.CgroupOptions{MountMode: &readWrite},
+			},
+			expectedCgroupMountMode: runtimeapi.CgroupMountMode_CGROUP_MOUNT_MODE_READ_WRITE,
+		},
+		{
+			desc:              "CgroupOptions ReadWrite with the feature gate disabled",
+			cgroupOptionsGate: false,
+			sc: &v1.SecurityContext{
+				CgroupOptions: &v1.CgroupOptions{MountMode: &readWrite},
+			},
+			expectedCgroupMountMode: runtimeapi.CgroupMountMode_CGROUP_MOUNT_MODE_UNSPECIFIED,
+		},
+		{
+			desc:              "CgroupOptions with an unknown mount mode",
+			cgroupOptionsGate: true,
+			sc: &v1.SecurityContext{
+				CgroupOptions: &v1.CgroupOptions{MountMode: &unknown},
+			},
+			expectedErr: "unsupported cgroup mount mode",
+		},
+		{
+			desc:              "CgroupOptions ReadOnly on a host without the writable cgroup requirements",
+			cgroupOptionsGate: true,
+			cgroupV1:          true,
+			noNsdelegate:      true,
+			noCgroupsPerQOS:   true,
+			sc: &v1.SecurityContext{
+				CgroupOptions: &v1.CgroupOptions{MountMode: &readOnly},
+			},
+			expectedCgroupMountMode: runtimeapi.CgroupMountMode_CGROUP_MOUNT_MODE_READ_ONLY,
+		},
+		{
+			desc:              "CgroupOptions ReadWrite on cgroup v1",
+			cgroupOptionsGate: true,
+			cgroupV1:          true,
+			sc: &v1.SecurityContext{
+				CgroupOptions: &v1.CgroupOptions{MountMode: &readWrite},
+			},
+			expectedErr: "require cgroup v2",
+		},
+		{
+			desc:              "CgroupOptions ReadWrite without nsdelegate",
+			cgroupOptionsGate: true,
+			noNsdelegate:      true,
+			sc: &v1.SecurityContext{
+				CgroupOptions: &v1.CgroupOptions{MountMode: &readWrite},
+			},
+			expectedErr: "nsdelegate",
+		},
+		{
+			desc:              "CgroupOptions ReadWrite without a pod cgroup",
+			cgroupOptionsGate: true,
+			noCgroupsPerQOS:   true,
+			sc: &v1.SecurityContext{
+				CgroupOptions: &v1.CgroupOptions{MountMode: &readWrite},
+			},
+			expectedErr: "cgroup per pod",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.desc, func(t *testing.T) {
+			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.CgroupOptions, tc.cgroupOptionsGate)
+
+			pod := &v1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					UID:       "12345678",
+					Name:      "bar",
+					Namespace: "new",
+				},
+				Spec: v1.PodSpec{
+					SecurityContext: tc.podSc,
+					Containers: []v1.Container{
+						{
+							Name:            "foo",
+							Image:           "busybox",
+							SecurityContext: tc.sc,
+						},
+					},
+				},
+			}
+
+			tCtx := ktesting.Init(t)
+			_, _, m, err := createTestRuntimeManager(tCtx)
+			require.NoError(t, err)
+			cgroupVersion := 2
+			if tc.cgroupV1 {
+				cgroupVersion = 1
+			}
+			m.containerManager = cm.NewFakeContainerManagerWithNodeConfig(cm.NodeConfig{
+				CgroupVersion:    cgroupVersion,
+				CgroupsPerQOS:    !tc.noCgroupsPerQOS,
+				CgroupNsdelegate: !tc.noNsdelegate,
+			})
+
+			result, err := m.determineEffectiveSecurityContext(tCtx, pod, &pod.Spec.Containers[0], nil, "")
+			if tc.expectedErr != "" {
+				require.ErrorContains(t, err, tc.expectedErr)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tc.expectedCgroupMountMode, result.CgroupMountMode)
+		})
+	}
+}

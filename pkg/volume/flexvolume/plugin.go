@@ -20,22 +20,22 @@ import (
 	"fmt"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 
 	api "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/klog"
-	"k8s.io/kubernetes/pkg/util/mount"
+	"k8s.io/klog/v2"
 	"k8s.io/kubernetes/pkg/volume"
 	"k8s.io/kubernetes/pkg/volume/util"
+	"k8s.io/mount-utils"
 	"k8s.io/utils/exec"
 	utilstrings "k8s.io/utils/strings"
 )
 
 const (
-	flexVolumePluginName       = "kubernetes.io/flexvolume"
-	flexVolumePluginNamePrefix = "flexvolume-"
+	flexVolumePluginName = "kubernetes.io/flexvolume"
 )
 
 // FlexVolumePlugin object.
@@ -102,6 +102,10 @@ func (plugin *flexVolumePlugin) Init(host volume.VolumeHost) error {
 	return nil
 }
 
+func (plugin *flexVolumePlugin) VerifyExhaustedResource(spec *volume.Spec) bool {
+	return false
+}
+
 func (plugin *flexVolumePlugin) getExecutable() string {
 	parts := strings.Split(plugin.driverName, "/")
 	execName := parts[len(parts)-1]
@@ -114,7 +118,7 @@ func (plugin *flexVolumePlugin) getExecutable() string {
 
 // Name is part of the volume.VolumePlugin interface.
 func (plugin *flexVolumePlugin) GetPluginName() string {
-	return flexVolumePluginNamePrefix + plugin.driverName
+	return plugin.driverName
 }
 
 // GetVolumeName is part of the volume.VolumePlugin interface.
@@ -134,7 +138,7 @@ func (plugin *flexVolumePlugin) GetVolumeName(spec *volume.Spec) (string, error)
 		return "", err
 	}
 
-	klog.Warning(logPrefix(plugin), "GetVolumeName is not supported yet. Defaulting to PV or volume name: ", name)
+	klog.V(4).Info(logPrefix(plugin), "GetVolumeName is not supported yet. Defaulting to PV or volume name: ", name)
 
 	return name, nil
 }
@@ -148,12 +152,8 @@ func (plugin *flexVolumePlugin) CanSupport(spec *volume.Spec) bool {
 	return sourceDriver == plugin.driverName
 }
 
-func (plugin *flexVolumePlugin) IsMigratedToCSI() bool {
-	return false
-}
-
 // RequiresRemount is part of the volume.VolumePlugin interface.
-func (plugin *flexVolumePlugin) RequiresRemount() bool {
+func (plugin *flexVolumePlugin) RequiresRemount(spec *volume.Spec) bool {
 	return false
 }
 
@@ -166,8 +166,8 @@ func (plugin *flexVolumePlugin) GetAccessModes() []api.PersistentVolumeAccessMod
 }
 
 // NewMounter is part of the volume.VolumePlugin interface.
-func (plugin *flexVolumePlugin) NewMounter(spec *volume.Spec, pod *api.Pod, _ volume.VolumeOptions) (volume.Mounter, error) {
-	return plugin.newMounterInternal(spec, pod, plugin.host.GetMounter(plugin.GetPluginName()), plugin.runner)
+func (plugin *flexVolumePlugin) NewMounter(spec *volume.Spec, pod *api.Pod) (volume.Mounter, error) {
+	return plugin.newMounterInternal(spec, pod, plugin.host.GetMounter(), plugin.runner)
 }
 
 // newMounterInternal is the internal mounter routine to build the volume.
@@ -211,7 +211,7 @@ func (plugin *flexVolumePlugin) newMounterInternal(spec *volume.Spec, pod *api.P
 
 // NewUnmounter is part of the volume.VolumePlugin interface.
 func (plugin *flexVolumePlugin) NewUnmounter(volName string, podUID types.UID) (volume.Unmounter, error) {
-	return plugin.newUnmounterInternal(volName, podUID, plugin.host.GetMounter(plugin.GetPluginName()), plugin.runner)
+	return plugin.newUnmounterInternal(volName, podUID, plugin.host.GetMounter(), plugin.runner)
 }
 
 // newUnmounterInternal is the internal unmounter routine to clean the volume.
@@ -265,7 +265,7 @@ func (plugin *flexVolumeAttachablePlugin) CanDeviceMount(spec *volume.Spec) (boo
 }
 
 // ConstructVolumeSpec is part of the volume.AttachableVolumePlugin interface.
-func (plugin *flexVolumePlugin) ConstructVolumeSpec(volumeName, mountPath string) (*volume.Spec, error) {
+func (plugin *flexVolumePlugin) ConstructVolumeSpec(volumeName, mountPath string) (volume.ReconstructedVolume, error) {
 	flexVolume := &api.Volume{
 		Name: volumeName,
 		VolumeSource: api.VolumeSource{
@@ -274,7 +274,9 @@ func (plugin *flexVolumePlugin) ConstructVolumeSpec(volumeName, mountPath string
 			},
 		},
 	}
-	return volume.NewSpecFromVolume(flexVolume), nil
+	return volume.ReconstructedVolume{
+		Spec: volume.NewSpecFromVolume(flexVolume),
+	}, nil
 }
 
 func (plugin *flexVolumePlugin) SupportsMountOption() bool {
@@ -288,24 +290,19 @@ func (plugin *flexVolumePlugin) unsupported(commands ...string) {
 	plugin.unsupportedCommands = append(plugin.unsupportedCommands, commands...)
 }
 
-func (plugin *flexVolumePlugin) SupportsBulkVolumeVerification() bool {
-	return false
+func (plugin *flexVolumePlugin) SupportsSELinuxContextMount(spec *volume.Spec) (bool, error) {
+	return false, nil
 }
 
 // Returns true iff the given command is known to be unsupported.
 func (plugin *flexVolumePlugin) isUnsupported(command string) bool {
 	plugin.Lock()
 	defer plugin.Unlock()
-	for _, unsupportedCommand := range plugin.unsupportedCommands {
-		if command == unsupportedCommand {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(plugin.unsupportedCommands, command)
 }
 
 func (plugin *flexVolumePlugin) GetDeviceMountRefs(deviceMountPath string) ([]string, error) {
-	mounter := plugin.host.GetMounter(plugin.GetPluginName())
+	mounter := plugin.host.GetMounter()
 	return mounter.GetMountRefs(deviceMountPath)
 }
 

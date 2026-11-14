@@ -17,12 +17,16 @@ limitations under the License.
 package phases
 
 import (
-	"github.com/pkg/errors"
-	"k8s.io/klog"
+	"fmt"
+
+	"k8s.io/klog/v2"
+	kubeletconfig "k8s.io/kubelet/config/v1beta1"
+
 	"k8s.io/kubernetes/cmd/kubeadm/app/cmd/options"
 	"k8s.io/kubernetes/cmd/kubeadm/app/cmd/phases/workflow"
 	cmdutil "k8s.io/kubernetes/cmd/kubeadm/app/cmd/util"
 	kubeletphase "k8s.io/kubernetes/cmd/kubeadm/app/phases/kubelet"
+	"k8s.io/kubernetes/cmd/kubeadm/app/util/errors"
 )
 
 var (
@@ -42,8 +46,11 @@ func NewKubeletStartPhase() workflow.Phase {
 		Run:     runKubeletStart,
 		InheritFlags: []string{
 			options.CfgPath,
+			options.ImageRepository,
 			options.NodeCRISocket,
 			options.NodeName,
+			options.Patches,
+			options.DryRun,
 		},
 	}
 }
@@ -69,14 +76,22 @@ func runKubeletStart(c workflow.RunData) error {
 		return errors.Wrap(err, "error writing a dynamic environment file for the kubelet")
 	}
 
+	// Write the instance kubelet configuration file to disk.
+	kubeletConfig := &kubeletconfig.KubeletConfiguration{
+		ContainerRuntimeEndpoint: data.Cfg().NodeRegistration.CRISocket,
+	}
+	if err := kubeletphase.WriteInstanceConfigToDisk(kubeletConfig, data.KubeletDir()); err != nil {
+		return errors.Wrap(err, "error writing instance kubelet configuration to disk")
+	}
+
 	// Write the kubelet configuration file to disk.
-	if err := kubeletphase.WriteConfigToDisk(data.Cfg().ComponentConfigs.Kubelet, data.KubeletDir()); err != nil {
+	if err := kubeletphase.WriteConfigToDisk(&data.Cfg().ClusterConfiguration, data.KubeletDir(), data.PatchesDir(), data.OutputWriter()); err != nil {
 		return errors.Wrap(err, "error writing kubelet configuration to disk")
 	}
 
 	// Try to start the kubelet service in case it's inactive
 	if !data.DryRun() {
-		klog.V(1).Infoln("Starting the kubelet")
+		fmt.Println("[kubelet-start] Starting the kubelet")
 		kubeletphase.TryStartKubelet()
 	}
 

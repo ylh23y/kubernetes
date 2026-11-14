@@ -17,22 +17,23 @@ limitations under the License.
 package apiapproval
 
 import (
+	"context"
 	"fmt"
 	"sync"
 	"time"
 
+	apiextensionsv1 "k8s.io/apiextensions-api/pkg/apis/apiextensions/v1"
+	client "k8s.io/apiextensions-api/pkg/client/clientset/clientset/typed/apiextensions/v1"
+	informers "k8s.io/apiextensions-api/pkg/client/informers/externalversions/apiextensions/v1"
+	listers "k8s.io/apiextensions-api/pkg/client/listers/apiextensions/v1"
 	"k8s.io/apiextensions-apiserver/pkg/apihelpers"
-	"k8s.io/apiextensions-apiserver/pkg/apis/apiextensions"
-	"k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1beta1"
-	client "k8s.io/apiextensions-apiserver/pkg/client/clientset/internalclientset/typed/apiextensions/internalversion"
-	informers "k8s.io/apiextensions-apiserver/pkg/client/informers/internalversion/apiextensions/internalversion"
-	listers "k8s.io/apiextensions-apiserver/pkg/client/listers/apiextensions/internalversion"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
-	"k8s.io/klog"
+	"k8s.io/klog/v2"
 )
 
 // KubernetesAPIApprovalPolicyConformantConditionController is maintaining the KubernetesAPIApprovalPolicyConformant condition.
@@ -43,9 +44,9 @@ type KubernetesAPIApprovalPolicyConformantConditionController struct {
 	crdSynced cache.InformerSynced
 
 	// To allow injection for testing.
-	syncFn func(key string) error
+	syncFn func(ctx context.Context, key string) error
 
-	queue workqueue.RateLimitingInterface
+	queue workqueue.TypedRateLimitingInterface[string]
 
 	// last protectedAnnotation value this controller updated the condition per CRD name (to avoid two
 	// different version of the apiextensions-apiservers in HA to fight for the right message)
@@ -59,10 +60,13 @@ func NewKubernetesAPIApprovalPolicyConformantConditionController(
 	crdClient client.CustomResourceDefinitionsGetter,
 ) *KubernetesAPIApprovalPolicyConformantConditionController {
 	c := &KubernetesAPIApprovalPolicyConformantConditionController{
-		crdClient:                   crdClient,
-		crdLister:                   crdInformer.Lister(),
-		crdSynced:                   crdInformer.Informer().HasSynced,
-		queue:                       workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "kubernetes_api_approval_conformant_condition_controller"),
+		crdClient: crdClient,
+		crdLister: crdInformer.Lister(),
+		crdSynced: crdInformer.Informer().HasSynced,
+		queue: workqueue.NewTypedRateLimitingQueueWithConfig(
+			workqueue.DefaultTypedControllerRateLimiter[string](),
+			workqueue.TypedRateLimitingQueueConfig[string]{Name: "kubernetes_api_approval_conformant_condition_controller"},
+		),
 		lastSeenProtectedAnnotation: map[string]string{},
 	}
 
@@ -78,7 +82,7 @@ func NewKubernetesAPIApprovalPolicyConformantConditionController(
 }
 
 // calculateCondition determines the new KubernetesAPIApprovalPolicyConformant condition
-func calculateCondition(crd *apiextensions.CustomResourceDefinition) *apiextensions.CustomResourceDefinitionCondition {
+func calculateCondition(crd *apiextensionsv1.CustomResourceDefinition) *apiextensionsv1.CustomResourceDefinitionCondition {
 	if !apihelpers.IsProtectedCommunityGroup(crd.Spec.Group) {
 		return nil
 	}
@@ -86,44 +90,44 @@ func calculateCondition(crd *apiextensions.CustomResourceDefinition) *apiextensi
 	approvalState, reason := apihelpers.GetAPIApprovalState(crd.Annotations)
 	switch approvalState {
 	case apihelpers.APIApprovalInvalid:
-		return &apiextensions.CustomResourceDefinitionCondition{
-			Type:    apiextensions.KubernetesAPIApprovalPolicyConformant,
-			Status:  apiextensions.ConditionFalse,
+		return &apiextensionsv1.CustomResourceDefinitionCondition{
+			Type:    apiextensionsv1.KubernetesAPIApprovalPolicyConformant,
+			Status:  apiextensionsv1.ConditionFalse,
 			Reason:  "InvalidAnnotation",
 			Message: reason,
 		}
 	case apihelpers.APIApprovalMissing:
-		return &apiextensions.CustomResourceDefinitionCondition{
-			Type:    apiextensions.KubernetesAPIApprovalPolicyConformant,
-			Status:  apiextensions.ConditionFalse,
+		return &apiextensionsv1.CustomResourceDefinitionCondition{
+			Type:    apiextensionsv1.KubernetesAPIApprovalPolicyConformant,
+			Status:  apiextensionsv1.ConditionFalse,
 			Reason:  "MissingAnnotation",
 			Message: reason,
 		}
 	case apihelpers.APIApproved:
-		return &apiextensions.CustomResourceDefinitionCondition{
-			Type:    apiextensions.KubernetesAPIApprovalPolicyConformant,
-			Status:  apiextensions.ConditionTrue,
+		return &apiextensionsv1.CustomResourceDefinitionCondition{
+			Type:    apiextensionsv1.KubernetesAPIApprovalPolicyConformant,
+			Status:  apiextensionsv1.ConditionTrue,
 			Reason:  "ApprovedAnnotation",
 			Message: reason,
 		}
 	case apihelpers.APIApprovalBypassed:
-		return &apiextensions.CustomResourceDefinitionCondition{
-			Type:    apiextensions.KubernetesAPIApprovalPolicyConformant,
-			Status:  apiextensions.ConditionFalse,
+		return &apiextensionsv1.CustomResourceDefinitionCondition{
+			Type:    apiextensionsv1.KubernetesAPIApprovalPolicyConformant,
+			Status:  apiextensionsv1.ConditionFalse,
 			Reason:  "UnapprovedAnnotation",
 			Message: reason,
 		}
 	default:
-		return &apiextensions.CustomResourceDefinitionCondition{
-			Type:    apiextensions.KubernetesAPIApprovalPolicyConformant,
-			Status:  apiextensions.ConditionUnknown,
+		return &apiextensionsv1.CustomResourceDefinitionCondition{
+			Type:    apiextensionsv1.KubernetesAPIApprovalPolicyConformant,
+			Status:  apiextensionsv1.ConditionUnknown,
 			Reason:  "UnknownAnnotation",
 			Message: reason,
 		}
 	}
 }
 
-func (c *KubernetesAPIApprovalPolicyConformantConditionController) sync(key string) error {
+func (c *KubernetesAPIApprovalPolicyConformantConditionController) sync(ctx context.Context, key string) error {
 	inCustomResourceDefinition, err := c.crdLister.Get(key)
 	if apierrors.IsNotFound(err) {
 		return nil
@@ -133,7 +137,7 @@ func (c *KubernetesAPIApprovalPolicyConformantConditionController) sync(key stri
 	}
 
 	// avoid repeated calculation for the same annotation
-	protectionAnnotationValue := inCustomResourceDefinition.Annotations[v1beta1.KubeAPIApprovedAnnotation]
+	protectionAnnotationValue := inCustomResourceDefinition.Annotations[apiextensionsv1.KubeAPIApprovedAnnotation]
 	c.lastSeenProtectedAnnotationLock.Lock()
 	lastSeen, seenBefore := c.lastSeenProtectedAnnotation[inCustomResourceDefinition.Name]
 	c.lastSeenProtectedAnnotationLock.Unlock()
@@ -147,7 +151,7 @@ func (c *KubernetesAPIApprovalPolicyConformantConditionController) sync(key stri
 		// because group is immutable, if we have no condition now, we have no need to remove a condition.
 		return nil
 	}
-	old := apiextensions.FindCRDCondition(inCustomResourceDefinition, apiextensions.KubernetesAPIApprovalPolicyConformant)
+	old := apihelpers.FindCRDCondition(inCustomResourceDefinition, apiextensionsv1.KubernetesAPIApprovalPolicyConformant)
 
 	// don't attempt a write if all the condition details are the same
 	if old != nil && old.Status == cond.Status && old.Reason == cond.Reason && old.Message == cond.Message {
@@ -157,9 +161,9 @@ func (c *KubernetesAPIApprovalPolicyConformantConditionController) sync(key stri
 
 	// update condition
 	crd := inCustomResourceDefinition.DeepCopy()
-	apiextensions.SetCRDCondition(crd, *cond)
+	apihelpers.SetCRDCondition(crd, *cond)
 
-	_, err = c.crdClient.CustomResourceDefinitions().UpdateStatus(crd)
+	_, err = c.crdClient.CustomResourceDefinitions().UpdateStatus(ctx, crd, metav1.UpdateOptions{})
 	if apierrors.IsNotFound(err) || apierrors.IsConflict(err) {
 		// deleted or changed in the meantime, we'll get called again
 		return nil
@@ -178,38 +182,45 @@ func (c *KubernetesAPIApprovalPolicyConformantConditionController) sync(key stri
 }
 
 // Run starts the controller.
-func (c *KubernetesAPIApprovalPolicyConformantConditionController) Run(threadiness int, stopCh <-chan struct{}) {
+func (c *KubernetesAPIApprovalPolicyConformantConditionController) Run(workers int, stopCh <-chan struct{}) {
+	c.RunWithContext(workers, wait.ContextForChannel(stopCh))
+}
+
+// RunWithContext starts the controller with a context.
+//
+//logcheck:context // RunWithContext should be used instead of Run in code which supports contextual logging.
+func (c *KubernetesAPIApprovalPolicyConformantConditionController) RunWithContext(workers int, ctx context.Context) {
 	defer utilruntime.HandleCrash()
 	defer c.queue.ShutDown()
 
 	klog.Infof("Starting KubernetesAPIApprovalPolicyConformantConditionController")
 	defer klog.Infof("Shutting down KubernetesAPIApprovalPolicyConformantConditionController")
 
-	if !cache.WaitForCacheSync(stopCh, c.crdSynced) {
+	if !cache.WaitForCacheSync(ctx.Done(), c.crdSynced) {
 		return
 	}
 
-	for i := 0; i < threadiness; i++ {
-		go wait.Until(c.runWorker, time.Second, stopCh)
+	for i := 0; i < workers; i++ {
+		go wait.UntilWithContext(ctx, c.runWorker, time.Second)
 	}
 
-	<-stopCh
+	<-ctx.Done()
 }
 
-func (c *KubernetesAPIApprovalPolicyConformantConditionController) runWorker() {
-	for c.processNextWorkItem() {
+func (c *KubernetesAPIApprovalPolicyConformantConditionController) runWorker(ctx context.Context) {
+	for c.processNextWorkItem(ctx) {
 	}
 }
 
 // processNextWorkItem deals with one key off the queue.  It returns false when it's time to quit.
-func (c *KubernetesAPIApprovalPolicyConformantConditionController) processNextWorkItem() bool {
+func (c *KubernetesAPIApprovalPolicyConformantConditionController) processNextWorkItem(ctx context.Context) bool {
 	key, quit := c.queue.Get()
 	if quit {
 		return false
 	}
 	defer c.queue.Done(key)
 
-	err := c.syncFn(key.(string))
+	err := c.syncFn(ctx, key)
 	if err == nil {
 		c.queue.Forget(key)
 		return true
@@ -221,7 +232,7 @@ func (c *KubernetesAPIApprovalPolicyConformantConditionController) processNextWo
 	return true
 }
 
-func (c *KubernetesAPIApprovalPolicyConformantConditionController) enqueue(obj *apiextensions.CustomResourceDefinition) {
+func (c *KubernetesAPIApprovalPolicyConformantConditionController) enqueue(obj *apiextensionsv1.CustomResourceDefinition) {
 	key, err := cache.DeletionHandlingMetaNamespaceKeyFunc(obj)
 	if err != nil {
 		utilruntime.HandleError(fmt.Errorf("Couldn't get key for object %#v: %v", obj, err))
@@ -232,26 +243,26 @@ func (c *KubernetesAPIApprovalPolicyConformantConditionController) enqueue(obj *
 }
 
 func (c *KubernetesAPIApprovalPolicyConformantConditionController) addCustomResourceDefinition(obj interface{}) {
-	castObj := obj.(*apiextensions.CustomResourceDefinition)
+	castObj := obj.(*apiextensionsv1.CustomResourceDefinition)
 	klog.V(4).Infof("Adding %s", castObj.Name)
 	c.enqueue(castObj)
 }
 
 func (c *KubernetesAPIApprovalPolicyConformantConditionController) updateCustomResourceDefinition(obj, _ interface{}) {
-	castObj := obj.(*apiextensions.CustomResourceDefinition)
+	castObj := obj.(*apiextensionsv1.CustomResourceDefinition)
 	klog.V(4).Infof("Updating %s", castObj.Name)
 	c.enqueue(castObj)
 }
 
 func (c *KubernetesAPIApprovalPolicyConformantConditionController) deleteCustomResourceDefinition(obj interface{}) {
-	castObj, ok := obj.(*apiextensions.CustomResourceDefinition)
+	castObj, ok := obj.(*apiextensionsv1.CustomResourceDefinition)
 	if !ok {
 		tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
 		if !ok {
 			klog.Errorf("Couldn't get object from tombstone %#v", obj)
 			return
 		}
-		castObj, ok = tombstone.Obj.(*apiextensions.CustomResourceDefinition)
+		castObj, ok = tombstone.Obj.(*apiextensionsv1.CustomResourceDefinition)
 		if !ok {
 			klog.Errorf("Tombstone contained object that is not expected %#v", obj)
 			return

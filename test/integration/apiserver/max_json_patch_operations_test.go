@@ -17,27 +17,28 @@ limitations under the License.
 package apiserver
 
 import (
-	"fmt"
 	"strings"
 	"testing"
 
-	"k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/errors"
+	v1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/ktesting"
 	"k8s.io/kubernetes/cmd/kube-apiserver/app/options"
 	"k8s.io/kubernetes/test/integration/framework"
 )
 
 // Tests that the apiserver limits the number of operations in a json patch.
 func TestMaxJSONPatchOperations(t *testing.T) {
-	stopCh := make(chan struct{})
-	defer close(stopCh)
-	clientSet, _ := framework.StartTestServer(t, stopCh, framework.TestServerSetup{
+	tCtx := ktesting.Init(t)
+
+	clientSet, _, tearDownFn := framework.StartTestServer(tCtx, t, framework.TestServerSetup{
 		ModifyServerRunOptions: func(opts *options.ServerRunOptions) {
 			opts.GenericServerRunOptions.MaxRequestBodyBytes = 1024 * 1024
 		},
 	})
+	defer tearDownFn()
 
 	p := `{"op":"add","path":"/x","value":"y"}`
 	// maxJSONPatchOperations = 10000
@@ -50,17 +51,17 @@ func TestMaxJSONPatchOperations(t *testing.T) {
 			Name: "test",
 		},
 	}
-	_, err := clientSet.CoreV1().Secrets("default").Create(secret)
+	_, err := clientSet.CoreV1().Secrets("default").Create(tCtx, secret, metav1.CreateOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	err = c.Patch(types.JSONPatchType).AbsPath(fmt.Sprintf("/api/v1/namespaces/default/secrets/test")).
-		Body(hugePatch).Do().Error()
+	err = c.Patch(types.JSONPatchType).AbsPath("/api/v1/namespaces/default/secrets/test").
+		Body(hugePatch).Do(tCtx).Error()
 	if err == nil {
 		t.Fatalf("unexpected no error")
 	}
-	if !errors.IsRequestEntityTooLargeError(err) {
+	if !apierrors.IsRequestEntityTooLargeError(err) {
 		t.Errorf("expected requested entity too large err, got %v", err)
 	}
 	if !strings.Contains(err.Error(), "The allowed maximum operations in a JSON patch is") {

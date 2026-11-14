@@ -18,11 +18,10 @@ package kubernetes_test
 
 import (
 	"bytes"
-	"io/ioutil"
+	"context"
+	"io"
 	"net/http"
 	"testing"
-
-	"github.com/davecgh/go-spew/spew"
 
 	appsv1 "k8s.io/api/apps/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -30,6 +29,7 @@ import (
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
 	manualfake "k8s.io/client-go/rest/fake"
+	"k8s.io/utils/dump"
 )
 
 func TestListTimeout(t *testing.T) {
@@ -38,9 +38,9 @@ func TestListTimeout(t *testing.T) {
 		NegotiatedSerializer: scheme.Codecs,
 		Client: manualfake.CreateHTTPClient(func(req *http.Request) (*http.Response, error) {
 			if req.URL.Query().Get("timeout") != "21s" {
-				t.Fatal(spew.Sdump(req.URL.Query()))
+				t.Fatal(dump.Pretty(req.URL.Query()))
 			}
-			return &http.Response{StatusCode: http.StatusNotFound, Body: ioutil.NopCloser(&bytes.Buffer{})}, nil
+			return &http.Response{StatusCode: http.StatusNotFound, Body: io.NopCloser(&bytes.Buffer{})}, nil
 		}),
 	}
 	clientConfig := &rest.Config{
@@ -55,6 +55,6 @@ func TestListTimeout(t *testing.T) {
 	realClient := kubernetes.New(restClient)
 
 	timeout := int64(21)
-	realClient.AppsV1().DaemonSets("").List(metav1.ListOptions{TimeoutSeconds: &timeout})
-	realClient.AppsV1().DaemonSets("").Watch(metav1.ListOptions{TimeoutSeconds: &timeout})
+	realClient.AppsV1().DaemonSets("").List(context.TODO(), metav1.ListOptions{TimeoutSeconds: &timeout})
+	realClient.AppsV1().DaemonSets("").Watch(context.TODO(), metav1.ListOptions{TimeoutSeconds: &timeout})
 }

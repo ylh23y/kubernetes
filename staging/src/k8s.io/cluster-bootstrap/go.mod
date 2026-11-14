@@ -2,25 +2,36 @@
 
 module k8s.io/cluster-bootstrap
 
-go 1.12
+go 1.27.0
+
+godebug default=go1.27
 
 require (
-	github.com/stretchr/testify v1.3.0
-	golang.org/x/crypto v0.0.0-20190611184440-5c40567a22f8 // indirect
-	gopkg.in/square/go-jose.v2 v2.2.2
+	github.com/go-jose/go-jose/v4 v4.1.9
+	github.com/stretchr/testify v1.12.1
 	k8s.io/api v0.0.0
 	k8s.io/apimachinery v0.0.0
-	k8s.io/klog v0.3.1
+	k8s.io/klog/v2 v2.140.0
+)
+
+require (
+	github.com/fxamacker/cbor/v2 v2.9.4 // indirect
+	github.com/go-logr/logr v1.4.4 // indirect
+	github.com/x448/float16 v0.8.4 // indirect
+	go.yaml.in/yaml/v2 v2.4.4 // indirect
+	go.yaml.in/yaml/v3 v3.0.5 // indirect
+	golang.org/x/net v0.62.0 // indirect
+	golang.org/x/text v0.43.0 // indirect
+	gopkg.in/inf.v0 v0.9.1 // indirect
+	k8s.io/utils v0.0.0-20260626114624-be93311217bd // indirect
+	sigs.k8s.io/json v0.0.0-20250730193827-2d320260d730 // indirect
+	sigs.k8s.io/randfill v1.0.0 // indirect
+	sigs.k8s.io/structured-merge-diff/v7 v7.0.1 // indirect
 )
 
 replace (
-	golang.org/x/crypto => golang.org/x/crypto v0.0.0-20181025213731-e84da0312774
-	golang.org/x/net => golang.org/x/net v0.0.0-20190206173232-65e2d4e15006
-	golang.org/x/sync => golang.org/x/sync v0.0.0-20181108010431-42b317875d0f
-	golang.org/x/sys => golang.org/x/sys v0.0.0-20190209173611-3b5209105503
-	golang.org/x/text => golang.org/x/text v0.3.1-0.20181227161524-e6919f6577db
-	golang.org/x/tools => golang.org/x/tools v0.0.0-20190313210603-aa82965741a9
 	k8s.io/api => ../api
 	k8s.io/apimachinery => ../apimachinery
-	k8s.io/cluster-bootstrap => ../cluster-bootstrap
+	k8s.io/ktesting => ../ktesting
+	k8s.io/streaming => ../streaming
 )

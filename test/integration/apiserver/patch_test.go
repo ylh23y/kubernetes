@@ -22,10 +22,12 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/pborman/uuid"
+	"github.com/google/uuid"
+	"github.com/stretchr/testify/require"
 
-	"k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/errors"
+	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -34,18 +36,18 @@ import (
 
 // Tests that the apiserver retries patches
 func TestPatchConflicts(t *testing.T) {
-	s, clientSet, closeFn := setup(t)
-	defer closeFn()
+	ctx, clientSet, _, tearDownFn := setup(t)
+	defer tearDownFn()
 
-	ns := framework.CreateTestingNamespace("status-code", s, t)
-	defer framework.DeleteTestingNamespace(ns, s, t)
+	ns := framework.CreateNamespaceOrDie(clientSet, "status-code", t)
+	defer framework.DeleteNamespaceOrDie(clientSet, ns, t)
 
 	numOfConcurrentPatches := 100
 
 	UIDs := make([]types.UID, numOfConcurrentPatches)
 	ownerRefs := []metav1.OwnerReference{}
-	for i := 0; i < numOfConcurrentPatches; i++ {
-		uid := types.UID(uuid.NewRandom().String())
+	for i := range numOfConcurrentPatches {
+		uid := types.UID(uuid.New().String())
 		ownerName := fmt.Sprintf("owner-%d", i)
 		UIDs[i] = uid
 		ownerRefs = append(ownerRefs, metav1.OwnerReference{
@@ -55,7 +57,7 @@ func TestPatchConflicts(t *testing.T) {
 			UID:        uid,
 		})
 	}
-	secret := &v1.Secret{
+	secret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:            "test",
 			OwnerReferences: ownerRefs,
@@ -63,30 +65,33 @@ func TestPatchConflicts(t *testing.T) {
 	}
 
 	// Create the object we're going to conflict on
-	clientSet.CoreV1().Secrets(ns.Name).Create(secret)
+	_, err := clientSet.CoreV1().Secrets(ns.Name).Create(ctx, secret, metav1.CreateOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
 	client := clientSet.CoreV1().RESTClient()
 
-	successes := int32(0)
+	var successes atomic.Int32
 
 	// Run a lot of simultaneous patch operations to exercise internal API server retry of application of patches that do not specify resourceVersion.
 	// They should all succeed.
 	wg := sync.WaitGroup{}
-	for i := 0; i < numOfConcurrentPatches; i++ {
+	for i := range numOfConcurrentPatches {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
 			labelName := fmt.Sprintf("label-%d", i)
-			value := uuid.NewRandom().String()
+			value := uuid.New().String()
 
 			obj, err := client.Patch(types.StrategicMergePatchType).
 				Namespace(ns.Name).
 				Resource("secrets").
 				Name("test").
 				Body([]byte(fmt.Sprintf(`{"metadata":{"labels":{"%s":"%s"}, "ownerReferences":[{"$patch":"delete","uid":"%s"}]}}`, labelName, value, UIDs[i]))).
-				Do().
+				Do(ctx).
 				Get()
 
-			if errors.IsConflict(err) {
+			if apierrors.IsConflict(err) {
 				t.Logf("tolerated conflict error patching %s: %v", "secrets", err)
 				return
 			}
@@ -107,23 +112,19 @@ func TestPatchConflicts(t *testing.T) {
 			}
 			// make sure the patch directive didn't get lost, and that an entry in the ownerReference list was deleted.
 			found := findOwnerRefByUID(accessor.GetOwnerReferences(), UIDs[i])
-			if err != nil {
-				t.Errorf("%v", err)
-				return
-			}
 			if found {
 				t.Errorf("patch of %s with $patch directive was ineffective, didn't delete the entry in the ownerReference slice: %#v", "secrets", UIDs[i])
 			}
 
-			atomic.AddInt32(&successes, 1)
+			successes.Add(1)
 		}(i)
 	}
 	wg.Wait()
 
-	if successes < int32(numOfConcurrentPatches) {
-		t.Errorf("Expected at least %d successful patches for %s, got %d", numOfConcurrentPatches, "secrets", successes)
+	if successes.Load() < int32(numOfConcurrentPatches) {
+		t.Errorf("Expected at least %d successful patches for %s, got %d", numOfConcurrentPatches, "secrets", successes.Load())
 	} else {
-		t.Logf("Got %d successful patches for %s", successes, "secrets")
+		t.Logf("Got %d successful patches for %s", successes.Load(), "secrets")
 	}
 
 }
@@ -135,4 +136,75 @@ func findOwnerRefByUID(ownerRefs []metav1.OwnerReference, uid types.UID) bool {
 		}
 	}
 	return false
+}
+
+// Shows that a strategic merge patch with a nested patch which is merged
+// with an empty slice is handled property
+// https://github.com/kubernetes/kubernetes/issues/117470
+func TestNestedStrategicMergePatchWithEmpty(t *testing.T) {
+	ctx, clientSet, _, tearDownFn := setup(t)
+	defer tearDownFn()
+
+	url := "https://foo.com"
+	se := admissionregistrationv1.SideEffectClassNone
+
+	_, err := clientSet.
+		AdmissionregistrationV1().
+		ValidatingWebhookConfigurations().
+		Create(
+			ctx,
+			&admissionregistrationv1.ValidatingWebhookConfiguration{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "base-validation",
+				},
+				Webhooks: []admissionregistrationv1.ValidatingWebhook{
+					{
+						AdmissionReviewVersions: []string{"v1"},
+						ClientConfig:            admissionregistrationv1.WebhookClientConfig{URL: &url},
+						Name:                    "foo.bar.com",
+						SideEffects:             &se,
+					},
+				},
+			},
+			metav1.CreateOptions{
+				FieldManager:    "kubectl-client-side-apply",
+				FieldValidation: metav1.FieldValidationStrict,
+			},
+		)
+	require.NoError(t, err)
+
+	_, err = clientSet.
+		AdmissionregistrationV1().
+		ValidatingWebhookConfigurations().
+		Patch(
+			ctx,
+			"base-validation",
+			types.StrategicMergePatchType,
+			[]byte(`
+	{
+		"webhooks": null
+	}
+`),
+			metav1.PatchOptions{
+				FieldManager:    "kubectl-edit",
+				FieldValidation: metav1.FieldValidationStrict,
+			},
+		)
+	require.NoError(t, err)
+
+	// Try to apply a patch to the webhook
+	_, err = clientSet.
+		AdmissionregistrationV1().
+		ValidatingWebhookConfigurations().
+		Patch(
+			ctx,
+			"base-validation",
+			types.StrategicMergePatchType,
+			[]byte(`{"$setElementOrder/webhooks":[{"name":"new.foo.com"}],"metadata":{"annotations":{"kubectl.kubernetes.io/last-applied-configuration":"{\"apiVersion\":\"admissionregistration.k8s.io/v1\",\"kind\":\"ValidatingWebhookConfiguration\",\"metadata\":{\"annotations\":{},\"name\":\"base-validation\"},\"webhooks\":[{\"admissionReviewVersions\":[\"v1\"],\"clientConfig\":{\"url\":\"https://foo.com\"},\"name\":\"new.foo.com\",\"sideEffects\":\"None\"}]}\n"}},"webhooks":[{"admissionReviewVersions":["v1"],"clientConfig":{"url":"https://foo.com"},"name":"new.foo.com","sideEffects":"None"},{"$patch":"delete","name":"foo.bar.com"}]}`),
+			metav1.PatchOptions{
+				FieldManager:    "kubectl-client-side-apply",
+				FieldValidation: metav1.FieldValidationStrict,
+			},
+		)
+	require.NoError(t, err)
 }

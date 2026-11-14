@@ -23,15 +23,25 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/google/go-cmp/cmp"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"sigs.k8s.io/structured-merge-diff/v7/typed"
 
+	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	runtime "k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	serializer "k8s.io/apimachinery/pkg/runtime/serializer"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/managedfields"
 	"k8s.io/apimachinery/pkg/watch"
+	"k8s.io/client-go/util/watchlist"
+	"k8s.io/klog/v2/ktesting"
+	"k8s.io/utils/ptr"
 )
 
 func getArbitraryResource(s schema.GroupVersionResource, name, namespace string) *unstructured.Unstructured {
@@ -45,7 +55,6 @@ func getArbitraryResource(s schema.GroupVersionResource, name, namespace string)
 				"generateName":    "test_generateName",
 				"uid":             "test_uid",
 				"resourceVersion": "test_resourceVersion",
-				"selfLink":        "test_selfLink",
 			},
 			"data": strconv.Itoa(rand.Int()),
 		},
@@ -53,6 +62,7 @@ func getArbitraryResource(s schema.GroupVersionResource, name, namespace string)
 }
 
 func TestWatchCallNonNamespace(t *testing.T) {
+	logger, _ := ktesting.NewTestContext(t)
 	testResource := schema.GroupVersionResource{Group: "", Version: "test_version", Resource: "test_kind"}
 	testObj := getArbitraryResource(testResource, "test_name", "test_namespace")
 	accessor, err := meta.Accessor(testObj)
@@ -62,7 +72,7 @@ func TestWatchCallNonNamespace(t *testing.T) {
 	ns := accessor.GetNamespace()
 	scheme := runtime.NewScheme()
 	codecs := serializer.NewCodecFactory(scheme)
-	o := NewObjectTracker(scheme, codecs.UniversalDecoder())
+	o := NewObjectTrackerWithLogger(logger, scheme, codecs.UniversalDecoder())
 	watch, err := o.Watch(testResource, ns)
 	if err != nil {
 		t.Fatalf("test resource watch failed in %s: %v ", ns, err)
@@ -78,6 +88,7 @@ func TestWatchCallNonNamespace(t *testing.T) {
 }
 
 func TestWatchCallAllNamespace(t *testing.T) {
+	logger, _ := ktesting.NewTestContext(t)
 	testResource := schema.GroupVersionResource{Group: "", Version: "test_version", Resource: "test_kind"}
 	testObj := getArbitraryResource(testResource, "test_name", "test_namespace")
 	accessor, err := meta.Accessor(testObj)
@@ -87,7 +98,7 @@ func TestWatchCallAllNamespace(t *testing.T) {
 	ns := accessor.GetNamespace()
 	scheme := runtime.NewScheme()
 	codecs := serializer.NewCodecFactory(scheme)
-	o := NewObjectTracker(scheme, codecs.UniversalDecoder())
+	o := NewObjectTrackerWithLogger(logger, scheme, codecs.UniversalDecoder())
 	w, err := o.Watch(testResource, "test_namespace")
 	if err != nil {
 		t.Fatalf("test resource watch failed in test_namespace: %v", err)
@@ -129,6 +140,7 @@ func TestWatchCallAllNamespace(t *testing.T) {
 }
 
 func TestWatchCallMultipleInvocation(t *testing.T) {
+	logger, _ := ktesting.NewTestContext(t)
 	cases := []struct {
 		name string
 		op   watch.EventType
@@ -180,7 +192,7 @@ func TestWatchCallMultipleInvocation(t *testing.T) {
 	codecs := serializer.NewCodecFactory(scheme)
 	testResource := schema.GroupVersionResource{Group: "", Version: "test_version", Resource: "test_kind"}
 
-	o := NewObjectTracker(scheme, codecs.UniversalDecoder())
+	o := NewObjectTrackerWithLogger(logger, scheme, codecs.UniversalDecoder())
 	watchNamespaces := []string{
 		"",
 		"",
@@ -204,7 +216,8 @@ func TestWatchCallMultipleInvocation(t *testing.T) {
 					event := <-w.ResultChan()
 					accessor, err := meta.Accessor(event.Object)
 					if err != nil {
-						t.Fatalf("unexpected error: %v", err)
+						t.Errorf("unexpected error: %v", err)
+						break
 					}
 					assert.Equal(t, c.op, event.Type, "watch event mismatched")
 					assert.Equal(t, c.name, accessor.GetName(), "watched object mismatch")
@@ -230,6 +243,7 @@ func TestWatchCallMultipleInvocation(t *testing.T) {
 }
 
 func TestWatchAddAfterStop(t *testing.T) {
+	logger, _ := ktesting.NewTestContext(t)
 	testResource := schema.GroupVersionResource{Group: "", Version: "test_version", Resource: "test_kind"}
 	testObj := getArbitraryResource(testResource, "test_name", "test_namespace")
 	accessor, err := meta.Accessor(testObj)
@@ -240,7 +254,7 @@ func TestWatchAddAfterStop(t *testing.T) {
 	ns := accessor.GetNamespace()
 	scheme := runtime.NewScheme()
 	codecs := serializer.NewCodecFactory(scheme)
-	o := NewObjectTracker(scheme, codecs.UniversalDecoder())
+	o := NewObjectTrackerWithLogger(logger, scheme, codecs.UniversalDecoder())
 	watch, err := o.Watch(testResource, ns)
 	if err != nil {
 		t.Errorf("watch creation failed: %v", err)
@@ -261,15 +275,696 @@ func TestWatchAddAfterStop(t *testing.T) {
 }
 
 func TestPatchWithMissingObject(t *testing.T) {
+	logger, _ := ktesting.NewTestContext(t)
 	nodesResource := schema.GroupVersionResource{Group: "", Version: "v1", Resource: "nodes"}
 
 	scheme := runtime.NewScheme()
 	codecs := serializer.NewCodecFactory(scheme)
-	o := NewObjectTracker(scheme, codecs.UniversalDecoder())
+	o := NewObjectTrackerWithLogger(logger, scheme, codecs.UniversalDecoder())
 	reaction := ObjectReaction(o)
 	action := NewRootPatchSubresourceAction(nodesResource, "node-1", types.StrategicMergePatchType, []byte(`{}`))
 	handled, node, err := reaction(action)
 	assert.True(t, handled)
 	assert.Nil(t, node)
 	assert.EqualError(t, err, `nodes "node-1" not found`)
+}
+
+func TestApplyCreate(t *testing.T) {
+	logger, _ := ktesting.NewTestContext(t)
+	cmResource := schema.GroupVersionResource{Group: "", Version: "v1", Resource: "configMaps"}
+	scheme := runtime.NewScheme()
+	scheme.AddKnownTypes(cmResource.GroupVersion(), &v1.ConfigMap{})
+	codecs := serializer.NewCodecFactory(scheme)
+	o := NewFieldManagedObjectTrackerWithLogger(logger, scheme, codecs.UniversalDecoder(), configMapTypeConverter(scheme))
+
+	reaction := ObjectReaction(o)
+	patch := []byte(`{"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "cm-1"}, "data": {"k": "v"}}`)
+	action := NewPatchActionWithOptions(cmResource, "default", "cm-1", types.ApplyPatchType, patch,
+		metav1.PatchOptions{FieldManager: "test-manager"})
+	handled, configMap, err := reaction(action)
+	assert.True(t, handled)
+	if err != nil {
+		t.Fatalf("Failed to create a resource with apply: %v", err)
+	}
+	cm := configMap.(*v1.ConfigMap)
+	assert.Equal(t, map[string]string{"k": "v"}, cm.Data)
+}
+
+func TestApplyNoMeta(t *testing.T) {
+	logger, _ := ktesting.NewTestContext(t)
+	cmResource := schema.GroupVersionResource{Group: "", Version: "v1", Resource: "configMaps"}
+	scheme := runtime.NewScheme()
+	scheme.AddKnownTypes(cmResource.GroupVersion(), &v1.ConfigMap{})
+	codecs := serializer.NewCodecFactory(scheme)
+	o := NewFieldManagedObjectTrackerWithLogger(logger, scheme, codecs.UniversalDecoder(), configMapTypeConverter(scheme))
+
+	reaction := ObjectReaction(o)
+	patch := []byte(`{"apiVersion": "v1", "kind": "ConfigMap", "data": {"k": "v"}}`)
+	action := NewPatchActionWithOptions(cmResource, "default", "cm-1", types.ApplyPatchType, patch,
+		metav1.PatchOptions{FieldManager: "test-manager"})
+	handled, configMap, err := reaction(action)
+	assert.True(t, handled)
+	if err != nil {
+		t.Fatalf("Failed to create a resource with apply: %v", err)
+	}
+	cm := configMap.(*v1.ConfigMap)
+	assert.Equal(t, "cm-1", cm.Name)
+	assert.Equal(t, map[string]string{"k": "v"}, cm.Data)
+}
+
+func TestApplyUpdateMultipleFieldManagers(t *testing.T) {
+	logger, _ := ktesting.NewTestContext(t)
+	cmResource := schema.GroupVersionResource{Group: "", Version: "v1", Resource: "configMaps"}
+	scheme := runtime.NewScheme()
+	scheme.AddKnownTypes(cmResource.GroupVersion(), &v1.ConfigMap{})
+	codecs := serializer.NewCodecFactory(scheme)
+	o := NewFieldManagedObjectTrackerWithLogger(logger, scheme, codecs.UniversalDecoder(), configMapTypeConverter(scheme))
+
+	reaction := ObjectReaction(o)
+	action := NewCreateAction(cmResource, "default", &v1.ConfigMap{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: "v1",
+			Kind:       "ConfigMap",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "cm-1",
+		},
+		Data: map[string]string{
+			"k0": "v0",
+		},
+	})
+	handled, _, err := reaction(action)
+	assert.True(t, handled)
+	if err != nil {
+		t.Errorf("Failed to create resource: %v", err)
+	}
+
+	// Apply with test-manager-1
+	// Expect data to be shared with initial create
+	patch := []byte(`{"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "cm-1"}, "data": {"k1": "v1"}}`)
+	applyAction := NewPatchActionWithOptions(cmResource, "default", "cm-1", types.ApplyPatchType, patch,
+		metav1.PatchOptions{FieldManager: "test-manager-1"})
+	handled, configMap, err := reaction(applyAction)
+	assert.True(t, handled)
+	if err != nil {
+		t.Errorf("Failed to apply resource: %v", err)
+	}
+	cm := configMap.(*v1.ConfigMap)
+	assert.Equal(t, map[string]string{"k0": "v0", "k1": "v1"}, cm.Data)
+
+	// Apply conflicting with test-manager-2, expect apply to fail
+	patch = []byte(`{"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "cm-1"}, "data": {"k1": "xyz"}}`)
+	applyAction = NewPatchActionWithOptions(cmResource, "default", "cm-1", types.ApplyPatchType, patch,
+		metav1.PatchOptions{FieldManager: "test-manager-2"})
+	handled, _, err = reaction(applyAction)
+	assert.True(t, handled)
+	if assert.Error(t, err) {
+		assert.Equal(t, "Apply failed with 1 conflict: conflict with \"test-manager-1\": .data.k1", err.Error())
+	}
+
+	// Apply with test-manager-2
+	// Expect data to be shared with initial create and test-manager-1
+	patch = []byte(`{"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "cm-1"}, "data": {"k2": "v2"}}`)
+	applyAction = NewPatchActionWithOptions(cmResource, "default", "cm-1", types.ApplyPatchType, patch,
+		metav1.PatchOptions{FieldManager: "test-manager-2"})
+	handled, configMap, err = reaction(applyAction)
+	assert.True(t, handled)
+	if err != nil {
+		t.Errorf("Failed to apply resource: %v", err)
+	}
+	cm = configMap.(*v1.ConfigMap)
+	assert.Equal(t, map[string]string{"k0": "v0", "k1": "v1", "k2": "v2"}, cm.Data)
+
+	// Apply with test-manager-1
+	// Expect owned data to be updated
+	patch = []byte(`{"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "cm-1"}, "data": {"k1": "v101"}}`)
+	applyAction = NewPatchActionWithOptions(cmResource, "default", "cm-1", types.ApplyPatchType, patch,
+		metav1.PatchOptions{FieldManager: "test-manager-1"})
+	handled, configMap, err = reaction(applyAction)
+	assert.True(t, handled)
+	if err != nil {
+		t.Errorf("Failed to apply resource: %v", err)
+	}
+	cm = configMap.(*v1.ConfigMap)
+	assert.Equal(t, map[string]string{"k0": "v0", "k1": "v101", "k2": "v2"}, cm.Data)
+
+	// Force apply with test-manager-2
+	// Expect data owned by test-manager-1 to be updated, expect data already owned but not in apply configuration to be removed
+	patch = []byte(`{"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "cm-1"}, "data": {"k1": "v202"}}`)
+	applyAction = NewPatchActionWithOptions(cmResource, "default", "cm-1", types.ApplyPatchType, patch,
+		metav1.PatchOptions{FieldManager: "test-manager-2", Force: ptr.To(true)})
+	handled, configMap, err = reaction(applyAction)
+	assert.True(t, handled)
+	if err != nil {
+		t.Errorf("Failed to apply resource: %v", err)
+	}
+	cm = configMap.(*v1.ConfigMap)
+	assert.Equal(t, map[string]string{"k0": "v0", "k1": "v202"}, cm.Data)
+
+	// Update with test-manager-1 to perform a force update of the entire resource
+	reaction = ObjectReaction(o)
+	updateAction := NewUpdateActionWithOptions(cmResource, "default", &v1.ConfigMap{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: "v1",
+			Kind:       "ConfigMap",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "cm-1",
+		},
+		Data: map[string]string{
+			"k99": "v99",
+		},
+	}, metav1.UpdateOptions{FieldManager: "test-manager-1"})
+	handled, configMap, err = reaction(updateAction)
+	assert.True(t, handled)
+	if err != nil {
+		t.Errorf("Failed to apply resource: %v", err)
+	}
+	typedCm := configMap.(*v1.ConfigMap)
+	assert.Equal(t, map[string]string{"k99": "v99"}, typedCm.Data)
+}
+
+func TestGetWithExactMatch(t *testing.T) {
+	logger, _ := ktesting.NewTestContext(t)
+	scheme := runtime.NewScheme()
+	codecs := serializer.NewCodecFactory(scheme)
+
+	constructObject := func(s schema.GroupVersionResource, name, namespace string) (*unstructured.Unstructured, schema.GroupVersionResource) {
+		obj := getArbitraryResource(s, name, namespace)
+		gvks, _, err := scheme.ObjectKinds(obj)
+		assert.NoError(t, err)
+		gvr, _ := meta.UnsafeGuessKindToResource(gvks[0])
+		return obj, gvr
+	}
+
+	var err error
+	// Object with empty namespace
+	o := NewObjectTrackerWithLogger(logger, scheme, codecs.UniversalDecoder())
+	nodeResource := schema.GroupVersionResource{Group: "", Version: "v1", Resource: "node"}
+	node, gvr := constructObject(nodeResource, "node", "")
+
+	assert.NoError(t, o.Add(node))
+
+	// Exact match
+	_, err = o.Get(gvr, "", "node")
+	assert.NoError(t, err)
+
+	// Unexpected namespace provided
+	_, err = o.Get(gvr, "ns", "node")
+	assert.Error(t, err)
+	errNotFound := errors.NewNotFound(gvr.GroupResource(), "node")
+	assert.EqualError(t, err, errNotFound.Error())
+
+	// Object with non-empty namespace
+	o = NewObjectTrackerWithLogger(logger, scheme, codecs.UniversalDecoder())
+	podResource := schema.GroupVersionResource{Group: "", Version: "v1", Resource: "pod"}
+	pod, gvr := constructObject(podResource, "pod", "default")
+	assert.NoError(t, o.Add(pod))
+
+	// Exact match
+	_, err = o.Get(gvr, "default", "pod")
+	assert.NoError(t, err)
+
+	// Missing namespace
+	_, err = o.Get(gvr, "", "pod")
+	assert.Error(t, err)
+	errNotFound = errors.NewNotFound(gvr.GroupResource(), "pod")
+	assert.EqualError(t, err, errNotFound.Error())
+}
+
+func Test_resourceCovers(t *testing.T) {
+	type args struct {
+		resource string
+		action   Action
+	}
+	tests := []struct {
+		name string
+		args args
+		want bool
+	}{
+		{
+			args: args{
+				resource: "*",
+				action:   ActionImpl{},
+			},
+			want: true,
+		},
+		{
+			args: args{
+				resource: "serviceaccounts",
+				action:   ActionImpl{},
+			},
+			want: false,
+		},
+		{
+			args: args{
+				resource: "serviceaccounts",
+				action: ActionImpl{
+					Resource: schema.GroupVersionResource{
+						Resource: "serviceaccounts",
+					},
+				},
+			},
+			want: true,
+		},
+		{
+			args: args{
+				resource: "serviceaccounts/token",
+				action: ActionImpl{
+					Resource: schema.GroupVersionResource{},
+				},
+			},
+			want: false,
+		},
+		{
+			args: args{
+				resource: "serviceaccounts/token",
+				action: ActionImpl{
+					Resource: schema.GroupVersionResource{
+						Resource: "serviceaccounts",
+					},
+				},
+			},
+			want: false,
+		},
+		{
+			args: args{
+				resource: "serviceaccounts/token",
+				action: ActionImpl{
+					Resource:    schema.GroupVersionResource{},
+					Subresource: "token",
+				},
+			},
+			want: false,
+		},
+		{
+			args: args{
+				resource: "serviceaccounts/token",
+				action: ActionImpl{
+					Resource: schema.GroupVersionResource{
+						Resource: "serviceaccounts",
+					},
+					Subresource: "token",
+				},
+			},
+			want: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := resourceCovers(tt.args.resource, tt.args.action); got != tt.want {
+				t.Errorf("resourceCovers() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func configMapTypeConverter(scheme *runtime.Scheme) managedfields.TypeConverter {
+	parser, err := typed.NewParser(configMapTypedSchema)
+	if err != nil {
+		panic(fmt.Sprintf("Failed to parse schema: %v", err))
+	}
+
+	return managedfields.NewSchemeTypeConverter(scheme, parser)
+}
+
+var configMapTypedSchema = typed.YAMLObject(`types:
+- name: io.k8s.api.core.v1.ConfigMap
+  map:
+    fields:
+    - name: apiVersion
+      type:
+        scalar: string
+    - name: data
+      type:
+        map:
+          elementType:
+            scalar: string
+    - name: kind
+      type:
+        scalar: string
+    - name: metadata
+      type:
+        namedType: io.k8s.apimachinery.pkg.apis.meta.v1.ObjectMeta
+      default: {}
+- name: io.k8s.apimachinery.pkg.apis.meta.v1.ObjectMeta
+  map:
+    fields:
+    - name: creationTimestamp
+      type:
+        namedType: io.k8s.apimachinery.pkg.apis.meta.v1.Time
+    - name: managedFields
+      type:
+        list:
+          elementType:
+            namedType: io.k8s.apimachinery.pkg.apis.meta.v1.ManagedFieldsEntry
+          elementRelationship: atomic
+    - name: name
+      type:
+        scalar: string
+    - name: namespace
+      type:
+        scalar: string
+- name: io.k8s.apimachinery.pkg.apis.meta.v1.ManagedFieldsEntry
+  map:
+    fields:
+    - name: apiVersion
+      type:
+        scalar: string
+    - name: fieldsType
+      type:
+        scalar: string
+    - name: fieldsV1
+      type:
+        namedType: io.k8s.apimachinery.pkg.apis.meta.v1.FieldsV1
+    - name: manager
+      type:
+        scalar: string
+    - name: operation
+      type:
+        scalar: string
+    - name: subresource
+      type:
+        scalar: string
+    - name: time
+      type:
+        namedType: io.k8s.apimachinery.pkg.apis.meta.v1.Time
+- name: io.k8s.apimachinery.pkg.apis.meta.v1.FieldsV1
+  map:
+    elementType:
+      scalar: untyped
+      list:
+        elementType:
+          namedType: __untyped_atomic_
+        elementRelationship: atomic
+      map:
+        elementType:
+          namedType: __untyped_deduced_
+        elementRelationship: separable
+- name: io.k8s.apimachinery.pkg.apis.meta.v1.Time
+  scalar: untyped
+- name: __untyped_deduced_
+  scalar: untyped
+  list:
+    elementType:
+      namedType: __untyped_atomic_
+    elementRelationship: atomic
+  map:
+    elementType:
+      namedType: __untyped_deduced_
+    elementRelationship: separable
+`)
+
+func TestManagedFieldsObjectTrackerReloadsScheme(t *testing.T) {
+	logger, _ := ktesting.NewTestContext(t)
+	cmResource := schema.GroupVersionResource{Version: "v1", Resource: "configmaps"}
+	scheme := runtime.NewScheme()
+	codecs := serializer.NewCodecFactory(scheme)
+
+	// Create tracker without registered ConfigMap type
+	tracker := NewFieldManagedObjectTrackerWithLogger(logger, scheme, codecs.UniversalDecoder(), configMapTypeConverter(scheme))
+
+	cm := &v1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-cm",
+		},
+		Data: map[string]string{"key": "value"},
+	}
+
+	// Register the type in scheme
+	scheme.AddKnownTypes(cmResource.GroupVersion(), &v1.ConfigMap{})
+
+	err := tracker.Create(cmResource, cm, "default", metav1.CreateOptions{FieldManager: "test-manager"})
+	assert.NoError(t, err, "Create should succeed after registering type")
+}
+
+func TestManagedFielsdObjectTrackerWithUnstructured(t *testing.T) {
+	logger, _ := ktesting.NewTestContext(t)
+	cmResource := schema.GroupVersionResource{Version: "v1", Resource: "configmaps"}
+	cmGVK := schema.GroupVersionKind{Version: "v1", Kind: "ConfigMap"}
+	scheme := runtime.NewScheme()
+	scheme.AddKnownTypeWithName(cmGVK, &unstructured.Unstructured{})
+	codecs := serializer.NewCodecFactory(scheme)
+
+	tracker := NewFieldManagedObjectTrackerWithLogger(logger, scheme, codecs.UniversalDecoder(), managedfields.NewDeducedTypeConverter())
+
+	cm := &unstructured.Unstructured{}
+	cm.SetAPIVersion("v1")
+	cm.SetKind("ConfigMap")
+	cm.SetName("test-cm")
+	cm.SetNamespace("default")
+	require.NoError(t, unstructured.SetNestedMap(cm.Object,
+		map[string]any{
+			"key": "value",
+		},
+		"data"),
+	)
+
+	// Validate creating through apply works
+	cmOriginal := cm.DeepCopy()
+
+	require.NoError(t, tracker.Apply(cmResource, cm, "default", metav1.PatchOptions{FieldManager: "test-manager"}))
+	cmActualUntyped, err := tracker.Get(cmResource, "default", cm.GetName())
+	require.NoError(t, err)
+
+	cmActual, ok := cmActualUntyped.(*unstructured.Unstructured)
+	require.True(t, ok)
+
+	unstructured.RemoveNestedField(cmActual.Object, "metadata", "managedFields")
+	require.Empty(t, cmp.Diff(cmOriginal, cmActual))
+
+	// Validate updating through apply works
+	require.NoError(t, unstructured.SetNestedMap(cmActual.Object,
+		map[string]any{
+			"key":         "value",
+			"another-key": "another-value",
+		},
+		"data"),
+	)
+
+	cmOriginal = cmActual.DeepCopy()
+	require.NoError(t, tracker.Apply(cmResource, cmActual, "default", metav1.PatchOptions{FieldManager: "test-manager"}))
+	cmActualUntyped, err = tracker.Get(cmResource, "default", cm.GetName())
+	require.NoError(t, err)
+
+	cmActual, ok = cmActualUntyped.(*unstructured.Unstructured)
+	require.True(t, ok)
+
+	unstructured.RemoveNestedField(cmActual.Object, "metadata", "managedFields")
+	require.Empty(t, cmp.Diff(cmOriginal, cmActual))
+}
+
+func TestDoesClientSupportWatchListSemantics(t *testing.T) {
+	logger, _ := ktesting.NewTestContext(t)
+	scheme := runtime.NewScheme()
+	codecs := serializer.NewCodecFactory(scheme)
+
+	target := NewObjectTrackerWithLogger(logger, scheme, codecs.UniversalDecoder())
+
+	if !watchlist.DoesClientNotSupportWatchListSemantics(target) {
+		t.Fatalf("ObjectTracker should NOT support WatchList semantics")
+	}
+}
+
+func newConfigMapTracker(t *testing.T) ObjectTracker {
+	logger, _ := ktesting.NewTestContext(t)
+	scheme := runtime.NewScheme()
+	require.NoError(t, v1.AddToScheme(scheme))
+	return NewObjectTrackerWithLogger(logger, scheme, serializer.NewCodecFactory(scheme).UniversalDecoder())
+}
+
+var configMapGVR = v1.SchemeGroupVersion.WithResource("configmaps")
+
+func configMap(namespace, name string) *v1.ConfigMap {
+	return &v1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: name}}
+}
+
+func listResourceVersion(t *testing.T, tracker ObjectTracker) string {
+	list, err := tracker.List(configMapGVR, v1.SchemeGroupVersion.WithKind("ConfigMap"), "")
+	require.NoError(t, err)
+	listMeta, err := meta.ListAccessor(list)
+	require.NoError(t, err)
+	return listMeta.GetResourceVersion()
+}
+
+// drainEvents returns what has been sent to the watch so far, formatted as "<type> <namespace>/<name>".
+func drainEvents(t *testing.T, w watch.Interface) []string {
+	var events []string
+	for {
+		select {
+		case event, ok := <-w.ResultChan():
+			if !ok {
+				return events
+			}
+			accessor, err := meta.Accessor(event.Object)
+			require.NoError(t, err)
+			events = append(events, fmt.Sprintf("%s %s/%s", event.Type, accessor.GetNamespace(), accessor.GetName()))
+		default:
+			return events
+		}
+	}
+}
+
+func TestDeleteBumpsResourceVersion(t *testing.T) {
+	tracker := newConfigMapTracker(t)
+	require.NoError(t, tracker.Add(configMap("ns", "one")))
+	before := listResourceVersion(t, tracker)
+	require.NoError(t, tracker.Delete(configMapGVR, "ns", "one"))
+	after := listResourceVersion(t, tracker)
+	require.NotEqual(t, before, after, "deleting an object must change the ResourceVersion of the list")
+
+	// Deleting something that doesn't exist is not a change.
+	require.Error(t, tracker.Delete(configMapGVR, "ns", "one"))
+	require.Equal(t, after, listResourceVersion(t, tracker))
+}
+
+// TestWatchReplaysDeletions covers a deletion which happens after List and before Watch.
+func TestWatchReplaysDeletions(t *testing.T) {
+	// The list returns ResourceVersion 4 for the three objects below.
+	setup := func(t *testing.T) ObjectTracker {
+		tracker := newConfigMapTracker(t)
+		require.NoError(t, tracker.Add(configMap("a", "one")))
+		require.NoError(t, tracker.Add(configMap("a", "two")))
+		require.NoError(t, tracker.Add(configMap("b", "three")))
+		require.Equal(t, "4", listResourceVersion(t, tracker))
+		return tracker
+	}
+
+	for name, tc := range map[string]struct {
+		mutate         func(t *testing.T, tracker ObjectTracker)
+		namespace      string
+		options        []metav1.ListOptions
+		expectedEvents []string
+	}{
+		"deleted-in-all-namespaces": {
+			mutate: func(t *testing.T, tracker ObjectTracker) {
+				require.NoError(t, tracker.Delete(configMapGVR, "b", "three"))
+				require.NoError(t, tracker.Delete(configMapGVR, "a", "one"))
+			},
+			options:        []metav1.ListOptions{{ResourceVersion: "4"}},
+			expectedEvents: []string{"DELETED b/three", "DELETED a/one"},
+		},
+		"deleted-in-one-namespace": {
+			mutate: func(t *testing.T, tracker ObjectTracker) {
+				require.NoError(t, tracker.Delete(configMapGVR, "b", "three"))
+				require.NoError(t, tracker.Delete(configMapGVR, "a", "one"))
+			},
+			namespace:      "a",
+			options:        []metav1.ListOptions{{ResourceVersion: "4"}},
+			expectedEvents: []string{"DELETED a/one"},
+		},
+		"deleted-and-created-again": {
+			mutate: func(t *testing.T, tracker ObjectTracker) {
+				require.NoError(t, tracker.Delete(configMapGVR, "a", "one"))
+				require.NoError(t, tracker.Create(configMapGVR, configMap("a", "one"), "a"))
+			},
+			options:        []metav1.ListOptions{{ResourceVersion: "4"}},
+			expectedEvents: []string{"DELETED a/one", "ADDED a/one"},
+		},
+		"deleted-before-resource-version": {
+			mutate: func(t *testing.T, tracker ObjectTracker) {
+				require.NoError(t, tracker.Delete(configMapGVR, "a", "one"))
+			},
+			// This is what List returns now.
+			options:        []metav1.ListOptions{{ResourceVersion: "5"}},
+			expectedEvents: nil,
+		},
+		"most-recent-with-unset-resource-version": {
+			mutate: func(t *testing.T, tracker ObjectTracker) {
+				require.NoError(t, tracker.Delete(configMapGVR, "a", "one"))
+			},
+			options:        []metav1.ListOptions{{}},
+			expectedEvents: []string{"ADDED a/two", "ADDED b/three"},
+		},
+		"most-recent-with-zero-resource-version": {
+			mutate: func(t *testing.T, tracker ObjectTracker) {
+				require.NoError(t, tracker.Delete(configMapGVR, "a", "one"))
+			},
+			options:        []metav1.ListOptions{{ResourceVersion: "0"}},
+			expectedEvents: []string{"ADDED a/two", "ADDED b/three"},
+		},
+		"without-options": {
+			mutate: func(t *testing.T, tracker ObjectTracker) {
+				require.NoError(t, tracker.Delete(configMapGVR, "a", "one"))
+			},
+			expectedEvents: nil,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			tracker := setup(t)
+			tc.mutate(t, tracker)
+			w, err := tracker.Watch(configMapGVR, tc.namespace, tc.options...)
+			require.NoError(t, err)
+			defer w.Stop()
+			require.Equal(t, tc.expectedEvents, drainEvents(t, w))
+		})
+	}
+}
+
+// TestWatchExpired covers a Watch that starts at a ResourceVersion for which not all
+// deletions are known anymore.
+func TestWatchExpired(t *testing.T) {
+	tracker := newConfigMapTracker(t)
+	for i := 0; i <= maxTrackedDeletions; i++ {
+		require.NoError(t, tracker.Add(configMap("ns", fmt.Sprintf("cm%d", i))))
+	}
+	listRV, err := strconv.ParseInt(listResourceVersion(t, tracker), 10, 64)
+	require.NoError(t, err)
+	for i := 0; i <= maxTrackedDeletions; i++ {
+		require.NoError(t, tracker.Delete(configMapGVR, "ns", fmt.Sprintf("cm%d", i)))
+	}
+
+	// The first deletion got dropped, so a watch which has seen
+	// nothing after the list may have missed it.
+	w, err := tracker.Watch(configMapGVR, "", metav1.ListOptions{ResourceVersion: strconv.FormatInt(listRV, 10)})
+	require.NoError(t, err)
+	event, ok := <-w.ResultChan()
+	require.True(t, ok, "expected an error event")
+	require.Equal(t, watch.Error, event.Type)
+	require.True(t, errors.IsResourceExpired(errors.FromObject(event.Object)), "expected an expired error, got: %v", event.Object)
+	_, ok = <-w.ResultChan()
+	require.False(t, ok, "expected the watch to be closed after the error")
+
+	// All deletions after the first one are still known.
+	w, err = tracker.Watch(configMapGVR, "", metav1.ListOptions{ResourceVersion: strconv.FormatInt(listRV+1, 10)})
+	require.NoError(t, err)
+	defer w.Stop()
+	require.Len(t, drainEvents(t, w), maxTrackedDeletions)
+
+	// Not asking for history works.
+	w, err = tracker.Watch(configMapGVR, "", metav1.ListOptions{})
+	require.NoError(t, err)
+	defer w.Stop()
+	require.Empty(t, drainEvents(t, w))
+}
+
+// TestWatchTooManyChanges covers a Watch that would have to send more events
+// than the new watch can buffer.
+func TestWatchTooManyChanges(t *testing.T) {
+	tracker := newConfigMapTracker(t)
+	for i := 0; i < maxTrackedDeletions; i++ {
+		require.NoError(t, tracker.Add(configMap("ns", fmt.Sprintf("cm%d", i))))
+	}
+	listRV, err := strconv.ParseInt(listResourceVersion(t, tracker), 10, 64)
+	require.NoError(t, err)
+	for i := 0; i < maxTrackedDeletions; i++ {
+		require.NoError(t, tracker.Delete(configMapGVR, "ns", fmt.Sprintf("cm%d", i)))
+	}
+	require.NoError(t, tracker.Add(configMap("ns", "another")))
+
+	// All deletions are still known, but together with the new object
+	// they are one event too many.
+	w, err := tracker.Watch(configMapGVR, "", metav1.ListOptions{ResourceVersion: strconv.FormatInt(listRV, 10)})
+	require.NoError(t, err)
+	defer w.Stop()
+	event := <-w.ResultChan()
+	require.Equal(t, watch.Error, event.Type)
+	require.True(t, errors.IsResourceExpired(errors.FromObject(event.Object)), "expected an expired error, got: %v", event.Object)
+
+	w, err = tracker.Watch(configMapGVR, "", metav1.ListOptions{ResourceVersion: strconv.FormatInt(listRV+1, 10)})
+	require.NoError(t, err)
+	defer w.Stop()
+	events := drainEvents(t, w)
+	require.Len(t, events, maxTrackedDeletions)
+	require.Equal(t, "ADDED ns/another", events[len(events)-1])
 }

@@ -1,4 +1,4 @@
-// +build darwin
+//go:build darwin
 
 /*
 Copyright 2018 The Kubernetes Authors.
@@ -25,10 +25,12 @@ import (
 	"unsafe"
 
 	"golang.org/x/sys/unix"
+
+	"k8s.io/klog/v2"
 )
 
 // GetBootTime returns the time at which the machine was started, truncated to the nearest second
-func GetBootTime() (time.Time, error) {
+func GetBootTime(klog.Logger) (time.Time, error) {
 	output, err := unix.SysctlRaw("kern.boottime")
 	if err != nil {
 		return time.Time{}, err

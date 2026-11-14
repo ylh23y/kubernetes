@@ -17,57 +17,77 @@ limitations under the License.
 package windows
 
 import (
+	"context"
 	"fmt"
+	appsv1 "k8s.io/api/apps/v1"
+	"net"
+	"strconv"
 
 	v1 "k8s.io/api/core/v1"
 	clientset "k8s.io/client-go/kubernetes"
-	"k8s.io/kubernetes/test/e2e/framework"
-	e2elog "k8s.io/kubernetes/test/e2e/framework/log"
-	e2enode "k8s.io/kubernetes/test/e2e/framework/node"
-	e2eservice "k8s.io/kubernetes/test/e2e/framework/service"
 
-	"github.com/onsi/ginkgo"
+	"k8s.io/kubernetes/test/e2e/framework"
+	e2enode "k8s.io/kubernetes/test/e2e/framework/node"
+	e2epod "k8s.io/kubernetes/test/e2e/framework/pod"
+	e2eservice "k8s.io/kubernetes/test/e2e/framework/service"
+	e2eskipper "k8s.io/kubernetes/test/e2e/framework/skipper"
+	imageutils "k8s.io/kubernetes/test/utils/image"
+	admissionapi "k8s.io/pod-security-admission/api"
+
+	"github.com/onsi/ginkgo/v2"
+	"github.com/onsi/gomega"
 )
 
-var _ = SIGDescribe("Services", func() {
+var _ = sigDescribe("Services", skipUnlessWindows(func() {
 	f := framework.NewDefaultFramework("services")
+	f.NamespacePodSecurityLevel = admissionapi.LevelPrivileged
 
 	var cs clientset.Interface
 
 	ginkgo.BeforeEach(func() {
 		//Only for Windows containers
-		framework.SkipUnlessNodeOSDistroIs("windows")
+		e2eskipper.SkipUnlessNodeOSDistroIs("windows")
 		cs = f.ClientSet
 	})
-	ginkgo.It("should be able to create a functioning NodePort service for Windows", func() {
+	ginkgo.It("should be able to create a functioning NodePort service for Windows", func(ctx context.Context) {
 		serviceName := "nodeport-test"
 		ns := f.Namespace.Name
 
-		jig := e2eservice.NewTestJig(cs, serviceName)
-		nodeIP, err := e2enode.PickIP(jig.Client)
-		if err != nil {
-			e2elog.Logf("Unexpected error occurred: %v", err)
-		}
-		// TODO: write a wrapper for ExpectNoErrorWithOffset()
-		framework.ExpectNoErrorWithOffset(0, err)
+		jig := e2eservice.NewTestJig(cs, ns, serviceName)
 
 		ginkgo.By("creating service " + serviceName + " with type=NodePort in namespace " + ns)
-		e2eservice := jig.CreateTCPServiceOrFail(ns, func(svc *v1.Service) {
+		svc, err := jig.CreateTCPService(ctx, func(svc *v1.Service) {
 			svc.Spec.Type = v1.ServiceTypeNodePort
 		})
-		jig.SanityCheckService(e2eservice, v1.ServiceTypeNodePort)
-		nodePort := int(e2eservice.Spec.Ports[0].NodePort)
+		framework.ExpectNoError(err)
+
+		node, err := e2enode.GetRandomReadySchedulableNode(ctx, jig.Client)
+		framework.ExpectNoError(err)
+		ips := e2enode.GetAddressesByTypeAndFamily(node, v1.NodeInternalIP, svc.Spec.IPFamilies[0])
+		gomega.Expect(ips).NotTo(gomega.BeEmpty())
+		nodeIP := ips[0]
+		nodePort := int(svc.Spec.Ports[0].NodePort)
 
 		ginkgo.By("creating Pod to be part of service " + serviceName)
-		jig.RunOrFail(ns, nil)
+		// tweak the Jig to use windows...
+		windowsNodeSelectorTweak := func(rc *appsv1.Deployment) {
+			rc.Spec.Template.Spec.NodeSelector = map[string]string{
+				"kubernetes.io/os": "windows",
+			}
+		}
+		_, err = jig.Run(ctx, windowsNodeSelectorTweak)
+		framework.ExpectNoError(err)
 
 		//using hybrid_network methods
 		ginkgo.By("creating Windows testing Pod")
-		windowsPod := createTestPod(f, windowsBusyBoximage, windowsOS)
+		testPod := createTestPod(f, imageutils.GetE2EImage(imageutils.Agnhost), windowsOS)
+		testPod = e2epod.NewPodClient(f).CreateSync(ctx, testPod)
 
+		ginkgo.By("verifying that pod has the correct nodeSelector")
+		// Admission controllers may sometimes do the wrong thing
+		gomega.Expect(testPod.Spec.NodeSelector).To(gomega.HaveKeyWithValue("kubernetes.io/os", "windows"), "pod.spec.nodeSelector")
 		ginkgo.By(fmt.Sprintf("checking connectivity Pod to curl http://%s:%d", nodeIP, nodePort))
-		assertConsistentConnectivity(f, windowsPod.ObjectMeta.Name, windowsOS, windowsCheck(fmt.Sprintf("http://%s:%d", nodeIP, nodePort)))
+		assertConsistentConnectivity(ctx, f, testPod.ObjectMeta.Name, windowsOS, windowsCheck(fmt.Sprintf("http://%s", net.JoinHostPort(nodeIP, strconv.Itoa(nodePort)))), internalMaxTries)
 
 	})
-
-})
+}))

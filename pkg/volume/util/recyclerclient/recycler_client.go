@@ -17,16 +17,18 @@ limitations under the License.
 package recyclerclient
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"sync"
 
 	"k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/errors"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/watch"
 	clientset "k8s.io/client-go/kubernetes"
-	"k8s.io/klog"
+	"k8s.io/klog/v2"
 )
 
 // RecycleEventRecorder is a func that defines how to record RecycleEvent.
@@ -42,9 +44,9 @@ type RecycleEventRecorder func(eventtype, message string)
 // function deletes it as it is not able to judge if it is an old recycler
 // or user has forged a fake recycler to block Kubernetes from recycling.//
 //
-//  pod - the pod designed by a volume plugin to recycle the volume. pod.Name
-//        will be overwritten with unique name based on PV.Name.
-//	client - kube client for API operations.
+//	 pod - the pod designed by a volume plugin to recycle the volume. pod.Name
+//	       will be overwritten with unique name based on PV.Name.
+//		client - kube client for API operations.
 func RecycleVolumeByWatchingPodUntilCompletion(pvName string, pod *v1.Pod, kubeClient clientset.Interface, recorder RecycleEventRecorder) error {
 	return internalRecycleVolumeByWatchingPodUntilCompletion(pvName, pod, newRecyclerClient(kubeClient, recorder))
 }
@@ -71,7 +73,7 @@ func internalRecycleVolumeByWatchingPodUntilCompletion(pvName string, pod *v1.Po
 	// Start the pod
 	_, err = recyclerClient.CreatePod(pod)
 	if err != nil {
-		if errors.IsAlreadyExists(err) {
+		if apierrors.IsAlreadyExists(err) {
 			deleteErr := recyclerClient.DeletePod(pod.Name, pod.Namespace)
 			if deleteErr != nil {
 				return fmt.Errorf("failed to delete old recycler pod %s/%s: %s", pod.Namespace, pod.Name, deleteErr)
@@ -88,7 +90,7 @@ func internalRecycleVolumeByWatchingPodUntilCompletion(pvName string, pod *v1.Po
 	klog.V(2).Infof("deleting recycler pod %s/%s", pod.Namespace, pod.Name)
 	deleteErr := recyclerClient.DeletePod(pod.Name, pod.Namespace)
 	if deleteErr != nil {
-		klog.Errorf("failed to delete recycler pod %s/%s: %v", pod.Namespace, pod.Name, err)
+		klog.Errorf("failed to delete recycler pod %s/%s: %v", pod.Namespace, pod.Name, deleteErr)
 	}
 
 	// Returning recycler error is preferred, the pod will be deleted again on
@@ -127,7 +129,7 @@ func waitForPod(pod *v1.Pod, recyclerClient recyclerClient, podCh <-chan watch.E
 				}
 				if pod.Status.Phase == v1.PodFailed {
 					if pod.Status.Message != "" {
-						return fmt.Errorf(pod.Status.Message)
+						return errors.New(pod.Status.Message)
 					}
 					return fmt.Errorf("pod failed, pod.Status.Message unknown")
 				}
@@ -177,15 +179,15 @@ type realRecyclerClient struct {
 }
 
 func (c *realRecyclerClient) CreatePod(pod *v1.Pod) (*v1.Pod, error) {
-	return c.client.CoreV1().Pods(pod.Namespace).Create(pod)
+	return c.client.CoreV1().Pods(pod.Namespace).Create(context.TODO(), pod, metav1.CreateOptions{})
 }
 
 func (c *realRecyclerClient) GetPod(name, namespace string) (*v1.Pod, error) {
-	return c.client.CoreV1().Pods(namespace).Get(name, metav1.GetOptions{})
+	return c.client.CoreV1().Pods(namespace).Get(context.TODO(), name, metav1.GetOptions{})
 }
 
 func (c *realRecyclerClient) DeletePod(name, namespace string) error {
-	return c.client.CoreV1().Pods(namespace).Delete(name, nil)
+	return c.client.CoreV1().Pods(namespace).Delete(context.TODO(), name, metav1.DeleteOptions{})
 }
 
 func (c *realRecyclerClient) Event(eventtype, message string) {
@@ -204,13 +206,13 @@ func (c *realRecyclerClient) WatchPod(name, namespace string, stopChannel chan s
 		Watch:         true,
 	}
 
-	podWatch, err := c.client.CoreV1().Pods(namespace).Watch(options)
+	podWatch, err := c.client.CoreV1().Pods(namespace).Watch(context.TODO(), options)
 	if err != nil {
 		return nil, err
 	}
 
 	eventSelector, _ := fields.ParseSelector("involvedObject.name=" + name)
-	eventWatch, err := c.client.CoreV1().Events(namespace).Watch(metav1.ListOptions{
+	eventWatch, err := c.client.CoreV1().Events(namespace).Watch(context.TODO(), metav1.ListOptions{
 		FieldSelector: eventSelector.String(),
 		Watch:         true,
 	})
@@ -233,7 +235,7 @@ func (c *realRecyclerClient) WatchPod(name, namespace string, stopChannel chan s
 		defer wg.Done()
 		for {
 			select {
-			case _ = <-stopChannel:
+			case <-stopChannel:
 				return
 			case eventEvent, ok := <-eventWatch.ResultChan():
 				if !ok {

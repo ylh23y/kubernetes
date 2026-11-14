@@ -17,96 +17,161 @@ limitations under the License.
 package kuberuntime
 
 import (
-	"k8s.io/api/core/v1"
+	"context"
+
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
-	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
-	"k8s.io/klog"
-	credentialprovidersecrets "k8s.io/kubernetes/pkg/credentialprovider/secrets"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1"
+	"k8s.io/klog/v2"
+	crededentialprovider "k8s.io/kubernetes/pkg/credentialprovider"
+	"k8s.io/kubernetes/pkg/features"
 	kubecontainer "k8s.io/kubernetes/pkg/kubelet/container"
-	"k8s.io/kubernetes/pkg/util/parsers"
+	"k8s.io/kubernetes/pkg/kubelet/images"
 )
 
 // PullImage pulls an image from the network to local storage using the supplied
 // secrets if necessary.
-func (m *kubeGenericRuntimeManager) PullImage(image kubecontainer.ImageSpec, pullSecrets []v1.Secret, podSandboxConfig *runtimeapi.PodSandboxConfig) (string, error) {
+func (m *kubeGenericRuntimeManager) PullImage(ctx context.Context, image kubecontainer.ImageSpec, credentials []crededentialprovider.TrackedAuthConfig, podSandboxConfig *runtimeapi.PodSandboxConfig) (string, *crededentialprovider.TrackedAuthConfig, error) {
+	logger := klog.FromContext(ctx)
 	img := image.Image
-	repoToPull, _, _, err := parsers.ParseImageName(img)
-	if err != nil {
-		return "", err
-	}
+	imgSpec := ToRuntimeAPIImageSpec(image)
 
-	keyring, err := credentialprovidersecrets.MakeDockerKeyring(pullSecrets, m.keyring)
-	if err != nil {
-		return "", err
-	}
+	if len(credentials) == 0 {
+		logger.V(3).Info("Pulling image without credentials", "image", img)
 
-	imgSpec := &runtimeapi.ImageSpec{Image: img}
-	creds, withCredentials := keyring.Lookup(repoToPull)
-	if !withCredentials {
-		klog.V(3).Infof("Pulling image %q without credentials", img)
-
-		imageRef, err := m.imageService.PullImage(imgSpec, nil, podSandboxConfig)
+		imageRef, err := m.imageService.PullImage(ctx, imgSpec, nil, podSandboxConfig)
 		if err != nil {
-			klog.Errorf("Pull image %q failed: %v", img, err)
-			return "", err
+			logger.Error(err, "Failed to pull image", "image", img)
+			return "", nil, err
 		}
 
-		return imageRef, nil
+		return imageRef, nil, nil
 	}
 
 	var pullErrs []error
-	for _, currentCreds := range creds {
-		auth := &runtimeapi.AuthConfig{
-			Username:      currentCreds.Username,
-			Password:      currentCreds.Password,
-			Auth:          currentCreds.Auth,
-			ServerAddress: currentCreds.ServerAddress,
-			IdentityToken: currentCreds.IdentityToken,
-			RegistryToken: currentCreds.RegistryToken,
-		}
+	for _, currentCreds := range credentials {
+		auth := toRuntimeAuthConfig(currentCreds)
 
-		imageRef, err := m.imageService.PullImage(imgSpec, auth, podSandboxConfig)
+		imageRef, err := m.imageService.PullImage(ctx, imgSpec, auth, podSandboxConfig)
 		// If there was no error, return success
 		if err == nil {
-			return imageRef, nil
+			return imageRef, &currentCreds, nil
 		}
 
 		pullErrs = append(pullErrs, err)
 	}
 
-	return "", utilerrors.NewAggregate(pullErrs)
+	return "", nil, utilerrors.NewAggregate(pullErrs)
+}
+
+// PullSecurityProfile pulls a security profile with the supplied credentials,
+// trying them in order, and returns whether the profile was already present.
+func (m *kubeGenericRuntimeManager) PullSecurityProfile(ctx context.Context, image kubecontainer.ImageSpec, credentials []crededentialprovider.TrackedAuthConfig, podSandboxConfig *runtimeapi.PodSandboxConfig, kind runtimeapi.SecurityProfileKind) (bool, error) {
+	logger := klog.FromContext(ctx)
+	imgSpec := ToRuntimeAPIImageSpec(image)
+	// Profile references are canonical, so the reference as written in the
+	// pod spec is the one passed as image.
+	imgSpec.UserSpecifiedImage = image.Image
+
+	if len(credentials) == 0 {
+		resp, err := m.imageService.PullSecurityProfile(ctx, imgSpec, nil, podSandboxConfig, kind)
+		if err != nil {
+			logger.Error(err, "Failed to pull security profile", "ref", image.Image)
+			return false, err
+		}
+		return resp.GetCached(), nil
+	}
+
+	// The caller classifies the error by its gRPC code and well-known message
+	// prefix, so the last error is returned as is rather than aggregated.
+	var lastErr error
+	for _, currentCreds := range credentials {
+		auth := toRuntimeAuthConfig(currentCreds)
+
+		resp, err := m.imageService.PullSecurityProfile(ctx, imgSpec, auth, podSandboxConfig, kind)
+		if err == nil {
+			return resp.GetCached(), nil
+		}
+		// A rejection is a property of the profile or of the runtime, not of
+		// the credentials used, so the other credentials cannot change it.
+		if images.IsSecurityProfileRejected(err) {
+			return false, err
+		}
+		logger.V(3).Info("Failed to pull security profile with credentials, trying the next", "ref", image.Image, "err", err)
+		lastErr = err
+	}
+
+	return false, lastErr
+}
+
+// ListSecurityProfiles lists the security profiles in the runtime's storage.
+func (m *kubeGenericRuntimeManager) ListSecurityProfiles(ctx context.Context) ([]*runtimeapi.SecurityProfileInfo, error) {
+	return m.imageService.ListSecurityProfiles(ctx)
+}
+
+// RemoveSecurityProfile removes a security profile by its digest.
+func (m *kubeGenericRuntimeManager) RemoveSecurityProfile(ctx context.Context, digest string) error {
+	return m.imageService.RemoveSecurityProfile(ctx, digest)
 }
 
 // GetImageRef gets the ID of the image which has already been in
 // the local storage. It returns ("", nil) if the image isn't in the local storage.
-func (m *kubeGenericRuntimeManager) GetImageRef(image kubecontainer.ImageSpec) (string, error) {
-	status, err := m.imageService.ImageStatus(&runtimeapi.ImageSpec{Image: image.Image})
+func (m *kubeGenericRuntimeManager) GetImageRef(ctx context.Context, image kubecontainer.ImageSpec) (string, error) {
+	logger := klog.FromContext(ctx)
+	resp, err := m.imageService.ImageStatus(ctx, ToRuntimeAPIImageSpec(image), false)
 	if err != nil {
-		klog.Errorf("ImageStatus for image %q failed: %v", image, err)
+		logger.Error(err, "Failed to get image status", "image", image.Image)
 		return "", err
 	}
-	if status == nil {
+	if resp.Image == nil {
 		return "", nil
 	}
-	return status.Id, nil
+	return resp.Image.Id, nil
+}
+
+func (m *kubeGenericRuntimeManager) GetImageSize(ctx context.Context, image kubecontainer.ImageSpec) (uint64, error) {
+	logger := klog.FromContext(ctx)
+	resp, err := m.imageService.ImageStatus(ctx, ToRuntimeAPIImageSpec(image), false)
+	if err != nil {
+		logger.Error(err, "Failed to get image status", "image", image.Image)
+		return 0, err
+	}
+	if resp.Image == nil {
+		return 0, nil
+	}
+	return resp.Image.Size, nil
 }
 
 // ListImages gets all images currently on the machine.
-func (m *kubeGenericRuntimeManager) ListImages() ([]kubecontainer.Image, error) {
+func (m *kubeGenericRuntimeManager) ListImages(ctx context.Context) ([]kubecontainer.Image, error) {
+	logger := klog.FromContext(ctx)
 	var images []kubecontainer.Image
 
-	allImages, err := m.imageService.ListImages(nil)
+	allImages, err := m.imageService.ListImages(ctx, nil)
 	if err != nil {
-		klog.Errorf("ListImages failed: %v", err)
+		logger.Error(err, "Failed to list images")
 		return nil, err
 	}
 
 	for _, img := range allImages {
+		// Container runtimes may choose not to implement changes needed for KEP 4216. If
+		// the changes are not implemented by a container runtime, the exisiting behavior
+		// of not populating the runtimeHandler CRI field in ImageSpec struct is preserved.
+		// Therefore, when RuntimeClassInImageCriAPI feature gate is set, check to see if this
+		// field is empty and log a warning message.
+		if utilfeature.DefaultFeatureGate.Enabled(features.RuntimeClassInImageCriAPI) {
+			if img.Spec == nil || (img.Spec != nil && img.Spec.RuntimeHandler == "") {
+				logger.V(2).Info("WARNING: RuntimeHandler is empty", "ImageID", img.Id)
+			}
+		}
+
 		images = append(images, kubecontainer.Image{
 			ID:          img.Id,
-			Size:        int64(img.Size_),
+			Size:        int64(img.Size),
 			RepoTags:    img.RepoTags,
 			RepoDigests: img.RepoDigests,
+			Spec:        ToKubeContainerImageSpec(img),
+			Pinned:      img.Pinned,
 		})
 	}
 
@@ -114,10 +179,11 @@ func (m *kubeGenericRuntimeManager) ListImages() ([]kubecontainer.Image, error) 
 }
 
 // RemoveImage removes the specified image.
-func (m *kubeGenericRuntimeManager) RemoveImage(image kubecontainer.ImageSpec) error {
-	err := m.imageService.RemoveImage(&runtimeapi.ImageSpec{Image: image.Image})
+func (m *kubeGenericRuntimeManager) RemoveImage(ctx context.Context, image kubecontainer.ImageSpec) error {
+	logger := klog.FromContext(ctx)
+	err := m.imageService.RemoveImage(ctx, &runtimeapi.ImageSpec{Image: image.Image})
 	if err != nil {
-		klog.Errorf("Remove image %q failed: %v", image.Image, err)
+		logger.Error(err, "Failed to remove image", "image", image.Image)
 		return err
 	}
 
@@ -128,15 +194,37 @@ func (m *kubeGenericRuntimeManager) RemoveImage(image kubecontainer.ImageSpec) e
 // Notice that current logic doesn't really work for images which share layers (e.g. docker image),
 // this is a known issue, and we'll address this by getting imagefs stats directly from CRI.
 // TODO: Get imagefs stats directly from CRI.
-func (m *kubeGenericRuntimeManager) ImageStats() (*kubecontainer.ImageStats, error) {
-	allImages, err := m.imageService.ListImages(nil)
+func (m *kubeGenericRuntimeManager) ImageStats(ctx context.Context) (*kubecontainer.ImageStats, error) {
+	logger := klog.FromContext(ctx)
+	allImages, err := m.imageService.ListImages(ctx, nil)
 	if err != nil {
-		klog.Errorf("ListImages failed: %v", err)
+		logger.Error(err, "Failed to list images")
 		return nil, err
 	}
 	stats := &kubecontainer.ImageStats{}
 	for _, img := range allImages {
-		stats.TotalStorageBytes += img.Size_
+		stats.TotalStorageBytes += img.Size
 	}
 	return stats, nil
+}
+
+func (m *kubeGenericRuntimeManager) ImageFsInfo(ctx context.Context) (*runtimeapi.ImageFsInfoResponse, error) {
+	logger := klog.FromContext(ctx)
+	allImages, err := m.imageService.ImageFsInfo(ctx)
+	if err != nil {
+		logger.Error(err, "Failed to get image filesystem")
+		return nil, err
+	}
+	return allImages, nil
+}
+
+func toRuntimeAuthConfig(creds crededentialprovider.TrackedAuthConfig) *runtimeapi.AuthConfig {
+	return &runtimeapi.AuthConfig{
+		Username:      creds.Username,
+		Password:      creds.Password,
+		Auth:          creds.Auth,
+		ServerAddress: creds.ServerAddress,
+		IdentityToken: creds.IdentityToken,
+		RegistryToken: creds.RegistryToken,
+	}
 }

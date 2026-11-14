@@ -21,102 +21,18 @@ import (
 	"reflect"
 	"testing"
 
-	"k8s.io/apimachinery/pkg/util/diff"
+	"github.com/google/go-cmp/cmp"
+	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/apimachinery/pkg/util/version"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	featuregatetesting "k8s.io/component-base/featuregate/testing"
+	"k8s.io/utils/ptr"
+
 	"k8s.io/kubernetes/pkg/apis/core"
 	"k8s.io/kubernetes/pkg/features"
 )
-
-func TestDropAlphaPVCVolumeMode(t *testing.T) {
-	vmode := core.PersistentVolumeFilesystem
-
-	pvcWithoutVolumeMode := func() *core.PersistentVolumeClaim {
-		return &core.PersistentVolumeClaim{
-			Spec: core.PersistentVolumeClaimSpec{
-				VolumeMode: nil,
-			},
-		}
-	}
-	pvcWithVolumeMode := func() *core.PersistentVolumeClaim {
-		return &core.PersistentVolumeClaim{
-			Spec: core.PersistentVolumeClaimSpec{
-				VolumeMode: &vmode,
-			},
-		}
-	}
-
-	pvcInfo := []struct {
-		description   string
-		hasVolumeMode bool
-		pvc           func() *core.PersistentVolumeClaim
-	}{
-		{
-			description:   "pvc without VolumeMode",
-			hasVolumeMode: false,
-			pvc:           pvcWithoutVolumeMode,
-		},
-		{
-			description:   "pvc with Filesystem VolumeMode",
-			hasVolumeMode: true,
-			pvc:           pvcWithVolumeMode,
-		},
-		{
-			description:   "is nil",
-			hasVolumeMode: false,
-			pvc:           func() *core.PersistentVolumeClaim { return nil },
-		},
-	}
-
-	for _, enabled := range []bool{true, false} {
-		for _, oldpvcInfo := range pvcInfo {
-			for _, newpvcInfo := range pvcInfo {
-				oldpvcHasVolumeMode, oldpvc := oldpvcInfo.hasVolumeMode, oldpvcInfo.pvc()
-				newpvcHasVolumeMode, newpvc := newpvcInfo.hasVolumeMode, newpvcInfo.pvc()
-				if newpvc == nil {
-					continue
-				}
-
-				t.Run(fmt.Sprintf("feature enabled=%v, old pvc %v, new pvc %v", enabled, oldpvcInfo.description, newpvcInfo.description), func(t *testing.T) {
-					defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.BlockVolume, enabled)()
-
-					var oldpvcSpec *core.PersistentVolumeClaimSpec
-					if oldpvc != nil {
-						oldpvcSpec = &oldpvc.Spec
-					}
-					DropDisabledFields(&newpvc.Spec, oldpvcSpec)
-
-					// old pvc should never be changed
-					if !reflect.DeepEqual(oldpvc, oldpvcInfo.pvc()) {
-						t.Errorf("old pvc changed: %v", diff.ObjectReflectDiff(oldpvc, oldpvcInfo.pvc()))
-					}
-
-					switch {
-					case enabled || oldpvcHasVolumeMode:
-						// new pvc should not be changed if the feature is enabled, or if the old pvc had BlockVolume
-						if !reflect.DeepEqual(newpvc, newpvcInfo.pvc()) {
-							t.Errorf("new pvc changed: %v", diff.ObjectReflectDiff(newpvc, newpvcInfo.pvc()))
-						}
-					case newpvcHasVolumeMode:
-						// new pvc should be changed
-						if reflect.DeepEqual(newpvc, newpvcInfo.pvc()) {
-							t.Errorf("new pvc was not changed")
-						}
-						// new pvc should not have BlockVolume
-						if !reflect.DeepEqual(newpvc, pvcWithoutVolumeMode()) {
-							t.Errorf("new pvc had pvcBlockVolume: %v", diff.ObjectReflectDiff(newpvc, pvcWithoutVolumeMode()))
-						}
-					default:
-						// new pvc should not need to be changed
-						if !reflect.DeepEqual(newpvc, newpvcInfo.pvc()) {
-							t.Errorf("new pvc changed: %v", diff.ObjectReflectDiff(newpvc, newpvcInfo.pvc()))
-						}
-					}
-				})
-			}
-		}
-	}
-}
 
 func TestDropDisabledSnapshotDataSource(t *testing.T) {
 	pvcWithoutDataSource := func() *core.PersistentVolumeClaim {
@@ -140,73 +56,44 @@ func TestDropDisabledSnapshotDataSource(t *testing.T) {
 	}
 
 	pvcInfo := []struct {
-		description   string
-		hasDataSource bool
-		pvc           func() *core.PersistentVolumeClaim
+		description string
+		pvc         func() *core.PersistentVolumeClaim
 	}{
 		{
-			description:   "pvc without DataSource",
-			hasDataSource: false,
-			pvc:           pvcWithoutDataSource,
+			description: "pvc without DataSource",
+			pvc:         pvcWithoutDataSource,
 		},
 		{
-			description:   "pvc with DataSource",
-			hasDataSource: true,
-			pvc:           pvcWithDataSource,
+			description: "pvc with DataSource",
+			pvc:         pvcWithDataSource,
 		},
 		{
-			description:   "is nil",
-			hasDataSource: false,
-			pvc:           func() *core.PersistentVolumeClaim { return nil },
+			description: "is nil",
+			pvc:         func() *core.PersistentVolumeClaim { return nil },
 		},
 	}
 
-	for _, enabled := range []bool{true, false} {
-		for _, oldpvcInfo := range pvcInfo {
-			for _, newpvcInfo := range pvcInfo {
-				oldPvcHasDataSource, oldpvc := oldpvcInfo.hasDataSource, oldpvcInfo.pvc()
-				newPvcHasDataSource, newpvc := newpvcInfo.hasDataSource, newpvcInfo.pvc()
-				if newpvc == nil {
-					continue
+	for _, oldpvcInfo := range pvcInfo {
+		for _, newpvcInfo := range pvcInfo {
+			oldpvc := oldpvcInfo.pvc()
+			newpvc := newpvcInfo.pvc()
+			if newpvc == nil {
+				continue
+			}
+
+			t.Run(fmt.Sprintf("old pvc %v, new pvc %v", oldpvcInfo.description, newpvcInfo.description), func(t *testing.T) {
+				EnforceDataSourceBackwardsCompatibility(&newpvc.Spec, nil)
+
+				// old pvc should never be changed
+				if !reflect.DeepEqual(oldpvc, oldpvcInfo.pvc()) {
+					t.Errorf("old pvc changed: %v", cmp.Diff(oldpvc, oldpvcInfo.pvc()))
 				}
 
-				t.Run(fmt.Sprintf("feature enabled=%v, old pvc %v, new pvc %v", enabled, oldpvcInfo.description, newpvcInfo.description), func(t *testing.T) {
-					defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.VolumeSnapshotDataSource, enabled)()
-
-					var oldpvcSpec *core.PersistentVolumeClaimSpec
-					if oldpvc != nil {
-						oldpvcSpec = &oldpvc.Spec
-					}
-					DropDisabledFields(&newpvc.Spec, oldpvcSpec)
-
-					// old pvc should never be changed
-					if !reflect.DeepEqual(oldpvc, oldpvcInfo.pvc()) {
-						t.Errorf("old pvc changed: %v", diff.ObjectReflectDiff(oldpvc, oldpvcInfo.pvc()))
-					}
-
-					switch {
-					case enabled || oldPvcHasDataSource:
-						// new pvc should not be changed if the feature is enabled, or if the old pvc had DataSource
-						if !reflect.DeepEqual(newpvc, newpvcInfo.pvc()) {
-							t.Errorf("new pvc changed: %v", diff.ObjectReflectDiff(newpvc, newpvcInfo.pvc()))
-						}
-					case newPvcHasDataSource:
-						// new pvc should be changed
-						if reflect.DeepEqual(newpvc, newpvcInfo.pvc()) {
-							t.Errorf("new pvc was not changed")
-						}
-						// new pvc should not have DataSource
-						if !reflect.DeepEqual(newpvc, pvcWithoutDataSource()) {
-							t.Errorf("new pvc had DataSource: %v", diff.ObjectReflectDiff(newpvc, pvcWithoutDataSource()))
-						}
-					default:
-						// new pvc should not need to be changed
-						if !reflect.DeepEqual(newpvc, newpvcInfo.pvc()) {
-							t.Errorf("new pvc changed: %v", diff.ObjectReflectDiff(newpvc, newpvcInfo.pvc()))
-						}
-					}
-				})
-			}
+				// new pvc should not be changed
+				if !reflect.DeepEqual(newpvc, newpvcInfo.pvc()) {
+					t.Errorf("new pvc changed: %v", cmp.Diff(newpvc, newpvcInfo.pvc()))
+				}
+			})
 		}
 	}
 }
@@ -238,62 +125,655 @@ func TestPVCDataSourceSpecFilter(t *testing.T) {
 	}
 
 	var tests = map[string]struct {
-		spec        core.PersistentVolumeClaimSpec
-		gateEnabled bool
-		want        *core.TypedLocalObjectReference
+		spec core.PersistentVolumeClaimSpec
+		want *core.TypedLocalObjectReference
 	}{
 		"enabled with empty ds": {
-			spec:        core.PersistentVolumeClaimSpec{},
-			gateEnabled: true,
-			want:        nil,
+			spec: core.PersistentVolumeClaimSpec{},
+			want: nil,
 		},
 		"enabled with invalid spec": {
-			spec:        invalidSpec,
-			gateEnabled: true,
-			want:        nil,
+			spec: invalidSpec,
+			want: nil,
 		},
 		"enabled with valid spec": {
-			spec:        validSpec,
-			gateEnabled: true,
-			want:        validSpec.DataSource,
-		},
-		"disabled with invalid spec": {
-			spec:        invalidSpec,
-			gateEnabled: false,
-			want:        nil,
-		},
-		"disabled with valid spec": {
-			spec:        validSpec,
-			gateEnabled: false,
-			want:        nil,
-		},
-		"diabled with empty ds": {
-			spec:        core.PersistentVolumeClaimSpec{},
-			gateEnabled: false,
-			want:        nil,
+			spec: validSpec,
+			want: validSpec.DataSource,
 		},
 		"enabled with valid spec but nil APIGroup": {
-			spec:        validSpecNilAPIGroup,
-			gateEnabled: true,
-			want:        validSpecNilAPIGroup.DataSource,
-		},
-		"disabled with valid spec but nil APIGroup": {
-			spec:        validSpecNilAPIGroup,
-			gateEnabled: false,
-			want:        nil,
+			spec: validSpecNilAPIGroup,
+			want: validSpecNilAPIGroup.DataSource,
 		},
 	}
 
 	for testName, test := range tests {
 		t.Run(testName, func(t *testing.T) {
-			defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.VolumePVCDataSource, test.gateEnabled)()
-			DropDisabledFields(&test.spec, nil)
+			EnforceDataSourceBackwardsCompatibility(&test.spec, nil)
 			if test.spec.DataSource != test.want {
-				t.Errorf("expected drop datasource condition was not met, test: %s, gateEnabled: %v, spec: %v, expected: %v", testName, test.gateEnabled, test.spec, test.want)
+				t.Errorf("expected drop datasource condition was not met, test: %s, spec: %v, expected: %v", testName, test.spec, test.want)
 			}
 
 		})
+	}
+}
 
+var (
+	coreGroup    = ""
+	snapGroup    = "snapshot.storage.k8s.io"
+	genericGroup = "generic.storage.k8s.io"
+	pvcKind      = "PersistentVolumeClaim"
+	snapKind     = "VolumeSnapshot"
+	genericKind  = "Generic"
+	podKind      = "Pod"
+)
+
+func makeDataSource(apiGroup, kind, name string) *core.TypedLocalObjectReference {
+	return &core.TypedLocalObjectReference{
+		APIGroup: &apiGroup,
+		Kind:     kind,
+		Name:     name,
+	}
+}
+
+func makeDataSourceRef(apiGroup, kind, name string, namespace *string) *core.TypedObjectReference {
+	return &core.TypedObjectReference{
+		APIGroup:  &apiGroup,
+		Kind:      kind,
+		Name:      name,
+		Namespace: namespace,
+	}
+}
+
+// TestDataSourceFilter checks to ensure CrossNamespaceVolumeDataSource works
+func TestDataSourceFilter(t *testing.T) {
+	ns := "ns1"
+	volumeDataSource := makeDataSource(coreGroup, pvcKind, "my-vol")
+	volumeDataSourceRef := makeDataSourceRef(coreGroup, pvcKind, "my-vol", nil)
+	xnsVolumeDataSourceRef := makeDataSourceRef(coreGroup, pvcKind, "my-vol", &ns)
+
+	var tests = map[string]struct {
+		spec       core.PersistentVolumeClaimSpec
+		oldSpec    core.PersistentVolumeClaimSpec
+		anyEnabled bool
+		xnsEnabled bool
+		want       *core.TypedLocalObjectReference
+		wantRef    *core.TypedObjectReference
+	}{
+		"empty ds": {
+			spec: core.PersistentVolumeClaimSpec{},
+		},
+		"volume ds": {
+			spec: core.PersistentVolumeClaimSpec{DataSource: volumeDataSource},
+			want: volumeDataSource,
+		},
+		"volume ds ref": {
+			spec:    core.PersistentVolumeClaimSpec{DataSourceRef: volumeDataSourceRef},
+			wantRef: volumeDataSourceRef,
+		},
+		"both data sources": {
+			spec:    core.PersistentVolumeClaimSpec{DataSource: volumeDataSource, DataSourceRef: volumeDataSourceRef},
+			want:    volumeDataSource,
+			wantRef: volumeDataSourceRef,
+		},
+		"xns enabled with xns volume ds": {
+			spec:       core.PersistentVolumeClaimSpec{DataSourceRef: xnsVolumeDataSourceRef},
+			xnsEnabled: true,
+			wantRef:    xnsVolumeDataSourceRef,
+		},
+		"xns enabled with xns volume ds when xns volume exists in oldSpec": {
+			spec:       core.PersistentVolumeClaimSpec{DataSourceRef: xnsVolumeDataSourceRef},
+			oldSpec:    core.PersistentVolumeClaimSpec{DataSourceRef: xnsVolumeDataSourceRef},
+			xnsEnabled: true,
+			wantRef:    xnsVolumeDataSourceRef,
+		},
+		"xns volume ds": {
+			spec: core.PersistentVolumeClaimSpec{DataSourceRef: xnsVolumeDataSourceRef},
+		},
+		"xns volume ds when xns volume exists in oldSpec": {
+			spec:    core.PersistentVolumeClaimSpec{DataSourceRef: xnsVolumeDataSourceRef},
+			oldSpec: core.PersistentVolumeClaimSpec{DataSourceRef: xnsVolumeDataSourceRef},
+			wantRef: xnsVolumeDataSourceRef, // existing field isn't dropped.
+		},
+		"xns volume ds when volume exists in oldSpec": {
+			spec:    core.PersistentVolumeClaimSpec{DataSourceRef: xnsVolumeDataSourceRef},
+			oldSpec: core.PersistentVolumeClaimSpec{DataSourceRef: volumeDataSourceRef},
+			wantRef: xnsVolumeDataSourceRef, // existing field isn't dropped.8
+		},
 	}
 
+	for testName, test := range tests {
+		t.Run(testName, func(t *testing.T) {
+			featuregatetesting.SetFeatureGatesDuringTest(t, utilfeature.DefaultFeatureGate, featuregatetesting.FeatureOverrides{
+				features.CrossNamespaceVolumeDataSource: test.xnsEnabled,
+			})
+			DropDisabledFields(&test.spec, &test.oldSpec)
+			if test.spec.DataSource != test.want {
+				t.Errorf("expected condition was not met, test: %s, anyEnabled: %v, xnsEnabled: %v, spec: %+v, expected DataSource: %+v",
+					testName, test.anyEnabled, test.xnsEnabled, test.spec, test.want)
+			}
+			if test.spec.DataSourceRef != test.wantRef {
+				t.Errorf("expected condition was not met, test: %s, anyEnabled: %v, xnsEnabled: %v, spec: %+v, expected DataSourceRef: %+v",
+					testName, test.anyEnabled, test.xnsEnabled, test.spec, test.wantRef)
+			}
+		})
+	}
+}
+
+// TestDataSourceRef checks to ensure the DataSourceRef field handles backwards
+// compatibility with the DataSource field
+func TestDataSourceRef(t *testing.T) {
+	ns := "ns1"
+	volumeDataSource := makeDataSource(coreGroup, pvcKind, "my-vol")
+	volumeDataSourceRef := makeDataSourceRef(coreGroup, pvcKind, "my-vol", nil)
+	xnsVolumeDataSourceRef := makeDataSourceRef(coreGroup, pvcKind, "my-vol", &ns)
+	snapshotDataSource := makeDataSource(snapGroup, snapKind, "my-snap")
+	snapshotDataSourceRef := makeDataSourceRef(snapGroup, snapKind, "my-snap", nil)
+	xnsSnapshotDataSourceRef := makeDataSourceRef(snapGroup, snapKind, "my-snap", &ns)
+	genericDataSource := makeDataSource(genericGroup, genericKind, "my-foo")
+	genericDataSourceRef := makeDataSourceRef(genericGroup, genericKind, "my-foo", nil)
+	xnsGenericDataSourceRef := makeDataSourceRef(genericGroup, genericKind, "my-foo", &ns)
+	coreDataSource := makeDataSource(coreGroup, podKind, "my-pod")
+	coreDataSourceRef := makeDataSourceRef(coreGroup, podKind, "my-pod", nil)
+	xnsCoreDataSourceRef := makeDataSourceRef(coreGroup, podKind, "my-pod", &ns)
+
+	var tests = map[string]struct {
+		spec    core.PersistentVolumeClaimSpec
+		want    *core.TypedLocalObjectReference
+		wantRef *core.TypedObjectReference
+	}{
+		"empty ds": {
+			spec: core.PersistentVolumeClaimSpec{},
+		},
+		"volume ds": {
+			spec:    core.PersistentVolumeClaimSpec{DataSource: volumeDataSource},
+			want:    volumeDataSource,
+			wantRef: volumeDataSourceRef,
+		},
+		"snapshot ds": {
+			spec:    core.PersistentVolumeClaimSpec{DataSource: snapshotDataSource},
+			want:    snapshotDataSource,
+			wantRef: snapshotDataSourceRef,
+		},
+		"generic ds": {
+			spec:    core.PersistentVolumeClaimSpec{DataSource: genericDataSource},
+			want:    genericDataSource,
+			wantRef: genericDataSourceRef,
+		},
+		"core ds": {
+			spec:    core.PersistentVolumeClaimSpec{DataSource: coreDataSource},
+			want:    coreDataSource,
+			wantRef: coreDataSourceRef,
+		},
+		"volume ds ref": {
+			spec:    core.PersistentVolumeClaimSpec{DataSourceRef: volumeDataSourceRef},
+			want:    volumeDataSource,
+			wantRef: volumeDataSourceRef,
+		},
+		"snapshot ds ref": {
+			spec:    core.PersistentVolumeClaimSpec{DataSourceRef: snapshotDataSourceRef},
+			want:    snapshotDataSource,
+			wantRef: snapshotDataSourceRef,
+		},
+		"generic ds ref": {
+			spec:    core.PersistentVolumeClaimSpec{DataSourceRef: genericDataSourceRef},
+			want:    genericDataSource,
+			wantRef: genericDataSourceRef,
+		},
+		"core ds ref": {
+			spec:    core.PersistentVolumeClaimSpec{DataSourceRef: coreDataSourceRef},
+			want:    coreDataSource,
+			wantRef: coreDataSourceRef,
+		},
+		"xns volume ds ref": {
+			spec:    core.PersistentVolumeClaimSpec{DataSourceRef: xnsVolumeDataSourceRef},
+			wantRef: xnsVolumeDataSourceRef,
+		},
+		"xns snapshot ds ref": {
+			spec:    core.PersistentVolumeClaimSpec{DataSourceRef: xnsSnapshotDataSourceRef},
+			wantRef: xnsSnapshotDataSourceRef,
+		},
+		"xns generic ds ref": {
+			spec:    core.PersistentVolumeClaimSpec{DataSourceRef: xnsGenericDataSourceRef},
+			wantRef: xnsGenericDataSourceRef,
+		},
+		"xns core ds ref": {
+			spec:    core.PersistentVolumeClaimSpec{DataSourceRef: xnsCoreDataSourceRef},
+			wantRef: xnsCoreDataSourceRef,
+		},
+	}
+
+	featuregatetesting.SetFeatureGatesDuringTest(t, utilfeature.DefaultFeatureGate, featuregatetesting.FeatureOverrides{
+		features.CrossNamespaceVolumeDataSource: true,
+	})
+
+	for testName, test := range tests {
+		t.Run(testName, func(t *testing.T) {
+			NormalizeDataSources(&test.spec)
+			if !reflect.DeepEqual(test.spec.DataSource, test.want) {
+				t.Errorf("expected condition was not met, test: %s, spec.datasource: %+v, want: %+v",
+					testName, test.spec.DataSource, test.want)
+			}
+			if !reflect.DeepEqual(test.spec.DataSourceRef, test.wantRef) {
+				t.Errorf("expected condition was not met, test: %s, spec.datasourceRef: %+v, wantRef: %+v",
+					testName, test.spec.DataSourceRef, test.wantRef)
+			}
+		})
+	}
+}
+
+func TestDropDisabledVolumeAttributesClass(t *testing.T) {
+	vacName := ptr.To("foo")
+
+	var tests = map[string]struct {
+		spec       core.PersistentVolumeClaimSpec
+		oldSpec    core.PersistentVolumeClaimSpec
+		vacEnabled bool
+		wantVAC    *string
+	}{
+		"vac disabled with empty vac": {
+			spec: core.PersistentVolumeClaimSpec{},
+		},
+		"vac disabled with vac": {
+			spec: core.PersistentVolumeClaimSpec{VolumeAttributesClassName: vacName},
+		},
+		"vac enabled with empty vac": {
+			spec:       core.PersistentVolumeClaimSpec{},
+			vacEnabled: true,
+		},
+		"vac enabled with vac": {
+			spec:       core.PersistentVolumeClaimSpec{VolumeAttributesClassName: vacName},
+			vacEnabled: true,
+			wantVAC:    vacName,
+		},
+		"vac disabled with vac when vac doesn't exists in oldSpec": {
+			spec:    core.PersistentVolumeClaimSpec{VolumeAttributesClassName: vacName},
+			oldSpec: core.PersistentVolumeClaimSpec{},
+		},
+		"vac disabled with vac when vac exists in oldSpec": {
+			spec:       core.PersistentVolumeClaimSpec{VolumeAttributesClassName: vacName},
+			oldSpec:    core.PersistentVolumeClaimSpec{VolumeAttributesClassName: vacName},
+			vacEnabled: false,
+			wantVAC:    vacName,
+		},
+		"vac enabled with vac when vac doesn't exists in oldSpec": {
+			spec:       core.PersistentVolumeClaimSpec{VolumeAttributesClassName: vacName},
+			oldSpec:    core.PersistentVolumeClaimSpec{},
+			vacEnabled: true,
+			wantVAC:    vacName,
+		},
+		"vac enable with vac when vac exists in oldSpec": {
+			spec:       core.PersistentVolumeClaimSpec{VolumeAttributesClassName: vacName},
+			oldSpec:    core.PersistentVolumeClaimSpec{VolumeAttributesClassName: vacName},
+			vacEnabled: true,
+			wantVAC:    vacName,
+		},
+	}
+
+	for testName, test := range tests {
+		t.Run(testName, func(t *testing.T) {
+			if !test.vacEnabled {
+				featuregatetesting.SetFeatureGateEmulationVersionDuringTest(t, utilfeature.DefaultFeatureGate, version.MustParse("1.35"))
+			}
+			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.VolumeAttributesClass, test.vacEnabled)
+			DropDisabledFields(&test.spec, &test.oldSpec)
+			if test.spec.VolumeAttributesClassName != test.wantVAC {
+				t.Errorf("expected vac was not met, test: %s, vacEnabled: %v, spec: %+v, expected VAC: %+v",
+					testName, test.vacEnabled, test.spec, test.wantVAC)
+			}
+		})
+	}
+}
+
+func TestDropDisabledFieldsFromStatus(t *testing.T) {
+	featuregatetesting.SetFeatureGateEmulationVersionDuringTest(t, utilfeature.DefaultFeatureGate, version.MustParse("1.33"))
+	tests := []struct {
+		name                        string
+		enableVolumeAttributesClass bool
+		enableCSIVolumeHealth       bool
+		pvc                         *core.PersistentVolumeClaim
+		oldPVC                      *core.PersistentVolumeClaim
+		expected                    *core.PersistentVolumeClaim
+	}{
+		{
+			name:                        "for:newPVC=hasAllocatedResource,oldPVC=doesnot; should keep field",
+			enableVolumeAttributesClass: false,
+			pvc:                         withAllocatedResource("5G"),
+			oldPVC:                      getPVC(),
+			expected:                    withAllocatedResource("5G"),
+		},
+		{
+			name:                        "for:newPVC=hasAllocatedResource,oldPVC=hasAllocatedResource; should keep field",
+			enableVolumeAttributesClass: false,
+			pvc:                         withAllocatedResource("5G"),
+			oldPVC:                      withAllocatedResource("5G"),
+			expected:                    withAllocatedResource("5G"),
+		},
+		{
+			name:                        "for:newPVC=hasResizeStatus,oldPVC=doesnot; should keep field",
+			enableVolumeAttributesClass: false,
+			pvc:                         withResizeStatus(core.PersistentVolumeClaimNodeResizeInfeasible),
+			oldPVC:                      getPVC(),
+			expected:                    withResizeStatus(core.PersistentVolumeClaimNodeResizeInfeasible),
+		},
+		{
+			name:                        "for:newPVC=hasResizeStatus,oldPVC=hasResizeStatus; should keep field",
+			enableVolumeAttributesClass: false,
+			pvc:                         withResizeStatus(core.PersistentVolumeClaimNodeResizeInfeasible),
+			oldPVC:                      withResizeStatus(core.PersistentVolumeClaimNodeResizeInfeasible),
+			expected:                    withResizeStatus(core.PersistentVolumeClaimNodeResizeInfeasible),
+		},
+		{
+			name:                        "for:newPVC=hasVolumeAttributeClass,oldPVC=nil, featuregate=false should drop field",
+			enableVolumeAttributesClass: false,
+			pvc:                         withVolumeAttributesClassName("foo"),
+			oldPVC:                      nil,
+			expected:                    getPVC(),
+		},
+		{
+			name:                        "for:newPVC=hasVolumeAttributeClass,oldPVC=doesnot,featuregate=VolumeAttributesClass=true; should keep field",
+			enableVolumeAttributesClass: true,
+			pvc:                         withVolumeAttributesClassName("foo"),
+			oldPVC:                      getPVC(),
+			expected:                    withVolumeAttributesClassName("foo"),
+		},
+		{
+			name:                        "for:newPVC=hasVolumeAttributeClass,oldPVC=hasVolumeAttributeClass,featuregate=VolumeAttributesClass=true; should keep field",
+			enableVolumeAttributesClass: true,
+			pvc:                         withVolumeAttributesClassName("foo"),
+			oldPVC:                      withVolumeAttributesClassName("foo"),
+			expected:                    withVolumeAttributesClassName("foo"),
+		},
+		{
+			name:                        "for:newPVC=hasVolumeAttributeClass,oldPVC=hasVolumeAttributeClass,featuregate=false; should keep field",
+			enableVolumeAttributesClass: false,
+			pvc:                         withVolumeAttributesClassName("foo"),
+			oldPVC:                      withVolumeAttributesClassName("foo"),
+			expected:                    withVolumeAttributesClassName("foo"),
+		},
+		{
+			name:                        "for:newPVC=hasVolumeAttributesModifyStatus,oldPVC=nil, featuregate=false should drop field",
+			enableVolumeAttributesClass: false,
+			pvc:                         withVolumeAttributesModifyStatus("bar", core.PersistentVolumeClaimModifyVolumePending),
+			oldPVC:                      nil,
+			expected:                    getPVC(),
+		},
+		{
+			name:                        "for:newPVC=hasVolumeAttributesModifyStatus,oldPVC=doesnot,featuregate=VolumeAttributesClass=true; should keep field",
+			enableVolumeAttributesClass: true,
+			pvc:                         withVolumeAttributesModifyStatus("bar", core.PersistentVolumeClaimModifyVolumePending),
+			oldPVC:                      getPVC(),
+			expected:                    withVolumeAttributesModifyStatus("bar", core.PersistentVolumeClaimModifyVolumePending),
+		},
+		{
+			name:                        "for:newPVC=hasVolumeAttributesModifyStatus,oldPVC=hasVolumeAttributesModifyStatus,featuregate=VolumeAttributesClass=true; should keep field",
+			enableVolumeAttributesClass: true,
+			pvc:                         withVolumeAttributesModifyStatus("bar", core.PersistentVolumeClaimModifyVolumePending),
+			oldPVC:                      withVolumeAttributesModifyStatus("bar", core.PersistentVolumeClaimModifyVolumePending),
+			expected:                    withVolumeAttributesModifyStatus("bar", core.PersistentVolumeClaimModifyVolumePending),
+		},
+		{
+			name:                        "for:newPVC=hasVolumeAttributesModifyStatus,oldPVC=hasVolumeAttributesModifyStatus,featuregate=false; should keep field",
+			enableVolumeAttributesClass: false,
+			pvc:                         withVolumeAttributesModifyStatus("bar", core.PersistentVolumeClaimModifyVolumePending),
+			oldPVC:                      withVolumeAttributesModifyStatus("bar", core.PersistentVolumeClaimModifyVolumePending),
+			expected:                    withVolumeAttributesModifyStatus("bar", core.PersistentVolumeClaimModifyVolumePending),
+		},
+		{
+			name:                  "for:newPVC=hasHealthStatus,oldPVC=nil,featuregate=CSIVolumeHealth=false; should drop field",
+			enableCSIVolumeHealth: false,
+			pvc:                   withHealthStatus(),
+			oldPVC:                nil,
+			expected:              getPVC(),
+		},
+		{
+			name:                  "for:newPVC=hasHealthStatus,oldPVC=doesnot,featuregate=CSIVolumeHealth=false; should drop field",
+			enableCSIVolumeHealth: false,
+			pvc:                   withHealthStatus(),
+			oldPVC:                getPVC(),
+			expected:              getPVC(),
+		},
+		{
+			name:                  "for:newPVC=hasHealthStatus,oldPVC=hasHealthStatus,featuregate=CSIVolumeHealth=false; should keep field",
+			enableCSIVolumeHealth: false,
+			pvc:                   withHealthStatus(),
+			oldPVC:                withHealthStatus(),
+			expected:              withHealthStatus(),
+		},
+		{
+			name:                  "for:newPVC=hasHealthStatus,oldPVC=nil,featuregate=CSIVolumeHealth=true; should keep field",
+			enableCSIVolumeHealth: true,
+			pvc:                   withHealthStatus(),
+			oldPVC:                nil,
+			expected:              withHealthStatus(),
+		},
+		{
+			name:                  "for:newPVC=hasHealthStatus,oldPVC=doesnot,featuregate=CSIVolumeHealth=true; should keep field",
+			enableCSIVolumeHealth: true,
+			pvc:                   withHealthStatus(),
+			oldPVC:                getPVC(),
+			expected:              withHealthStatus(),
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			featuregatetesting.SetFeatureGatesDuringTest(t, utilfeature.DefaultFeatureGate, featuregatetesting.FeatureOverrides{
+				features.VolumeAttributesClass: test.enableVolumeAttributesClass,
+				features.CSIVolumeHealth:       test.enableCSIVolumeHealth,
+			})
+
+			DropDisabledFieldsFromStatus(test.pvc, test.oldPVC)
+
+			if !reflect.DeepEqual(*test.expected, *test.pvc) {
+				t.Errorf("Unexpected change: %+v", cmp.Diff(test.expected, test.pvc))
+			}
+		})
+	}
+}
+
+func getPVC() *core.PersistentVolumeClaim {
+	return &core.PersistentVolumeClaim{}
+}
+
+func withAllocatedResource(q string) *core.PersistentVolumeClaim {
+	return &core.PersistentVolumeClaim{
+		Status: core.PersistentVolumeClaimStatus{
+			AllocatedResources: core.ResourceList{
+				core.ResourceStorage: resource.MustParse(q),
+			},
+		},
+	}
+}
+
+func withResizeStatus(status core.ClaimResourceStatus) *core.PersistentVolumeClaim {
+	return &core.PersistentVolumeClaim{
+		Status: core.PersistentVolumeClaimStatus{
+			AllocatedResourceStatuses: map[core.ResourceName]core.ClaimResourceStatus{
+				core.ResourceStorage: status,
+			},
+		},
+	}
+}
+
+func withVolumeAttributesClassName(vacName string) *core.PersistentVolumeClaim {
+	return &core.PersistentVolumeClaim{
+		Status: core.PersistentVolumeClaimStatus{
+			CurrentVolumeAttributesClassName: &vacName,
+		},
+	}
+}
+
+func withHealthStatus() *core.PersistentVolumeClaim {
+	return &core.PersistentVolumeClaim{
+		Status: core.PersistentVolumeClaimStatus{
+			HealthStatus: &core.VolumeHealthStatus{
+				HealthConditions: []core.VolumeHealthCondition{
+					{
+						Status: core.VolumeHealthDegraded,
+						Reason: "DiskSlow",
+					},
+				},
+			},
+		},
+	}
+}
+
+func withVolumeAttributesModifyStatus(target string, status core.PersistentVolumeClaimModifyVolumeStatus) *core.PersistentVolumeClaim {
+	return &core.PersistentVolumeClaim{
+		Status: core.PersistentVolumeClaimStatus{
+			ModifyVolumeStatus: &core.ModifyVolumeStatus{
+				TargetVolumeAttributesClassName: target,
+				Status:                          status,
+			},
+		},
+	}
+}
+
+func TestWarnings(t *testing.T) {
+	testcases := []struct {
+		name     string
+		template *core.PersistentVolumeClaim
+		expected []string
+	}{
+		{
+			name:     "null",
+			template: nil,
+			expected: nil,
+		},
+		{
+			name: "200Mi requests no warning",
+			template: &core.PersistentVolumeClaim{
+				Spec: core.PersistentVolumeClaimSpec{
+					Resources: core.VolumeResourceRequirements{
+						Requests: core.ResourceList{
+							core.ResourceStorage: resource.MustParse("200Mi"),
+						},
+						Limits: core.ResourceList{
+							core.ResourceStorage: resource.MustParse("200Mi"),
+						},
+					},
+				},
+			},
+			expected: nil,
+		},
+		{
+			name: "200m warning",
+			template: &core.PersistentVolumeClaim{
+				Spec: core.PersistentVolumeClaimSpec{
+					Resources: core.VolumeResourceRequirements{
+						Requests: core.ResourceList{
+							core.ResourceStorage: resource.MustParse("200m"),
+						},
+						Limits: core.ResourceList{
+							core.ResourceStorage: resource.MustParse("100m"),
+						},
+					},
+				},
+			},
+			expected: []string{
+				`spec.resources.requests[storage]: fractional byte value "200m" is invalid, must be an integer`,
+				`spec.resources.limits[storage]: fractional byte value "100m" is invalid, must be an integer`,
+			},
+		},
+		{
+			name: "integer no warning",
+			template: &core.PersistentVolumeClaim{
+				Spec: core.PersistentVolumeClaimSpec{
+					Resources: core.VolumeResourceRequirements{
+						Requests: core.ResourceList{
+							core.ResourceStorage: resource.MustParse("200"),
+						},
+					},
+				},
+			},
+			expected: nil,
+		},
+		{
+			name: "large integer no warning",
+			template: &core.PersistentVolumeClaim{
+				Spec: core.PersistentVolumeClaimSpec{
+					Resources: core.VolumeResourceRequirements{
+						Requests: core.ResourceList{
+							core.ResourceStorage: resource.MustParse("9223372036854775808"),
+						},
+						Limits: core.ResourceList{
+							core.ResourceStorage: resource.MustParse("9223372036854775808"),
+						},
+					},
+				},
+			},
+			expected: nil,
+		},
+		{
+			name: "large fractional warning",
+			template: &core.PersistentVolumeClaim{
+				Spec: core.PersistentVolumeClaimSpec{
+					Resources: core.VolumeResourceRequirements{
+						Requests: core.ResourceList{
+							core.ResourceStorage: resource.MustParse("9223372036854775808.001"),
+						},
+					},
+				},
+			},
+			expected: []string{
+				`spec.resources.requests[storage]: fractional byte value "9223372036854775808001m" is invalid, must be an integer`,
+			},
+		},
+		{
+			name: "whole byte value whose milli projection overflows int64",
+			template: &core.PersistentVolumeClaim{
+				Spec: core.PersistentVolumeClaimSpec{
+					Resources: core.VolumeResourceRequirements{
+						Requests: core.ResourceList{
+							core.ResourceStorage: resource.MustParse("9223372036854776"),
+						},
+					},
+				},
+			},
+			expected: nil,
+		},
+		{
+			name: "fractional byte value within a milli of the next whole byte",
+			template: &core.PersistentVolumeClaim{
+				Spec: core.PersistentVolumeClaimSpec{
+					Resources: core.VolumeResourceRequirements{
+						Requests: core.ResourceList{
+							core.ResourceStorage: resource.MustParse("1.9999"),
+						},
+					},
+				},
+			},
+			expected: []string{
+				`spec.resources.requests[storage]: fractional byte value "1999900u" is invalid, must be an integer`,
+			},
+		},
+		{
+			name: "storageclass annotations warning",
+			template: &core.PersistentVolumeClaim{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "foo",
+					Annotations: map[string]string{
+						core.BetaStorageClassAnnotation: "",
+					},
+				},
+			},
+			expected: []string{
+				`metadata.annotations[volume.beta.kubernetes.io/storage-class]: deprecated since v1.8; use "storageClassName" attribute instead`,
+			},
+		},
+	}
+
+	for _, tc := range testcases {
+		t.Run("pvcspec_"+tc.name, func(t *testing.T) {
+			actual := sets.New[string](GetWarningsForPersistentVolumeClaim(tc.template)...)
+			expected := sets.New[string](tc.expected...)
+			for _, missing := range sets.List[string](expected.Difference(actual)) {
+				t.Errorf("missing: %s", missing)
+			}
+			for _, extra := range sets.List[string](actual.Difference(expected)) {
+				t.Errorf("extra: %s", extra)
+			}
+		})
+
+	}
 }

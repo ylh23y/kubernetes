@@ -17,12 +17,13 @@ limitations under the License.
 package testing
 
 import (
+	"context"
 	"reflect"
 	"testing"
 
+	"github.com/google/go-cmp/cmp"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/util/diff"
 	"k8s.io/apiserver/pkg/admission"
 )
 
@@ -40,11 +41,11 @@ type reinvoker struct {
 
 // Admit reinvokes the admission handler and reports a test error if the admission handler performs
 // non-idempotent mutatations to the admission object.
-func (r *reinvoker) Admit(a admission.Attributes, o admission.ObjectInterfaces) error {
+func (r *reinvoker) Admit(ctx context.Context, a admission.Attributes, o admission.ObjectInterfaces) error {
 	r.t.Helper()
 	outputs := []runtime.Object{}
 	for i := 0; i < 2; i++ {
-		err := r.admission.Admit(a, o)
+		err := r.admission.Admit(ctx, a, o)
 		if err != nil {
 			return err
 		}
@@ -62,7 +63,7 @@ func (r *reinvoker) Admit(a admission.Attributes, o admission.ObjectInterfaces) 
 	}
 	for i := 1; i < len(outputs); i++ {
 		if !apiequality.Semantic.DeepEqual(outputs[0], outputs[i]) {
-			r.t.Errorf("expected mutating admission plugin to be idempontent, but got different results on reinvocation, diff:\n%s", diff.ObjectReflectDiff(outputs[0], outputs[i]))
+			r.t.Errorf("expected mutating admission plugin to be idempontent, but got different results on reinvocation, diff:\n%s", cmp.Diff(outputs[0], outputs[i]))
 		}
 	}
 	return nil

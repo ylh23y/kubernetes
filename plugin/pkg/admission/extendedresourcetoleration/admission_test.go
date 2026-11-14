@@ -17,6 +17,7 @@ limitations under the License.
 package extendedresourcetoleration
 
 import (
+	"context"
 	"testing"
 
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -355,7 +356,7 @@ func TestAdmit(t *testing.T) {
 		},
 	}
 	for i, test := range tests {
-		err := plugin.Admit(admission.NewAttributesRecord(&test.requestedPod, nil, core.Kind("Pod").WithVersion("version"), "foo", "name", core.Resource("pods").WithVersion("version"), "", "ignored", nil, false, nil), nil)
+		err := plugin.Admit(context.TODO(), admission.NewAttributesRecord(&test.requestedPod, nil, core.Kind("Pod").WithVersion("version"), "foo", "name", core.Resource("pods").WithVersion("version"), "", "ignored", nil, false, nil), nil)
 		if err != nil {
 			t.Errorf("[%d: %s] unexpected error %v for pod %+v", i, test.description, err, test.requestedPod)
 		}
@@ -378,6 +379,27 @@ func TestHandles(t *testing.T) {
 		result := plugin.Handles(op)
 		if result != expected {
 			t.Errorf("Unexpected result for operation %s: %v\n", op, result)
+		}
+	}
+}
+
+func TestDynamicSubresource(t *testing.T) {
+	plugin := admissiontesting.WithReinvocationTesting(t, newExtendedResourceToleration())
+	container := core.Container{
+		Name: "added",
+		Resources: core.ResourceRequirements{
+			Requests: core.ResourceList{"example.com/device": *resource.NewQuantity(1, resource.DecimalSI)},
+		},
+	}
+	for subresource, expectTolerations := range map[string]int{"": 1, "dynamic": 1, "status": 0} {
+		oldPod := &core.Pod{}
+		pod := &core.Pod{Spec: core.PodSpec{Containers: []core.Container{container}}}
+		attrs := admission.NewAttributesRecord(pod, oldPod, core.Kind("Pod").WithVersion("version"), "foo", "name", core.Resource("pods").WithVersion("version"), subresource, admission.Update, nil, false, nil)
+		if err := plugin.Admit(t.Context(), attrs, nil); err != nil {
+			t.Fatalf("subresource %q: unexpected error %v", subresource, err)
+		}
+		if len(pod.Spec.Tolerations) != expectTolerations {
+			t.Errorf("subresource %q: expected %d tolerations, got %v", subresource, expectTolerations, pod.Spec.Tolerations)
 		}
 	}
 }

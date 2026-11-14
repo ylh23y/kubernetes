@@ -17,12 +17,15 @@ limitations under the License.
 package rbac
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"testing"
 
 	rbacv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/fields"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apiserver/pkg/authentication/user"
 	"k8s.io/apiserver/pkg/authorization/authorizer"
 	rbacv1helpers "k8s.io/kubernetes/pkg/apis/rbac/v1"
@@ -134,6 +137,12 @@ func (d *defaultAttributes) GetAPIGroup() string     { return d.apiGroup }
 func (d *defaultAttributes) GetAPIVersion() string   { return "" }
 func (d *defaultAttributes) IsResourceRequest() bool { return true }
 func (d *defaultAttributes) GetPath() string         { return "" }
+func (d *defaultAttributes) GetFieldSelector() (fields.Requirements, error) {
+	panic("not supported for RBAC")
+}
+func (d *defaultAttributes) GetLabelSelector() (labels.Requirements, error) {
+	panic("not supported for RBAC")
+}
 
 func TestAuthorizer(t *testing.T) {
 	tests := []struct {
@@ -248,13 +257,13 @@ func TestAuthorizer(t *testing.T) {
 		ruleResolver, _ := rbacregistryvalidation.NewTestRuleResolver(tt.roles, tt.roleBindings, tt.clusterRoles, tt.clusterRoleBindings)
 		a := RBACAuthorizer{ruleResolver}
 		for _, attr := range tt.shouldPass {
-			if decision, _, _ := a.Authorize(attr); decision != authorizer.DecisionAllow {
+			if decision, _, _ := a.Authorize(context.Background(), attr); decision != authorizer.DecisionAllow {
 				t.Errorf("case %d: incorrectly restricted %s", i, attr)
 			}
 		}
 
 		for _, attr := range tt.shouldFail {
-			if decision, _, _ := a.Authorize(attr); decision == authorizer.DecisionAllow {
+			if decision, _, _ := a.Authorize(context.Background(), attr); decision == authorizer.DecisionAllow {
 				t.Errorf("case %d: incorrectly passed %s", i, attr)
 			}
 		}
@@ -262,135 +271,139 @@ func TestAuthorizer(t *testing.T) {
 }
 
 func TestRuleMatches(t *testing.T) {
+	type requestToTest struct {
+		request  authorizer.AttributesRecord
+		expected bool
+	}
 	tests := []struct {
 		name string
 		rule rbacv1.PolicyRule
 
-		requestsToExpected map[authorizer.AttributesRecord]bool
+		requestsToExpected []*requestToTest
 	}{
 		{
 			name: "star verb, exact match other",
 			rule: rbacv1helpers.NewRule("*").Groups("group1").Resources("resource1").RuleOrDie(),
-			requestsToExpected: map[authorizer.AttributesRecord]bool{
-				resourceRequest("verb1").Group("group1").Resource("resource1").New(): true,
-				resourceRequest("verb1").Group("group2").Resource("resource1").New(): false,
-				resourceRequest("verb1").Group("group1").Resource("resource2").New(): false,
-				resourceRequest("verb1").Group("group2").Resource("resource2").New(): false,
-				resourceRequest("verb2").Group("group1").Resource("resource1").New(): true,
-				resourceRequest("verb2").Group("group2").Resource("resource1").New(): false,
-				resourceRequest("verb2").Group("group1").Resource("resource2").New(): false,
-				resourceRequest("verb2").Group("group2").Resource("resource2").New(): false,
+			requestsToExpected: []*requestToTest{
+				{resourceRequest("verb1").Group("group1").Resource("resource1").New(), true},
+				{resourceRequest("verb1").Group("group2").Resource("resource1").New(), false},
+				{resourceRequest("verb1").Group("group1").Resource("resource2").New(), false},
+				{resourceRequest("verb1").Group("group2").Resource("resource2").New(), false},
+				{resourceRequest("verb2").Group("group1").Resource("resource1").New(), true},
+				{resourceRequest("verb2").Group("group2").Resource("resource1").New(), false},
+				{resourceRequest("verb2").Group("group1").Resource("resource2").New(), false},
+				{resourceRequest("verb2").Group("group2").Resource("resource2").New(), false},
 			},
 		},
 		{
 			name: "star group, exact match other",
 			rule: rbacv1helpers.NewRule("verb1").Groups("*").Resources("resource1").RuleOrDie(),
-			requestsToExpected: map[authorizer.AttributesRecord]bool{
-				resourceRequest("verb1").Group("group1").Resource("resource1").New(): true,
-				resourceRequest("verb1").Group("group2").Resource("resource1").New(): true,
-				resourceRequest("verb1").Group("group1").Resource("resource2").New(): false,
-				resourceRequest("verb1").Group("group2").Resource("resource2").New(): false,
-				resourceRequest("verb2").Group("group1").Resource("resource1").New(): false,
-				resourceRequest("verb2").Group("group2").Resource("resource1").New(): false,
-				resourceRequest("verb2").Group("group1").Resource("resource2").New(): false,
-				resourceRequest("verb2").Group("group2").Resource("resource2").New(): false,
+			requestsToExpected: []*requestToTest{
+				{resourceRequest("verb1").Group("group1").Resource("resource1").New(), true},
+				{resourceRequest("verb1").Group("group2").Resource("resource1").New(), true},
+				{resourceRequest("verb1").Group("group1").Resource("resource2").New(), false},
+				{resourceRequest("verb1").Group("group2").Resource("resource2").New(), false},
+				{resourceRequest("verb2").Group("group1").Resource("resource1").New(), false},
+				{resourceRequest("verb2").Group("group2").Resource("resource1").New(), false},
+				{resourceRequest("verb2").Group("group1").Resource("resource2").New(), false},
+				{resourceRequest("verb2").Group("group2").Resource("resource2").New(), false},
 			},
 		},
 		{
 			name: "star resource, exact match other",
 			rule: rbacv1helpers.NewRule("verb1").Groups("group1").Resources("*").RuleOrDie(),
-			requestsToExpected: map[authorizer.AttributesRecord]bool{
-				resourceRequest("verb1").Group("group1").Resource("resource1").New(): true,
-				resourceRequest("verb1").Group("group2").Resource("resource1").New(): false,
-				resourceRequest("verb1").Group("group1").Resource("resource2").New(): true,
-				resourceRequest("verb1").Group("group2").Resource("resource2").New(): false,
-				resourceRequest("verb2").Group("group1").Resource("resource1").New(): false,
-				resourceRequest("verb2").Group("group2").Resource("resource1").New(): false,
-				resourceRequest("verb2").Group("group1").Resource("resource2").New(): false,
-				resourceRequest("verb2").Group("group2").Resource("resource2").New(): false,
+			requestsToExpected: []*requestToTest{
+				{resourceRequest("verb1").Group("group1").Resource("resource1").New(), true},
+				{resourceRequest("verb1").Group("group2").Resource("resource1").New(), false},
+				{resourceRequest("verb1").Group("group1").Resource("resource2").New(), true},
+				{resourceRequest("verb1").Group("group2").Resource("resource2").New(), false},
+				{resourceRequest("verb2").Group("group1").Resource("resource1").New(), false},
+				{resourceRequest("verb2").Group("group2").Resource("resource1").New(), false},
+				{resourceRequest("verb2").Group("group1").Resource("resource2").New(), false},
+				{resourceRequest("verb2").Group("group2").Resource("resource2").New(), false},
 			},
 		},
 		{
 			name: "tuple expansion",
 			rule: rbacv1helpers.NewRule("verb1", "verb2").Groups("group1", "group2").Resources("resource1", "resource2").RuleOrDie(),
-			requestsToExpected: map[authorizer.AttributesRecord]bool{
-				resourceRequest("verb1").Group("group1").Resource("resource1").New(): true,
-				resourceRequest("verb1").Group("group2").Resource("resource1").New(): true,
-				resourceRequest("verb1").Group("group1").Resource("resource2").New(): true,
-				resourceRequest("verb1").Group("group2").Resource("resource2").New(): true,
-				resourceRequest("verb2").Group("group1").Resource("resource1").New(): true,
-				resourceRequest("verb2").Group("group2").Resource("resource1").New(): true,
-				resourceRequest("verb2").Group("group1").Resource("resource2").New(): true,
-				resourceRequest("verb2").Group("group2").Resource("resource2").New(): true,
+			requestsToExpected: []*requestToTest{
+				{resourceRequest("verb1").Group("group1").Resource("resource1").New(), true},
+				{resourceRequest("verb1").Group("group2").Resource("resource1").New(), true},
+				{resourceRequest("verb1").Group("group1").Resource("resource2").New(), true},
+				{resourceRequest("verb1").Group("group2").Resource("resource2").New(), true},
+				{resourceRequest("verb2").Group("group1").Resource("resource1").New(), true},
+				{resourceRequest("verb2").Group("group2").Resource("resource1").New(), true},
+				{resourceRequest("verb2").Group("group1").Resource("resource2").New(), true},
+				{resourceRequest("verb2").Group("group2").Resource("resource2").New(), true},
 			},
 		},
 		{
 			name: "subresource expansion",
 			rule: rbacv1helpers.NewRule("*").Groups("*").Resources("resource1/subresource1").RuleOrDie(),
-			requestsToExpected: map[authorizer.AttributesRecord]bool{
-				resourceRequest("verb1").Group("group1").Resource("resource1").Subresource("subresource1").New(): true,
-				resourceRequest("verb1").Group("group2").Resource("resource1").Subresource("subresource2").New(): false,
-				resourceRequest("verb1").Group("group1").Resource("resource2").Subresource("subresource1").New(): false,
-				resourceRequest("verb1").Group("group2").Resource("resource2").Subresource("subresource1").New(): false,
-				resourceRequest("verb2").Group("group1").Resource("resource1").Subresource("subresource1").New(): true,
-				resourceRequest("verb2").Group("group2").Resource("resource1").Subresource("subresource2").New(): false,
-				resourceRequest("verb2").Group("group1").Resource("resource2").Subresource("subresource1").New(): false,
-				resourceRequest("verb2").Group("group2").Resource("resource2").Subresource("subresource1").New(): false,
+			requestsToExpected: []*requestToTest{
+				{resourceRequest("verb1").Group("group1").Resource("resource1").Subresource("subresource1").New(), true},
+				{resourceRequest("verb1").Group("group2").Resource("resource1").Subresource("subresource2").New(), false},
+				{resourceRequest("verb1").Group("group1").Resource("resource2").Subresource("subresource1").New(), false},
+				{resourceRequest("verb1").Group("group2").Resource("resource2").Subresource("subresource1").New(), false},
+				{resourceRequest("verb2").Group("group1").Resource("resource1").Subresource("subresource1").New(), true},
+				{resourceRequest("verb2").Group("group2").Resource("resource1").Subresource("subresource2").New(), false},
+				{resourceRequest("verb2").Group("group1").Resource("resource2").Subresource("subresource1").New(), false},
+				{resourceRequest("verb2").Group("group2").Resource("resource2").Subresource("subresource1").New(), false},
 			},
 		},
 		{
 			name: "star nonresource, exact match other",
 			rule: rbacv1helpers.NewRule("verb1").URLs("*").RuleOrDie(),
-			requestsToExpected: map[authorizer.AttributesRecord]bool{
-				nonresourceRequest("verb1").URL("/foo").New():         true,
-				nonresourceRequest("verb1").URL("/foo/bar").New():     true,
-				nonresourceRequest("verb1").URL("/foo/baz").New():     true,
-				nonresourceRequest("verb1").URL("/foo/bar/one").New(): true,
-				nonresourceRequest("verb1").URL("/foo/baz/one").New(): true,
-				nonresourceRequest("verb2").URL("/foo").New():         false,
-				nonresourceRequest("verb2").URL("/foo/bar").New():     false,
-				nonresourceRequest("verb2").URL("/foo/baz").New():     false,
-				nonresourceRequest("verb2").URL("/foo/bar/one").New(): false,
-				nonresourceRequest("verb2").URL("/foo/baz/one").New(): false,
+			requestsToExpected: []*requestToTest{
+				{nonresourceRequest("verb1").URL("/foo").New(), true},
+				{nonresourceRequest("verb1").URL("/foo/bar").New(), true},
+				{nonresourceRequest("verb1").URL("/foo/baz").New(), true},
+				{nonresourceRequest("verb1").URL("/foo/bar/one").New(), true},
+				{nonresourceRequest("verb1").URL("/foo/baz/one").New(), true},
+				{nonresourceRequest("verb2").URL("/foo").New(), false},
+				{nonresourceRequest("verb2").URL("/foo/bar").New(), false},
+				{nonresourceRequest("verb2").URL("/foo/baz").New(), false},
+				{nonresourceRequest("verb2").URL("/foo/bar/one").New(), false},
+				{nonresourceRequest("verb2").URL("/foo/baz/one").New(), false},
 			},
 		},
 		{
 			name: "star nonresource subpath",
 			rule: rbacv1helpers.NewRule("verb1").URLs("/foo/*").RuleOrDie(),
-			requestsToExpected: map[authorizer.AttributesRecord]bool{
-				nonresourceRequest("verb1").URL("/foo").New():            false,
-				nonresourceRequest("verb1").URL("/foo/bar").New():        true,
-				nonresourceRequest("verb1").URL("/foo/baz").New():        true,
-				nonresourceRequest("verb1").URL("/foo/bar/one").New():    true,
-				nonresourceRequest("verb1").URL("/foo/baz/one").New():    true,
-				nonresourceRequest("verb1").URL("/notfoo").New():         false,
-				nonresourceRequest("verb1").URL("/notfoo/bar").New():     false,
-				nonresourceRequest("verb1").URL("/notfoo/baz").New():     false,
-				nonresourceRequest("verb1").URL("/notfoo/bar/one").New(): false,
-				nonresourceRequest("verb1").URL("/notfoo/baz/one").New(): false,
+			requestsToExpected: []*requestToTest{
+				{nonresourceRequest("verb1").URL("/foo").New(), false},
+				{nonresourceRequest("verb1").URL("/foo/bar").New(), true},
+				{nonresourceRequest("verb1").URL("/foo/baz").New(), true},
+				{nonresourceRequest("verb1").URL("/foo/bar/one").New(), true},
+				{nonresourceRequest("verb1").URL("/foo/baz/one").New(), true},
+				{nonresourceRequest("verb1").URL("/notfoo").New(), false},
+				{nonresourceRequest("verb1").URL("/notfoo/bar").New(), false},
+				{nonresourceRequest("verb1").URL("/notfoo/baz").New(), false},
+				{nonresourceRequest("verb1").URL("/notfoo/bar/one").New(), false},
+				{nonresourceRequest("verb1").URL("/notfoo/baz/one").New(), false},
 			},
 		},
 		{
 			name: "star verb, exact nonresource",
 			rule: rbacv1helpers.NewRule("*").URLs("/foo", "/foo/bar/one").RuleOrDie(),
-			requestsToExpected: map[authorizer.AttributesRecord]bool{
-				nonresourceRequest("verb1").URL("/foo").New():         true,
-				nonresourceRequest("verb1").URL("/foo/bar").New():     false,
-				nonresourceRequest("verb1").URL("/foo/baz").New():     false,
-				nonresourceRequest("verb1").URL("/foo/bar/one").New(): true,
-				nonresourceRequest("verb1").URL("/foo/baz/one").New(): false,
-				nonresourceRequest("verb2").URL("/foo").New():         true,
-				nonresourceRequest("verb2").URL("/foo/bar").New():     false,
-				nonresourceRequest("verb2").URL("/foo/baz").New():     false,
-				nonresourceRequest("verb2").URL("/foo/bar/one").New(): true,
-				nonresourceRequest("verb2").URL("/foo/baz/one").New(): false,
+			requestsToExpected: []*requestToTest{
+				{nonresourceRequest("verb1").URL("/foo").New(), true},
+				{nonresourceRequest("verb1").URL("/foo/bar").New(), false},
+				{nonresourceRequest("verb1").URL("/foo/baz").New(), false},
+				{nonresourceRequest("verb1").URL("/foo/bar/one").New(), true},
+				{nonresourceRequest("verb1").URL("/foo/baz/one").New(), false},
+				{nonresourceRequest("verb2").URL("/foo").New(), true},
+				{nonresourceRequest("verb2").URL("/foo/bar").New(), false},
+				{nonresourceRequest("verb2").URL("/foo/baz").New(), false},
+				{nonresourceRequest("verb2").URL("/foo/bar/one").New(), true},
+				{nonresourceRequest("verb2").URL("/foo/baz/one").New(), false},
 			},
 		},
 	}
 	for _, tc := range tests {
-		for request, expected := range tc.requestsToExpected {
-			if e, a := expected, RuleAllows(request, &tc.rule); e != a {
-				t.Errorf("%q: expected %v, got %v for %v", tc.name, e, a, request)
+		for _, requestToTest := range tc.requestsToExpected {
+			if e, a := requestToTest.expected, RuleAllows(requestToTest.request, &tc.rule); e != a {
+				t.Errorf("%q: expected %v, got %v for %v", tc.name, e, a, requestToTest.request)
 			}
 		}
 	}
@@ -516,7 +529,7 @@ func BenchmarkAuthorize(b *testing.B) {
 	for _, request := range requests {
 		b.Run(request.name, func(b *testing.B) {
 			for i := 0; i < b.N; i++ {
-				authz.Authorize(request.attrs)
+				authz.Authorize(context.Background(), request.attrs)
 			}
 		})
 	}

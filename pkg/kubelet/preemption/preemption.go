@@ -17,20 +17,23 @@ limitations under the License.
 package preemption
 
 import (
+	"context"
 	"fmt"
 	"math"
 
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/client-go/tools/record"
-	"k8s.io/klog"
+	"k8s.io/klog/v2"
+	podutil "k8s.io/kubernetes/pkg/api/v1/pod"
 	"k8s.io/kubernetes/pkg/api/v1/resource"
 	v1qos "k8s.io/kubernetes/pkg/apis/core/v1/helper/qos"
+	"k8s.io/kubernetes/pkg/features"
 	"k8s.io/kubernetes/pkg/kubelet/events"
 	"k8s.io/kubernetes/pkg/kubelet/eviction"
 	"k8s.io/kubernetes/pkg/kubelet/lifecycle"
+	"k8s.io/kubernetes/pkg/kubelet/metrics"
 	kubetypes "k8s.io/kubernetes/pkg/kubelet/types"
-	"k8s.io/kubernetes/pkg/kubelet/util/format"
-	"k8s.io/kubernetes/pkg/scheduler/algorithm/predicates"
 )
 
 const message = "Preempted in order to admit critical pod"
@@ -60,16 +63,29 @@ func NewCriticalPodAdmissionHandler(getPodsFunc eviction.ActivePodsFunc, killPod
 
 // HandleAdmissionFailure gracefully handles admission rejection, and, in some cases,
 // to allow admission of the pod despite its previous failure.
-func (c *CriticalPodAdmissionHandler) HandleAdmissionFailure(admitPod *v1.Pod, failureReasons []predicates.PredicateFailureReason) (bool, []predicates.PredicateFailureReason, error) {
+func (c *CriticalPodAdmissionHandler) HandleAdmissionFailure(ctx context.Context, admitPod *v1.Pod, failureReasons []lifecycle.PredicateFailureReason, attrs *lifecycle.PodAdmitAttributes) ([]lifecycle.PredicateFailureReason, error) {
 	if !kubetypes.IsCriticalPod(admitPod) {
-		return false, failureReasons, nil
+		return failureReasons, nil
+	}
+	if attrs.Operation == lifecycle.UpdateOperation {
+		if !attrs.Update.Resize {
+			// The pod is already running and the update doesn't request more resources, so
+			// preemption can't help it fit.
+			return failureReasons, nil
+		}
+		if utilfeature.DefaultFeatureGate.Enabled(features.InPlacePodVerticalScalingSchedulerPreemption) {
+			// For in-place pod resizes, the scheduler owns all preemption decisions.
+			// When a resize cannot be accommodated immediately on the node, Kubelet defers the
+			// resize request and relies on the scheduler to handle preemption asynchronously.
+			return failureReasons, nil
+		}
 	}
 	// InsufficientResourceError is not a reason to reject a critical pod.
 	// Instead of rejecting, we free up resources to admit it, if no other reasons for rejection exist.
-	nonResourceReasons := []predicates.PredicateFailureReason{}
+	nonResourceReasons := []lifecycle.PredicateFailureReason{}
 	resourceReasons := []*admissionRequirement{}
 	for _, reason := range failureReasons {
-		if r, ok := reason.(*predicates.InsufficientResourceError); ok {
+		if r, ok := reason.(*lifecycle.InsufficientResourceError); ok {
 			resourceReasons = append(resourceReasons, &admissionRequirement{
 				resourceName: r.ResourceName,
 				quantity:     r.GetInsufficientAmount(),
@@ -80,38 +96,50 @@ func (c *CriticalPodAdmissionHandler) HandleAdmissionFailure(admitPod *v1.Pod, f
 	}
 	if len(nonResourceReasons) > 0 {
 		// Return only reasons that are not resource related, since critical pods cannot fail admission for resource reasons.
-		return false, nonResourceReasons, nil
+		return nonResourceReasons, nil
 	}
-	err := c.evictPodsToFreeRequests(admitPod, admissionRequirementList(resourceReasons))
+	err := c.evictPodsToFreeRequests(ctx, admitPod, admissionRequirementList(resourceReasons))
 	// if no error is returned, preemption succeeded and the pod is safe to admit.
-	return err == nil, nil, err
+	return nil, err
 }
 
 // evictPodsToFreeRequests takes a list of insufficient resources, and attempts to free them by evicting pods
 // based on requests.  For example, if the only insufficient resource is 200Mb of memory, this function could
 // evict a pod with request=250Mb.
-func (c *CriticalPodAdmissionHandler) evictPodsToFreeRequests(admitPod *v1.Pod, insufficientResources admissionRequirementList) error {
+func (c *CriticalPodAdmissionHandler) evictPodsToFreeRequests(ctx context.Context, admitPod *v1.Pod, insufficientResources admissionRequirementList) error {
+	logger := klog.FromContext(ctx)
 	podsToPreempt, err := getPodsToPreempt(admitPod, c.getPodsFunc(), insufficientResources)
 	if err != nil {
 		return fmt.Errorf("preemption: error finding a set of pods to preempt: %v", err)
 	}
-	klog.Infof("preemption: attempting to evict pods %v, in order to free up resources: %s", podsToPreempt, insufficientResources.toString())
 	for _, pod := range podsToPreempt {
-		status := v1.PodStatus{
-			Phase:   v1.PodFailed,
-			Message: message,
-			Reason:  events.PreemptContainer,
-		}
 		// record that we are evicting the pod
 		c.recorder.Eventf(pod, v1.EventTypeWarning, events.PreemptContainer, message)
 		// this is a blocking call and should only return when the pod and its containers are killed.
-		err := c.killPodFunc(pod, status, nil)
+		logger.V(2).Info("Preempting pod to free up resources", "pod", klog.KObj(pod), "podUID", pod.UID, "insufficientResources", insufficientResources.toString(), "requestingPod", klog.KObj(admitPod))
+		err := c.killPodFunc(pod, true, nil, func(status *v1.PodStatus) {
+			status.Phase = v1.PodFailed
+			status.Reason = events.PreemptContainer
+			status.Message = message
+			podutil.UpdatePodCondition(status, &v1.PodCondition{
+				Type:               v1.DisruptionTarget,
+				ObservedGeneration: podutil.CalculatePodConditionObservedGeneration(status, pod.Generation, v1.DisruptionTarget),
+				Status:             v1.ConditionTrue,
+				Reason:             v1.PodReasonTerminationByKubelet,
+				Message:            "Pod was preempted by Kubelet to accommodate a critical pod.",
+			})
+		})
 		if err != nil {
-			klog.Warningf("preemption: pod %s failed to evict %v", format.Pod(pod), err)
+			logger.Error(err, "Failed to evict pod", "pod", klog.KObj(pod))
 			// In future syncPod loops, the kubelet will retry the pod deletion steps that it was stuck on.
 			continue
 		}
-		klog.Infof("preemption: pod %s evicted successfully", format.Pod(pod))
+		if len(insufficientResources) > 0 {
+			metrics.Preemptions.WithLabelValues(insufficientResources[0].resourceName.String()).Inc()
+		} else {
+			metrics.Preemptions.WithLabelValues("").Inc()
+		}
+		logger.Info("Pod evicted successfully", "pod", klog.KObj(pod))
 	}
 	return nil
 }
@@ -126,21 +154,21 @@ func getPodsToPreempt(pod *v1.Pod, pods []*v1.Pod, requirements admissionRequire
 		return nil, fmt.Errorf("no set of running pods found to reclaim resources: %v", unableToMeetRequirements.toString())
 	}
 	// find the guaranteed pods we would need to evict if we already evicted ALL burstable and besteffort pods.
-	guarateedToEvict, err := getPodsToPreemptByDistance(guaranteedPods, requirements.subtract(append(bestEffortPods, burstablePods...)...))
+	guaranteedToEvict, err := getPodsToPreemptByDistance(guaranteedPods, requirements.subtract(append(bestEffortPods, burstablePods...)...))
 	if err != nil {
 		return nil, err
 	}
 	// Find the burstable pods we would need to evict if we already evicted ALL besteffort pods, and the required guaranteed pods.
-	burstableToEvict, err := getPodsToPreemptByDistance(burstablePods, requirements.subtract(append(bestEffortPods, guarateedToEvict...)...))
+	burstableToEvict, err := getPodsToPreemptByDistance(burstablePods, requirements.subtract(append(bestEffortPods, guaranteedToEvict...)...))
 	if err != nil {
 		return nil, err
 	}
 	// Find the besteffort pods we would need to evict if we already evicted the required guaranteed and burstable pods.
-	bestEffortToEvict, err := getPodsToPreemptByDistance(bestEffortPods, requirements.subtract(append(burstableToEvict, guarateedToEvict...)...))
+	bestEffortToEvict, err := getPodsToPreemptByDistance(bestEffortPods, requirements.subtract(append(burstableToEvict, guaranteedToEvict...)...))
 	if err != nil {
 		return nil, err
 	}
-	return append(append(bestEffortToEvict, burstableToEvict...), guarateedToEvict...), nil
+	return append(append(bestEffortToEvict, burstableToEvict...), guaranteedToEvict...), nil
 }
 
 // getPodsToPreemptByDistance finds the pods that have pod requests >= admission requirements.

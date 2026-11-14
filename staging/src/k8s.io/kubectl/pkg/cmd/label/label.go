@@ -18,12 +18,10 @@ package label
 
 import (
 	"fmt"
-	"reflect"
 	"strings"
 
-	jsonpatch "github.com/evanphx/json-patch"
 	"github.com/spf13/cobra"
-	"k8s.io/klog"
+	jsonpatch "gopkg.in/evanphx/json-patch.v4"
 
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -32,38 +30,66 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/apimachinery/pkg/util/json"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/validation"
+	"k8s.io/klog/v2"
 
 	"k8s.io/cli-runtime/pkg/genericclioptions"
+	"k8s.io/cli-runtime/pkg/genericiooptions"
 	"k8s.io/cli-runtime/pkg/printers"
 	"k8s.io/cli-runtime/pkg/resource"
+	"k8s.io/client-go/tools/clientcmd"
 	cmdutil "k8s.io/kubectl/pkg/cmd/util"
 	"k8s.io/kubectl/pkg/scheme"
+	"k8s.io/kubectl/pkg/util/completion"
 	"k8s.io/kubectl/pkg/util/i18n"
 	"k8s.io/kubectl/pkg/util/templates"
 )
 
-// LabelOptions have the data required to perform the label operation
-type LabelOptions struct {
-	// Filename options
+const (
+	MsgNotLabeled = "not labeled"
+	MsgLabeled    = "labeled"
+	MsgUnLabeled  = "unlabeled"
+	MsgModified   = "modified"
+)
+
+// LabelFlags directly reflect the information that CLI is gathering via flags.
+type LabelFlags struct {
 	resource.FilenameOptions
 	RecordFlags *genericclioptions.RecordFlags
 
 	PrintFlags *genericclioptions.PrintFlags
-	ToPrinter  func(string) (printers.ResourcePrinter, error)
 
-	// Common user flags
+	Overwrite       bool
+	List            bool
+	Local           bool
+	All             bool
+	AllNamespaces   bool
+	ResourceVersion string
+	Selector        string
+	FieldSelector   string
+	FieldManager    string
+
+	genericiooptions.IOStreams
+}
+
+// LabelOptions have the data required to perform the label operation
+type LabelOptions struct {
+	resource.FilenameOptions
+	ToPrinter func(string) (printers.ResourcePrinter, error)
+
 	overwrite       bool
 	list            bool
 	local           bool
-	dryrun          bool
+	dryRunStrategy  cmdutil.DryRunStrategy
 	all             bool
+	allNamespaces   bool
 	resourceVersion string
 	selector        string
 	fieldSelector   string
 	outputFormat    string
+	fieldManager    string
 
-	// results of arg parsing
 	resources    []string
 	newLabels    map[string]string
 	removeLabels []string
@@ -75,8 +101,7 @@ type LabelOptions struct {
 	builder                      *resource.Builder
 	unstructuredClientForMapping func(mapping *meta.RESTMapping) (resource.RESTClient, error)
 
-	// Common shared fields
-	genericclioptions.IOStreams
+	genericiooptions.IOStreams
 }
 
 var (
@@ -84,15 +109,15 @@ var (
 		Update the labels on a resource.
 
 		* A label key and value must begin with a letter or number, and may contain letters, numbers, hyphens, dots, and underscores, up to %[1]d characters each.
-		* Optionally, the key can begin with a DNS subdomain prefix and a single '/', like example.com/my-app
+		* Optionally, the key can begin with a DNS subdomain prefix and a single '/', like example.com/my-app.
 		* If --overwrite is true, then existing labels can be overwritten, otherwise attempting to overwrite a label will result in an error.
 		* If --resource-version is specified, then updates will use this resource version, otherwise the existing resource-version will be used.`))
 
 	labelExample = templates.Examples(i18n.T(`
-		# Update pod 'foo' with the label 'unhealthy' and the value 'true'.
+		# Update pod 'foo' with the label 'unhealthy' and the value 'true'
 		kubectl label pods foo unhealthy=true
 
-		# Update pod 'foo' with the label 'status' and the value 'unhealthy', overwriting any existing value.
+		# Update pod 'foo' with the label 'status' and the value 'unhealthy', overwriting any existing value
 		kubectl label --overwrite pods foo status=unhealthy
 
 		# Update all pods in the namespace
@@ -101,27 +126,25 @@ var (
 		# Update a pod identified by the type and name in "pod.json"
 		kubectl label -f pod.json status=unhealthy
 
-		# Update pod 'foo' only if the resource is unchanged from version 1.
+		# Update pod 'foo' only if the resource is unchanged from version 1
 		kubectl label pods foo status=unhealthy --resource-version=1
 
-		# Update pod 'foo' by removing a label named 'bar' if it exists.
-		# Does not require the --overwrite flag.
+		# Update pod 'foo' by removing a label named 'bar' if it exists
+		# Does not require the --overwrite flag
 		kubectl label pods foo bar-`))
 )
 
-func NewLabelOptions(ioStreams genericclioptions.IOStreams) *LabelOptions {
-	return &LabelOptions{
+func NewLabelFlags(ioStreams genericiooptions.IOStreams) *LabelFlags {
+	return &LabelFlags{
 		RecordFlags: genericclioptions.NewRecordFlags(),
-		Recorder:    genericclioptions.NoopRecorder{},
-
-		PrintFlags: genericclioptions.NewPrintFlags("labeled").WithTypeSetter(scheme.Scheme),
+		PrintFlags:  genericclioptions.NewPrintFlags("labeled").WithTypeSetter(scheme.Scheme),
 
 		IOStreams: ioStreams,
 	}
 }
 
-func NewCmdLabel(f cmdutil.Factory, ioStreams genericclioptions.IOStreams) *cobra.Command {
-	o := NewLabelOptions(ioStreams)
+func NewCmdLabel(f cmdutil.Factory, ioStreams genericiooptions.IOStreams) *cobra.Command {
+	flags := NewLabelFlags(ioStreams)
 
 	cmd := &cobra.Command{
 		Use:                   "label [--overwrite] (-f FILENAME | TYPE NAME) KEY_1=VAL_1 ... KEY_N=VAL_N [--resource-version=version]",
@@ -129,72 +152,107 @@ func NewCmdLabel(f cmdutil.Factory, ioStreams genericclioptions.IOStreams) *cobr
 		Short:                 i18n.T("Update the labels on a resource"),
 		Long:                  fmt.Sprintf(labelLong, validation.LabelValueMaxLength),
 		Example:               labelExample,
+		ValidArgsFunction:     completion.ResourceTypeAndNameCompletionFunc(f),
 		Run: func(cmd *cobra.Command, args []string) {
-			cmdutil.CheckErr(o.Complete(f, cmd, args))
+			o, err := flags.ToOptions(f, cmd, args)
+			cmdutil.CheckErr(err)
 			cmdutil.CheckErr(o.Validate())
 			cmdutil.CheckErr(o.RunLabel())
 		},
 	}
 
-	o.RecordFlags.AddFlags(cmd)
-	o.PrintFlags.AddFlags(cmd)
-
-	cmd.Flags().BoolVar(&o.overwrite, "overwrite", o.overwrite, "If true, allow labels to be overwritten, otherwise reject label updates that overwrite existing labels.")
-	cmd.Flags().BoolVar(&o.list, "list", o.list, "If true, display the labels for a given resource.")
-	cmd.Flags().BoolVar(&o.local, "local", o.local, "If true, label will NOT contact api-server but run locally.")
-	cmd.Flags().StringVarP(&o.selector, "selector", "l", o.selector, "Selector (label query) to filter on, not including uninitialized ones, supports '=', '==', and '!='.(e.g. -l key1=value1,key2=value2).")
-	cmd.Flags().StringVar(&o.fieldSelector, "field-selector", o.fieldSelector, "Selector (field query) to filter on, supports '=', '==', and '!='.(e.g. --field-selector key1=value1,key2=value2). The server only supports a limited number of field queries per type.")
-	cmd.Flags().BoolVar(&o.all, "all", o.all, "Select all resources, including uninitialized ones, in the namespace of the specified resource types")
-	cmd.Flags().StringVar(&o.resourceVersion, "resource-version", o.resourceVersion, i18n.T("If non-empty, the labels update will only succeed if this is the current resource-version for the object. Only valid when specifying a single resource."))
-	usage := "identifying the resource to update the labels"
-	cmdutil.AddFilenameOptionFlags(cmd, &o.FilenameOptions, usage)
-	cmdutil.AddDryRunFlag(cmd)
-	cmdutil.AddIncludeUninitializedFlag(cmd)
+	flags.AddFlags(cmd)
 
 	return cmd
 }
 
-// Complete adapts from the command line args and factory to the data required.
-func (o *LabelOptions) Complete(f cmdutil.Factory, cmd *cobra.Command, args []string) error {
+// AddFlags registers flags for a cli
+func (flags *LabelFlags) AddFlags(cmd *cobra.Command) {
+	flags.RecordFlags.AddFlags(cmd)
+	flags.PrintFlags.AddFlags(cmd)
+
+	cmd.Flags().BoolVar(&flags.Overwrite, "overwrite", flags.Overwrite, "If true, allow labels to be overwritten, otherwise reject label updates that overwrite existing labels.")
+	cmd.Flags().BoolVar(&flags.List, "list", flags.List, "If true, display the labels for a given resource.")
+	cmd.Flags().BoolVar(&flags.Local, "local", flags.Local, "If true, label will NOT contact api-server but run locally.")
+	cmd.Flags().StringVar(&flags.FieldSelector, "field-selector", flags.FieldSelector, "Selector (field query) to filter on, supports '=', '==', and '!='.(e.g. --field-selector key1=value1,key2=value2). The server only supports a limited number of field queries per type.")
+	cmd.Flags().BoolVar(&flags.All, "all", flags.All, "Select all resources, in the namespace of the specified resource types")
+	cmd.Flags().BoolVarP(&flags.AllNamespaces, "all-namespaces", "A", flags.AllNamespaces, "If true, check the specified action in all namespaces.")
+	cmd.Flags().StringVar(&flags.ResourceVersion, "resource-version", flags.ResourceVersion, i18n.T("If non-empty, the labels update will only succeed if this is the current resource-version for the object. Only valid when specifying a single resource."))
+	usage := "identifying the resource to update the labels"
+	cmdutil.AddFilenameOptionFlags(cmd, &flags.FilenameOptions, usage)
+	cmdutil.AddDryRunFlag(cmd)
+	cmdutil.AddFieldManagerFlagVar(cmd, &flags.FieldManager, "kubectl-label")
+	cmdutil.AddLabelSelectorFlagVar(cmd, &flags.Selector)
+}
+
+// ToOptions converts from CLI inputs to runtime inputs
+func (flags *LabelFlags) ToOptions(f cmdutil.Factory, cmd *cobra.Command, args []string) (*LabelOptions, error) {
+	o := &LabelOptions{
+		FilenameOptions: flags.FilenameOptions,
+
+		overwrite:       flags.Overwrite,
+		list:            flags.List,
+		local:           flags.Local,
+		all:             flags.All,
+		allNamespaces:   flags.AllNamespaces,
+		resourceVersion: flags.ResourceVersion,
+		selector:        flags.Selector,
+		fieldSelector:   flags.FieldSelector,
+		fieldManager:    flags.FieldManager,
+
+		Recorder: genericclioptions.NoopRecorder{},
+
+		IOStreams: flags.IOStreams,
+	}
+
 	var err error
 
-	o.RecordFlags.Complete(cmd)
-	o.Recorder, err = o.RecordFlags.ToRecorder()
+	err = flags.RecordFlags.Complete(cmd)
 	if err != nil {
-		return err
+		return nil, err
+	}
+	o.Recorder, err = flags.RecordFlags.ToRecorder()
+	if err != nil {
+		return nil, err
 	}
 
 	o.outputFormat = cmdutil.GetFlagString(cmd, "output")
-	o.dryrun = cmdutil.GetDryRunFlag(cmd)
+	o.dryRunStrategy, err = cmdutil.GetDryRunStrategy(cmd)
+	if err != nil {
+		return nil, err
+	}
 
+	printFlags := flags.PrintFlags
+	dryRunStrategy := o.dryRunStrategy
 	o.ToPrinter = func(operation string) (printers.ResourcePrinter, error) {
-		o.PrintFlags.NamePrintFlags.Operation = operation
-		if o.dryrun {
-			o.PrintFlags.Complete("%s (dry run)")
-		}
-
-		return o.PrintFlags.ToPrinter()
+		printFlags.NamePrintFlags.Operation = operation
+		// PrintFlagsWithDryRunStrategy must be done after NamePrintFlags.Operation is set
+		cmdutil.PrintFlagsWithDryRunStrategy(printFlags, dryRunStrategy)
+		return printFlags.ToPrinter()
 	}
 
 	resources, labelArgs, err := cmdutil.GetResourcesAndPairs(args, "label")
 	if err != nil {
-		return err
+		return nil, err
 	}
 	o.resources = resources
 	o.newLabels, o.removeLabels, err = parseLabels(labelArgs)
+	if err != nil {
+		return nil, err
+	}
 
 	if o.list && len(o.outputFormat) > 0 {
-		return fmt.Errorf("--list and --output may not be specified together")
+		return nil, fmt.Errorf("--list and --output may not be specified together")
 	}
 
 	o.namespace, o.enforceNamespace, err = f.ToRawKubeConfigLoader().Namespace()
-	if err != nil {
-		return err
+	if err != nil && !(o.local && clientcmd.IsEmptyConfig(err)) {
+		return nil, err
 	}
 	o.builder = f.NewBuilder()
 	o.unstructuredClientForMapping = f.UnstructuredClientForMapping
 
-	return nil
+	return o, nil
 }
 
 // Validate checks to the LabelOptions to see if there is sufficient information run the command.
@@ -205,8 +263,23 @@ func (o *LabelOptions) Validate() error {
 	if o.all && len(o.fieldSelector) > 0 {
 		return fmt.Errorf("cannot set --all and --field-selector at the same time")
 	}
-	if len(o.resources) < 1 && cmdutil.IsFilenameSliceEmpty(o.FilenameOptions.Filenames, o.FilenameOptions.Kustomize) {
-		return fmt.Errorf("one or more resources must be specified as <resource> <name> or <resource>/<name>")
+	if o.list && (len(o.newLabels) > 0 || len(o.removeLabels) > 0) {
+		return fmt.Errorf("cannot modify labels when --list is specified")
+	}
+	if o.local {
+		if o.dryRunStrategy == cmdutil.DryRunServer {
+			return fmt.Errorf("cannot specify --local and --dry-run=server - did you mean --dry-run=client?")
+		}
+		if len(o.resources) > 0 {
+			return fmt.Errorf("can only use local files by -f pod.yaml or --filename=pod.json when --local=true is set")
+		}
+		if cmdutil.IsFilenameSliceEmpty(o.FilenameOptions.Filenames, o.FilenameOptions.Kustomize) {
+			return fmt.Errorf("one or more files must be specified as -f pod.yaml or --filename=pod.json")
+		}
+	} else {
+		if len(o.resources) < 1 && cmdutil.IsFilenameSliceEmpty(o.FilenameOptions.Filenames, o.FilenameOptions.Kustomize) {
+			return fmt.Errorf("one or more resources must be specified as <resource> <name> or <resource>/<name>")
+		}
 	}
 	if len(o.newLabels) < 1 && len(o.removeLabels) < 1 && !o.list {
 		return fmt.Errorf("at least one label update is required")
@@ -227,6 +300,7 @@ func (o *LabelOptions) RunLabel() error {
 	if !o.local {
 		b = b.LabelSelectorParam(o.selector).
 			FieldSelectorParam(o.fieldSelector).
+			AllNamespaces(o.allNamespaces).
 			ResourceTypeOrNameArgs(o.all, o.resources...).
 			Latest()
 	}
@@ -251,20 +325,26 @@ func (o *LabelOptions) RunLabel() error {
 		var outputObj runtime.Object
 		var dataChangeMsg string
 		obj := info.Object
+
+		if len(o.resourceVersion) != 0 {
+			// ensure resourceVersion is always sent in the patch by clearing it from the starting JSON
+			accessor, err := meta.Accessor(obj)
+			if err != nil {
+				return err
+			}
+			accessor.SetResourceVersion("")
+		}
+
 		oldData, err := json.Marshal(obj)
 		if err != nil {
 			return err
 		}
-		if o.dryrun || o.local || o.list {
-			err = labelFunc(obj, o.overwrite, o.resourceVersion, o.newLabels, o.removeLabels)
+		if o.dryRunStrategy == cmdutil.DryRunClient || o.local || o.list {
+			added, removed, err := labelFunc(obj, o.overwrite, o.resourceVersion, o.newLabels, o.removeLabels)
 			if err != nil {
 				return err
 			}
-			newObj, err := json.Marshal(obj)
-			if err != nil {
-				return err
-			}
-			dataChangeMsg = updateDataChangeMsg(oldData, newObj)
+			dataChangeMsg = updateDataChangeMsg(added, removed)
 			outputObj = info.Object
 		} else {
 			name, namespace := info.Name, info.Namespace
@@ -277,41 +357,49 @@ func (o *LabelOptions) RunLabel() error {
 			}
 			for _, label := range o.removeLabels {
 				if _, ok := accessor.GetLabels()[label]; !ok {
-					fmt.Fprintf(o.Out, "label %q not found.\n", label)
+					fmt.Fprintf(o.ErrOut, "label %q not found.\n", label)
 				}
 			}
 
-			if err := labelFunc(obj, o.overwrite, o.resourceVersion, o.newLabels, o.removeLabels); err != nil {
+			added, removed, err := labelFunc(obj, o.overwrite, o.resourceVersion, o.newLabels, o.removeLabels)
+			if err != nil {
 				return err
 			}
+
+			dataChangeMsg = updateDataChangeMsg(added, removed)
+
 			if err := o.Recorder.Record(obj); err != nil {
 				klog.V(4).Infof("error recording current command: %v", err)
 			}
-			newObj, err := json.Marshal(obj)
-			if err != nil {
-				return err
-			}
-			dataChangeMsg = updateDataChangeMsg(oldData, newObj)
-			patchBytes, err := jsonpatch.CreateMergePatch(oldData, newObj)
-			createdPatch := err == nil
-			if err != nil {
-				klog.V(2).Infof("couldn't compute patch: %v", err)
-			}
 
-			mapping := info.ResourceMapping()
-			client, err := o.unstructuredClientForMapping(mapping)
-			if err != nil {
-				return err
-			}
-			helper := resource.NewHelper(client, mapping)
+			if added.Len() > 0 || removed.Len() > 0 {
+				newObj, err := json.Marshal(obj)
+				if err != nil {
+					return err
+				}
+				patchBytes, err := jsonpatch.CreateMergePatch(oldData, newObj)
+				createdPatch := err == nil
+				if err != nil {
+					klog.V(2).Infof("couldn't compute patch: %v", err)
+				}
 
-			if createdPatch {
-				outputObj, err = helper.Patch(namespace, name, types.MergePatchType, patchBytes, nil)
-			} else {
-				outputObj, err = helper.Replace(namespace, name, false, obj)
-			}
-			if err != nil {
-				return err
+				mapping := info.ResourceMapping()
+				client, err := o.unstructuredClientForMapping(mapping)
+				if err != nil {
+					return err
+				}
+				helper := resource.NewHelper(client, mapping).
+					DryRun(o.dryRunStrategy == cmdutil.DryRunServer).
+					WithFieldManager(o.fieldManager)
+
+				if createdPatch {
+					outputObj, err = helper.Patch(namespace, name, types.MergePatchType, patchBytes, nil)
+				} else {
+					outputObj, err = helper.Replace(namespace, name, false, obj)
+				}
+				if err != nil {
+					return err
+				}
 			}
 		}
 
@@ -328,7 +416,7 @@ func (o *LabelOptions) RunLabel() error {
 				if err != nil {
 					return err
 				}
-				fmt.Fprintf(o.ErrOut, "Listing labels for %s.%s/%s:\n", gvks[0].Kind, gvks[0].Group, info.Name)
+				fmt.Fprintf(o.Out, "Listing labels for %s.%s/%s:\n", gvks[0].Kind, gvks[0].Group, info.Name)
 			}
 			for k, v := range accessor.GetLabels() {
 				fmt.Fprintf(o.Out, "%s%s=%s\n", indent, k, v)
@@ -345,19 +433,24 @@ func (o *LabelOptions) RunLabel() error {
 	})
 }
 
-func updateDataChangeMsg(oldObj []byte, newObj []byte) string {
-	msg := "not labeled"
-	if !reflect.DeepEqual(oldObj, newObj) {
-		msg = "labeled"
+func updateDataChangeMsg(actuallyAdded, actuallyRemoved sets.Set[string]) string {
+	msg := MsgNotLabeled
+	switch {
+	case actuallyAdded.Len() > 0 && actuallyRemoved.Len() > 0:
+		msg = MsgModified
+	case actuallyAdded.Len() > 0:
+		msg = MsgLabeled
+	case actuallyRemoved.Len() > 0:
+		msg = MsgUnLabeled
 	}
 	return msg
 }
 
 func validateNoOverwrites(accessor metav1.Object, labels map[string]string) error {
 	allErrs := []error{}
-	for key := range labels {
-		if value, found := accessor.GetLabels()[key]; found {
-			allErrs = append(allErrs, fmt.Errorf("'%s' already has a value (%s), and --overwrite is false", key, value))
+	for key, value := range labels {
+		if currValue, found := accessor.GetLabels()[key]; found && currValue != value {
+			allErrs = append(allErrs, fmt.Errorf("'%s' already has a value (%s), and --overwrite is false", key, currValue))
 		}
 	}
 	return utilerrors.NewAggregate(allErrs)
@@ -390,14 +483,14 @@ func parseLabels(spec []string) (map[string]string, []string, error) {
 	return labels, remove, nil
 }
 
-func labelFunc(obj runtime.Object, overwrite bool, resourceVersion string, labels map[string]string, remove []string) error {
+func labelFunc(obj runtime.Object, overwrite bool, resourceVersion string, labels map[string]string, remove []string) (sets.Set[string], sets.Set[string], error) {
 	accessor, err := meta.Accessor(obj)
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
 	if !overwrite {
 		if err := validateNoOverwrites(accessor, labels); err != nil {
-			return err
+			return nil, nil, err
 		}
 	}
 
@@ -406,16 +499,25 @@ func labelFunc(obj runtime.Object, overwrite bool, resourceVersion string, label
 		objLabels = make(map[string]string)
 	}
 
+	added := sets.New[string]()
+	removed := sets.New[string]()
+
 	for key, value := range labels {
-		objLabels[key] = value
+		if currentValue, ok := objLabels[key]; !ok || currentValue != value {
+			objLabels[key] = value
+			added.Insert(key)
+		}
 	}
 	for _, label := range remove {
-		delete(objLabels, label)
+		if _, ok := objLabels[label]; ok {
+			delete(objLabels, label)
+			removed.Insert(label)
+		}
 	}
 	accessor.SetLabels(objLabels)
 
 	if len(resourceVersion) != 0 {
 		accessor.SetResourceVersion(resourceVersion)
 	}
-	return nil
+	return added, removed, nil
 }

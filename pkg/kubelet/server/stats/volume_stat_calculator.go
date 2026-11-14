@@ -17,17 +17,20 @@ limitations under the License.
 package stats
 
 import (
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
-	stats "k8s.io/kubernetes/pkg/kubelet/apis/stats/v1alpha1"
-	"k8s.io/kubernetes/pkg/kubelet/util/format"
+	"k8s.io/client-go/tools/record"
+	"k8s.io/component-helpers/storage/ephemeral"
+	"k8s.io/klog/v2"
+	stats "k8s.io/kubelet/pkg/apis/stats/v1alpha1"
 	"k8s.io/kubernetes/pkg/volume"
-
-	"k8s.io/klog"
+	"k8s.io/kubernetes/pkg/volume/util"
+	utiltrace "k8s.io/utils/trace"
 )
 
 // volumeStatCalculator calculates volume metrics for a given pod periodically in the background and caches the result
@@ -39,6 +42,7 @@ type volumeStatCalculator struct {
 	startO        sync.Once
 	stopO         sync.Once
 	latest        atomic.Value
+	eventRecorder record.EventRecorder
 }
 
 // PodVolumeStats encapsulates the VolumeStats for a pod.
@@ -49,20 +53,21 @@ type PodVolumeStats struct {
 }
 
 // newVolumeStatCalculator creates a new VolumeStatCalculator
-func newVolumeStatCalculator(statsProvider Provider, jitterPeriod time.Duration, pod *v1.Pod) *volumeStatCalculator {
+func newVolumeStatCalculator(statsProvider Provider, jitterPeriod time.Duration, pod *v1.Pod, eventRecorder record.EventRecorder) *volumeStatCalculator {
 	return &volumeStatCalculator{
 		statsProvider: statsProvider,
 		jitterPeriod:  jitterPeriod,
 		pod:           pod,
 		stopChannel:   make(chan struct{}),
+		eventRecorder: eventRecorder,
 	}
 }
 
 // StartOnce starts pod volume calc that will occur periodically in the background until s.StopOnce is called
-func (s *volumeStatCalculator) StartOnce() *volumeStatCalculator {
+func (s *volumeStatCalculator) StartOnce(logger klog.Logger) *volumeStatCalculator {
 	s.startO.Do(func() {
 		go wait.JitterUntil(func() {
-			s.calcAndStoreStats()
+			s.calcAndStoreStats(logger)
 		}, s.jitterPeriod, 1.0, true, s.stopChannel)
 	})
 	return s
@@ -88,15 +93,37 @@ func (s *volumeStatCalculator) GetLatest() (PodVolumeStats, bool) {
 
 // calcAndStoreStats calculates PodVolumeStats for a given pod and writes the result to the s.latest cache.
 // If the pod references PVCs, the prometheus metrics for those are updated with the result.
-func (s *volumeStatCalculator) calcAndStoreStats() {
+func (s *volumeStatCalculator) calcAndStoreStats(logger klog.Logger) {
 	// Find all Volumes for the Pod
 	volumes, found := s.statsProvider.ListVolumesForPod(s.pod.UID)
-	if !found {
+	blockVolumes, bvFound := s.statsProvider.ListBlockVolumesForPod(s.pod.UID)
+	if !found && !bvFound {
 		return
 	}
 
+	metricVolumes := make(map[string]volume.MetricsProvider)
+
+	if found {
+		for name, v := range volumes {
+			metricVolumes[name] = v
+		}
+	}
+	if bvFound {
+		for name, v := range blockVolumes {
+			// Only add the blockVolume if it implements the MetricsProvider interface
+			if _, ok := v.(volume.MetricsProvider); ok {
+				// Some drivers inherit the MetricsProvider interface from Filesystem
+				// mode volumes, but do not implement it for Block mode. Checking
+				// SupportsMetrics() will prevent panics in that case.
+				if v.SupportsMetrics() {
+					metricVolumes[name] = v
+				}
+			}
+		}
+	}
+
 	// Get volume specs for the pod - key'd by volume name
-	volumesSpec := make(map[string]v1.Volume)
+	volumesSpec := make(map[string]v1.Volume, len(s.pod.Spec.Volumes))
 	for _, v := range s.pod.Spec.Volumes {
 		volumesSpec[v.Name] = v
 	}
@@ -104,12 +131,16 @@ func (s *volumeStatCalculator) calcAndStoreStats() {
 	// Call GetMetrics on each Volume and copy the result to a new VolumeStats.FsStats
 	var ephemeralStats []stats.VolumeStats
 	var persistentStats []stats.VolumeStats
-	for name, v := range volumes {
-		metric, err := v.GetMetrics()
+	for name, v := range metricVolumes {
+		metric, err := func() (*volume.Metrics, error) {
+			trace := utiltrace.New(fmt.Sprintf("Calculate volume metrics of %v for pod %v/%v", name, s.pod.Namespace, s.pod.Name))
+			defer trace.LogIfLong(1 * time.Second)
+			return v.GetMetrics()
+		}()
 		if err != nil {
 			// Expected for Volumes that don't support Metrics
 			if !volume.IsNotSupported(err) {
-				klog.V(4).Infof("Failed to calculate volume metrics for pod %s volume %s: %+v", format.Pod(s.pod), name, err)
+				logger.V(4).Info("Failed to calculate volume metrics", "pod", klog.KObj(s.pod), "podUID", s.pod.UID, "volumeName", name, "err", err)
 			}
 			continue
 		}
@@ -121,9 +152,14 @@ func (s *volumeStatCalculator) calcAndStoreStats() {
 				Name:      pvcSource.ClaimName,
 				Namespace: s.pod.GetNamespace(),
 			}
+		} else if volSpec.Ephemeral != nil {
+			pvcRef = &stats.PVCReference{
+				Name:      ephemeral.VolumeClaimName(s.pod, &volSpec),
+				Namespace: s.pod.GetNamespace(),
+			}
 		}
 		volumeStats := s.parsePodVolumeStats(name, pvcRef, metric, volSpec)
-		if isVolumeEphemeral(volSpec) {
+		if util.IsLocalEphemeralVolume(volSpec) {
 			ephemeralStats = append(ephemeralStats, volumeStats)
 		} else {
 			persistentStats = append(persistentStats, volumeStats)
@@ -139,7 +175,10 @@ func (s *volumeStatCalculator) calcAndStoreStats() {
 // parsePodVolumeStats converts (internal) volume.Metrics to (external) stats.VolumeStats structures
 func (s *volumeStatCalculator) parsePodVolumeStats(podName string, pvcRef *stats.PVCReference, metric *volume.Metrics, volSpec v1.Volume) stats.VolumeStats {
 
-	var available, capacity, used, inodes, inodesFree, inodesUsed uint64
+	var (
+		available, capacity, used, inodes, inodesFree, inodesUsed uint64
+	)
+
 	if metric.Available != nil {
 		available = uint64(metric.Available.Value())
 	}
@@ -159,18 +198,12 @@ func (s *volumeStatCalculator) parsePodVolumeStats(podName string, pvcRef *stats
 		inodesUsed = uint64(metric.InodesUsed.Value())
 	}
 
-	return stats.VolumeStats{
+	volumeStats := stats.VolumeStats{
 		Name:   podName,
 		PVCRef: pvcRef,
 		FsStats: stats.FsStats{Time: metric.Time, AvailableBytes: &available, CapacityBytes: &capacity,
 			UsedBytes: &used, Inodes: &inodes, InodesFree: &inodesFree, InodesUsed: &inodesUsed},
 	}
-}
 
-func isVolumeEphemeral(volume v1.Volume) bool {
-	if (volume.EmptyDir != nil && volume.EmptyDir.Medium == v1.StorageMediumDefault) ||
-		volume.ConfigMap != nil || volume.GitRepo != nil {
-		return true
-	}
-	return false
+	return volumeStats
 }

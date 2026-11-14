@@ -18,15 +18,17 @@ package webhook
 
 import (
 	"encoding/json"
+	"fmt"
 	"reflect"
 	"testing"
 
-	jsonpatch "github.com/evanphx/json-patch"
+	jsonpatch "gopkg.in/evanphx/json-patch.v4"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
 
 func TestPatches(t *testing.T) {
+	sidecarImage = "test-image"
 	testCases := []struct {
 		patch    string
 		initial  interface{}
@@ -81,6 +83,36 @@ func TestPatches(t *testing.T) {
 				},
 			},
 		},
+		{
+			patch: fmt.Sprintf(podsSidecarPatch, sidecarImage),
+			initial: corev1.Pod{
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{
+						{
+							Image:     "image1",
+							Name:      "container1",
+							Resources: corev1.ResourceRequirements{},
+						},
+					},
+				},
+			},
+			expected: &corev1.Pod{
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{
+						{
+							Image:     "image1",
+							Name:      "container1",
+							Resources: corev1.ResourceRequirements{},
+						},
+						{
+							Image:     sidecarImage,
+							Name:      "webhook-added-sidecar",
+							Resources: corev1.ResourceRequirements{},
+						},
+					},
+				},
+			},
+		},
 	}
 	for _, testcase := range testCases {
 		objJS, err := json.Marshal(testcase.initial)
@@ -129,6 +161,9 @@ func TestJSONPatchForUnstructured(t *testing.T) {
 		t.Fatal(err)
 	}
 	patchedJS, err := patchObj.Apply(crJS)
+	if err != nil {
+		t.Fatal(err)
+	}
 	patchedObj := unstructured.Unstructured{}
 	err = json.Unmarshal(patchedJS, &patchedObj)
 	if err != nil {

@@ -19,7 +19,6 @@ package plugin
 import (
 	"bytes"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -27,43 +26,56 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"k8s.io/cli-runtime/pkg/genericclioptions"
+	"k8s.io/cli-runtime/pkg/genericiooptions"
+
 	cmdutil "k8s.io/kubectl/pkg/cmd/util"
 	"k8s.io/kubectl/pkg/util/i18n"
 	"k8s.io/kubectl/pkg/util/templates"
 )
 
 var (
-	pluginLong = templates.LongDesc(`
+	pluginLong = templates.LongDesc(i18n.T(`
 		Provides utilities for interacting with plugins.
 
 		Plugins provide extended functionality that is not part of the major command-line distribution.
-		Please refer to the documentation and examples for more information about how write your own plugins.`)
+		Please refer to the documentation and examples for more information about how write your own plugins.
 
-	pluginListLong = templates.LongDesc(`
+		The easiest way to discover and install plugins is via the kubernetes sub-project krew: [krew.sigs.k8s.io].
+		To install krew, visit https://krew.sigs.k8s.io/docs/user-guide/setup/install`))
+
+	pluginExample = templates.Examples(i18n.T(`
+		# List all available plugins
+		kubectl plugin list
+		
+		# List only binary names of available plugins without paths
+		kubectl plugin list --name-only`))
+
+	pluginListLong = templates.LongDesc(i18n.T(`
 		List all available plugin files on a user's PATH.
+		To see plugins binary names without the full path use --name-only flag.
 
 		Available plugin files are those that are:
 		- executable
 		- anywhere on the user's PATH
 		- begin with "kubectl-"
-`)
+`))
 
 	ValidPluginFilenamePrefixes = []string{"kubectl"}
 )
 
-func NewCmdPlugin(f cmdutil.Factory, streams genericclioptions.IOStreams) *cobra.Command {
+func NewCmdPlugin(streams genericiooptions.IOStreams) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:                   "plugin [flags]",
 		DisableFlagsInUseLine: true,
-		Short:                 i18n.T("Provides utilities for interacting with plugins."),
+		Short:                 i18n.T("Provides utilities for interacting with plugins"),
 		Long:                  pluginLong,
+		Example:               pluginExample,
 		Run: func(cmd *cobra.Command, args []string) {
 			cmdutil.DefaultSubCommandRun(streams.ErrOut)(cmd, args)
 		},
 	}
 
-	cmd.AddCommand(NewCmdPluginList(f, streams))
+	cmd.AddCommand(NewCmdPluginList(streams))
 	return cmd
 }
 
@@ -73,19 +85,20 @@ type PluginListOptions struct {
 
 	PluginPaths []string
 
-	genericclioptions.IOStreams
+	genericiooptions.IOStreams
 }
 
 // NewCmdPluginList provides a way to list all plugin executables visible to kubectl
-func NewCmdPluginList(f cmdutil.Factory, streams genericclioptions.IOStreams) *cobra.Command {
+func NewCmdPluginList(streams genericiooptions.IOStreams) *cobra.Command {
 	o := &PluginListOptions{
 		IOStreams: streams,
 	}
 
 	cmd := &cobra.Command{
-		Use:   "list",
-		Short: "list all visible plugin executables on a user's PATH",
-		Long:  pluginListLong,
+		Use:     "list",
+		Short:   i18n.T("List all visible plugin executables on a user's PATH"),
+		Example: pluginExample,
+		Long:    pluginListLong,
 		Run: func(cmd *cobra.Command, args []string) {
 			cmdutil.CheckErr(o.Complete(cmd))
 			cmdutil.CheckErr(o.Run())
@@ -99,7 +112,7 @@ func NewCmdPluginList(f cmdutil.Factory, streams genericclioptions.IOStreams) *c
 func (o *PluginListOptions) Complete(cmd *cobra.Command) error {
 	o.Verifier = &CommandOverrideVerifier{
 		root:        cmd.Root(),
-		seenPlugins: make(map[string]string, 0),
+		seenPlugins: make(map[string]string),
 	}
 
 	o.PluginPaths = filepath.SplitList(os.Getenv("PATH"))
@@ -107,20 +120,65 @@ func (o *PluginListOptions) Complete(cmd *cobra.Command) error {
 }
 
 func (o *PluginListOptions) Run() error {
-	pluginsFound := false
-	isFirstFile := true
-	pluginErrors := []error{}
+	plugins, pluginErrors := o.ListPlugins()
+
+	if len(plugins) > 0 {
+		fmt.Fprintf(o.Out, "The following compatible plugins are available:\n\n")
+	} else {
+		pluginErrors = append(pluginErrors, fmt.Errorf("error: unable to find any kubectl plugins in your PATH"))
+	}
+
 	pluginWarnings := 0
+	for _, pluginPath := range plugins {
+		if o.NameOnly {
+			fmt.Fprintf(o.Out, "%s\n", filepath.Base(pluginPath))
+		} else {
+			fmt.Fprintf(o.Out, "%s\n", pluginPath)
+		}
+		if errs := o.Verifier.Verify(pluginPath); len(errs) != 0 {
+			for _, err := range errs {
+				fmt.Fprintf(o.ErrOut, "  - %s\n", err)
+				pluginWarnings++
+			}
+		}
+	}
+
+	if pluginWarnings > 0 {
+		if pluginWarnings == 1 {
+			pluginErrors = append(pluginErrors, fmt.Errorf("error: one plugin warning was found"))
+		} else {
+			pluginErrors = append(pluginErrors, fmt.Errorf("error: %v plugin warnings were found", pluginWarnings))
+		}
+	}
+	if len(pluginErrors) > 0 {
+		errs := bytes.NewBuffer(nil)
+		for _, e := range pluginErrors {
+			fmt.Fprintln(errs, e)
+		}
+		return fmt.Errorf("%s", errs.String())
+	}
+
+	return nil
+}
+
+// ListPlugins returns list of plugin paths.
+func (o *PluginListOptions) ListPlugins() ([]string, []error) {
+	plugins := []string{}
+	errors := []error{}
 
 	for _, dir := range uniquePathsList(o.PluginPaths) {
-		files, err := ioutil.ReadDir(dir)
+		if len(strings.TrimSpace(dir)) == 0 {
+			continue
+		}
+
+		files, err := os.ReadDir(dir)
 		if err != nil {
 			if _, ok := err.(*os.PathError); ok {
-				fmt.Fprintf(o.ErrOut, "Unable read directory %q from your PATH: %v. Skipping...", dir, err)
+				fmt.Fprintf(o.ErrOut, "Unable to read directory %q from your PATH: %v. Skipping...\n", dir, err)
 				continue
 			}
 
-			pluginErrors = append(pluginErrors, fmt.Errorf("error: unable to read directory %q in your PATH: %v", dir, err))
+			errors = append(errors, fmt.Errorf("error: unable to read directory %q in your PATH: %v", dir, err))
 			continue
 		}
 
@@ -132,48 +190,11 @@ func (o *PluginListOptions) Run() error {
 				continue
 			}
 
-			if isFirstFile {
-				fmt.Fprintf(o.ErrOut, "The following compatible plugins are available:\n\n")
-				pluginsFound = true
-				isFirstFile = false
-			}
-
-			pluginPath := f.Name()
-			if !o.NameOnly {
-				pluginPath = filepath.Join(dir, pluginPath)
-			}
-
-			fmt.Fprintf(o.Out, "%s\n", pluginPath)
-			if errs := o.Verifier.Verify(filepath.Join(dir, f.Name())); len(errs) != 0 {
-				for _, err := range errs {
-					fmt.Fprintf(o.ErrOut, "  - %s\n", err)
-					pluginWarnings++
-				}
-			}
+			plugins = append(plugins, filepath.Join(dir, f.Name()))
 		}
 	}
 
-	if !pluginsFound {
-		pluginErrors = append(pluginErrors, fmt.Errorf("error: unable to find any kubectl plugins in your PATH"))
-	}
-
-	if pluginWarnings > 0 {
-		if pluginWarnings == 1 {
-			pluginErrors = append(pluginErrors, fmt.Errorf("error: one plugin warning was found"))
-		} else {
-			pluginErrors = append(pluginErrors, fmt.Errorf("error: %v plugin warnings were found", pluginWarnings))
-		}
-	}
-	if len(pluginErrors) > 0 {
-		fmt.Fprintln(o.ErrOut)
-		errs := bytes.NewBuffer(nil)
-		for _, e := range pluginErrors {
-			fmt.Fprintln(errs, e)
-		}
-		return fmt.Errorf("%s", errs.String())
-	}
-
-	return nil
+	return plugins, errors
 }
 
 // pathVerifier receives a path and determines if it is valid or not
@@ -196,8 +217,7 @@ func (v *CommandOverrideVerifier) Verify(path string) []error {
 	}
 
 	// extract the plugin binary name
-	segs := strings.Split(path, "/")
-	binName := segs[len(segs)-1]
+	binName := filepath.Base(path)
 
 	cmdPath := strings.Split(binName, "-")
 	if len(cmdPath) > 1 {

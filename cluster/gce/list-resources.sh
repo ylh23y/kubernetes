@@ -29,7 +29,7 @@ set -o pipefail
 ZONE=${ZONE:-}
 REGION=${ZONE%-*}
 INSTANCE_PREFIX=${KUBE_GCE_INSTANCE_PREFIX:-${CLUSTER_NAME:-}}
-NETWORK=${KUBE_GCE_NETWORK:-${KUBE_GKE_NETWORK:-}}
+NETWORK=${KUBE_GCE_NETWORK:-${KUBE_GKE_NETWORK:-default}}
 
 # In GKE the instance prefix starts with "gke-".
 if [[ "${KUBERNETES_PROVIDER:-}" == "gke" ]]; then
@@ -75,6 +75,9 @@ echo "Provider: ${KUBERNETES_PROVIDER:-}"
 
 # List resources related to instances, filtering by the instance prefix if
 # provided.
+
+set +e # do not stop on error
+
 gcloud-list compute instance-templates "name ~ '${INSTANCE_PREFIX}.*'"
 gcloud-list compute instance-groups "${ZONE:+"zone:(${ZONE}) AND "}name ~ '${INSTANCE_PREFIX}.*'"
 gcloud-list compute instances "${ZONE:+"zone:(${ZONE}) AND "}name ~ '${INSTANCE_PREFIX}.*'"
@@ -87,7 +90,7 @@ gcloud-list compute disks "${ZONE:+"zone:(${ZONE}) AND "}name ~ '${INSTANCE_PREF
 gcloud-list compute addresses "${REGION:+"region=(${REGION}) AND "}name ~ 'a.*|${INSTANCE_PREFIX}.*'"
 # Match either the header or a line with the specified e2e network.
 # This assumes that the network name is the second field in the output.
-GREP_REGEX="^NAME\|^[^ ]\+[ ]\+\(default\|${NETWORK}\) "
+GREP_REGEX="^NAME\|^[^ ]\+[ ]\+\(${NETWORK}\) "
 gcloud-list compute routes "name ~ 'default.*|${INSTANCE_PREFIX}.*'"
 gcloud-list compute firewall-rules "name ~ 'default.*|k8s-fw.*|${INSTANCE_PREFIX}.*'"
 GREP_REGEX=""
@@ -95,3 +98,5 @@ gcloud-list compute forwarding-rules ${REGION:+"region=(${REGION})"}
 gcloud-list compute target-pools ${REGION:+"region=(${REGION})"}
 
 gcloud-list logging sinks
+
+set -e

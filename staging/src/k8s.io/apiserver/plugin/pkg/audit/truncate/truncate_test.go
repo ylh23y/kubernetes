@@ -25,6 +25,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	auditinternal "k8s.io/apiserver/pkg/apis/audit"
 	auditv1 "k8s.io/apiserver/pkg/apis/audit/v1"
+	"k8s.io/apiserver/pkg/audit"
 	"k8s.io/apiserver/plugin/pkg/audit/fake"
 	// Importing just for the schema definitions.
 	_ "k8s.io/apiserver/plugin/pkg/audit/webhook"
@@ -70,7 +71,6 @@ func TestTruncatingEvents(t *testing.T) {
 	}
 
 	for _, tc := range testCases {
-		tc := tc
 		t.Run(tc.desc, func(t *testing.T) {
 			t.Parallel()
 
@@ -78,7 +78,7 @@ func TestTruncatingEvents(t *testing.T) {
 
 			fb := &fake.Backend{
 				OnRequest: func(events []*auditinternal.Event) {
-					require.Equal(t, 1, len(events), "Expected single event in batch")
+					require.Len(t, events, 1, "Expected single event in batch")
 					event = events[0]
 				},
 			}
@@ -93,6 +93,28 @@ func TestTruncatingEvents(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestTruncatingDoesNotModifyOriginalEvent(t *testing.T) {
+	event := &auditinternal.Event{
+		Level: auditinternal.LevelRequest,
+		RequestObject: &runtime.Unknown{
+			Raw: []byte("\"" + strings.Repeat("A", int(defaultConfig.MaxEventSize)) + "\""),
+		},
+		Annotations: map[string]string{"authorization.k8s.io/decision": "allow"},
+	}
+
+	var truncated, untouched *auditinternal.Event
+	b := audit.Union(
+		NewBackend(&fake.Backend{OnRequest: func(events []*auditinternal.Event) { truncated = events[0] }}, defaultConfig, auditv1.SchemeGroupVersion),
+		&fake.Backend{OnRequest: func(events []*auditinternal.Event) { untouched = events[0] }},
+	)
+	b.ProcessEvents(event)
+
+	require.Equal(t, annotationValue, truncated.Annotations[annotationKey], "Truncated event should be annotated")
+	require.NotContains(t, untouched.Annotations, annotationKey, "Event passed to other backends should not be annotated as truncated")
+	require.NotNil(t, untouched.RequestObject, "Event passed to other backends should keep its request")
+	require.Equal(t, map[string]string{"authorization.k8s.io/decision": "allow"}, event.Annotations, "Original event annotations should be unchanged")
 }
 
 func TestSplittingBatches(t *testing.T) {
@@ -122,7 +144,6 @@ func TestSplittingBatches(t *testing.T) {
 		},
 	}
 	for _, tc := range testCases {
-		tc := tc
 		t.Run(tc.desc, func(t *testing.T) {
 			t.Parallel()
 

@@ -20,16 +20,13 @@ import (
 	"reflect"
 	"testing"
 
+	apiv1 "k8s.io/api/core/v1"
 	"k8s.io/api/scheduling/v1beta1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/kubernetes/pkg/api/legacyscheme"
 
-	apiv1 "k8s.io/api/core/v1"
-	utilfeature "k8s.io/apiserver/pkg/util/feature"
-	featuregatetesting "k8s.io/component-base/featuregate/testing"
-	// enforce that all types are installed
-	_ "k8s.io/kubernetes/pkg/api/testapi"
-	"k8s.io/kubernetes/pkg/features"
+	// ensure types are installed
+	_ "k8s.io/kubernetes/pkg/apis/scheduling/install"
 )
 
 func roundTrip(t *testing.T, obj runtime.Object) runtime.Object {
@@ -56,11 +53,96 @@ func roundTrip(t *testing.T, obj runtime.Object) runtime.Object {
 func TestSetDefaultPreempting(t *testing.T) {
 	priorityClass := &v1beta1.PriorityClass{}
 
-	// set NonPreemptingPriority true
-	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.NonPreemptingPriority, true)()
-
 	output := roundTrip(t, runtime.Object(priorityClass)).(*v1beta1.PriorityClass)
 	if output.PreemptionPolicy == nil || *output.PreemptionPolicy != apiv1.PreemptLowerPriority {
 		t.Errorf("Expected PriorityClass.Preempting value: %+v\ngot: %+v\n", apiv1.PreemptLowerPriority, output.PreemptionPolicy)
+	}
+}
+
+func TestSetDefaultsPodGroup(t *testing.T) {
+	preemptNever := v1beta1.PreemptNever
+	preemptLowerPriority := v1beta1.PreemptLowerPriority
+
+	tests := []struct {
+		name           string
+		podGroup       *v1beta1.PodGroup
+		expectedPolicy *v1beta1.PreemptionPolicy
+	}{
+		{
+			name:           "nil policy is left for priority admission",
+			podGroup:       &v1beta1.PodGroup{},
+			expectedPolicy: nil,
+		},
+		{
+			name: "policy is set to PreemptNever",
+			podGroup: &v1beta1.PodGroup{
+				Spec: v1beta1.PodGroupSpec{
+					PreemptionPolicy: &preemptNever,
+				},
+			},
+			expectedPolicy: &preemptNever,
+		},
+		{
+			name: "policy is set to PreemptLowerPriority",
+			podGroup: &v1beta1.PodGroup{
+				Spec: v1beta1.PodGroupSpec{
+					PreemptionPolicy: &preemptLowerPriority,
+				},
+			},
+			expectedPolicy: &preemptLowerPriority,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			output := roundTrip(t, runtime.Object(tc.podGroup)).(*v1beta1.PodGroup)
+			if !reflect.DeepEqual(output.Spec.PreemptionPolicy, tc.expectedPolicy) {
+				t.Errorf("Expected PreemptionPolicy: %v, got: %v", tc.expectedPolicy, output.Spec.PreemptionPolicy)
+			}
+		})
+	}
+}
+
+func TestSetDefaultsCompositePodGroup(t *testing.T) {
+	preemptNever := v1beta1.PreemptNever
+	preemptLowerPriority := v1beta1.PreemptLowerPriority
+
+	tests := []struct {
+		name           string
+		cpg            *v1beta1.CompositePodGroup
+		expectedPolicy *v1beta1.PreemptionPolicy
+	}{
+		{
+			name:           "nil policy is left for priority admission",
+			cpg:            &v1beta1.CompositePodGroup{},
+			expectedPolicy: nil,
+		},
+		{
+			name: "policy is set to PreemptNever",
+			cpg: &v1beta1.CompositePodGroup{
+				Spec: v1beta1.CompositePodGroupSpec{
+					PreemptionPolicy: &preemptNever,
+				},
+			},
+			expectedPolicy: &preemptNever,
+		},
+		{
+			name: "policy is set to PreemptLowerPriority",
+			cpg: &v1beta1.CompositePodGroup{
+				Spec: v1beta1.CompositePodGroupSpec{
+					PreemptionPolicy: &preemptLowerPriority,
+				},
+			},
+			expectedPolicy: &preemptLowerPriority,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			output := roundTrip(t, runtime.Object(tc.cpg)).(*v1beta1.CompositePodGroup)
+			if !reflect.DeepEqual(output.Spec.PreemptionPolicy, tc.expectedPolicy) {
+				t.Errorf("Expected PreemptionPolicy: %v, got: %v", tc.expectedPolicy, output.Spec.PreemptionPolicy)
+			}
+		})
 	}
 }

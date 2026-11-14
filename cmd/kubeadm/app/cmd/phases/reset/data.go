@@ -21,6 +21,7 @@ import (
 
 	"k8s.io/apimachinery/pkg/util/sets"
 	clientset "k8s.io/client-go/kubernetes"
+
 	kubeadmapi "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm"
 )
 
@@ -29,10 +30,29 @@ import (
 type resetData interface {
 	ForceReset() bool
 	InputReader() io.Reader
-	IgnorePreflightErrors() sets.String
+	IgnorePreflightErrors() sets.Set[string]
 	Cfg() *kubeadmapi.InitConfiguration
+	ResetCfg() *kubeadmapi.ResetConfiguration
+	DryRun() bool
 	Client() clientset.Interface
-	AddDirsToClean(dirs ...string)
 	CertificatesDir() string
 	CRISocketPath() string
+	CleanupTmpDir() bool
 }
+
+// a package local type for testing purposes.
+type testData struct{}
+
+// testData must satisfy resetData.
+var _ resetData = &testData{}
+
+func (t *testData) ForceReset() bool                         { return false }
+func (t *testData) InputReader() io.Reader                   { return nil }
+func (t *testData) IgnorePreflightErrors() sets.Set[string]  { return nil }
+func (t *testData) Cfg() *kubeadmapi.InitConfiguration       { return nil }
+func (t *testData) DryRun() bool                             { return false }
+func (t *testData) Client() clientset.Interface              { return nil }
+func (t *testData) CertificatesDir() string                  { return "" }
+func (t *testData) CRISocketPath() string                    { return "" }
+func (t *testData) CleanupTmpDir() bool                      { return false }
+func (t *testData) ResetCfg() *kubeadmapi.ResetConfiguration { return nil }

@@ -17,20 +17,21 @@ limitations under the License.
 package csi
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
-	"path"
-	"sort"
+	"path/filepath"
 	"strings"
 	"time"
 
-	"context"
+	"google.golang.org/grpc/codes"
+	"k8s.io/klog/v2"
 
-	"k8s.io/klog"
-
+	authenticationv1 "k8s.io/api/authentication/v1"
 	api "k8s.io/api/core/v1"
-	apierrs "k8s.io/apimachinery/pkg/api/errors"
+	storage "k8s.io/api/storage/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	meta "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
@@ -38,22 +39,20 @@ import (
 	"k8s.io/apimachinery/pkg/util/wait"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	clientset "k8s.io/client-go/kubernetes"
-	storagelisters "k8s.io/client-go/listers/storage/v1beta1"
+	storagelisters "k8s.io/client-go/listers/storage/v1"
+	"k8s.io/client-go/tools/cache"
 	csitranslationplugins "k8s.io/csi-translation-lib/plugins"
 	"k8s.io/kubernetes/pkg/features"
+	"k8s.io/kubernetes/pkg/kubelet/util"
 	"k8s.io/kubernetes/pkg/volume"
 	"k8s.io/kubernetes/pkg/volume/csi/nodeinfomanager"
+	volumetypes "k8s.io/kubernetes/pkg/volume/util/types"
 )
 
 const (
 	// CSIPluginName is the name of the in-tree CSI Plugin
 	CSIPluginName = "kubernetes.io/csi"
 
-	// TODO (vladimirvivien) implement a more dynamic way to discover
-	// the unix domain socket path for each installed csi driver.
-	// TODO (vladimirvivien) would be nice to name socket with a .sock extension
-	// for consistency.
-	csiAddrTemplate = "/var/lib/kubelet/plugins/%v/csi.sock"
 	csiTimeout      = 2 * time.Minute
 	volNameSep      = "^"
 	volDataFileName = "vol_data.json"
@@ -64,31 +63,18 @@ const (
 	CsiResyncPeriod = time.Minute
 )
 
-var deprecatedSocketDirVersions = []string{"0.1.0", "0.2.0", "0.3.0", "0.4.0"}
-
 type csiPlugin struct {
-	host            volume.VolumeHost
-	blockEnabled    bool
-	csiDriverLister storagelisters.CSIDriverLister
+	host                      volume.VolumeHost
+	csiDriverLister           storagelisters.CSIDriverLister
+	csiDriverInformer         cache.SharedIndexInformer
+	serviceAccountTokenGetter func(namespace, name string, tr *authenticationv1.TokenRequest) (*authenticationv1.TokenRequest, error)
+	volumeAttachmentLister    storagelisters.VolumeAttachmentLister
 }
-
-//TODO (vladimirvivien) add this type to storage api
-type driverMode string
-
-const persistentDriverMode driverMode = "persistent"
-const ephemeralDriverMode driverMode = "ephemeral"
-const combinedDriverMode driverMode = "persistent+ephemeral"
-
-type csiVolumeMode string
-
-const persistentVolumeMode csiVolumeMode = "persistent"
-const ephemeralVolumeMode csiVolumeMode = "ephemeral"
 
 // ProbeVolumePlugins returns implemented plugins
 func ProbeVolumePlugins() []volume.VolumePlugin {
 	p := &csiPlugin{
-		host:         nil,
-		blockEnabled: utilfeature.DefaultFeatureGate.Enabled(features.CSIBlockVolume),
+		host: nil,
 	}
 	return []volume.VolumePlugin{p}
 }
@@ -98,6 +84,7 @@ var _ volume.VolumePlugin = &csiPlugin{}
 
 // RegistrationHandler is the handler which is fed to the pluginwatcher API.
 type RegistrationHandler struct {
+	csiPlugin *csiPlugin
 }
 
 // TODO (verult) consider using a struct instead of global variables
@@ -107,35 +94,29 @@ var csiDrivers = &DriversStore{}
 
 var nim nodeinfomanager.Interface
 
+var csiNodeUpdaterVar *csiNodeUpdater
+
 // PluginHandler is the plugin registration handler interface passed to the
 // pluginwatcher module in kubelet
 var PluginHandler = &RegistrationHandler{}
 
 // ValidatePlugin is called by kubelet's plugin watcher upon detection
 // of a new registration socket opened by CSI Driver registrar side car.
-func (h *RegistrationHandler) ValidatePlugin(pluginName string, endpoint string, versions []string, foundInDeprecatedDir bool) error {
-	klog.Infof(log("Trying to validate a new CSI Driver with name: %s endpoint: %s versions: %s, foundInDeprecatedDir: %v",
-		pluginName, endpoint, strings.Join(versions, ","), foundInDeprecatedDir))
-
-	if foundInDeprecatedDir {
-		// CSI 0.x drivers used /var/lib/kubelet/plugins as the socket dir.
-		// This was deprecated as the socket dir for kubelet drivers, in lieu of a dedicated dir /var/lib/kubelet/plugins_registry
-		// The deprecated dir will only be allowed for a whitelisted set of old versions.
-		// CSI 1.x drivers should use the /var/lib/kubelet/plugins_registry
-		if !isDeprecatedSocketDirAllowed(versions) {
-			err := fmt.Errorf("socket for CSI driver %q versions %v was found in a deprecated dir. Drivers implementing CSI 1.x+ must use the new dir", pluginName, versions)
-			klog.Error(err)
-			return err
-		}
-	}
+func (h *RegistrationHandler) ValidatePlugin(ctx context.Context, pluginName string, endpoint string, versions []string) error {
+	klog.Info(log("Trying to validate a new CSI Driver with name: %s endpoint: %s versions: %s",
+		pluginName, endpoint, strings.Join(versions, ",")))
 
 	_, err := h.validateVersions("ValidatePlugin", pluginName, endpoint, versions)
+	if err != nil {
+		return fmt.Errorf("validation failed for CSI Driver %s at endpoint %s: %v", pluginName, endpoint, err)
+	}
+
 	return err
 }
 
 // RegisterPlugin is called when a plugin can be registered
-func (h *RegistrationHandler) RegisterPlugin(pluginName string, endpoint string, versions []string) error {
-	klog.Infof(log("Register new plugin with name: %s at endpoint: %s", pluginName, endpoint))
+func (h *RegistrationHandler) RegisterPlugin(ctx context.Context, pluginName string, endpoint string, versions []string, pluginClientTimeout *time.Duration) error {
+	klog.Info(log("Register new plugin with name: %s at endpoint: %s", pluginName, endpoint))
 
 	highestSupportedVersion, err := h.validateVersions("RegisterPlugin", pluginName, endpoint, versions)
 	if err != nil {
@@ -155,10 +136,17 @@ func (h *RegistrationHandler) RegisterPlugin(pluginName string, endpoint string,
 		return err
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), csiTimeout)
+	var timeout time.Duration
+	if pluginClientTimeout == nil {
+		timeout = csiTimeout
+	} else {
+		timeout = *pluginClientTimeout
+	}
+
+	newCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	driverNodeID, maxVolumePerNode, accessibleTopology, err := csi.NodeGetInfo(ctx)
+	driverNodeID, maxVolumePerNode, accessibleTopology, err := csi.NodeGetInfo(newCtx)
 	if err != nil {
 		if unregErr := unregisterDriver(pluginName); unregErr != nil {
 			klog.Error(log("registrationHandler.RegisterPlugin failed to unregister plugin due to previous error: %v", unregErr))
@@ -174,30 +162,103 @@ func (h *RegistrationHandler) RegisterPlugin(pluginName string, endpoint string,
 		return err
 	}
 
+	if csiNodeUpdaterVar != nil {
+		csiNodeUpdaterVar.syncDriverUpdater(pluginName)
+	}
+
 	return nil
+}
+
+func updateCSIDriver(pluginName string) error {
+	csi, err := newCsiDriverClient(csiDriverName(pluginName))
+	if err != nil {
+		return fmt.Errorf("failed to create CSI client for driver %q: %w", pluginName, err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), csiTimeout)
+	defer cancel()
+
+	driverNodeID, maxVolumePerNode, accessibleTopology, err := csi.NodeGetInfo(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get NodeGetInfo from driver %q: %w", pluginName, err)
+	}
+
+	if err := nim.UpdateCSIDriver(pluginName, driverNodeID, maxVolumePerNode, accessibleTopology); err != nil {
+		return fmt.Errorf("failed to update driver %q: %w", pluginName, err)
+	}
+	return nil
+}
+
+func (p *csiPlugin) VerifyExhaustedResource(spec *volume.Spec) bool {
+	if spec == nil || spec.PersistentVolume == nil || spec.PersistentVolume.Spec.CSI == nil {
+		klog.ErrorS(nil, "Invalid volume spec for CSI")
+		return false
+	}
+
+	pluginName := spec.PersistentVolume.Spec.CSI.Driver
+
+	driver, err := p.getCSIDriver(pluginName)
+	if err != nil {
+		klog.ErrorS(err, "Failed to retrieve CSIDriver", "pluginName", pluginName)
+		return false
+	}
+
+	period := getNodeAllocatableUpdatePeriod(driver)
+	if period == 0 {
+		return false
+	}
+
+	volumeHandle := spec.PersistentVolume.Spec.CSI.VolumeHandle
+	attachmentName := getAttachmentName(volumeHandle, pluginName, string(p.host.GetNodeName()))
+	kubeClient := p.host.GetKubeClient()
+
+	ctx, cancel := context.WithTimeout(context.Background(), csiTimeout)
+	defer cancel()
+
+	attachment, err := kubeClient.StorageV1().VolumeAttachments().Get(ctx, attachmentName, meta.GetOptions{})
+	if err != nil {
+		klog.ErrorS(err, "Failed to get volume attachment", "attachmentName", attachmentName)
+		return false
+	}
+
+	if isResourceExhaustError(attachment) {
+		klog.V(4).InfoS("Detected ResourceExhausted error for volume", "pluginName", pluginName, "volumeHandle", volumeHandle)
+		if err := updateCSIDriver(pluginName); err != nil {
+			klog.ErrorS(err, "Failed to update CSIDriver", "pluginName", pluginName)
+		}
+		return true
+	}
+	return false
+}
+
+func isResourceExhaustError(attachment *storage.VolumeAttachment) bool {
+	if attachment == nil || attachment.Status.AttachError == nil {
+		return false
+	}
+	return attachment.Status.AttachError.ErrorCode != nil &&
+		*attachment.Status.AttachError.ErrorCode == int32(codes.ResourceExhausted)
 }
 
 func (h *RegistrationHandler) validateVersions(callerName, pluginName string, endpoint string, versions []string) (*utilversion.Version, error) {
 	if len(versions) == 0 {
-		err := fmt.Errorf("%s for CSI driver %q failed. Plugin returned an empty list for supported versions", callerName, pluginName)
-		klog.Error(err)
-		return nil, err
+		return nil, errors.New(log("%s for CSI driver %q failed. Plugin returned an empty list for supported versions", callerName, pluginName))
 	}
 
 	// Validate version
-	newDriverHighestVersion, err := highestSupportedVersion(versions)
+	// CSI currently only has version 0.x and 1.x (see https://github.com/container-storage-interface/spec/releases).
+	// Therefore any driver claiming version 2.x+ is ignored as an unsupported versions.
+	// Future 1.x versions of CSI are supposed to be backwards compatible so this version of Kubernetes will work with any 1.x driver
+	// (or 0.x), but it may not work with 2.x drivers (because 2.x does not have to be backwards compatible with 1.x).
+	// CSI v0.x is no longer supported as of Kubernetes v1.17 in accordance with deprecation policy set out in Kubernetes v1.13.
+	newDriverHighestVersion, err := utilversion.HighestSupportedVersion(versions)
 	if err != nil {
-		err := fmt.Errorf("%s for CSI driver %q failed. None of the versions specified %q are supported. err=%v", callerName, pluginName, versions, err)
-		klog.Error(err)
-		return nil, err
+		return nil, errors.New(log("%s for CSI driver %q failed. None of the versions specified %q are supported. err=%v", callerName, pluginName, versions, err))
 	}
 
 	existingDriver, driverExists := csiDrivers.Get(pluginName)
 	if driverExists {
 		if !existingDriver.highestSupportedVersion.LessThan(newDriverHighestVersion) {
-			err := fmt.Errorf("%s for CSI driver %q failed. Another driver with the same name is already registered with a higher supported version: %q", callerName, pluginName, existingDriver.highestSupportedVersion)
-			klog.Error(err)
-			return nil, err
+			return nil, errors.New(log("%s for CSI driver %q failed. Another driver with the same name is already registered with a higher supported version: %q", callerName, pluginName, existingDriver.highestSupportedVersion))
 		}
 	}
 
@@ -206,98 +267,136 @@ func (h *RegistrationHandler) validateVersions(callerName, pluginName string, en
 
 // DeRegisterPlugin is called when a plugin removed its socket, signaling
 // it is no longer available
-func (h *RegistrationHandler) DeRegisterPlugin(pluginName string) {
-	klog.V(4).Info(log("registrationHandler.DeRegisterPlugin request for plugin %s", pluginName))
+func (h *RegistrationHandler) DeRegisterPlugin(ctx context.Context, pluginName, endpoint string) {
+	klog.Info(log("registrationHandler.DeRegisterPlugin request for plugin %s, endpoint %s", pluginName, endpoint))
 	if err := unregisterDriver(pluginName); err != nil {
 		klog.Error(log("registrationHandler.DeRegisterPlugin failed: %v", err))
+	}
+
+	if csiNodeUpdaterVar != nil {
+		csiNodeUpdaterVar.syncDriverUpdater(pluginName)
 	}
 }
 
 func (p *csiPlugin) Init(host volume.VolumeHost) error {
 	p.host = host
 
-	if utilfeature.DefaultFeatureGate.Enabled(features.CSIDriverRegistry) {
-		csiClient := host.GetKubeClient()
-		if csiClient == nil {
-			klog.Warning(log("kubeclient not set, assuming standalone kubelet"))
-		} else {
-			// set CSIDriverLister
-			adcHost, ok := host.(volume.AttachDetachVolumeHost)
-			if ok {
-				p.csiDriverLister = adcHost.CSIDriverLister()
-				if p.csiDriverLister == nil {
-					klog.Error(log("CSIDriverLister not found on AttachDetachVolumeHost"))
-				}
+	csiClient := host.GetKubeClient()
+	if csiClient == nil {
+		klog.Warning(log("kubeclient not set, assuming standalone kubelet"))
+	} else {
+		// set CSIDriverLister and volumeAttachmentLister
+		seLinuxHost, ok := host.(volume.CSIDriverVolumeHost)
+		if ok {
+			p.csiDriverLister = seLinuxHost.CSIDriverLister()
+			if p.csiDriverLister == nil {
+				klog.Error(log("CSIDriverLister not found on CSIDriverVolumeHost"))
 			}
-			kletHost, ok := host.(volume.KubeletVolumeHost)
-			if ok {
-				p.csiDriverLister = kletHost.CSIDriverLister()
-				if p.csiDriverLister == nil {
-					klog.Error(log("CSIDriverLister not found on KubeletVolumeHost"))
-				}
+		}
+		adcHost, ok := host.(volume.AttachDetachVolumeHost)
+		if ok {
+			p.volumeAttachmentLister = adcHost.VolumeAttachmentLister()
+			if p.volumeAttachmentLister == nil {
+				klog.Error(log("VolumeAttachmentLister not found on AttachDetachVolumeHost"))
+			}
+		}
+		kletHost, ok := host.(volume.KubeletVolumeHost)
+		if ok {
+			p.csiDriverLister = kletHost.CSIDriverLister()
+			if p.csiDriverLister == nil {
+				klog.Error(log("CSIDriverLister not found on KubeletVolumeHost"))
+			}
+			p.serviceAccountTokenGetter = host.GetServiceAccountTokenFunc()
+			if p.serviceAccountTokenGetter == nil {
+				klog.Error(log("ServiceAccountTokenGetter not found on KubeletVolumeHost"))
+			}
+			// We don't run the volumeAttachmentLister in the kubelet context
+			p.volumeAttachmentLister = nil
+
+			informerFactory := kletHost.GetInformerFactory()
+			if informerFactory == nil {
+				klog.Error(log("InformerFactory not found on KubeletVolumeHost"))
+			} else {
+				p.csiDriverInformer = informerFactory.Storage().V1().CSIDrivers().Informer()
 			}
 		}
 	}
 
 	var migratedPlugins = map[string](func() bool){
 		csitranslationplugins.GCEPDInTreePluginName: func() bool {
-			return utilfeature.DefaultFeatureGate.Enabled(features.CSIMigration) && utilfeature.DefaultFeatureGate.Enabled(features.CSIMigrationGCE)
+			return true
 		},
 		csitranslationplugins.AWSEBSInTreePluginName: func() bool {
-			return utilfeature.DefaultFeatureGate.Enabled(features.CSIMigration) && utilfeature.DefaultFeatureGate.Enabled(features.CSIMigrationAWS)
+			return true
 		},
 		csitranslationplugins.CinderInTreePluginName: func() bool {
-			return utilfeature.DefaultFeatureGate.Enabled(features.CSIMigration) && utilfeature.DefaultFeatureGate.Enabled(features.CSIMigrationOpenStack)
+			return true
+		},
+		csitranslationplugins.AzureDiskInTreePluginName: func() bool {
+			return true
+		},
+		csitranslationplugins.AzureFileInTreePluginName: func() bool {
+			return true
+		},
+		csitranslationplugins.VSphereInTreePluginName: func() bool {
+			return true
+		},
+		csitranslationplugins.PortworxVolumePluginName: func() bool {
+			return true
 		},
 	}
 
 	// Initializing the label management channels
 	nim = nodeinfomanager.NewNodeInfoManager(host.GetNodeName(), host, migratedPlugins)
+	PluginHandler.csiPlugin = p
 
-	if utilfeature.DefaultFeatureGate.Enabled(features.CSINodeInfo) &&
-		utilfeature.DefaultFeatureGate.Enabled(features.CSIMigration) {
-		// This function prevents Kubelet from posting Ready status until CSINodeInfo
-		// is both installed and initialized
-		if err := initializeCSINode(host); err != nil {
-			return fmt.Errorf("failed to initialize CSINodeInfo: %v", err)
-		}
+	// This function prevents Kubelet from posting Ready status until CSINode
+	// is both installed and initialized
+	if err := initializeCSINode(host, p.csiDriverInformer); err != nil {
+		return errors.New(log("failed to initialize CSINode: %v", err))
 	}
-
 	return nil
 }
 
-func initializeCSINode(host volume.VolumeHost) error {
+func initializeCSINode(host volume.VolumeHost, csiDriverInformer cache.SharedIndexInformer) error {
 	kvh, ok := host.(volume.KubeletVolumeHost)
 	if !ok {
-		klog.V(4).Info("Cast from VolumeHost to KubeletVolumeHost failed. Skipping CSINodeInfo initialization, not running on kubelet")
+		klog.V(4).Info("Cast from VolumeHost to KubeletVolumeHost failed. Skipping CSINode initialization, not running on kubelet")
 		return nil
 	}
 	kubeClient := host.GetKubeClient()
 	if kubeClient == nil {
-		// Kubelet running in standalone mode. Skip CSINodeInfo initialization
-		klog.Warning("Skipping CSINodeInfo initialization, kubelet running in standalone mode")
+		// Kubelet running in standalone mode. Skip CSINode initialization
+		klog.Warning("Skipping CSINode initialization, kubelet running in standalone mode")
 		return nil
 	}
 
-	kvh.SetKubeletError(errors.New("CSINodeInfo is not yet initialized"))
+	kvh.SetKubeletError(errors.New("CSINode is not yet initialized"))
 
 	go func() {
 		defer utilruntime.HandleCrash()
+
+		// First wait indefinitely to talk to Kube APIServer
+		nodeName := host.GetNodeName()
+		err := waitForAPIServerForever(kubeClient, nodeName)
+		if err != nil {
+			klog.Fatalf("Failed to initialize CSINode while waiting for API server to report ok: %v", err)
+		}
 
 		// Backoff parameters tuned to retry over 140 seconds. Will fail and restart the Kubelet
 		// after max retry steps.
 		initBackoff := wait.Backoff{
 			Steps:    6,
-			Duration: 15 * time.Millisecond,
-			Factor:   6.0,
+			Duration: 30 * time.Millisecond,
+			Factor:   8.0,
 			Jitter:   0.1,
 		}
-		err := wait.ExponentialBackoff(initBackoff, func() (bool, error) {
-			klog.V(4).Infof("Initializing migrated drivers on CSINodeInfo")
+		err = wait.ExponentialBackoff(initBackoff, func() (bool, error) {
+			klog.V(4).Infof("Initializing migrated drivers on CSINode")
 			err := nim.InitializeCSINodeWithAnnotation()
 			if err != nil {
-				kvh.SetKubeletError(fmt.Errorf("Failed to initialize CSINodeInfo: %v", err))
-				klog.Errorf("Failed to initialize CSINodeInfo: %v", err)
+				kvh.SetKubeletError(fmt.Errorf("failed to initialize CSINode: %v", err))
+				klog.Errorf("Failed to initialize CSINode: %v", err)
 				return false, nil
 			}
 
@@ -311,9 +410,21 @@ func initializeCSINode(host volume.VolumeHost) error {
 			// using CSI for all Migrated volume plugins. Then all the CSINode initialization
 			// code can be dropped from Kubelet.
 			// Kill the Kubelet process and allow it to restart to retry initialization
-			klog.Fatalf("Failed to initialize CSINodeInfo after retrying")
+			klog.Fatalf("Failed to initialize CSINode after retrying: %v", err)
 		}
 	}()
+
+	if utilfeature.DefaultFeatureGate.Enabled(features.MutableCSINodeAllocatableCount) && csiNodeUpdaterVar == nil {
+		if csiDriverInformer != nil {
+			var err error
+			csiNodeUpdaterVar, err = NewCSINodeUpdater(csiDriverInformer)
+			if err != nil {
+				klog.ErrorS(err, "Failed to create CSINodeUpdater")
+			} else {
+				go csiNodeUpdaterVar.Run()
+			}
+		}
+	}
 	return nil
 }
 
@@ -326,8 +437,7 @@ func (p *csiPlugin) GetPluginName() string {
 func (p *csiPlugin) GetVolumeName(spec *volume.Spec) (string, error) {
 	csi, err := getPVSourceFromSpec(spec)
 	if err != nil {
-		klog.Error(log("plugin.GetVolumeName failed to extract volume source from spec: %v", err))
-		return "", err
+		return "", errors.New(log("plugin.GetVolumeName failed to extract volume source from spec: %v", err))
 	}
 
 	// return driverName<separator>volumeHandle
@@ -340,26 +450,30 @@ func (p *csiPlugin) CanSupport(spec *volume.Spec) bool {
 	if spec == nil {
 		return false
 	}
-	if utilfeature.DefaultFeatureGate.Enabled(features.CSIInlineVolume) {
-		return (spec.PersistentVolume != nil && spec.PersistentVolume.Spec.CSI != nil) ||
-			(spec.Volume != nil && spec.Volume.CSI != nil)
+	return (spec.PersistentVolume != nil && spec.PersistentVolume.Spec.CSI != nil) ||
+		(spec.Volume != nil && spec.Volume.CSI != nil)
+}
+
+func (p *csiPlugin) RequiresRemount(spec *volume.Spec) bool {
+	if p.csiDriverLister == nil {
+		return false
 	}
-
-	return spec.PersistentVolume != nil && spec.PersistentVolume.Spec.CSI != nil
-}
-
-func (p *csiPlugin) IsMigratedToCSI() bool {
-	return false
-}
-
-func (p *csiPlugin) RequiresRemount() bool {
-	return false
+	driverName, err := GetCSIDriverName(spec)
+	if err != nil {
+		klog.V(5).Info(log("Failed to mark %q as republish required, err: %v", spec.Name(), err))
+		return false
+	}
+	csiDriver, err := p.getCSIDriver(driverName)
+	if err != nil {
+		klog.V(5).Info(log("Failed to mark %q as republish required, err: %v", spec.Name(), err))
+		return false
+	}
+	return *csiDriver.Spec.RequiresRepublish
 }
 
 func (p *csiPlugin) NewMounter(
 	spec *volume.Spec,
-	pod *api.Pod,
-	_ volume.VolumeOptions) (volume.Mounter, error) {
+	pod *api.Pod) (volume.Mounter, error) {
 
 	volSrc, pvSrc, err := getSourceFromSpec(spec)
 	if err != nil {
@@ -373,7 +487,7 @@ func (p *csiPlugin) NewMounter(
 	)
 
 	switch {
-	case volSrc != nil && utilfeature.DefaultFeatureGate.Enabled(features.CSIInlineVolume):
+	case volSrc != nil:
 		volumeHandle = makeVolumeHandle(string(pod.UID), spec.Name())
 		driverName = volSrc.Driver
 		if volSrc.ReadOnly != nil {
@@ -384,91 +498,51 @@ func (p *csiPlugin) NewMounter(
 		volumeHandle = pvSrc.VolumeHandle
 		readOnly = spec.ReadOnly
 	default:
-		return nil, fmt.Errorf("volume source not found in volume.Spec")
+		return nil, errors.New(log("volume source not found in volume.Spec"))
 	}
 
-	csiVolumeMode, err := p.getCSIVolumeMode(spec)
+	volumeLifecycleMode, err := p.getVolumeLifecycleMode(spec)
 	if err != nil {
 		return nil, err
 	}
 
-	// TODO(pohly): check CSIDriver.Spec.Mode to ensure that the CSI driver
-	// supports the current csiVolumeMode.
-	// In alpha it is assumed that drivers are used correctly without
-	// the additional sanity check.
-
 	k8s := p.host.GetKubeClient()
 	if k8s == nil {
-		klog.Error(log("failed to get a kubernetes client"))
-		return nil, errors.New("failed to get a Kubernetes client")
+		return nil, errors.New(log("failed to get a kubernetes client"))
 	}
 
 	kvh, ok := p.host.(volume.KubeletVolumeHost)
 	if !ok {
-		klog.Error(log("cast from VolumeHost to KubeletVolumeHost failed"))
-		return nil, errors.New("cast from VolumeHost to KubeletVolumeHost failed")
+		return nil, errors.New(log("cast from VolumeHost to KubeletVolumeHost failed"))
 	}
 
 	mounter := &csiMountMgr{
-		plugin:        p,
-		k8s:           k8s,
-		spec:          spec,
-		pod:           pod,
-		podUID:        pod.UID,
-		driverName:    csiDriverName(driverName),
-		csiVolumeMode: csiVolumeMode,
-		volumeID:      volumeHandle,
-		specVolumeID:  spec.Name(),
-		readOnly:      readOnly,
-		kubeVolHost:   kvh,
+		plugin:              p,
+		k8s:                 k8s,
+		spec:                spec,
+		pod:                 pod,
+		podUID:              pod.UID,
+		driverName:          csiDriverName(driverName),
+		volumeLifecycleMode: volumeLifecycleMode,
+		volumeID:            volumeHandle,
+		specVolumeID:        spec.Name(),
+		readOnly:            readOnly,
+		kubeVolHost:         kvh,
 	}
 	mounter.csiClientGetter.driverName = csiDriverName(driverName)
 
-	// Save volume info in pod dir
 	dir := mounter.GetPath()
-	dataDir := path.Dir(dir) // dropoff /mount at end
-
-	if err := os.MkdirAll(dataDir, 0750); err != nil {
-		klog.Error(log("failed to create dir %#v:  %v", dataDir, err))
-		return nil, err
-	}
-	klog.V(4).Info(log("created path successfully [%s]", dataDir))
-
 	mounter.MetricsProvider = NewMetricsCsi(volumeHandle, dir, csiDriverName(driverName))
-
-	// persist volume info data for teardown
-	node := string(p.host.GetNodeName())
-	volData := map[string]string{
-		volDataKey.specVolID:     spec.Name(),
-		volDataKey.volHandle:     volumeHandle,
-		volDataKey.driverName:    driverName,
-		volDataKey.nodeName:      node,
-		volDataKey.csiVolumeMode: string(csiVolumeMode),
-	}
-
-	attachID := getAttachmentName(volumeHandle, driverName, node)
-	volData[volDataKey.attachmentID] = attachID
-
-	if err := saveVolumeData(dataDir, volDataFileName, volData); err != nil {
-		klog.Error(log("failed to save volume info data: %v", err))
-		if removeErr := os.RemoveAll(dataDir); removeErr != nil {
-			klog.Error(log("failed to remove dir after error [%s]: %v", dataDir, removeErr))
-		}
-		return nil, err
-	}
-
 	klog.V(4).Info(log("mounter created successfully"))
-
 	return mounter, nil
 }
 
 func (p *csiPlugin) NewUnmounter(specName string, podUID types.UID) (volume.Unmounter, error) {
-	klog.V(4).Infof(log("setting up unmounter for [name=%v, podUID=%v]", specName, podUID))
+	klog.V(4).Info(log("setting up unmounter for [name=%v, podUID=%v]", specName, podUID))
 
 	kvh, ok := p.host.(volume.KubeletVolumeHost)
 	if !ok {
-		klog.Error(log("cast from VolumeHost to KubeletVolumeHost failed"))
-		return nil, errors.New("cast from VolumeHost to KubeletVolumeHost failed")
+		return nil, errors.New(log("cast from VolumeHost to KubeletVolumeHost failed"))
 	}
 
 	unmounter := &csiMountMgr{
@@ -480,11 +554,23 @@ func (p *csiPlugin) NewUnmounter(specName string, podUID types.UID) (volume.Unmo
 
 	// load volume info from file
 	dir := unmounter.GetPath()
-	dataDir := path.Dir(dir) // dropoff /mount at end
+	dataDir := filepath.Dir(dir) // dropoff /mount at end
 	data, err := loadVolumeData(dataDir, volDataFileName)
 	if err != nil {
-		klog.Error(log("unmounter failed to load volume data file [%s]: %v", dir, err))
-		return nil, err
+		if !utilfeature.DefaultFeatureGate.Enabled(features.CSIGlobalMountReconstruction) {
+			return nil, errors.New(log("unmounter failed to load volume data file [%s]: %v", dir, err))
+		}
+		// The same recovery ConstructVolumeSpec performs. Without it a volume
+		// that reconstruction just rescued cannot be unmounted here, the
+		// unmount operation is never generated, the pod is never dropped from
+		// the actual state of the world, and the global mount it was rescued
+		// from stays orphaned, which is the leak this feature exists to close.
+		globalDir, fallbackData, fallbackErr := findGlobalMountDataFromPodMount(p.host, dataDir, specName)
+		if fallbackErr != nil {
+			return nil, errors.New(log("unmounter failed to load volume data file [%s]: %v (global mount fallback also failed: %v)", dir, err, fallbackErr))
+		}
+		klog.V(2).Info(log("unmounter recovered vol_data from global mount %s", globalDir))
+		data = fallbackData
 	}
 	unmounter.driverName = csiDriverName(data[volDataKey.driverName])
 	unmounter.volumeID = data[volDataKey.volHandle]
@@ -493,31 +579,49 @@ func (p *csiPlugin) NewUnmounter(specName string, podUID types.UID) (volume.Unmo
 	return unmounter, nil
 }
 
-func (p *csiPlugin) ConstructVolumeSpec(volumeName, mountPath string) (*volume.Spec, error) {
+func (p *csiPlugin) ConstructVolumeSpec(volumeName, mountPath string) (volume.ReconstructedVolume, error) {
 	klog.V(4).Info(log("plugin.ConstructVolumeSpec [pv.Name=%v, path=%v]", volumeName, mountPath))
 
 	volData, err := loadVolumeData(mountPath, volDataFileName)
 	if err != nil {
-		klog.Error(log("plugin.ConstructVolumeSpec failed loading volume data using [%s]: %v", mountPath, err))
-		return nil, err
+		if !utilfeature.DefaultFeatureGate.Enabled(features.CSIGlobalMountReconstruction) {
+			return volume.ReconstructedVolume{}, errors.New(log("plugin.ConstructVolumeSpec failed loading volume data using [%s]: %v", mountPath, err))
+		}
+		// Pod-local vol_data.json is missing or corrupt. Fall back to the
+		// global mount data that MountDevice wrote, found through the mount
+		// reference the pod-local bind mount still holds. Prevents orphaned
+		// global mounts on failed reconstruction (issue #101791).
+		globalDir, fallbackData, fallbackErr := findGlobalMountDataFromPodMount(p.host, mountPath, volumeName)
+		if fallbackErr != nil {
+			return volume.ReconstructedVolume{}, errors.New(log("plugin.ConstructVolumeSpec failed loading volume data using [%s]: %v (global mount fallback also failed: %v)", mountPath, err, fallbackErr))
+		}
+		volData = fallbackData
+		if volData[volDataKey.specVolID] == "" {
+			// A global vol_data.json written by a kubelet older than this
+			// feature carries only volHandle and driverName. volumeName is the
+			// name of the pod directory, which is the same value SetUpAt would
+			// have stored, so the reconstructed spec is not left unnamed.
+			volData[volDataKey.specVolID] = volumeName
+		}
+		klog.V(2).Info(log("plugin.ConstructVolumeSpec recovered vol_data from global mount %s", globalDir))
 	}
-
 	klog.V(4).Info(log("plugin.ConstructVolumeSpec extracted [%#v]", volData))
 
-	var spec *volume.Spec
-	inlineEnabled := utilfeature.DefaultFeatureGate.Enabled(features.CSIInlineVolume)
-
-	// If inlineEnabled is true and mode is ephemeralVolumeMode,
-	// use constructVolSourceSpec to construct volume source spec.
-	// If inlineEnabled is false or mode is persistentVolumeMode,
-	// use constructPVSourceSpec to construct volume construct pv source spec.
-	if inlineEnabled && csiVolumeMode(volData[volDataKey.csiVolumeMode]) == ephemeralVolumeMode {
-		spec = p.constructVolSourceSpec(volData[volDataKey.specVolID], volData[volDataKey.driverName])
-		return spec, nil
+	var ret volume.ReconstructedVolume
+	if utilfeature.DefaultFeatureGate.Enabled(features.SELinuxMountReadWriteOncePod) {
+		ret.SELinuxMountContext = volData[volDataKey.seLinuxMountContext]
 	}
-	spec = p.constructPVSourceSpec(volData[volDataKey.specVolID], volData[volDataKey.driverName], volData[volDataKey.volHandle])
 
-	return spec, nil
+	// If mode is VolumeLifecycleEphemeral, use constructVolSourceSpec
+	// to construct volume source spec. If mode is VolumeLifecyclePersistent,
+	// use constructPVSourceSpec to construct volume construct pv source spec.
+	if storage.VolumeLifecycleMode(volData[volDataKey.volumeLifecycleMode]) == storage.VolumeLifecycleEphemeral {
+		ret.Spec = p.constructVolSourceSpec(volData[volDataKey.specVolID], volData[volDataKey.driverName])
+		return ret, nil
+	}
+
+	ret.Spec = p.constructPVSourceSpec(volData[volDataKey.specVolID], volData[volDataKey.driverName], volData[volDataKey.volHandle])
+	return ret, nil
 }
 
 // constructVolSourceSpec constructs volume.Spec with CSIVolumeSource
@@ -533,7 +637,7 @@ func (p *csiPlugin) constructVolSourceSpec(volSpecName, driverName string) *volu
 	return volume.NewSpecFromVolume(vol)
 }
 
-//constructPVSourceSpec constructs volume.Spec with CSIPersistentVolumeSource
+// constructPVSourceSpec constructs volume.Spec with CSIPersistentVolumeSource
 func (p *csiPlugin) constructPVSourceSpec(volSpecName, driverName, volumeHandle string) *volume.Spec {
 	fsMode := api.PersistentVolumeFilesystem
 	pv := &api.PersistentVolume{
@@ -562,8 +666,25 @@ func (p *csiPlugin) SupportsMountOption() bool {
 	return true
 }
 
-func (p *csiPlugin) SupportsBulkVolumeVerification() bool {
-	return false
+func (p *csiPlugin) SupportsSELinuxContextMount(spec *volume.Spec) (bool, error) {
+	if utilfeature.DefaultFeatureGate.Enabled(features.SELinuxMountReadWriteOncePod) {
+		driver, err := GetCSIDriverName(spec)
+		if err != nil {
+			return false, err
+		}
+		csiDriver, err := p.getCSIDriver(driver)
+		if err != nil {
+			if apierrors.IsNotFound(err) {
+				return false, nil
+			}
+			return false, err
+		}
+		if csiDriver.Spec.SELinuxMount != nil {
+			return *csiDriver.Spec.SELinuxMount, nil
+		}
+		return false, nil
+	}
+	return false, nil
 }
 
 // volume.AttachableVolumePlugin methods
@@ -584,17 +705,14 @@ func (p *csiPlugin) NewDetacher() (volume.Detacher, error) {
 }
 
 func (p *csiPlugin) CanAttach(spec *volume.Spec) (bool, error) {
-	inlineEnabled := utilfeature.DefaultFeatureGate.Enabled(features.CSIInlineVolume)
-	if inlineEnabled {
-		csiVolumeMode, err := p.getCSIVolumeMode(spec)
-		if err != nil {
-			return false, err
-		}
+	volumeLifecycleMode, err := p.getVolumeLifecycleMode(spec)
+	if err != nil {
+		return false, err
+	}
 
-		if csiVolumeMode == ephemeralVolumeMode {
-			klog.V(5).Info(log("plugin.CanAttach = false, ephemeral mode detected for spec %v", spec.Name()))
-			return false, nil
-		}
+	if volumeLifecycleMode == storage.VolumeLifecycleEphemeral {
+		klog.V(5).Info(log("plugin.CanAttach = false, ephemeral mode detected for spec %v", spec.Name()))
+		return false, nil
 	}
 
 	pvSrc, err := getCSISourceFromSpec(spec)
@@ -614,18 +732,12 @@ func (p *csiPlugin) CanAttach(spec *volume.Spec) (bool, error) {
 
 // CanDeviceMount returns true if the spec supports device mount
 func (p *csiPlugin) CanDeviceMount(spec *volume.Spec) (bool, error) {
-	inlineEnabled := utilfeature.DefaultFeatureGate.Enabled(features.CSIInlineVolume)
-	if !inlineEnabled {
-		// No need to check anything, we assume it is a persistent volume.
-		return true, nil
-	}
-
-	csiVolumeMode, err := p.getCSIVolumeMode(spec)
+	volumeLifecycleMode, err := p.getVolumeLifecycleMode(spec)
 	if err != nil {
 		return false, err
 	}
 
-	if csiVolumeMode == ephemeralVolumeMode {
+	if volumeLifecycleMode == storage.VolumeLifecycleEphemeral {
 		klog.V(5).Info(log("plugin.CanDeviceMount skipped ephemeral mode detected for spec %v", spec.Name()))
 		return false, nil
 	}
@@ -639,18 +751,14 @@ func (p *csiPlugin) NewDeviceUnmounter() (volume.DeviceUnmounter, error) {
 }
 
 func (p *csiPlugin) GetDeviceMountRefs(deviceMountPath string) ([]string, error) {
-	m := p.host.GetMounter(p.GetPluginName())
+	m := p.host.GetMounter()
 	return m.GetMountRefs(deviceMountPath)
 }
 
 // BlockVolumePlugin methods
 var _ volume.BlockVolumePlugin = &csiPlugin{}
 
-func (p *csiPlugin) NewBlockVolumeMapper(spec *volume.Spec, podRef *api.Pod, opts volume.VolumeOptions) (volume.BlockVolumeMapper, error) {
-	if !p.blockEnabled {
-		return nil, errors.New("CSIBlockVolume feature not enabled")
-	}
-
+func (p *csiPlugin) NewBlockVolumeMapper(spec *volume.Spec, podRef *api.Pod) (volume.BlockVolumeMapper, error) {
 	pvSource, err := getCSISourceFromSpec(spec)
 	if err != nil {
 		return nil, err
@@ -664,8 +772,7 @@ func (p *csiPlugin) NewBlockVolumeMapper(spec *volume.Spec, podRef *api.Pod, opt
 
 	k8s := p.host.GetKubeClient()
 	if k8s == nil {
-		klog.Error(log("failed to get a kubernetes client"))
-		return nil, errors.New("failed to get a Kubernetes client")
+		return nil, errors.New(log("failed to get a kubernetes client"))
 	}
 
 	mapper := &csiBlockMapper{
@@ -676,6 +783,7 @@ func (p *csiPlugin) NewBlockVolumeMapper(spec *volume.Spec, podRef *api.Pod, opt
 		readOnly:   readOnly,
 		spec:       spec,
 		specName:   spec.Name(),
+		pod:        podRef,
 		podUID:     podRef.UID,
 	}
 	mapper.csiClientGetter.driverName = csiDriverName(pvSource.Driver)
@@ -684,10 +792,16 @@ func (p *csiPlugin) NewBlockVolumeMapper(spec *volume.Spec, podRef *api.Pod, opt
 	dataDir := getVolumeDeviceDataDir(spec.Name(), p.host)
 
 	if err := os.MkdirAll(dataDir, 0750); err != nil {
-		klog.Error(log("failed to create data dir %s:  %v", dataDir, err))
-		return nil, err
+		return nil, errors.New(log("failed to create data dir %s:  %v", dataDir, err))
 	}
 	klog.V(4).Info(log("created path successfully [%s]", dataDir))
+
+	blockPath, err := mapper.GetGlobalMapPath(spec)
+	if err != nil {
+		return nil, errors.New(log("failed to get device path: %v", err))
+	}
+
+	mapper.MetricsProvider = NewMetricsCsi(pvSource.VolumeHandle, blockPath+"/"+string(podRef.UID), csiDriverName(pvSource.Driver))
 
 	// persist volume info data for teardown
 	node := string(p.host.GetNodeName())
@@ -700,23 +814,28 @@ func (p *csiPlugin) NewBlockVolumeMapper(spec *volume.Spec, podRef *api.Pod, opt
 		volDataKey.attachmentID: attachID,
 	}
 
-	if err := saveVolumeData(dataDir, volDataFileName, volData); err != nil {
-		klog.Error(log("failed to save volume info data: %v", err))
-		if removeErr := os.RemoveAll(dataDir); removeErr != nil {
-			klog.Error(log("failed to remove dir after error [%s]: %v", dataDir, removeErr))
+	err = saveVolumeData(dataDir, volDataFileName, volData)
+	defer func() {
+		// Only if there was an error and volume operation was considered
+		// finished, we should remove the directory.
+		if err != nil && volumetypes.IsOperationFinishedError(err) {
+			// attempt to cleanup volume mount dir.
+			if err = removeMountDir(p, dataDir); err != nil {
+				klog.Error(log("attacher.MountDevice failed to remove mount dir after error [%s]: %v", dataDir, err))
+			}
 		}
-		return nil, err
+	}()
+	if err != nil {
+		errorMsg := log("csi.NewBlockVolumeMapper failed to save volume info data: %v", err)
+		klog.Error(errorMsg)
+		return nil, errors.New(errorMsg)
 	}
 
 	return mapper, nil
 }
 
 func (p *csiPlugin) NewBlockVolumeUnmapper(volName string, podUID types.UID) (volume.BlockVolumeUnmapper, error) {
-	if !p.blockEnabled {
-		return nil, errors.New("CSIBlockVolume feature not enabled")
-	}
-
-	klog.V(4).Infof(log("setting up block unmapper for [Spec=%v, podUID=%v]", volName, podUID))
+	klog.V(4).Info(log("setting up block unmapper for [Spec=%v, podUID=%v]", volName, podUID))
 	unmapper := &csiBlockMapper{
 		plugin:   p,
 		podUID:   podUID,
@@ -727,8 +846,7 @@ func (p *csiPlugin) NewBlockVolumeUnmapper(volName string, podUID types.UID) (vo
 	dataDir := getVolumeDeviceDataDir(unmapper.specName, p.host)
 	data, err := loadVolumeData(dataDir, volDataFileName)
 	if err != nil {
-		klog.Error(log("unmapper failed to load volume data file [%s]: %v", dataDir, err))
-		return nil, err
+		return nil, errors.New(log("unmapper failed to load volume data file [%s]: %v", dataDir, err))
 	}
 	unmapper.driverName = csiDriverName(data[volDataKey.driverName])
 	unmapper.volumeID = data[volDataKey.volHandle]
@@ -738,17 +856,12 @@ func (p *csiPlugin) NewBlockVolumeUnmapper(volName string, podUID types.UID) (vo
 }
 
 func (p *csiPlugin) ConstructBlockVolumeSpec(podUID types.UID, specVolName, mapPath string) (*volume.Spec, error) {
-	if !p.blockEnabled {
-		return nil, errors.New("CSIBlockVolume feature not enabled")
-	}
-
 	klog.V(4).Infof("plugin.ConstructBlockVolumeSpec [podUID=%s, specVolName=%s, path=%s]", string(podUID), specVolName, mapPath)
 
 	dataDir := getVolumeDeviceDataDir(specVolName, p.host)
 	volData, err := loadVolumeData(dataDir, volDataFileName)
 	if err != nil {
-		klog.Error(log("plugin.ConstructBlockVolumeSpec failed loading volume data using [%s]: %v", mapPath, err))
-		return nil, err
+		return nil, errors.New(log("plugin.ConstructBlockVolumeSpec failed loading volume data using [%s]: %v", mapPath, err))
 	}
 
 	klog.V(4).Info(log("plugin.ConstructBlockVolumeSpec extracted [%#v]", volData))
@@ -775,21 +888,9 @@ func (p *csiPlugin) ConstructBlockVolumeSpec(podUID types.UID, specVolName, mapP
 // skipAttach looks up CSIDriver object associated with driver name
 // to determine if driver requires attachment volume operation
 func (p *csiPlugin) skipAttach(driver string) (bool, error) {
-	if !utilfeature.DefaultFeatureGate.Enabled(features.CSIDriverRegistry) {
-		return false, nil
-	}
-
-	kletHost, ok := p.host.(volume.KubeletVolumeHost)
-	if ok {
-		kletHost.WaitForCacheSync()
-	}
-
-	if p.csiDriverLister == nil {
-		return false, errors.New("CSIDriver lister does not exist")
-	}
-	csiDriver, err := p.csiDriverLister.Get(driver)
+	csiDriver, err := p.getCSIDriver(driver)
 	if err != nil {
-		if apierrs.IsNotFound(err) {
+		if apierrors.IsNotFound(err) {
 			// Don't skip attach if CSIDriver does not exist
 			return false, nil
 		}
@@ -801,11 +902,26 @@ func (p *csiPlugin) skipAttach(driver string) (bool, error) {
 	return false, nil
 }
 
-// getCSIVolumeMode returns the mode for the specified spec: {persistent|ephemeral}.
+func (p *csiPlugin) getCSIDriver(driver string) (*storage.CSIDriver, error) {
+	kletHost, ok := p.host.(volume.KubeletVolumeHost)
+	if ok {
+		if err := kletHost.WaitForCacheSync(); err != nil {
+			return nil, err
+		}
+	}
+
+	if p.csiDriverLister == nil {
+		return nil, errors.New("CSIDriver lister does not exist")
+	}
+	csiDriver, err := p.csiDriverLister.Get(driver)
+	return csiDriver, err
+}
+
+// getVolumeLifecycleMode returns the mode for the specified spec: {persistent|ephemeral}.
 // 1) If mode cannot be determined, it will default to "persistent".
 // 2) If Mode cannot be resolved to either {persistent | ephemeral}, an error is returned
-// See https://github.com/kubernetes/enhancements/blob/master/keps/sig-storage/20190122-csi-inline-volumes.md
-func (p *csiPlugin) getCSIVolumeMode(spec *volume.Spec) (csiVolumeMode, error) {
+// See https://github.com/kubernetes/enhancements/blob/master/keps/sig-storage/596-csi-inline-volumes/README.md
+func (p *csiPlugin) getVolumeLifecycleMode(spec *volume.Spec) (storage.VolumeLifecycleMode, error) {
 	// 1) if volume.Spec.Volume.CSI != nil -> mode is ephemeral
 	// 2) if volume.Spec.PersistentVolume.Spec.CSI != nil -> persistent
 	volSrc, _, err := getSourceFromSpec(spec)
@@ -813,10 +929,10 @@ func (p *csiPlugin) getCSIVolumeMode(spec *volume.Spec) (csiVolumeMode, error) {
 		return "", err
 	}
 
-	if volSrc != nil && utilfeature.DefaultFeatureGate.Enabled(features.CSIInlineVolume) {
-		return ephemeralVolumeMode, nil
+	if volSrc != nil {
+		return storage.VolumeLifecycleEphemeral, nil
 	}
-	return persistentVolumeMode, nil
+	return storage.VolumeLifecyclePersistent, nil
 }
 
 func (p *csiPlugin) getPublishContext(client clientset.Interface, handle, driver, nodeName string) (map[string]string, error) {
@@ -831,7 +947,7 @@ func (p *csiPlugin) getPublishContext(client clientset.Interface, handle, driver
 	attachID := getAttachmentName(handle, driver, nodeName)
 
 	// search for attachment by VolumeAttachment.Spec.Source.PersistentVolumeName
-	attachment, err := client.StorageV1().VolumeAttachments().Get(attachID, meta.GetOptions{})
+	attachment, err := client.StorageV1().VolumeAttachments().Get(context.TODO(), attachID, meta.GetOptions{})
 	if err != nil {
 		return nil, err // This err already has enough context ("VolumeAttachment xyz not found")
 	}
@@ -846,81 +962,70 @@ func (p *csiPlugin) getPublishContext(client clientset.Interface, handle, driver
 func (p *csiPlugin) newAttacherDetacher() (*csiAttacher, error) {
 	k8s := p.host.GetKubeClient()
 	if k8s == nil {
-		klog.Error(log("unable to get kubernetes client from host"))
-		return nil, errors.New("unable to get Kubernetes client")
+		return nil, errors.New(log("unable to get kubernetes client from host"))
 	}
 
 	return &csiAttacher{
-		plugin:        p,
-		k8s:           k8s,
-		waitSleepTime: 1 * time.Second,
+		plugin:       p,
+		k8s:          k8s,
+		watchTimeout: csiTimeout,
 	}, nil
+}
+
+// podInfoEnabled  check CSIDriver enabled pod info flag
+func (p *csiPlugin) podInfoEnabled(driverName string) (bool, error) {
+	csiDriver, err := p.getCSIDriver(driverName)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			klog.V(4).Info(log("CSIDriver %q not found, not adding pod information", driverName))
+			return false, nil
+		}
+		return false, err
+	}
+
+	// if PodInfoOnMount is not set or false we do not set pod attributes
+	if csiDriver.Spec.PodInfoOnMount == nil || *csiDriver.Spec.PodInfoOnMount == false {
+		klog.V(4).Info(log("CSIDriver %q does not require pod information", driverName))
+		return false, nil
+	}
+	return true, nil
 }
 
 func unregisterDriver(driverName string) error {
 	csiDrivers.Delete(driverName)
 
 	if err := nim.UninstallCSIDriver(driverName); err != nil {
-		klog.Errorf("Error uninstalling CSI driver: %v", err)
-		return err
+		return errors.New(log("Error uninstalling CSI driver: %v", err))
 	}
 
 	return nil
 }
 
-// Return the highest supported version
-func highestSupportedVersion(versions []string) (*utilversion.Version, error) {
-	if len(versions) == 0 {
-		return nil, fmt.Errorf("CSI driver reporting empty array for supported versions")
-	}
-
-	// Sort by lowest to highest version
-	sort.Slice(versions, func(i, j int) bool {
-		parsedVersionI, err := utilversion.ParseGeneric(versions[i])
-		if err != nil {
-			// Push bad values to the bottom
-			return true
+// waitForAPIServerForever waits forever to get a CSINode instance as a proxy
+// for a healthy APIServer
+func waitForAPIServerForever(client clientset.Interface, nodeName types.NodeName) error {
+	var lastErr error
+	// Served object is discarded so no risk to have stale object with benefit to
+	// reduce the load on APIServer and etcd.
+	opts := meta.GetOptions{}
+	util.FromApiserverCache(&opts)
+	err := wait.PollImmediateInfinite(time.Second, func() (bool, error) {
+		// Get a CSINode from API server to make sure 1) kubelet can reach API server
+		// and 2) it has enough permissions. Kubelet may have restricted permissions
+		// when it's bootstrapping TLS.
+		// https://kubernetes.io/docs/reference/access-authn-authz/kubelet-tls-bootstrapping/
+		_, lastErr = client.StorageV1().CSINodes().Get(context.TODO(), string(nodeName), opts)
+		if lastErr == nil || apierrors.IsNotFound(lastErr) {
+			// API server contacted
+			return true, nil
 		}
-
-		parsedVersionJ, err := utilversion.ParseGeneric(versions[j])
-		if err != nil {
-			// Push bad values to the bottom
-			return false
-		}
-
-		return parsedVersionI.LessThan(parsedVersionJ)
+		klog.V(2).Infof("Failed to contact API server when waiting for CSINode publishing: %s", lastErr)
+		return false, nil
 	})
-
-	for i := len(versions) - 1; i >= 0; i-- {
-		highestSupportedVersion, err := utilversion.ParseGeneric(versions[i])
-		if err != nil {
-			return nil, err
-		}
-
-		if highestSupportedVersion.Major() <= 1 {
-			return highestSupportedVersion, nil
-		}
-	}
-
-	return nil, fmt.Errorf("None of the CSI versions reported by this driver are supported")
-}
-
-// Only drivers that implement CSI 0.x are allowed to use deprecated socket dir.
-func isDeprecatedSocketDirAllowed(versions []string) bool {
-	for _, version := range versions {
-		if isV0Version(version) {
-			return true
-		}
-	}
-
-	return false
-}
-
-func isV0Version(version string) bool {
-	parsedVersion, err := utilversion.ParseGeneric(version)
 	if err != nil {
-		return false
+		// In theory this is unreachable, but just in case:
+		return fmt.Errorf("%v: %v", err, lastErr)
 	}
 
-	return parsedVersion.Major() == 0
+	return nil
 }

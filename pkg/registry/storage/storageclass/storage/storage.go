@@ -28,16 +28,18 @@ import (
 	"k8s.io/kubernetes/pkg/registry/storage/storageclass"
 )
 
+// REST implements a RESTStorage for storage classes.
 type REST struct {
 	*genericregistry.Store
 }
 
-// NewREST returns a RESTStorage object that will work against persistent volumes.
-func NewREST(optsGetter generic.RESTOptionsGetter) *REST {
+// NewREST returns a RESTStorage object that will work against storage classes.
+func NewREST(optsGetter generic.RESTOptionsGetter) (*REST, error) {
 	store := &genericregistry.Store{
-		NewFunc:                  func() runtime.Object { return &storageapi.StorageClass{} },
-		NewListFunc:              func() runtime.Object { return &storageapi.StorageClassList{} },
-		DefaultQualifiedResource: storageapi.Resource("storageclasses"),
+		NewFunc:                   func() runtime.Object { return &storageapi.StorageClass{} },
+		NewListFunc:               func() runtime.Object { return &storageapi.StorageClassList{} },
+		DefaultQualifiedResource:  storageapi.Resource("storageclasses"),
+		SingularQualifiedResource: storageapi.Resource("storageclass"),
 
 		CreateStrategy:      storageclass.Strategy,
 		UpdateStrategy:      storageclass.Strategy,
@@ -48,10 +50,10 @@ func NewREST(optsGetter generic.RESTOptionsGetter) *REST {
 	}
 	options := &generic.StoreOptions{RESTOptions: optsGetter}
 	if err := store.CompleteWithOptions(options); err != nil {
-		panic(err) // TODO: Propagate error up
+		return nil, err
 	}
 
-	return &REST{store}
+	return &REST{store}, nil
 }
 
 // Implement ShortNamesProvider

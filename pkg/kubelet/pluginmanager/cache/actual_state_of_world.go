@@ -21,11 +21,13 @@ keep track of registered plugins.
 package cache
 
 import (
+	"context"
 	"fmt"
 	"sync"
 	"time"
 
-	"k8s.io/klog"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/klog/v2"
 )
 
 // ActualStateOfWorld defines a set of thread-safe operations for the kubelet
@@ -43,19 +45,26 @@ type ActualStateOfWorld interface {
 	// Note that this is different from desired world cache's AddOrUpdatePlugin
 	// because for the actual state of world cache, there won't be a scenario where
 	// we need to update an existing plugin if the timestamps don't match. This is
-	// because the plugin should have been unregistered in the reconciller and therefore
+	// because the plugin should have been unregistered in the reconciler and therefore
 	// removed from the actual state of world cache first before adding it back into
 	// the actual state of world cache again with the new timestamp
-	AddPlugin(pluginInfo PluginInfo) error
+	AddPlugin(ctx context.Context, pluginInfo PluginInfo) error
 
 	// RemovePlugin deletes the plugin with the given socket path from the actual
 	// state of world.
 	// If a plugin does not exist with the given socket path, this is a no-op.
 	RemovePlugin(socketPath string)
 
-	// PluginExists checks if the given plugin exists in the current actual
-	// state of world cache with the correct timestamp
+	// PluginExistsWithCorrectTimestamp checks if the given plugin exists in the current actual
+	// state of world cache with the correct timestamp.
+	//
+	// Deprecated: please use `PluginExistsWithCorrectUUID` instead as it provides a better
+	// cross-platform support
 	PluginExistsWithCorrectTimestamp(pluginInfo PluginInfo) bool
+
+	// PluginExistsWithCorrectUUID checks if the given plugin exists in the current actual
+	// state of world cache with the correct UUID
+	PluginExistsWithCorrectUUID(pluginInfo PluginInfo) bool
 }
 
 // NewActualStateOfWorld returns a new instance of ActualStateOfWorld
@@ -77,20 +86,25 @@ var _ ActualStateOfWorld = &actualStateOfWorld{}
 
 // PluginInfo holds information of a plugin
 type PluginInfo struct {
-	SocketPath           string
-	FoundInDeprecatedDir bool
-	Timestamp            time.Time
+	SocketPath string
+	Timestamp  time.Time
+	UUID       types.UID
+	Handler    PluginHandler
+	Name       string
+	Endpoint   string
 }
 
-func (asw *actualStateOfWorld) AddPlugin(pluginInfo PluginInfo) error {
+func (asw *actualStateOfWorld) AddPlugin(ctx context.Context, pluginInfo PluginInfo) error {
 	asw.Lock()
 	defer asw.Unlock()
 
+	logger := klog.FromContext(ctx)
+
 	if pluginInfo.SocketPath == "" {
-		return fmt.Errorf("Socket path is empty")
+		return fmt.Errorf("socket path is empty")
 	}
 	if _, ok := asw.socketFileToInfo[pluginInfo.SocketPath]; ok {
-		klog.V(2).Infof("Plugin (Path %s) exists in actual state cache", pluginInfo.SocketPath)
+		logger.V(2).Info("Plugin exists in actual state cache", "path", pluginInfo.SocketPath)
 	}
 	asw.socketFileToInfo[pluginInfo.SocketPath] = pluginInfo
 	return nil
@@ -122,4 +136,14 @@ func (asw *actualStateOfWorld) PluginExistsWithCorrectTimestamp(pluginInfo Plugi
 	// matches the given plugin (from the desired state cache) timestamp
 	actualStatePlugin, exists := asw.socketFileToInfo[pluginInfo.SocketPath]
 	return exists && (actualStatePlugin.Timestamp == pluginInfo.Timestamp)
+}
+
+func (asw *actualStateOfWorld) PluginExistsWithCorrectUUID(pluginInfo PluginInfo) bool {
+	asw.RLock()
+	defer asw.RUnlock()
+
+	// We need to check both if the socket file path exists, and the UUID
+	// matches the given plugin (from the desired state cache) UUID
+	actualStatePlugin, exists := asw.socketFileToInfo[pluginInfo.SocketPath]
+	return exists && (actualStatePlugin.UUID == pluginInfo.UUID)
 }

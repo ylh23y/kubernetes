@@ -19,6 +19,8 @@ package storage
 import (
 	"context"
 
+	"sigs.k8s.io/structured-merge-diff/v7/fieldpath"
+
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apiserver/pkg/registry/generic"
@@ -34,31 +36,33 @@ import (
 // REST implements a RESTStorage for DaemonSets
 type REST struct {
 	*genericregistry.Store
-	categories []string
 }
 
 // NewREST returns a RESTStorage object that will work against DaemonSets.
-func NewREST(optsGetter generic.RESTOptionsGetter) (*REST, *StatusREST) {
+func NewREST(optsGetter generic.RESTOptionsGetter) (*REST, *StatusREST, error) {
 	store := &genericregistry.Store{
-		NewFunc:                  func() runtime.Object { return &apps.DaemonSet{} },
-		NewListFunc:              func() runtime.Object { return &apps.DaemonSetList{} },
-		DefaultQualifiedResource: apps.Resource("daemonsets"),
+		NewFunc:                   func() runtime.Object { return &apps.DaemonSet{} },
+		NewListFunc:               func() runtime.Object { return &apps.DaemonSetList{} },
+		DefaultQualifiedResource:  apps.Resource("daemonsets"),
+		SingularQualifiedResource: apps.Resource("daemonset"),
 
-		CreateStrategy: daemonset.Strategy,
-		UpdateStrategy: daemonset.Strategy,
-		DeleteStrategy: daemonset.Strategy,
+		CreateStrategy:      daemonset.Strategy,
+		UpdateStrategy:      daemonset.Strategy,
+		DeleteStrategy:      daemonset.Strategy,
+		ResetFieldsStrategy: daemonset.Strategy,
 
 		TableConvertor: printerstorage.TableConvertor{TableGenerator: printers.NewTableGenerator().With(printersinternal.AddHandlers)},
 	}
 	options := &generic.StoreOptions{RESTOptions: optsGetter}
 	if err := store.CompleteWithOptions(options); err != nil {
-		panic(err) // TODO: Propagate error up
+		return nil, nil, err
 	}
 
 	statusStore := *store
 	statusStore.UpdateStrategy = daemonset.StatusStrategy
+	statusStore.ResetFieldsStrategy = daemonset.StatusStrategy
 
-	return &REST{store, []string{"all"}}, &StatusREST{store: &statusStore}
+	return &REST{store}, &StatusREST{store: &statusStore}, nil
 }
 
 // Implement ShortNamesProvider
@@ -73,13 +77,7 @@ var _ rest.CategoriesProvider = &REST{}
 
 // Categories implements the CategoriesProvider interface. Returns a list of categories a resource is part of.
 func (r *REST) Categories() []string {
-	return r.categories
-}
-
-// WithCategories sets categories for REST.
-func (r *REST) WithCategories(categories []string) *REST {
-	r.categories = categories
-	return r
+	return []string{"all"}
 }
 
 // StatusREST implements the REST endpoint for changing the status of a daemonset
@@ -92,6 +90,12 @@ func (r *StatusREST) New() runtime.Object {
 	return &apps.DaemonSet{}
 }
 
+// Destroy cleans up resources on shutdown.
+func (r *StatusREST) Destroy() {
+	// Given that underlying store is shared with REST,
+	// we don't destroy it here explicitly.
+}
+
 // Get retrieves the object from the storage. It is required to support Patch.
 func (r *StatusREST) Get(ctx context.Context, name string, options *metav1.GetOptions) (runtime.Object, error) {
 	return r.store.Get(ctx, name, options)
@@ -102,4 +106,13 @@ func (r *StatusREST) Update(ctx context.Context, name string, objInfo rest.Updat
 	// We are explicitly setting forceAllowCreate to false in the call to the underlying storage because
 	// subresources should never allow create on update.
 	return r.store.Update(ctx, name, objInfo, createValidation, updateValidation, false, options)
+}
+
+// GetResetFields implements rest.ResetFieldsStrategy
+func (r *StatusREST) GetResetFields() map[fieldpath.APIVersion]*fieldpath.Set {
+	return r.store.GetResetFields()
+}
+
+func (r *StatusREST) ConvertToTable(ctx context.Context, object runtime.Object, tableOptions runtime.Object) (*metav1.Table, error) {
+	return r.store.ConvertToTable(ctx, object, tableOptions)
 }

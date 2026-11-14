@@ -17,17 +17,22 @@ limitations under the License.
 package v1alpha1
 
 import (
-	"time"
-
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	kruntime "k8s.io/apimachinery/pkg/runtime"
-	componentbaseconfigv1alpha1 "k8s.io/component-base/config/v1alpha1"
+	serviceconfigv1alpha1 "k8s.io/cloud-provider/controllers/service/config/v1alpha1"
+	cmconfigv1alpha1 "k8s.io/controller-manager/config/v1alpha1"
 	kubectrlmgrconfigv1alpha1 "k8s.io/kube-controller-manager/config/v1alpha1"
 	csrsigningconfigv1alpha1 "k8s.io/kubernetes/pkg/controller/certificates/signer/config/v1alpha1"
+	cronjobconfigv1alpha1 "k8s.io/kubernetes/pkg/controller/cronjob/config/v1alpha1"
 	daemonconfigv1alpha1 "k8s.io/kubernetes/pkg/controller/daemon/config/v1alpha1"
 	deploymentconfigv1alpha1 "k8s.io/kubernetes/pkg/controller/deployment/config/v1alpha1"
+	devicetaintevictionconfigv1alpha1 "k8s.io/kubernetes/pkg/controller/devicetainteviction/config/v1alpha1"
+	disruptionconfigv1alpha1 "k8s.io/kubernetes/pkg/controller/disruption/config/v1alpha1"
 	endpointconfigv1alpha1 "k8s.io/kubernetes/pkg/controller/endpoint/config/v1alpha1"
+	endpointsliceconfigv1alpha1 "k8s.io/kubernetes/pkg/controller/endpointslice/config/v1alpha1"
+	endpointslicemirroringconfigv1alpha1 "k8s.io/kubernetes/pkg/controller/endpointslicemirroring/config/v1alpha1"
+	evictionrequestconfigv1alpha1 "k8s.io/kubernetes/pkg/controller/evictionrequest/config/v1alpha1"
 	garbagecollectorconfigv1alpha1 "k8s.io/kubernetes/pkg/controller/garbagecollector/config/v1alpha1"
+	imperativeevictionresponderv1alpha1 "k8s.io/kubernetes/pkg/controller/imperativeevictionresponder/config/v1alpha1"
 	jobconfigv1alpha1 "k8s.io/kubernetes/pkg/controller/job/config/v1alpha1"
 	namespaceconfigv1alpha1 "k8s.io/kubernetes/pkg/controller/namespace/config/v1alpha1"
 	nodeipamconfigv1alpha1 "k8s.io/kubernetes/pkg/controller/nodeipam/config/v1alpha1"
@@ -36,14 +41,15 @@ import (
 	podgcconfigv1alpha1 "k8s.io/kubernetes/pkg/controller/podgc/config/v1alpha1"
 	replicasetconfigv1alpha1 "k8s.io/kubernetes/pkg/controller/replicaset/config/v1alpha1"
 	replicationconfigv1alpha1 "k8s.io/kubernetes/pkg/controller/replication/config/v1alpha1"
+	resourceclaimconfigv1alpha1 "k8s.io/kubernetes/pkg/controller/resourceclaim/config/v1alpha1"
 	resourcequotaconfigv1alpha1 "k8s.io/kubernetes/pkg/controller/resourcequota/config/v1alpha1"
-	serviceconfigv1alpha1 "k8s.io/kubernetes/pkg/controller/service/config/v1alpha1"
 	serviceaccountconfigv1alpha1 "k8s.io/kubernetes/pkg/controller/serviceaccount/config/v1alpha1"
 	statefulsetconfigv1alpha1 "k8s.io/kubernetes/pkg/controller/statefulset/config/v1alpha1"
 	ttlafterfinishedconfigv1alpha1 "k8s.io/kubernetes/pkg/controller/ttlafterfinished/config/v1alpha1"
+	validatingadmissionpolicystatusv1alpha1 "k8s.io/kubernetes/pkg/controller/validatingadmissionpolicystatus/config/v1alpha1"
 	attachdetachconfigv1alpha1 "k8s.io/kubernetes/pkg/controller/volume/attachdetach/config/v1alpha1"
+	ephemeralvolumeconfigv1alpha1 "k8s.io/kubernetes/pkg/controller/volume/ephemeral/config/v1alpha1"
 	persistentvolumeconfigv1alpha1 "k8s.io/kubernetes/pkg/controller/volume/persistentvolume/config/v1alpha1"
-	utilpointer "k8s.io/utils/pointer"
 )
 
 func addDefaultingFuncs(scheme *kruntime.Scheme) error {
@@ -51,10 +57,6 @@ func addDefaultingFuncs(scheme *kruntime.Scheme) error {
 }
 
 func SetDefaults_KubeControllerManagerConfiguration(obj *kubectrlmgrconfigv1alpha1.KubeControllerManagerConfiguration) {
-	if obj.DeprecatedController.RegisterRetryCount == 0 {
-		obj.DeprecatedController.RegisterRetryCount = 10
-	}
-
 	// These defaults override the recommended defaults from the componentbaseconfigv1alpha1 package that are applied automatically
 	// These client-connection defaults are specific to the kube-controller-manager
 	if obj.Generic.ClientConnection.QPS == 0.0 {
@@ -65,7 +67,7 @@ func SetDefaults_KubeControllerManagerConfiguration(obj *kubectrlmgrconfigv1alph
 	}
 
 	// Use the default RecommendedDefaultGenericControllerManagerConfiguration options
-	RecommendedDefaultGenericControllerManagerConfiguration(&obj.Generic)
+	cmconfigv1alpha1.RecommendedDefaultGenericControllerManagerConfiguration(&obj.Generic)
 	// Use the default RecommendedDefaultHPAControllerConfiguration options
 	attachdetachconfigv1alpha1.RecommendedDefaultAttachDetachControllerConfiguration(&obj.AttachDetachController)
 	// Use the default RecommendedDefaultCSRSigningControllerConfiguration options
@@ -74,14 +76,32 @@ func SetDefaults_KubeControllerManagerConfiguration(obj *kubectrlmgrconfigv1alph
 	daemonconfigv1alpha1.RecommendedDefaultDaemonSetControllerConfiguration(&obj.DaemonSetController)
 	// Use the default RecommendedDefaultDeploymentControllerConfiguration options
 	deploymentconfigv1alpha1.RecommendedDefaultDeploymentControllerConfiguration(&obj.DeploymentController)
+	// Use the default RecommendedDefaultDisruptionControllerConfiguration options
+	disruptionconfigv1alpha1.RecommendedDefaultDisruptionControllerConfiguration(&obj.DisruptionController)
+	// Use the default RecommendedDefaultDeviceTaintEvictionControllerConfiguration options
+	devicetaintevictionconfigv1alpha1.RecommendedDefaultDeviceTaintEvictionControllerConfiguration(&obj.DeviceTaintEvictionController)
+	// Use the default RecommendedDefaultResourceClaimControllerConfiguration options
+	resourceclaimconfigv1alpha1.RecommendedDefaultResourceClaimControllerConfiguration(&obj.ResourceClaimController)
 	// Use the default RecommendedDefaultStatefulSetControllerConfiguration options
 	statefulsetconfigv1alpha1.RecommendedDefaultStatefulSetControllerConfiguration(&obj.StatefulSetController)
 	// Use the default RecommendedDefaultEndpointControllerConfiguration options
 	endpointconfigv1alpha1.RecommendedDefaultEndpointControllerConfiguration(&obj.EndpointController)
-	// Use the default RecommendedDefaultGenericControllerManagerConfiguration options
+	// Use the default RecommendedDefaultEndpointSliceControllerConfiguration options
+	endpointsliceconfigv1alpha1.RecommendedDefaultEndpointSliceControllerConfiguration(&obj.EndpointSliceController)
+	// Use the default RecommendedDefaultEndpointSliceMirroringControllerConfiguration options
+	endpointslicemirroringconfigv1alpha1.RecommendedDefaultEndpointSliceMirroringControllerConfiguration(&obj.EndpointSliceMirroringController)
+	// Use the default RecommendedDefaultEphemeralVolumeControllerConfiguration options
+	ephemeralvolumeconfigv1alpha1.RecommendedDefaultEphemeralVolumeControllerConfiguration(&obj.EphemeralVolumeController)
+	// Use the default RecommendedDefaultEvictionRequestControllerConfiguration options
+	evictionrequestconfigv1alpha1.RecommendedDefaultEvictionRequestControllerConfiguration(&obj.EvictionRequestController)
+	// Use the default RecommendedDefaultGarbageCollectorControllerConfiguration options
 	garbagecollectorconfigv1alpha1.RecommendedDefaultGarbageCollectorControllerConfiguration(&obj.GarbageCollectorController)
+	// Use the default RecommendedDefaultImperativeEvictionResponderControllerConfiguration options
+	imperativeevictionresponderv1alpha1.RecommendedDefaultImperativeEvictionResponderControllerConfiguration(&obj.ImperativeEvictionResponderController)
 	// Use the default RecommendedDefaultJobControllerConfiguration options
 	jobconfigv1alpha1.RecommendedDefaultJobControllerConfiguration(&obj.JobController)
+	// Use the default RecommendedDefaultCronJobControllerConfiguration options
+	cronjobconfigv1alpha1.RecommendedDefaultCronJobControllerConfiguration(&obj.CronJobController)
 	// Use the default RecommendedDefaultNamespaceControllerConfiguration options
 	namespaceconfigv1alpha1.RecommendedDefaultNamespaceControllerConfiguration(&obj.NamespaceController)
 	// Use the default RecommendedDefaultNodeIPAMControllerConfiguration options
@@ -98,48 +118,16 @@ func SetDefaults_KubeControllerManagerConfiguration(obj *kubectrlmgrconfigv1alph
 	replicationconfigv1alpha1.RecommendedDefaultReplicationControllerConfiguration(&obj.ReplicationController)
 	// Use the default RecommendedDefaultResourceQuotaControllerConfiguration options
 	resourcequotaconfigv1alpha1.RecommendedDefaultResourceQuotaControllerConfiguration(&obj.ResourceQuotaController)
-	// Use the default RecommendedDefaultGenericControllerManagerConfiguration options
+	// Use the default RecommendedDefaultServiceControllerConfiguration options
 	serviceconfigv1alpha1.RecommendedDefaultServiceControllerConfiguration(&obj.ServiceController)
+	// Use the default RecommendedDefaultLegacySATokenCleanerConfiguration options
+	serviceaccountconfigv1alpha1.RecommendedDefaultLegacySATokenCleanerConfiguration(&obj.LegacySATokenCleaner)
 	// Use the default RecommendedDefaultSAControllerConfiguration options
 	serviceaccountconfigv1alpha1.RecommendedDefaultSAControllerConfiguration(&obj.SAController)
 	// Use the default RecommendedDefaultTTLAfterFinishedControllerConfiguration options
 	ttlafterfinishedconfigv1alpha1.RecommendedDefaultTTLAfterFinishedControllerConfiguration(&obj.TTLAfterFinishedController)
 	// Use the default RecommendedDefaultPersistentVolumeBinderControllerConfiguration options
 	persistentvolumeconfigv1alpha1.RecommendedDefaultPersistentVolumeBinderControllerConfiguration(&obj.PersistentVolumeBinderController)
-}
-
-func RecommendedDefaultGenericControllerManagerConfiguration(obj *kubectrlmgrconfigv1alpha1.GenericControllerManagerConfiguration) {
-	zero := metav1.Duration{}
-	if obj.Address == "" {
-		obj.Address = "0.0.0.0"
-	}
-	if obj.MinResyncPeriod == zero {
-		obj.MinResyncPeriod = metav1.Duration{Duration: 12 * time.Hour}
-	}
-	if obj.ControllerStartInterval == zero {
-		obj.ControllerStartInterval = metav1.Duration{Duration: 0 * time.Second}
-	}
-	if len(obj.Controllers) == 0 {
-		obj.Controllers = []string{"*"}
-	}
-
-	// Use the default ClientConnectionConfiguration and LeaderElectionConfiguration options
-	componentbaseconfigv1alpha1.RecommendedDefaultClientConnectionConfiguration(&obj.ClientConnection)
-	componentbaseconfigv1alpha1.RecommendedDefaultLeaderElectionConfiguration(&obj.LeaderElection)
-}
-
-func SetDefaults_KubeCloudSharedConfiguration(obj *kubectrlmgrconfigv1alpha1.KubeCloudSharedConfiguration) {
-	zero := metav1.Duration{}
-	if obj.NodeMonitorPeriod == zero {
-		obj.NodeMonitorPeriod = metav1.Duration{Duration: 5 * time.Second}
-	}
-	if obj.ClusterName == "" {
-		obj.ClusterName = "kubernetes"
-	}
-	if obj.ConfigureCloudRoutes == nil {
-		obj.ConfigureCloudRoutes = utilpointer.BoolPtr(true)
-	}
-	if obj.RouteReconciliationPeriod == zero {
-		obj.RouteReconciliationPeriod = metav1.Duration{Duration: 10 * time.Second}
-	}
+	// Use the default RecommendedDefaultValidatingAdmissionPolicyStatusControllerConfiguration options
+	validatingadmissionpolicystatusv1alpha1.RecommendedDefaultValidatingAdmissionPolicyStatusControllerConfiguration(&obj.ValidatingAdmissionPolicyStatusController)
 }

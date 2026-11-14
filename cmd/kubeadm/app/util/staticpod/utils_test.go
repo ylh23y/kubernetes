@@ -17,18 +17,24 @@ limitations under the License.
 package staticpod
 
 import (
-	"io/ioutil"
+	_ "embed"
+	"io"
 	"os"
 	"path/filepath"
 	"reflect"
+	goruntime "runtime"
 	"sort"
 	"strconv"
+	"strings"
 	"testing"
 
-	"k8s.io/api/core/v1"
+	"github.com/google/go-cmp/cmp"
+
+	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
 	kubeadmapi "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm"
-	testutil "k8s.io/kubernetes/cmd/kubeadm/test"
+	kubeadmconstants "k8s.io/kubernetes/cmd/kubeadm/app/constants"
 )
 
 func TestComponentResources(t *testing.T) {
@@ -62,6 +68,27 @@ func TestGetAPIServerProbeAddress(t *testing.T) {
 			},
 			expected: "10.10.10.10",
 		},
+		{
+			desc: "filled in ipv6 AdvertiseAddress endpoint returns it",
+			endpoint: &kubeadmapi.APIEndpoint{
+				AdvertiseAddress: "2001:abcd:bcda::1",
+			},
+			expected: "2001:abcd:bcda::1",
+		},
+		{
+			desc: "filled in 0.0.0.0 AdvertiseAddress endpoint returns empty",
+			endpoint: &kubeadmapi.APIEndpoint{
+				AdvertiseAddress: "0.0.0.0",
+			},
+			expected: "",
+		},
+		{
+			desc: "filled in :: AdvertiseAddress endpoint returns empty",
+			endpoint: &kubeadmapi.APIEndpoint{
+				AdvertiseAddress: "::",
+			},
+			expected: "",
+		},
 	}
 
 	for _, test := range tests {
@@ -84,7 +111,7 @@ func TestGetControllerManagerProbeAddress(t *testing.T) {
 			desc: "no controller manager extra args leads to 127.0.0.1 being used",
 			cfg: &kubeadmapi.ClusterConfiguration{
 				ControllerManager: kubeadmapi.ControlPlaneComponent{
-					ExtraArgs: map[string]string{},
+					ExtraArgs: []kubeadmapi.Arg{},
 				},
 			},
 			expected: "127.0.0.1",
@@ -93,12 +120,45 @@ func TestGetControllerManagerProbeAddress(t *testing.T) {
 			desc: "setting controller manager extra address arg to something acknowledges it",
 			cfg: &kubeadmapi.ClusterConfiguration{
 				ControllerManager: kubeadmapi.ControlPlaneComponent{
-					ExtraArgs: map[string]string{
-						kubeControllerManagerAddressArg: "10.10.10.10",
+					ExtraArgs: []kubeadmapi.Arg{
+						{Name: kubeControllerManagerBindAddressArg, Value: "10.10.10.10"},
 					},
 				},
 			},
 			expected: "10.10.10.10",
+		},
+		{
+			desc: "setting controller manager extra ipv6 address arg to something acknowledges it",
+			cfg: &kubeadmapi.ClusterConfiguration{
+				ControllerManager: kubeadmapi.ControlPlaneComponent{
+					ExtraArgs: []kubeadmapi.Arg{
+						{Name: kubeControllerManagerBindAddressArg, Value: "2001:abcd:bcda::1"},
+					},
+				},
+			},
+			expected: "2001:abcd:bcda::1",
+		},
+		{
+			desc: "setting controller manager extra address arg to 0.0.0.0 returns empty",
+			cfg: &kubeadmapi.ClusterConfiguration{
+				ControllerManager: kubeadmapi.ControlPlaneComponent{
+					ExtraArgs: []kubeadmapi.Arg{
+						{Name: kubeControllerManagerBindAddressArg, Value: "0.0.0.0"},
+					},
+				},
+			},
+			expected: "",
+		},
+		{
+			desc: "setting controller manager extra ipv6 address arg to :: returns empty",
+			cfg: &kubeadmapi.ClusterConfiguration{
+				ControllerManager: kubeadmapi.ControlPlaneComponent{
+					ExtraArgs: []kubeadmapi.Arg{
+						{Name: kubeControllerManagerBindAddressArg, Value: "::"},
+					},
+				},
+			},
+			expected: "",
 		},
 	}
 
@@ -112,136 +172,240 @@ func TestGetControllerManagerProbeAddress(t *testing.T) {
 	}
 }
 
-func TestEtcdProbe(t *testing.T) {
-	var tests = []struct {
-		name     string
-		cfg      *kubeadmapi.Etcd
-		port     int
-		certsDir string
-		cacert   string
-		cert     string
-		key      string
+func TestGetSchedulerProbeAddress(t *testing.T) {
+	tests := []struct {
+		desc     string
+		cfg      *kubeadmapi.ClusterConfiguration
 		expected string
 	}{
 		{
-			name: "valid etcd probe using listen-client-urls IPv4 addresses",
-			cfg: &kubeadmapi.Etcd{
-				Local: &kubeadmapi.LocalEtcd{
-					ExtraArgs: map[string]string{
-						"listen-client-urls": "http://1.2.3.4:2379,http://4.3.2.1:2379"},
+			desc: "no scheduler extra args leads to 127.0.0.1 being used",
+			cfg: &kubeadmapi.ClusterConfiguration{
+				Scheduler: kubeadmapi.ControlPlaneComponent{
+					ExtraArgs: []kubeadmapi.Arg{},
 				},
 			},
-			port:     1,
-			certsDir: "secretsA",
-			cacert:   "ca1",
-			cert:     "cert1",
-			key:      "key1",
-			expected: "ETCDCTL_API=3 etcdctl --endpoints=https://[1.2.3.4]:1 --cacert=secretsA/ca1 --cert=secretsA/cert1 --key=secretsA/key1 get foo",
+			expected: "127.0.0.1",
 		},
 		{
-			name: "valid etcd probe using listen-client-urls unspecified IPv6 address",
-			cfg: &kubeadmapi.Etcd{
-				Local: &kubeadmapi.LocalEtcd{
-					ExtraArgs: map[string]string{
-						"listen-client-urls": "http://[0:0:0:0:0:0:0:0]:2379"},
+			desc: "setting scheduler extra address arg to something acknowledges it",
+			cfg: &kubeadmapi.ClusterConfiguration{
+				Scheduler: kubeadmapi.ControlPlaneComponent{
+					ExtraArgs: []kubeadmapi.Arg{
+						{Name: kubeSchedulerBindAddressArg, Value: "10.10.10.10"},
+					},
 				},
 			},
-			port:     1,
-			certsDir: "secretsB",
-			cacert:   "ca2",
-			cert:     "cert2",
-			key:      "key2",
-			expected: "ETCDCTL_API=3 etcdctl --endpoints=https://[::1]:1 --cacert=secretsB/ca2 --cert=secretsB/cert2 --key=secretsB/key2 get foo",
+			expected: "10.10.10.10",
 		},
 		{
-			name: "valid etcd probe using listen-client-urls unspecified IPv6 address 2",
-			cfg: &kubeadmapi.Etcd{
-				Local: &kubeadmapi.LocalEtcd{
-					ExtraArgs: map[string]string{
-						"listen-client-urls": "http://[::0:0]:2379"},
+			desc: "setting scheduler extra ipv6 address arg to something acknowledges it",
+			cfg: &kubeadmapi.ClusterConfiguration{
+				Scheduler: kubeadmapi.ControlPlaneComponent{
+					ExtraArgs: []kubeadmapi.Arg{
+						{Name: kubeSchedulerBindAddressArg, Value: "2001:abcd:bcda::1"},
+					},
 				},
 			},
-			port:     1,
-			certsDir: "secretsB",
-			cacert:   "ca2",
-			cert:     "cert2",
-			key:      "key2",
-			expected: "ETCDCTL_API=3 etcdctl --endpoints=https://[::1]:1 --cacert=secretsB/ca2 --cert=secretsB/cert2 --key=secretsB/key2 get foo",
+			expected: "2001:abcd:bcda::1",
 		},
 		{
-			name: "valid etcd probe using listen-client-urls unspecified IPv6 address 3",
-			cfg: &kubeadmapi.Etcd{
-				Local: &kubeadmapi.LocalEtcd{
-					ExtraArgs: map[string]string{
-						"listen-client-urls": "http://[::]:2379"},
+			desc: "setting scheduler extra ipv6 address arg to 0.0.0.0 returns empty",
+			cfg: &kubeadmapi.ClusterConfiguration{
+				Scheduler: kubeadmapi.ControlPlaneComponent{
+					ExtraArgs: []kubeadmapi.Arg{
+						{Name: kubeSchedulerBindAddressArg, Value: "0.0.0.0"},
+					},
 				},
 			},
-			port:     1,
-			certsDir: "secretsB",
-			cacert:   "ca2",
-			cert:     "cert2",
-			key:      "key2",
-			expected: "ETCDCTL_API=3 etcdctl --endpoints=https://[::1]:1 --cacert=secretsB/ca2 --cert=secretsB/cert2 --key=secretsB/key2 get foo",
+			expected: "",
 		},
 		{
-			name: "valid etcd probe using listen-client-urls unspecified IPv4 address",
-			cfg: &kubeadmapi.Etcd{
-				Local: &kubeadmapi.LocalEtcd{
-					ExtraArgs: map[string]string{
-						"listen-client-urls": "http://1.2.3.4:2379,http://4.3.2.1:2379"},
+			desc: "setting scheduler extra ipv6 address arg to :: returns empty",
+			cfg: &kubeadmapi.ClusterConfiguration{
+				Scheduler: kubeadmapi.ControlPlaneComponent{
+					ExtraArgs: []kubeadmapi.Arg{
+						{Name: kubeSchedulerBindAddressArg, Value: "::"},
+					},
 				},
 			},
-			port:     1,
-			certsDir: "secretsA",
-			cacert:   "ca1",
-			cert:     "cert1",
-			key:      "key1",
-			expected: "ETCDCTL_API=3 etcdctl --endpoints=https://[1.2.3.4]:1 --cacert=secretsA/ca1 --cert=secretsA/cert1 --key=secretsA/key1 get foo",
+			expected: "",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.desc, func(t *testing.T) {
+			actual := GetSchedulerProbeAddress(test.cfg)
+			if actual != test.expected {
+				t.Errorf("Unexpected result from GetSchedulerProbeAddress:\n\texpected: %s\n\tactual: %s", test.expected, actual)
+			}
+		})
+	}
+}
+func TestGetEtcdProbeEndpoint(t *testing.T) {
+	var tests = []struct {
+		name             string
+		cfg              *kubeadmapi.Etcd
+		isIPv6           bool
+		expectedHostname string
+		expectedPort     int32
+		expectedScheme   v1.URIScheme
+	}{
+		{
+			name: "etcd probe URL from two URLs",
+			cfg: &kubeadmapi.Etcd{
+				Local: &kubeadmapi.LocalEtcd{
+					ExtraArgs: []kubeadmapi.Arg{
+						{Name: "listen-metrics-urls", Value: "https://1.2.3.4:1234,https://4.3.2.1:2381"},
+					},
+				},
+			},
+			isIPv6:           false,
+			expectedHostname: "1.2.3.4",
+			expectedPort:     1234,
+			expectedScheme:   v1.URISchemeHTTPS,
 		},
 		{
-			name: "valid etcd probe using listen-client-urls IPv6 addresses",
+			name: "etcd probe URL with HTTP scheme",
 			cfg: &kubeadmapi.Etcd{
 				Local: &kubeadmapi.LocalEtcd{
-					ExtraArgs: map[string]string{
-						"listen-client-urls": "http://[2001:db8::1]:2379,http://[2001:db8::2]:2379"},
+					ExtraArgs: []kubeadmapi.Arg{
+						{Name: "listen-metrics-urls", Value: "http://1.2.3.4:1234"},
+					},
 				},
 			},
-			port:     1,
-			certsDir: "secretsB",
-			cacert:   "ca2",
-			cert:     "cert2",
-			key:      "key2",
-			expected: "ETCDCTL_API=3 etcdctl --endpoints=https://[2001:db8::1]:1 --cacert=secretsB/ca2 --cert=secretsB/cert2 --key=secretsB/key2 get foo",
+			isIPv6:           false,
+			expectedHostname: "1.2.3.4",
+			expectedPort:     1234,
+			expectedScheme:   v1.URISchemeHTTP,
 		},
 		{
-			name: "valid IPv4 etcd probe using hostname for listen-client-urls",
+			name: "etcd probe URL without scheme should result in defaults",
 			cfg: &kubeadmapi.Etcd{
 				Local: &kubeadmapi.LocalEtcd{
-					ExtraArgs: map[string]string{
-						"listen-client-urls": "http://localhost:2379"},
+					ExtraArgs: []kubeadmapi.Arg{
+						{Name: "listen-metrics-urls", Value: "1.2.3.4"},
+					},
 				},
 			},
-			port:     1,
-			certsDir: "secretsC",
-			cacert:   "ca3",
-			cert:     "cert3",
-			key:      "key3",
-			expected: "ETCDCTL_API=3 etcdctl --endpoints=https://[127.0.0.1]:1 --cacert=secretsC/ca3 --cert=secretsC/cert3 --key=secretsC/key3 get foo",
+			isIPv6:           false,
+			expectedHostname: "127.0.0.1",
+			expectedPort:     kubeadmconstants.EtcdMetricsPort,
+			expectedScheme:   v1.URISchemeHTTP,
+		},
+		{
+			name: "etcd probe URL without port",
+			cfg: &kubeadmapi.Etcd{
+				Local: &kubeadmapi.LocalEtcd{
+					ExtraArgs: []kubeadmapi.Arg{
+						{Name: "listen-metrics-urls", Value: "https://1.2.3.4"},
+					},
+				},
+			},
+			isIPv6:           false,
+			expectedHostname: "1.2.3.4",
+			expectedPort:     kubeadmconstants.EtcdMetricsPort,
+			expectedScheme:   v1.URISchemeHTTPS,
+		},
+		{
+			name: "etcd probe URL from two IPv6 URLs",
+			cfg: &kubeadmapi.Etcd{
+				Local: &kubeadmapi.LocalEtcd{
+					ExtraArgs: []kubeadmapi.Arg{
+						{Name: "listen-metrics-urls", Value: "https://[2001:abcd:bcda::1]:1234,https://[2001:abcd:bcda::2]:2381"},
+					},
+				},
+			},
+			isIPv6:           true,
+			expectedHostname: "2001:abcd:bcda::1",
+			expectedPort:     1234,
+			expectedScheme:   v1.URISchemeHTTPS,
+		},
+		{
+			name: "etcd probe localhost IPv6 URL with HTTP scheme",
+			cfg: &kubeadmapi.Etcd{
+				Local: &kubeadmapi.LocalEtcd{
+					ExtraArgs: []kubeadmapi.Arg{
+						{Name: "listen-metrics-urls", Value: "http://[::1]:1234"},
+					},
+				},
+			},
+			isIPv6:           true,
+			expectedHostname: "::1",
+			expectedPort:     1234,
+			expectedScheme:   v1.URISchemeHTTP,
+		},
+		{
+			name: "etcd probe IPv6 URL with HTTP scheme",
+			cfg: &kubeadmapi.Etcd{
+				Local: &kubeadmapi.LocalEtcd{
+					ExtraArgs: []kubeadmapi.Arg{
+						{Name: "listen-metrics-urls", Value: "http://[2001:abcd:bcda::1]:1234"},
+					},
+				},
+			},
+			isIPv6:           true,
+			expectedHostname: "2001:abcd:bcda::1",
+			expectedPort:     1234,
+			expectedScheme:   v1.URISchemeHTTP,
+		},
+		{
+			name: "etcd probe IPv6 URL without port",
+			cfg: &kubeadmapi.Etcd{
+				Local: &kubeadmapi.LocalEtcd{
+					ExtraArgs: []kubeadmapi.Arg{
+						{Name: "listen-metrics-urls", Value: "https://[2001:abcd:bcda::1]"},
+					},
+				},
+			},
+			isIPv6:           true,
+			expectedHostname: "2001:abcd:bcda::1",
+			expectedPort:     kubeadmconstants.EtcdMetricsPort,
+			expectedScheme:   v1.URISchemeHTTPS,
+		},
+		{
+			name: "etcd probe URL from defaults",
+			cfg: &kubeadmapi.Etcd{
+				Local: &kubeadmapi.LocalEtcd{},
+			},
+			isIPv6:           false,
+			expectedHostname: "127.0.0.1",
+			expectedPort:     kubeadmconstants.EtcdMetricsPort,
+			expectedScheme:   v1.URISchemeHTTP,
+		},
+		{
+			name: "etcd probe URL from defaults if IPv6",
+			cfg: &kubeadmapi.Etcd{
+				Local: &kubeadmapi.LocalEtcd{},
+			},
+			isIPv6:           true,
+			expectedHostname: "::1",
+			expectedPort:     kubeadmconstants.EtcdMetricsPort,
+			expectedScheme:   v1.URISchemeHTTP,
 		},
 	}
 	for _, rt := range tests {
 		t.Run(rt.name, func(t *testing.T) {
-			actual := EtcdProbe(rt.cfg, rt.port, rt.certsDir, rt.cacert, rt.cert, rt.key)
-			if actual.Handler.Exec.Command[2] != rt.expected {
-				t.Errorf("%s test case failed:\n\texpected: %s\n\t  actual: %s",
-					rt.name, rt.expected,
-					actual.Handler.Exec.Command[2])
+			hostname, port, scheme := GetEtcdProbeEndpoint(rt.cfg, rt.isIPv6)
+			if hostname != rt.expectedHostname {
+				t.Errorf("%q test case failed:\n\texpected hostname: %s\n\tgot: %s",
+					rt.name, rt.expectedHostname, hostname)
+			}
+			if port != rt.expectedPort {
+				t.Errorf("%q test case failed:\n\texpected port: %d\n\tgot: %d",
+					rt.name, rt.expectedPort, port)
+			}
+			if scheme != rt.expectedScheme {
+				t.Errorf("%q test case failed:\n\texpected scheme: %v\n\tgot: %v",
+					rt.name, rt.expectedScheme, scheme)
 			}
 		})
 	}
 }
 
 func TestComponentPod(t *testing.T) {
+	// priority value for system-node-critical class
+	priority := int32(2000001000)
 	var tests = []struct {
 		name     string
 		expected v1.Pod
@@ -259,12 +423,18 @@ func TestComponentPod(t *testing.T) {
 					Labels:    map[string]string{"component": "foo", "tier": "control-plane"},
 				},
 				Spec: v1.PodSpec{
+					SecurityContext: &v1.PodSecurityContext{
+						SeccompProfile: &v1.SeccompProfile{
+							Type: v1.SeccompProfileTypeRuntimeDefault,
+						},
+					},
 					Containers: []v1.Container{
 						{
 							Name: "foo",
 						},
 					},
-					PriorityClassName: "system-cluster-critical",
+					Priority:          &priority,
+					PriorityClassName: "system-node-critical",
 					HostNetwork:       true,
 					Volumes:           []v1.Volume{},
 				},
@@ -275,7 +445,7 @@ func TestComponentPod(t *testing.T) {
 	for _, rt := range tests {
 		t.Run(rt.name, func(t *testing.T) {
 			c := v1.Container{Name: rt.name}
-			actual := ComponentPod(c, map[string]v1.Volume{})
+			actual := ComponentPod(c, map[string]v1.Volume{}, nil)
 			if !reflect.DeepEqual(rt.expected, actual) {
 				t.Errorf(
 					"failed componentPod:\n\texpected: %v\n\t  actual: %v",
@@ -409,75 +579,21 @@ func TestVolumeMountMapToSlice(t *testing.T) {
 	}
 }
 
-func TestGetExtraParameters(t *testing.T) {
-	var tests = []struct {
-		name      string
-		overrides map[string]string
-		defaults  map[string]string
-		expected  []string
-	}{
-		{
-			name: "with admission-control default NamespaceLifecycle",
-			overrides: map[string]string{
-				"admission-control": "NamespaceLifecycle,LimitRanger",
-			},
-			defaults: map[string]string{
-				"admission-control":     "NamespaceLifecycle",
-				"insecure-bind-address": "127.0.0.1",
-				"allow-privileged":      "true",
-			},
-			expected: []string{
-				"--admission-control=NamespaceLifecycle,LimitRanger",
-				"--insecure-bind-address=127.0.0.1",
-				"--allow-privileged=true",
-			},
-		},
-		{
-			name: "without admission-control default",
-			overrides: map[string]string{
-				"admission-control": "NamespaceLifecycle,LimitRanger",
-			},
-			defaults: map[string]string{
-				"insecure-bind-address": "127.0.0.1",
-				"allow-privileged":      "true",
-			},
-			expected: []string{
-				"--admission-control=NamespaceLifecycle,LimitRanger",
-				"--insecure-bind-address=127.0.0.1",
-				"--allow-privileged=true",
-			},
-		},
-	}
+var (
+	//go:embed testdata/valid-pod.yaml
+	validPod string
 
-	for _, rt := range tests {
-		t.Run(rt.name, func(t *testing.T) {
-			actual := GetExtraParameters(rt.overrides, rt.defaults)
-			sort.Strings(actual)
-			sort.Strings(rt.expected)
-			if !reflect.DeepEqual(actual, rt.expected) {
-				t.Errorf("failed getExtraParameters:\nexpected:\n%v\nsaw:\n%v", rt.expected, actual)
-			}
-		})
-	}
-}
+	//go:embed testdata/valid-pod-different-order.yaml
+	validPodWithDifferentFieldsOrder string
 
-const (
-	validPod = `
-apiVersion: v1
-kind: Pod
-metadata:
-  labels:
-    component: etcd
-    tier: control-plane
-  name: etcd
-  namespace: kube-system
-spec:
-  containers:
-  - image: gcr.io/google_containers/etcd-amd64:3.1.11
-status: {}
-`
-	invalidPod = `---{ broken yaml @@@`
+	//go:embed testdata/invalid-with-default-fields.yaml
+	invalidWithDefaultFields string
+
+	//go:embed testdata/valid-pod2.yaml
+	validPod2 string
 )
+
+const invalidPod = `---{ broken yaml @@@`
 
 func TestReadStaticPodFromDisk(t *testing.T) {
 	tests := []struct {
@@ -508,12 +624,11 @@ func TestReadStaticPodFromDisk(t *testing.T) {
 
 	for _, rt := range tests {
 		t.Run(rt.description, func(t *testing.T) {
-			tmpdir := testutil.SetupTempDir(t)
-			defer os.RemoveAll(tmpdir)
+			tmpdir := t.TempDir()
 
 			manifestPath := filepath.Join(tmpdir, "pod.yaml")
 			if rt.writeManifest {
-				err := ioutil.WriteFile(manifestPath, []byte(rt.podYaml), 0644)
+				err := os.WriteFile(manifestPath, []byte(rt.podYaml), 0644)
 				if err != nil {
 					t.Fatalf("Failed to write pod manifest\n%s\n\tfatal error: %v", rt.description, err)
 				}
@@ -533,11 +648,105 @@ func TestReadStaticPodFromDisk(t *testing.T) {
 	}
 }
 
+// getFileNotFoundForOS returns the expected error message for a file not found error on the current OS
+// - on Windows, the error message is "The system cannot find the file specified"
+// - on other, the error message is "no such file or directory"
+func getFileNotFoundForOS() string {
+	if goruntime.GOOS == "windows" {
+		return "The system cannot find the file specified"
+	} else {
+		return "no such file or directory"
+	}
+}
+
+func TestReadMultipleStaticPodsFromDisk(t *testing.T) {
+	getTestPod := func(name string) *v1.Pod {
+		return &v1.Pod{
+			TypeMeta: metav1.TypeMeta{
+				Kind:       "Pod",
+				APIVersion: "v1",
+			},
+			ObjectMeta: metav1.ObjectMeta{
+				Name: name,
+			},
+		}
+	}
+
+	testCases := []struct {
+		name                  string
+		setup                 func(dir string)
+		components            []string
+		expected              []*v1.Pod
+		expectedErrorContains []string
+	}{
+		{
+			name: "valid: all pods are written and read",
+			setup: func(dir string) {
+				var pod *v1.Pod
+				pod = getTestPod("a")
+				_ = WriteStaticPodToDisk(kubeadmconstants.KubeAPIServer, dir, *pod)
+				pod = getTestPod("b")
+				_ = WriteStaticPodToDisk(kubeadmconstants.KubeControllerManager, dir, *pod)
+				pod = getTestPod("c")
+				_ = WriteStaticPodToDisk(kubeadmconstants.KubeScheduler, dir, *pod)
+			},
+			components: kubeadmconstants.ControlPlaneComponents,
+			expected: []*v1.Pod{
+				getTestPod("a"),
+				getTestPod("b"),
+				getTestPod("c"),
+			},
+		},
+		{
+			name:       "invalid: all pods returned errors",
+			setup:      func(dir string) {},
+			components: kubeadmconstants.ControlPlaneComponents,
+			expectedErrorContains: []string{
+				"kube-apiserver.yaml: " + getFileNotFoundForOS(),
+				"kube-controller-manager.yaml: " + getFileNotFoundForOS(),
+				"kube-scheduler.yaml: " + getFileNotFoundForOS(),
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			tc.setup(dir)
+			m, err := ReadMultipleStaticPodsFromDisk(dir, tc.components...)
+			if err != nil {
+				for _, ec := range tc.expectedErrorContains {
+					if !strings.Contains(err.Error(), ec) {
+						t.Fatalf("expected error to contain string: %s\nerror:\n%v", ec, err)
+					}
+				}
+			}
+
+			// Compare sorted result to expected result.
+			var actual []*v1.Pod
+			for _, v := range m {
+				actual = append(actual, v)
+			}
+			sort.Slice(actual, func(a, b int) bool {
+				return actual[a].Name < actual[b].Name
+			})
+			sort.Slice(tc.expected, func(a, b int) bool {
+				return actual[a].Name < actual[b].Name
+			})
+
+			if diff := cmp.Diff(tc.expected, actual); diff != "" {
+				t.Fatalf("unexpected difference (-want,+got):\n%s", diff)
+			}
+		})
+	}
+}
+
 func TestManifestFilesAreEqual(t *testing.T) {
 	var tests = []struct {
 		description    string
 		podYamls       []string
 		expectedResult bool
+		expectedDiff   string
 		expectErr      bool
 	}{
 		{
@@ -547,10 +756,29 @@ func TestManifestFilesAreEqual(t *testing.T) {
 			expectErr:      false,
 		},
 		{
+			description:    "manifests are equal, ignore different fields order",
+			podYamls:       []string{validPod, validPodWithDifferentFieldsOrder},
+			expectedResult: true,
+			expectErr:      false,
+		},
+		{
 			description:    "manifests are not equal",
-			podYamls:       []string{validPod, validPod + "\n"},
+			podYamls:       []string{validPod, validPod2},
 			expectedResult: false,
 			expectErr:      false,
+			expectedDiff: `@@ -11 +11 @@
+-  - image: gcr.io/google_containers/etcd-amd64:3.1.11
++  - image: gcr.io/google_containers/etcd-amd64:3.1.12
+`,
+		},
+		{
+			description:    "manifests are not equal for adding new defaults",
+			podYamls:       []string{validPod, invalidWithDefaultFields},
+			expectedResult: false,
+			expectErr:      false,
+			expectedDiff: `@@ -13,0 +14 @@
++  restartPolicy: Always
+`,
 		},
 		{
 			description:    "first manifest doesn't exist",
@@ -568,14 +796,13 @@ func TestManifestFilesAreEqual(t *testing.T) {
 
 	for _, rt := range tests {
 		t.Run(rt.description, func(t *testing.T) {
-			tmpdir := testutil.SetupTempDir(t)
-			defer os.RemoveAll(tmpdir)
+			tmpdir := t.TempDir()
 
 			// write 2 manifests
-			for i := 0; i < 2; i++ {
+			for i := range 2 {
 				if rt.podYamls[i] != "" {
 					manifestPath := filepath.Join(tmpdir, strconv.Itoa(i)+".yaml")
-					err := ioutil.WriteFile(manifestPath, []byte(rt.podYamls[i]), 0644)
+					err := os.WriteFile(manifestPath, []byte(rt.podYamls[i]), 0644)
 					if err != nil {
 						t.Fatalf("Failed to write manifest file\n%s\n\tfatal error: %v", rt.description, err)
 					}
@@ -583,7 +810,7 @@ func TestManifestFilesAreEqual(t *testing.T) {
 			}
 
 			// compare them
-			result, actualErr := ManifestFilesAreEqual(filepath.Join(tmpdir, "0.yaml"), filepath.Join(tmpdir, "1.yaml"))
+			result, diff, actualErr := ManifestFilesAreEqual(filepath.Join(tmpdir, "0.yaml"), filepath.Join(tmpdir, "1.yaml"))
 			if result != rt.expectedResult {
 				t.Errorf(
 					"ManifestFilesAreEqual failed\n%s\nexpected result: %t\nactual result: %t",
@@ -600,6 +827,95 @@ func TestManifestFilesAreEqual(t *testing.T) {
 					(actualErr != nil),
 					actualErr,
 				)
+			}
+			if !strings.Contains(diff, rt.expectedDiff) {
+				t.Errorf(
+					"ManifestFilesAreEqual diff doesn't expected\n%s\n\texpected diff: %s\n\tactual diff: %s",
+					rt.description,
+					rt.expectedDiff,
+					diff,
+				)
+			}
+		})
+	}
+}
+
+func TestPatchStaticPod(t *testing.T) {
+	type file struct {
+		name string
+		data string
+	}
+
+	tests := []struct {
+		name          string
+		files         []*file
+		pod           *v1.Pod
+		expectedPod   *v1.Pod
+		expectedError bool
+	}{
+		{
+			name: "valid: patch a kube-apiserver target using a couple of ordered patches",
+			pod: &v1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "kube-apiserver",
+					Namespace: "foo",
+				},
+			},
+			expectedPod: &v1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "kube-apiserver",
+					Namespace: "bar2",
+				},
+			},
+			files: []*file{
+				{
+					name: "kube-apiserver1+merge.json",
+					data: `{"metadata":{"namespace":"bar2"}}`,
+				},
+				{
+					name: "kube-apiserver0+json.json",
+					data: `[{"op": "replace", "path": "/metadata/namespace", "value": "bar1"}]`,
+				},
+			},
+		},
+		{
+			name: "invalid: unknown patch target name",
+			pod: &v1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "foo",
+					Namespace: "bar",
+				},
+			},
+			expectedError: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			tempDir, err := os.MkdirTemp("", "patch-files")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer os.RemoveAll(tempDir)
+
+			for _, file := range tc.files {
+				filePath := filepath.Join(tempDir, file.name)
+				err := os.WriteFile(filePath, []byte(file.data), 0644)
+				if err != nil {
+					t.Fatalf("could not write temporary file %q", filePath)
+				}
+			}
+
+			pod, err := PatchStaticPod(tc.pod, tempDir, io.Discard)
+			if (err != nil) != tc.expectedError {
+				t.Fatalf("expected error: %v, got: %v, error: %v", tc.expectedError, (err != nil), err)
+			}
+			if err != nil {
+				return
+			}
+
+			if tc.expectedPod.String() != pod.String() {
+				t.Fatalf("expected object:\n%s\ngot:\n%s", tc.expectedPod.String(), pod.String())
 			}
 		})
 	}

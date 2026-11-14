@@ -17,22 +17,36 @@ limitations under the License.
 package deployment
 
 import (
+	"context"
 	"fmt"
 	"reflect"
 	"time"
 
-	"k8s.io/klog"
-
 	apps "k8s.io/api/apps/v1"
 	"k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	utilerrors "k8s.io/apimachinery/pkg/util/errors"
+	"k8s.io/klog/v2"
 	"k8s.io/kubernetes/pkg/controller/deployment/util"
 )
+
+// syncRolloutStatusAfter keeps reconciliation errors from skipping progress deadline checks.
+func (dc *DeploymentController) syncRolloutStatusAfter(ctx context.Context, reconcileErr error, allRSs []*apps.ReplicaSet, newRS *apps.ReplicaSet, d *apps.Deployment) error {
+	statusErr := dc.syncRolloutStatus(ctx, allRSs, newRS, d)
+	if reconcileErr == nil {
+		return statusErr
+	}
+	if statusErr == nil {
+		return reconcileErr
+	}
+	return utilerrors.NewAggregate([]error{reconcileErr, statusErr})
+}
 
 // syncRolloutStatus updates the status of a deployment during a rollout. There are
 // cases this helper will run that cannot be prevented from the scaling detection,
 // for example a resync of the deployment after it was scaled up. In those cases,
 // we shouldn't try to estimate any progress.
-func (dc *DeploymentController) syncRolloutStatus(allRSs []*apps.ReplicaSet, newRS *apps.ReplicaSet, d *apps.Deployment) error {
+func (dc *DeploymentController) syncRolloutStatus(ctx context.Context, allRSs []*apps.ReplicaSet, newRS *apps.ReplicaSet, d *apps.Deployment) error {
 	newStatus := calculateStatus(allRSs, newRS, d)
 
 	// If there is no progressDeadlineSeconds set, remove any Progressing condition.
@@ -82,7 +96,7 @@ func (dc *DeploymentController) syncRolloutStatus(allRSs []*apps.ReplicaSet, new
 			}
 			util.SetDeploymentCondition(&newStatus, *condition)
 
-		case util.DeploymentTimedOut(d, &newStatus):
+		case util.DeploymentTimedOut(ctx, d, &newStatus):
 			// Update the deployment with a timeout condition. If the condition already exists,
 			// we ignore this update.
 			msg := fmt.Sprintf("Deployment %q has timed out progressing.", d.Name)
@@ -106,13 +120,13 @@ func (dc *DeploymentController) syncRolloutStatus(allRSs []*apps.ReplicaSet, new
 	// Do not update if there is nothing new to add.
 	if reflect.DeepEqual(d.Status, newStatus) {
 		// Requeue the deployment if required.
-		dc.requeueStuckDeployment(d, newStatus)
+		dc.requeueStuckDeployment(ctx, d, newStatus)
 		return nil
 	}
 
 	newDeployment := d
 	newDeployment.Status = newStatus
-	_, err := dc.client.AppsV1().Deployments(newDeployment.Namespace).UpdateStatus(newDeployment)
+	_, err := dc.client.AppsV1().Deployments(newDeployment.Namespace).UpdateStatus(ctx, newDeployment, metav1.UpdateOptions{})
 	return err
 }
 
@@ -151,12 +165,13 @@ func (dc *DeploymentController) getReplicaFailures(allRSs []*apps.ReplicaSet, ne
 }
 
 // used for unit testing
-var nowFn = func() time.Time { return time.Now() }
+var nowFn = time.Now
 
 // requeueStuckDeployment checks whether the provided deployment needs to be synced for a progress
 // check. It returns the time after the deployment will be requeued for the progress check, 0 if it
 // will be requeued now, or -1 if it does not need to be requeued.
-func (dc *DeploymentController) requeueStuckDeployment(d *apps.Deployment, newStatus apps.DeploymentStatus) time.Duration {
+func (dc *DeploymentController) requeueStuckDeployment(ctx context.Context, d *apps.Deployment, newStatus apps.DeploymentStatus) time.Duration {
+	logger := klog.FromContext(ctx)
 	currentCond := util.GetDeploymentCondition(d.Status, apps.DeploymentProgressing)
 	// Can't estimate progress if there is no deadline in the spec or progressing condition in the current status.
 	if !util.HasProgressDeadline(d) || currentCond == nil {
@@ -186,11 +201,11 @@ func (dc *DeploymentController) requeueStuckDeployment(d *apps.Deployment, newSt
 	// Make it ratelimited so we stay on the safe side, eventually the Deployment should
 	// transition either to a Complete or to a TimedOut condition.
 	if after < time.Second {
-		klog.V(4).Infof("Queueing up deployment %q for a progress check now", d.Name)
+		logger.V(4).Info("Queueing up deployment for a progress check now", "deployment", klog.KObj(d))
 		dc.enqueueRateLimited(d)
 		return time.Duration(0)
 	}
-	klog.V(4).Infof("Queueing up deployment %q for a progress check after %ds", d.Name, int(after.Seconds()))
+	logger.V(4).Info("Queueing up deployment for a progress check", "deployment", klog.KObj(d), "queueAfter", int(after.Seconds()))
 	// Add a second to avoid milliseconds skew in AddAfter.
 	// See https://github.com/kubernetes/kubernetes/issues/39785#issuecomment-279959133 for more info.
 	dc.enqueueAfter(d, after+time.Second)

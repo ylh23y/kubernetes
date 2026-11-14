@@ -17,6 +17,8 @@ limitations under the License.
 package daemon
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"reflect"
 	"sort"
@@ -26,15 +28,15 @@ import (
 	"time"
 
 	apps "k8s.io/api/apps/v1"
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/util/clock"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/uuid"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/apiserver/pkg/storage/names"
-	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes/fake"
 	core "k8s.io/client-go/testing"
@@ -42,21 +44,17 @@ import (
 	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/util/flowcontrol"
 	"k8s.io/client-go/util/workqueue"
-	featuregatetesting "k8s.io/component-base/featuregate/testing"
-	"k8s.io/kubernetes/pkg/api/legacyscheme"
+	"k8s.io/klog/v2"
+	"k8s.io/klog/v2/ktesting"
 	podutil "k8s.io/kubernetes/pkg/api/v1/pod"
 	api "k8s.io/kubernetes/pkg/apis/core"
+	"k8s.io/kubernetes/pkg/apis/scheduling"
 	"k8s.io/kubernetes/pkg/controller"
-	"k8s.io/kubernetes/pkg/features"
-	kubelettypes "k8s.io/kubernetes/pkg/kubelet/types"
-	schedulerapi "k8s.io/kubernetes/pkg/scheduler/api"
+	"k8s.io/kubernetes/pkg/controller/daemon/util"
 	"k8s.io/kubernetes/pkg/securitycontext"
 	labelsutil "k8s.io/kubernetes/pkg/util/labels"
+	testingclock "k8s.io/utils/clock/testing"
 )
-
-// IMPORTANT NOTE: Some tests in file need to pass irrespective of ScheduleDaemonSetPods feature is enabled. For rest
-// of the tests, an explicit comment is mentioned whether we are testing codepath specific to ScheduleDaemonSetPods or
-// without that feature.
 
 var (
 	simpleDaemonSetLabel  = map[string]string{"name": "simple-daemon", "type": "production"}
@@ -64,6 +62,7 @@ var (
 	simpleNodeLabel       = map[string]string{"color": "blue", "speed": "fast"}
 	simpleNodeLabel2      = map[string]string{"color": "red", "speed": "fast"}
 	alwaysReady           = func() bool { return true }
+	informerSyncTimeout   = 30 * time.Second
 )
 
 var (
@@ -79,13 +78,13 @@ func nowPointer() *metav1.Time {
 
 var (
 	nodeNotReady = []v1.Taint{{
-		Key:       schedulerapi.TaintNodeNotReady,
+		Key:       v1.TaintNodeNotReady,
 		Effect:    v1.TaintEffectNoExecute,
 		TimeAdded: nowPointer(),
 	}}
 
 	nodeUnreachable = []v1.Taint{{
-		Key:       schedulerapi.TaintNodeUnreachable,
+		Key:       v1.TaintNodeUnreachable,
 		Effect:    v1.TaintEffectNoExecute,
 		TimeAdded: nowPointer(),
 	}}
@@ -125,8 +124,8 @@ func newDaemonSet(name string) *apps.DaemonSet {
 	}
 }
 
-func newRollbackStrategy() *apps.DaemonSetUpdateStrategy {
-	one := intstr.FromInt(1)
+func newRollingUpdateStrategy() *apps.DaemonSetUpdateStrategy {
+	one := intstr.FromInt32(1)
 	return &apps.DaemonSetUpdateStrategy{
 		Type:          apps.RollingUpdateDaemonSetStrategyType,
 		RollingUpdate: &apps.RollingUpdateDaemonSet{MaxUnavailable: &one},
@@ -140,7 +139,7 @@ func newOnDeleteStrategy() *apps.DaemonSetUpdateStrategy {
 }
 
 func updateStrategies() []*apps.DaemonSetUpdateStrategy {
-	return []*apps.DaemonSetUpdateStrategy{newOnDeleteStrategy(), newRollbackStrategy()}
+	return []*apps.DaemonSetUpdateStrategy{newOnDeleteStrategy(), newRollingUpdateStrategy()}
 }
 
 func newNode(name string, label map[string]string) *v1.Node {
@@ -225,13 +224,25 @@ func addFailedPods(podStore cache.Store, nodeName string, label map[string]strin
 	}
 }
 
+func newControllerRevision(name string, namespace string, label map[string]string,
+	ownerReferences []metav1.OwnerReference) *apps.ControllerRevision {
+	return &apps.ControllerRevision{
+		TypeMeta: metav1.TypeMeta{APIVersion: "apps/v1"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            name,
+			Labels:          label,
+			Namespace:       namespace,
+			OwnerReferences: ownerReferences,
+		},
+	}
+}
+
 type fakePodControl struct {
 	sync.Mutex
 	*controller.FakePodControl
 	podStore     cache.Store
 	podIDMap     map[string]*v1.Pod
 	expectations controller.ControllerExpectationsInterface
-	dsc          *daemonSetsController
 }
 
 func newFakePodControl() *fakePodControl {
@@ -242,44 +253,11 @@ func newFakePodControl() *fakePodControl {
 	}
 }
 
-func (f *fakePodControl) CreatePodsOnNode(nodeName, namespace string, template *v1.PodTemplateSpec, object runtime.Object, controllerRef *metav1.OwnerReference) error {
+func (f *fakePodControl) CreatePods(ctx context.Context, namespace string, template *v1.PodTemplateSpec, object runtime.Object, controllerRef *metav1.OwnerReference) error {
 	f.Lock()
 	defer f.Unlock()
-	if err := f.FakePodControl.CreatePodsOnNode(nodeName, namespace, template, object, controllerRef); err != nil {
-		return fmt.Errorf("failed to create pod on node %q", nodeName)
-	}
-
-	pod := &v1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			Labels:       template.Labels,
-			Namespace:    namespace,
-			GenerateName: fmt.Sprintf("%s-", nodeName),
-		},
-	}
-
-	if err := legacyscheme.Scheme.Convert(&template.Spec, &pod.Spec, nil); err != nil {
-		return fmt.Errorf("unable to convert pod template: %v", err)
-	}
-	if len(nodeName) != 0 {
-		pod.Spec.NodeName = nodeName
-	}
-	pod.Name = names.SimpleNameGenerator.GenerateName(fmt.Sprintf("%s-", nodeName))
-
-	f.podStore.Update(pod)
-	f.podIDMap[pod.Name] = pod
-
-	ds := object.(*apps.DaemonSet)
-	dsKey, _ := controller.KeyFunc(ds)
-	f.expectations.CreationObserved(dsKey)
-
-	return nil
-}
-
-func (f *fakePodControl) CreatePodsWithControllerRef(namespace string, template *v1.PodTemplateSpec, object runtime.Object, controllerRef *metav1.OwnerReference) error {
-	f.Lock()
-	defer f.Unlock()
-	if err := f.FakePodControl.CreatePodsWithControllerRef(namespace, template, object, controllerRef); err != nil {
-		return fmt.Errorf("failed to create pod for DaemonSet")
+	if err := f.FakePodControl.CreatePods(ctx, namespace, template, object, controllerRef); err != nil {
+		return fmt.Errorf("failed to create pod for DaemonSet: %w", err)
 	}
 
 	pod := &v1.Pod{
@@ -291,24 +269,22 @@ func (f *fakePodControl) CreatePodsWithControllerRef(namespace string, template 
 
 	pod.Name = names.SimpleNameGenerator.GenerateName(fmt.Sprintf("%p-", pod))
 
-	if err := legacyscheme.Scheme.Convert(&template.Spec, &pod.Spec, nil); err != nil {
-		return fmt.Errorf("unable to convert pod template: %v", err)
-	}
+	template.Spec.DeepCopyInto(&pod.Spec)
 
 	f.podStore.Update(pod)
 	f.podIDMap[pod.Name] = pod
 
 	ds := object.(*apps.DaemonSet)
 	dsKey, _ := controller.KeyFunc(ds)
-	f.expectations.CreationObserved(dsKey)
+	f.expectations.CreationObserved(klog.FromContext(ctx), dsKey)
 
 	return nil
 }
 
-func (f *fakePodControl) DeletePod(namespace string, podID string, object runtime.Object) error {
+func (f *fakePodControl) DeletePod(ctx context.Context, namespace string, podID string, object runtime.Object) error {
 	f.Lock()
 	defer f.Unlock()
-	if err := f.FakePodControl.DeletePod(namespace, podID, object); err != nil {
+	if err := f.FakePodControl.DeletePod(ctx, namespace, podID, object); err != nil {
 		return fmt.Errorf("failed to delete pod %q", podID)
 	}
 	pod, ok := f.podIDMap[podID]
@@ -320,7 +296,7 @@ func (f *fakePodControl) DeletePod(namespace string, podID string, object runtim
 
 	ds := object.(*apps.DaemonSet)
 	dsKey, _ := controller.KeyFunc(ds)
-	f.expectations.DeletionObserved(dsKey)
+	f.expectations.DeletionObserved(klog.FromContext(ctx), dsKey)
 
 	return nil
 }
@@ -335,17 +311,18 @@ type daemonSetsController struct {
 	fakeRecorder *record.FakeRecorder
 }
 
-func newTestController(initialObjects ...runtime.Object) (*daemonSetsController, *fakePodControl, *fake.Clientset, error) {
+func newTestController(ctx context.Context, initialObjects ...runtime.Object) (*daemonSetsController, *fakePodControl, *fake.Clientset, error) {
 	clientset := fake.NewSimpleClientset(initialObjects...)
 	informerFactory := informers.NewSharedInformerFactory(clientset, controller.NoResyncPeriodFunc())
 
 	dsc, err := NewDaemonSetsController(
+		ctx,
 		informerFactory.Apps().V1().DaemonSets(),
 		informerFactory.Apps().V1().ControllerRevisions(),
 		informerFactory.Core().V1().Pods(),
 		informerFactory.Core().V1().Nodes(),
 		clientset,
-		flowcontrol.NewFakeBackOff(50*time.Millisecond, 500*time.Millisecond, clock.NewFakeClock(time.Now())),
+		flowcontrol.NewFakeBackOff(50*time.Millisecond, 500*time.Millisecond, testingclock.NewFakeClock(time.Now())),
 	)
 	if err != nil {
 		return nil, nil, nil, err
@@ -383,74 +360,317 @@ func resetCounters(manager *daemonSetsController) {
 	manager.fakeRecorder = fakeRecorder
 }
 
-func validateSyncDaemonSets(t *testing.T, manager *daemonSetsController, fakePodControl *fakePodControl, expectedCreates, expectedDeletes int, expectedEvents int) {
+func validateSyncDaemonSets(manager *daemonSetsController, fakePodControl *fakePodControl, expectedCreates, expectedDeletes int, expectedEvents int) error {
 	if len(fakePodControl.Templates) != expectedCreates {
-		t.Errorf("Unexpected number of creates.  Expected %d, saw %d\n", expectedCreates, len(fakePodControl.Templates))
+		return fmt.Errorf("Unexpected number of creates.  Expected %d, saw %d\n", expectedCreates, len(fakePodControl.Templates))
 	}
 	if len(fakePodControl.DeletePodName) != expectedDeletes {
-		t.Errorf("Unexpected number of deletes.  Expected %d, saw %d\n", expectedDeletes, len(fakePodControl.DeletePodName))
+		return fmt.Errorf("Unexpected number of deletes.  Expected %d, got %v\n", expectedDeletes, fakePodControl.DeletePodName)
 	}
 	if len(manager.fakeRecorder.Events) != expectedEvents {
-		t.Errorf("Unexpected number of events.  Expected %d, saw %d\n", expectedEvents, len(manager.fakeRecorder.Events))
+		return fmt.Errorf("Unexpected number of events.  Expected %d, saw %d\n", expectedEvents, len(manager.fakeRecorder.Events))
 	}
 	// Every Pod created should have a ControllerRef.
 	if got, want := len(fakePodControl.ControllerRefs), expectedCreates; got != want {
-		t.Errorf("len(ControllerRefs) = %v, want %v", got, want)
+		return fmt.Errorf("len(ControllerRefs) = %v, want %v", got, want)
 	}
 	// Make sure the ControllerRefs are correct.
 	for _, controllerRef := range fakePodControl.ControllerRefs {
 		if got, want := controllerRef.APIVersion, "apps/v1"; got != want {
-			t.Errorf("controllerRef.APIVersion = %q, want %q", got, want)
+			return fmt.Errorf("controllerRef.APIVersion = %q, want %q", got, want)
 		}
 		if got, want := controllerRef.Kind, "DaemonSet"; got != want {
-			t.Errorf("controllerRef.Kind = %q, want %q", got, want)
+			return fmt.Errorf("controllerRef.Kind = %q, want %q", got, want)
 		}
 		if controllerRef.Controller == nil || *controllerRef.Controller != true {
-			t.Errorf("controllerRef.Controller is not set to true")
+			return fmt.Errorf("controllerRef.Controller is not set to true")
 		}
 	}
+	return nil
 }
 
-func syncAndValidateDaemonSets(t *testing.T, manager *daemonSetsController, ds *apps.DaemonSet, podControl *fakePodControl, expectedCreates, expectedDeletes int, expectedEvents int) {
+func expectSyncDaemonSets(t *testing.T, manager *daemonSetsController, ds *apps.DaemonSet, podControl *fakePodControl, expectedCreates, expectedDeletes int, expectedEvents int) {
+	t.Helper()
+	expectSyncDaemonSetsWithError(t, manager, ds, podControl, expectedCreates, expectedDeletes, expectedEvents, nil)
+}
+
+func expectSyncDaemonSetsWithError(t *testing.T, manager *daemonSetsController, ds *apps.DaemonSet, podControl *fakePodControl, expectedCreates, expectedDeletes int, expectedEvents int, expectedError error) {
+	t.Helper()
 	key, err := controller.KeyFunc(ds)
 	if err != nil {
-		t.Errorf("Could not get key for daemon.")
+		t.Fatal("could not get key for daemon")
 	}
-	manager.syncHandler(key)
-	validateSyncDaemonSets(t, manager, podControl, expectedCreates, expectedDeletes, expectedEvents)
+
+	err = manager.syncHandler(context.TODO(), key)
+	if expectedError != nil && !errors.Is(err, expectedError) {
+		t.Fatalf("Unexpected error returned from syncHandler: %v", err)
+	}
+
+	if expectedError == nil && err != nil {
+		t.Log(err)
+	}
+
+	err = validateSyncDaemonSets(manager, podControl, expectedCreates, expectedDeletes, expectedEvents)
+	if err != nil {
+		t.Fatal(err)
+	}
 }
 
 // clearExpectations copies the FakePodControl to PodStore and clears the create and delete expectations.
 func clearExpectations(t *testing.T, manager *daemonSetsController, ds *apps.DaemonSet, fakePodControl *fakePodControl) {
 	fakePodControl.Clear()
-
+	logger, _ := ktesting.NewTestContext(t)
 	key, err := controller.KeyFunc(ds)
 	if err != nil {
 		t.Errorf("Could not get key for daemon.")
 		return
 	}
-	manager.expectations.DeleteExpectations(key)
+	manager.expectations.DeleteExpectations(logger, key)
+
+	now := manager.failedPodsBackoff.Clock.Now()
+	hash, _ := currentDSHash(manager, ds)
+	// log all the pods in the store
+	var lines []string
+	for _, obj := range manager.podStore.List() {
+		pod := obj.(*v1.Pod)
+		if pod.CreationTimestamp.IsZero() {
+			pod.CreationTimestamp.Time = now
+		}
+		var readyLast time.Time
+		ready := podutil.IsPodReady(pod)
+		if ready {
+			if c := podutil.GetPodReadyCondition(pod.Status); c != nil {
+				readyLast = c.LastTransitionTime.Time.Add(time.Duration(ds.Spec.MinReadySeconds) * time.Second)
+			}
+		}
+		nodeName, _ := util.GetTargetNodeName(pod)
+
+		lines = append(lines, fmt.Sprintf("node=%s current=%-5t ready=%-5t age=%-4d pod=%s now=%d available=%d",
+			nodeName,
+			hash == pod.Labels[apps.ControllerRevisionHashLabelKey],
+			ready,
+			now.Unix(),
+			pod.Name,
+			pod.CreationTimestamp.Unix(),
+			readyLast.Unix(),
+		))
+	}
+	sort.Strings(lines)
+	for _, line := range lines {
+		logger.Info(line)
+	}
 }
 
 func TestDeleteFinalStateUnknown(t *testing.T) {
-	for _, f := range []bool{true, false} {
-		defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ScheduleDaemonSetPods, f)()
-		for _, strategy := range updateStrategies() {
-			manager, _, _, err := newTestController()
-			if err != nil {
-				t.Fatalf("error creating DaemonSets controller: %v", err)
-			}
-			addNodes(manager.nodeStore, 0, 1, nil)
-			ds := newDaemonSet("foo")
-			ds.Spec.UpdateStrategy = *strategy
-			// DeletedFinalStateUnknown should queue the embedded DS if found.
-			manager.deleteDaemonset(cache.DeletedFinalStateUnknown{Key: "foo", Obj: ds})
-			enqueuedKey, _ := manager.queue.Get()
-			if enqueuedKey.(string) != "default/foo" {
-				t.Errorf("expected delete of DeletedFinalStateUnknown to enqueue the daemonset but found: %#v", enqueuedKey)
-			}
+	for _, strategy := range updateStrategies() {
+		logger, ctx := ktesting.NewTestContext(t)
+		manager, _, _, err := newTestController(ctx)
+		if err != nil {
+			t.Fatalf("error creating DaemonSets controller: %v", err)
+		}
+		addNodes(manager.nodeStore, 0, 1, nil)
+		ds := newDaemonSet("foo")
+		ds.Spec.UpdateStrategy = *strategy
+		// DeletedFinalStateUnknown should queue the embedded DS if found.
+		manager.deleteDaemonset(logger, cache.DeletedFinalStateUnknown{Key: "foo", Obj: ds})
+		enqueuedKey, _ := manager.queue.Get()
+		if enqueuedKey != "default/foo" {
+			t.Errorf("expected delete of DeletedFinalStateUnknown to enqueue the daemonset but found: %#v", enqueuedKey)
 		}
 	}
+}
+
+func TestExpectationsOnRecreate(t *testing.T) {
+	_, ctx := ktesting.NewTestContext(t)
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	client := fake.NewSimpleClientset()
+
+	f := informers.NewSharedInformerFactory(client, controller.NoResyncPeriodFunc())
+	dsc, err := NewDaemonSetsController(
+		ctx,
+		f.Apps().V1().DaemonSets(),
+		f.Apps().V1().ControllerRevisions(),
+		f.Core().V1().Pods(),
+		f.Core().V1().Nodes(),
+		client,
+		flowcontrol.NewFakeBackOff(50*time.Millisecond, 500*time.Millisecond, testingclock.NewFakeClock(time.Now())),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	expectStableQueueLength := func(expected int) {
+		t.Helper()
+		for i := 0; i < 5; i++ {
+			if actual := dsc.queue.Len(); actual != expected {
+				t.Fatalf("expected queue len to remain at %d, got %d", expected, actual)
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	waitForQueueLength := func(expected int, msg string) {
+		t.Helper()
+		i := 0
+		err = wait.PollImmediate(100*time.Millisecond, informerSyncTimeout, func() (bool, error) {
+			current := dsc.queue.Len()
+			switch {
+			case current == expected:
+				return true, nil
+			case current > expected:
+				return false, fmt.Errorf("queue length %d exceeded expected length %d", current, expected)
+			default:
+				i++
+				if i > 1 {
+					t.Logf("Waiting for queue to have %d item, currently has: %d", expected, current)
+				}
+				return false, nil
+			}
+		})
+		if err != nil {
+			t.Fatalf("%s: %v", msg, err)
+		}
+		expectStableQueueLength(expected)
+	}
+
+	fakeRecorder := record.NewFakeRecorder(100)
+	dsc.eventRecorder = fakeRecorder
+
+	fakePodControl := newFakePodControl()
+	fakePodControl.podStore = cache.NewStore(cache.DeletionHandlingMetaNamespaceKeyFunc) // fake store that we don't use
+	fakePodControl.expectations = controller.NewControllerExpectations()                 // fake expectations that we don't use
+	dsc.podControl = fakePodControl
+
+	manager := &daemonSetsController{
+		DaemonSetsController: dsc,
+		fakeRecorder:         fakeRecorder,
+	}
+
+	_, err = client.CoreV1().Nodes().Create(context.Background(), newNode("master-0", nil), metav1.CreateOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	f.StartWithContext(ctx)
+	for ty, ok := range f.WaitForCacheSyncWithContext(ctx).Synced {
+		if !ok {
+			t.Fatalf("caches failed to sync: %v", ty)
+		}
+	}
+
+	expectStableQueueLength(0)
+
+	oldDS := newDaemonSet("test")
+	oldDS, err = client.AppsV1().DaemonSets(oldDS.Namespace).Create(context.Background(), oldDS, metav1.CreateOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// create of DS adds to queue, processes
+	waitForQueueLength(1, "created DS")
+	ok := dsc.processNextWorkItem(context.TODO())
+	if !ok {
+		t.Fatal("queue is shutting down")
+	}
+
+	err = validateSyncDaemonSets(manager, fakePodControl, 1, 0, 0)
+	if err != nil {
+		t.Error(err)
+	}
+	fakePodControl.Clear()
+
+	oldDSKey, err := controller.KeyFunc(oldDS)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	dsExp, exists, err := dsc.expectations.GetExpectations(oldDSKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !exists {
+		t.Fatalf("No expectations found for DaemonSet %q", oldDSKey)
+	}
+	if dsExp.Fulfilled() {
+		t.Errorf("There should be unfulfilled expectation for creating new pods for DaemonSet %q", oldDSKey)
+	}
+
+	// process updates DS, update adds to queue
+	waitForQueueLength(1, "updated DS")
+	ok = dsc.processNextWorkItem(context.TODO())
+	if !ok {
+		t.Fatal("queue is shutting down")
+	}
+
+	// process does not re-update the DS
+	expectStableQueueLength(0)
+
+	err = client.AppsV1().DaemonSets(oldDS.Namespace).Delete(context.Background(), oldDS.Name, metav1.DeleteOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	waitForQueueLength(1, "deleted DS")
+
+	_, exists, err = dsc.expectations.GetExpectations(oldDSKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if exists {
+		t.Errorf("There should be no expectations for DaemonSet %q after it was deleted", oldDSKey)
+	}
+
+	// skip sync for the delete event so we only see the new RS in sync
+	key, quit := dsc.queue.Get()
+	if quit {
+		t.Fatal("Queue is shutting down!")
+	}
+	dsc.queue.Done(key)
+	if key != oldDSKey {
+		t.Fatal("Keys should be equal!")
+	}
+
+	expectStableQueueLength(0)
+
+	newDS := oldDS.DeepCopy()
+	newDS.UID = uuid.NewUUID()
+	newDS, err = client.AppsV1().DaemonSets(newDS.Namespace).Create(context.Background(), newDS, metav1.CreateOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Sanity check
+	if newDS.UID == oldDS.UID {
+		t.Fatal("New DS has the same UID as the old one!")
+	}
+
+	waitForQueueLength(1, "recreated DS")
+	ok = dsc.processNextWorkItem(context.TODO())
+	if !ok {
+		t.Fatal("Queue is shutting down!")
+	}
+
+	newDSKey, err := controller.KeyFunc(newDS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dsExp, exists, err = dsc.expectations.GetExpectations(newDSKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !exists {
+		t.Fatalf("No expectations found for DaemonSet %q", oldDSKey)
+	}
+	if dsExp.Fulfilled() {
+		t.Errorf("There should be unfulfilled expectation for creating new pods for DaemonSet %q", oldDSKey)
+	}
+
+	err = validateSyncDaemonSets(manager, fakePodControl, 1, 0, 0)
+	if err != nil {
+		t.Error(err)
+	}
+	fakePodControl.Clear()
 }
 
 func markPodsReady(store cache.Store) {
@@ -468,41 +688,45 @@ func markPodReady(pod *v1.Pod) {
 
 // DaemonSets without node selectors should launch pods on every node.
 func TestSimpleDaemonSetLaunchesPods(t *testing.T) {
-	for _, f := range []bool{true, false} {
-		defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ScheduleDaemonSetPods, f)()
-		for _, strategy := range updateStrategies() {
-			ds := newDaemonSet("foo")
-			ds.Spec.UpdateStrategy = *strategy
-			manager, podControl, _, err := newTestController(ds)
-			if err != nil {
-				t.Fatalf("error creating DaemonSets controller: %v", err)
-			}
-			addNodes(manager.nodeStore, 0, 5, nil)
-			manager.dsStore.Add(ds)
-			syncAndValidateDaemonSets(t, manager, ds, podControl, 5, 0, 0)
+	for _, strategy := range updateStrategies() {
+		ds := newDaemonSet("foo")
+		ds.Spec.UpdateStrategy = *strategy
+		_, ctx := ktesting.NewTestContext(t)
+		manager, podControl, _, err := newTestController(ctx, ds)
+		if err != nil {
+			t.Fatalf("error creating DaemonSets controller: %v", err)
 		}
+		addNodes(manager.nodeStore, 0, 5, nil)
+		err = manager.dsStore.Add(ds)
+		if err != nil {
+			t.Error(err)
+		}
+
+		expectSyncDaemonSets(t, manager, ds, podControl, 5, 0, 0)
 	}
 }
 
-// When ScheduleDaemonSetPods is enabled, DaemonSets without node selectors should
-// launch pods on every node by NodeAffinity.
+// DaemonSets without node selectors should launch pods on every node by NodeAffinity.
 func TestSimpleDaemonSetScheduleDaemonSetPodsLaunchesPods(t *testing.T) {
-	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ScheduleDaemonSetPods, true)()
-
 	nodeNum := 5
 	for _, strategy := range updateStrategies() {
 		ds := newDaemonSet("foo")
 		ds.Spec.UpdateStrategy = *strategy
-		manager, podControl, _, err := newTestController(ds)
+		_, ctx := ktesting.NewTestContext(t)
+		manager, podControl, _, err := newTestController(ctx, ds)
 		if err != nil {
 			t.Fatalf("error creating DaemonSets controller: %v", err)
 		}
 		addNodes(manager.nodeStore, 0, nodeNum, nil)
-		manager.dsStore.Add(ds)
-		syncAndValidateDaemonSets(t, manager, ds, podControl, nodeNum, 0, 0)
-		// Check for ScheduleDaemonSetPods feature
+		err = manager.dsStore.Add(ds)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		expectSyncDaemonSets(t, manager, ds, podControl, nodeNum, 0, 0)
+
 		if len(podControl.podIDMap) != nodeNum {
-			t.Fatalf("failed to create pods for DaemonSet when enabled ScheduleDaemonSetPods.")
+			t.Fatalf("failed to create pods for DaemonSet")
 		}
 
 		nodeMap := make(map[string]*v1.Node)
@@ -541,7 +765,7 @@ func TestSimpleDaemonSetScheduleDaemonSetPodsLaunchesPods(t *testing.T) {
 			}
 
 			field := nodeSelector.NodeSelectorTerms[0].MatchFields[0]
-			if field.Key == schedulerapi.NodeFieldSelectorKeyNodeName {
+			if field.Key == metav1.ObjectNameField {
 				if field.Operator != v1.NodeSelectorOpIn {
 					t.Fatalf("the operation of hostname NodeAffinity is not %v", v1.NodeSelectorOpIn)
 				}
@@ -554,158 +778,266 @@ func TestSimpleDaemonSetScheduleDaemonSetPodsLaunchesPods(t *testing.T) {
 		}
 
 		if len(nodeMap) != 0 {
-			t.Fatalf("did not foud pods on nodes %+v", nodeMap)
+			t.Fatalf("did not find pods on nodes %+v", nodeMap)
 		}
 	}
-
 }
 
 // Simulate a cluster with 100 nodes, but simulate a limit (like a quota limit)
 // of 10 pods, and verify that the ds doesn't make 100 create calls per sync pass
 func TestSimpleDaemonSetPodCreateErrors(t *testing.T) {
-	for _, f := range []bool{true, false} {
-		defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ScheduleDaemonSetPods, f)()
-		for _, strategy := range updateStrategies() {
-			ds := newDaemonSet("foo")
-			ds.Spec.UpdateStrategy = *strategy
-			manager, podControl, _, err := newTestController(ds)
-			if err != nil {
-				t.Fatalf("error creating DaemonSets controller: %v", err)
-			}
-			podControl.FakePodControl.CreateLimit = 10
-			addNodes(manager.nodeStore, 0, podControl.FakePodControl.CreateLimit*10, nil)
-			manager.dsStore.Add(ds)
-			syncAndValidateDaemonSets(t, manager, ds, podControl, podControl.FakePodControl.CreateLimit, 0, 0)
-			expectedLimit := 0
-			for pass := uint8(0); expectedLimit <= podControl.FakePodControl.CreateLimit; pass++ {
-				expectedLimit += controller.SlowStartInitialBatchSize << pass
-			}
-			if podControl.FakePodControl.CreateCallCount > expectedLimit {
-				t.Errorf("Unexpected number of create calls.  Expected <= %d, saw %d\n", podControl.FakePodControl.CreateLimit*2, podControl.FakePodControl.CreateCallCount)
-			}
+	for _, strategy := range updateStrategies() {
+		ds := newDaemonSet("foo")
+		ds.Spec.UpdateStrategy = *strategy
+		_, ctx := ktesting.NewTestContext(t)
+		manager, podControl, clientset, err := newTestController(ctx, ds)
+		if err != nil {
+			t.Fatalf("error creating DaemonSets controller: %v", err)
+		}
+		podControl.FakePodControl.CreateLimit = 10
+		addNodes(manager.nodeStore, 0, podControl.FakePodControl.CreateLimit*10, nil)
+		err = manager.dsStore.Add(ds)
+		if err != nil {
+			t.Fatal(err)
+		}
 
+		var updated *apps.DaemonSet
+		clientset.PrependReactor("update", "daemonsets", func(action core.Action) (handled bool, ret runtime.Object, err error) {
+			if action.GetSubresource() != "status" {
+				return false, nil, nil
+			}
+			if u, ok := action.(core.UpdateAction); ok {
+				updated = u.GetObject().(*apps.DaemonSet)
+			}
+			return false, nil, nil
+		})
+
+		expectSyncDaemonSets(t, manager, ds, podControl, podControl.FakePodControl.CreateLimit, 0, 0)
+
+		expectedLimit := 0
+		for pass := uint8(0); expectedLimit <= podControl.FakePodControl.CreateLimit; pass++ {
+			expectedLimit += controller.SlowStartInitialBatchSize << pass
+		}
+		if podControl.FakePodControl.CreateCallCount > expectedLimit {
+			t.Errorf("Unexpected number of create calls.  Expected <= %d, saw %d\n", podControl.FakePodControl.CreateLimit*2, podControl.FakePodControl.CreateCallCount)
+		}
+		if updated == nil {
+			t.Fatalf("Failed to get updated status")
+		}
+		if got, want := updated.Status.DesiredNumberScheduled, int32(podControl.FakePodControl.CreateLimit)*10; got != want {
+			t.Errorf("Status.DesiredNumberScheduled = %v, want %v", got, want)
+		}
+		if got, want := updated.Status.CurrentNumberScheduled, int32(podControl.FakePodControl.CreateLimit); got != want {
+			t.Errorf("Status.CurrentNumberScheduled = %v, want %v", got, want)
+		}
+		if got, want := updated.Status.UpdatedNumberScheduled, int32(podControl.FakePodControl.CreateLimit); got != want {
+			t.Errorf("Status.UpdatedNumberScheduled = %v, want %v", got, want)
 		}
 	}
 }
 
 func TestDaemonSetPodCreateExpectationsError(t *testing.T) {
-	for _, f := range []bool{true, false} {
-		defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ScheduleDaemonSetPods, f)()
-		strategies := updateStrategies()
-		for _, strategy := range strategies {
-			ds := newDaemonSet("foo")
-			ds.Spec.UpdateStrategy = *strategy
-			manager, podControl, _, err := newTestController(ds)
-			if err != nil {
-				t.Fatalf("error creating DaemonSets controller: %v", err)
-			}
-			podControl.FakePodControl.CreateLimit = 10
-			creationExpectations := 100
-			addNodes(manager.nodeStore, 0, 100, nil)
-			manager.dsStore.Add(ds)
-			syncAndValidateDaemonSets(t, manager, ds, podControl, podControl.FakePodControl.CreateLimit, 0, 0)
-			dsKey, err := controller.KeyFunc(ds)
-			if err != nil {
-				t.Fatalf("error get DaemonSets controller key: %v", err)
-			}
+	logger, _ := ktesting.NewTestContext(t)
+	strategies := updateStrategies()
+	for _, strategy := range strategies {
+		ds := newDaemonSet("foo")
+		ds.Spec.UpdateStrategy = *strategy
+		_, ctx := ktesting.NewTestContext(t)
+		manager, podControl, _, err := newTestController(ctx, ds)
+		if err != nil {
+			t.Fatalf("error creating DaemonSets controller: %v", err)
+		}
+		podControl.FakePodControl.CreateLimit = 10
+		creationExpectations := 100
+		addNodes(manager.nodeStore, 0, 100, nil)
+		err = manager.dsStore.Add(ds)
+		if err != nil {
+			t.Fatal(err)
+		}
 
-			if !manager.expectations.SatisfiedExpectations(dsKey) {
-				t.Errorf("Unsatisfied pod creation expectatitons. Expected %d", creationExpectations)
-			}
+		expectSyncDaemonSets(t, manager, ds, podControl, podControl.FakePodControl.CreateLimit, 0, 0)
+
+		dsKey, err := controller.KeyFunc(ds)
+		if err != nil {
+			t.Fatalf("error get DaemonSets controller key: %v", err)
+		}
+
+		if !manager.expectations.SatisfiedExpectations(logger, dsKey) {
+			t.Errorf("Unsatisfied pod creation expectations. Expected %d", creationExpectations)
 		}
 	}
 }
 
 func TestSimpleDaemonSetUpdatesStatusAfterLaunchingPods(t *testing.T) {
-	for _, f := range []bool{true, false} {
-		defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ScheduleDaemonSetPods, f)()
-		for _, strategy := range updateStrategies() {
-			ds := newDaemonSet("foo")
-			ds.Spec.UpdateStrategy = *strategy
-			manager, podControl, clientset, err := newTestController(ds)
-			if err != nil {
-				t.Fatalf("error creating DaemonSets controller: %v", err)
-			}
-
-			var updated *apps.DaemonSet
-			clientset.PrependReactor("update", "daemonsets", func(action core.Action) (handled bool, ret runtime.Object, err error) {
-				if action.GetSubresource() != "status" {
-					return false, nil, nil
-				}
-				if u, ok := action.(core.UpdateAction); ok {
-					updated = u.GetObject().(*apps.DaemonSet)
-				}
-				return false, nil, nil
-			})
-
-			manager.dsStore.Add(ds)
-			addNodes(manager.nodeStore, 0, 5, nil)
-			syncAndValidateDaemonSets(t, manager, ds, podControl, 5, 0, 0)
-
-			// Make sure the single sync() updated Status already for the change made
-			// during the manage() phase.
-			if got, want := updated.Status.CurrentNumberScheduled, int32(5); got != want {
-				t.Errorf("Status.CurrentNumberScheduled = %v, want %v", got, want)
-			}
+	for _, strategy := range updateStrategies() {
+		ds := newDaemonSet("foo")
+		ds.Spec.UpdateStrategy = *strategy
+		_, ctx := ktesting.NewTestContext(t)
+		manager, podControl, clientset, err := newTestController(ctx, ds)
+		if err != nil {
+			t.Fatalf("error creating DaemonSets controller: %v", err)
 		}
+
+		var updated *apps.DaemonSet
+		clientset.PrependReactor("update", "daemonsets", func(action core.Action) (handled bool, ret runtime.Object, err error) {
+			if action.GetSubresource() != "status" {
+				return false, nil, nil
+			}
+			if u, ok := action.(core.UpdateAction); ok {
+				updated = u.GetObject().(*apps.DaemonSet)
+			}
+			return false, nil, nil
+		})
+
+		manager.dsStore.Add(ds)
+		addNodes(manager.nodeStore, 0, 5, nil)
+		expectSyncDaemonSets(t, manager, ds, podControl, 5, 0, 0)
+
+		// Make sure the single sync() updated Status already for the change made
+		// during the manage() phase.
+		if got, want := updated.Status.CurrentNumberScheduled, int32(5); got != want {
+			t.Errorf("Status.CurrentNumberScheduled = %v, want %v", got, want)
+		}
+	}
+}
+
+func TestSimpleDaemonSetUpdatesStatusError(t *testing.T) {
+	var (
+		syncErr   = fmt.Errorf("sync error")
+		statusErr = fmt.Errorf("status error")
+	)
+
+	testCases := []struct {
+		desc string
+
+		hasSyncErr   bool
+		hasStatusErr bool
+
+		expectedErr error
+	}{
+		{
+			desc:         "sync error",
+			hasSyncErr:   true,
+			hasStatusErr: false,
+			expectedErr:  syncErr,
+		},
+		{
+			desc:         "status error",
+			hasSyncErr:   false,
+			hasStatusErr: true,
+			expectedErr:  statusErr,
+		},
+		{
+			desc:         "sync and status error",
+			hasSyncErr:   true,
+			hasStatusErr: true,
+			expectedErr:  syncErr,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.desc, func(t *testing.T) {
+			for _, strategy := range updateStrategies() {
+				ds := newDaemonSet("foo")
+				ds.Spec.UpdateStrategy = *strategy
+				_, ctx := ktesting.NewTestContext(t)
+				manager, podControl, clientset, err := newTestController(ctx, ds)
+				if err != nil {
+					t.Fatalf("error creating DaemonSets controller: %v", err)
+				}
+
+				if tc.hasSyncErr {
+					podControl.FakePodControl.Err = syncErr
+				}
+
+				clientset.PrependReactor("update", "daemonsets", func(action core.Action) (handled bool, ret runtime.Object, err error) {
+					if action.GetSubresource() != "status" {
+						return false, nil, nil
+					}
+
+					if tc.hasStatusErr {
+						return true, nil, statusErr
+					} else {
+						return false, nil, nil
+					}
+				})
+
+				manager.dsStore.Add(ds)
+				addNodes(manager.nodeStore, 0, 1, nil)
+				expectSyncDaemonSetsWithError(t, manager, ds, podControl, 1, 0, 0, tc.expectedErr)
+			}
+		})
 	}
 }
 
 // DaemonSets should do nothing if there aren't any nodes
 func TestNoNodesDoesNothing(t *testing.T) {
-	for _, f := range []bool{true, false} {
-		defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ScheduleDaemonSetPods, f)()
-		for _, strategy := range updateStrategies() {
-			manager, podControl, _, err := newTestController()
-			if err != nil {
-				t.Fatalf("error creating DaemonSets controller: %v", err)
-			}
-			ds := newDaemonSet("foo")
-			ds.Spec.UpdateStrategy = *strategy
-			manager.dsStore.Add(ds)
-			syncAndValidateDaemonSets(t, manager, ds, podControl, 0, 0, 0)
+	for _, strategy := range updateStrategies() {
+		_, ctx := ktesting.NewTestContext(t)
+		manager, podControl, _, err := newTestController(ctx)
+		if err != nil {
+			t.Fatalf("error creating DaemonSets controller: %v", err)
 		}
+		ds := newDaemonSet("foo")
+		ds.Spec.UpdateStrategy = *strategy
+		err = manager.dsStore.Add(ds)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		expectSyncDaemonSets(t, manager, ds, podControl, 0, 0, 0)
 	}
 }
 
 // DaemonSets without node selectors should launch on a single node in a
 // single node cluster.
 func TestOneNodeDaemonLaunchesPod(t *testing.T) {
-	for _, f := range []bool{true, false} {
-		defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ScheduleDaemonSetPods, f)()
-		for _, strategy := range updateStrategies() {
-			ds := newDaemonSet("foo")
-			ds.Spec.UpdateStrategy = *strategy
-			manager, podControl, _, err := newTestController(ds)
-			if err != nil {
-				t.Fatalf("error creating DaemonSets controller: %v", err)
-			}
-			manager.nodeStore.Add(newNode("only-node", nil))
-			manager.dsStore.Add(ds)
-			syncAndValidateDaemonSets(t, manager, ds, podControl, 1, 0, 0)
+	for _, strategy := range updateStrategies() {
+		ds := newDaemonSet("foo")
+		ds.Spec.UpdateStrategy = *strategy
+		_, ctx := ktesting.NewTestContext(t)
+		manager, podControl, _, err := newTestController(ctx, ds)
+		if err != nil {
+			t.Fatalf("error creating DaemonSets controller: %v", err)
 		}
+		err = manager.nodeStore.Add(newNode("only-node", nil))
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = manager.dsStore.Add(ds)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		expectSyncDaemonSets(t, manager, ds, podControl, 1, 0, 0)
 	}
 }
 
 // DaemonSets should place onto NotReady nodes
 func TestNotReadyNodeDaemonDoesLaunchPod(t *testing.T) {
-	for _, f := range []bool{true, false} {
-		defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ScheduleDaemonSetPods, f)()
-		for _, strategy := range updateStrategies() {
-			ds := newDaemonSet("foo")
-			ds.Spec.UpdateStrategy = *strategy
-			manager, podControl, _, err := newTestController(ds)
-			if err != nil {
-				t.Fatalf("error creating DaemonSets controller: %v", err)
-			}
-			node := newNode("not-ready", nil)
-			node.Status.Conditions = []v1.NodeCondition{
-				{Type: v1.NodeReady, Status: v1.ConditionFalse},
-			}
-			manager.nodeStore.Add(node)
-			manager.dsStore.Add(ds)
-			syncAndValidateDaemonSets(t, manager, ds, podControl, 1, 0, 0)
+	for _, strategy := range updateStrategies() {
+		ds := newDaemonSet("foo")
+		ds.Spec.UpdateStrategy = *strategy
+		_, ctx := ktesting.NewTestContext(t)
+		manager, podControl, _, err := newTestController(ctx, ds)
+		if err != nil {
+			t.Fatalf("error creating DaemonSets controller: %v", err)
 		}
+		node := newNode("not-ready", nil)
+		node.Status.Conditions = []v1.NodeCondition{
+			{Type: v1.NodeReady, Status: v1.ConditionFalse},
+		}
+		err = manager.nodeStore.Add(node)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		err = manager.dsStore.Add(ds)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		expectSyncDaemonSets(t, manager, ds, podControl, 1, 0, 0)
 	}
 }
 
@@ -744,273 +1076,180 @@ func allocatableResources(memory, cpu string) v1.ResourceList {
 	}
 }
 
-// When ScheduleDaemonSetPods is disabled, DaemonSets should not place onto nodes with insufficient free resource
-func TestInsufficientCapacityNodeDaemonDoesNotLaunchPod(t *testing.T) {
-	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ScheduleDaemonSetPods, false)()
+// DaemonSets should not unschedule a daemonset pod from a node with insufficient free resource
+func TestInsufficientCapacityNodeDaemonDoesNotUnscheduleRunningPod(t *testing.T) {
 	for _, strategy := range updateStrategies() {
 		podSpec := resourcePodSpec("too-much-mem", "75M", "75m")
+		podSpec.NodeName = "too-much-mem"
 		ds := newDaemonSet("foo")
 		ds.Spec.UpdateStrategy = *strategy
 		ds.Spec.Template.Spec = podSpec
-		manager, podControl, _, err := newTestController(ds)
+		_, ctx := ktesting.NewTestContext(t)
+		manager, podControl, _, err := newTestController(ctx, ds)
 		if err != nil {
 			t.Fatalf("error creating DaemonSets controller: %v", err)
 		}
 		node := newNode("too-much-mem", nil)
 		node.Status.Allocatable = allocatableResources("100M", "200m")
-		manager.nodeStore.Add(node)
-		manager.podStore.Add(&v1.Pod{
+		err = manager.nodeStore.Add(node)
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = manager.podStore.Add(&v1.Pod{
 			Spec: podSpec,
 		})
-		manager.dsStore.Add(ds)
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = manager.dsStore.Add(ds)
+		if err != nil {
+			t.Fatal(err)
+		}
 		switch strategy.Type {
 		case apps.OnDeleteDaemonSetStrategyType:
-			syncAndValidateDaemonSets(t, manager, ds, podControl, 0, 0, 2)
+			expectSyncDaemonSets(t, manager, ds, podControl, 1, 0, 0)
 		case apps.RollingUpdateDaemonSetStrategyType:
-			syncAndValidateDaemonSets(t, manager, ds, podControl, 0, 0, 3)
+			expectSyncDaemonSets(t, manager, ds, podControl, 1, 0, 0)
 		default:
 			t.Fatalf("unexpected UpdateStrategy %+v", strategy)
 		}
 	}
 }
 
-// DaemonSets should not unschedule a daemonset pod from a node with insufficient free resource
-func TestInsufficientCapacityNodeDaemonDoesNotUnscheduleRunningPod(t *testing.T) {
-	for _, f := range []bool{true, false} {
-		defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ScheduleDaemonSetPods, f)()
-		for _, strategy := range updateStrategies() {
-			podSpec := resourcePodSpec("too-much-mem", "75M", "75m")
-			podSpec.NodeName = "too-much-mem"
-			ds := newDaemonSet("foo")
-			ds.Spec.UpdateStrategy = *strategy
-			ds.Spec.Template.Spec = podSpec
-			manager, podControl, _, err := newTestController(ds)
-			if err != nil {
-				t.Fatalf("error creating DaemonSets controller: %v", err)
-			}
-			node := newNode("too-much-mem", nil)
-			node.Status.Allocatable = allocatableResources("100M", "200m")
-			manager.nodeStore.Add(node)
-			manager.podStore.Add(&v1.Pod{
-				Spec: podSpec,
-			})
-			manager.dsStore.Add(ds)
-			switch strategy.Type {
-			case apps.OnDeleteDaemonSetStrategyType:
-				if !utilfeature.DefaultFeatureGate.Enabled(features.ScheduleDaemonSetPods) {
-					syncAndValidateDaemonSets(t, manager, ds, podControl, 0, 0, 2)
-				} else {
-					syncAndValidateDaemonSets(t, manager, ds, podControl, 1, 0, 0)
-				}
-			case apps.RollingUpdateDaemonSetStrategyType:
-				if !utilfeature.DefaultFeatureGate.Enabled(features.ScheduleDaemonSetPods) {
-					syncAndValidateDaemonSets(t, manager, ds, podControl, 0, 0, 3)
-				} else {
-					syncAndValidateDaemonSets(t, manager, ds, podControl, 1, 0, 0)
-				}
-			default:
-				t.Fatalf("unexpected UpdateStrategy %+v", strategy)
-			}
-		}
-	}
-}
-
 // DaemonSets should only place onto nodes with sufficient free resource and matched node selector
 func TestInsufficientCapacityNodeSufficientCapacityWithNodeLabelDaemonLaunchPod(t *testing.T) {
-	for _, f := range []bool{true, false} {
-		defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ScheduleDaemonSetPods, f)()
-		podSpec := resourcePodSpecWithoutNodeName("50M", "75m")
-		ds := newDaemonSet("foo")
-		ds.Spec.Template.Spec = podSpec
-		ds.Spec.Template.Spec.NodeSelector = simpleNodeLabel
-		manager, podControl, _, err := newTestController(ds)
-		if err != nil {
-			t.Fatalf("error creating DaemonSets controller: %v", err)
-		}
-		node1 := newNode("not-enough-resource", nil)
-		node1.Status.Allocatable = allocatableResources("10M", "20m")
-		node2 := newNode("enough-resource", simpleNodeLabel)
-		node2.Status.Allocatable = allocatableResources("100M", "200m")
-		manager.nodeStore.Add(node1)
-		manager.nodeStore.Add(node2)
-		manager.dsStore.Add(ds)
-		syncAndValidateDaemonSets(t, manager, ds, podControl, 1, 0, 0)
-		// we do not expect any event for insufficient free resource
-		if len(manager.fakeRecorder.Events) != 0 {
-			t.Fatalf("unexpected events, got %v, expected %v: %+v", len(manager.fakeRecorder.Events), 0, manager.fakeRecorder.Events)
-		}
+	_, ctx := ktesting.NewTestContext(t)
+	podSpec := resourcePodSpecWithoutNodeName("50M", "75m")
+	ds := newDaemonSet("foo")
+	ds.Spec.Template.Spec = podSpec
+	ds.Spec.Template.Spec.NodeSelector = simpleNodeLabel
+	manager, podControl, _, err := newTestController(ctx, ds)
+	if err != nil {
+		t.Fatalf("error creating DaemonSets controller: %v", err)
 	}
-}
-
-// When ScheduleDaemonSetPods is disabled, DaemonSetPods should launch onto node with terminated pods if there
-// are sufficient resources.
-func TestSufficientCapacityWithTerminatedPodsDaemonLaunchesPod(t *testing.T) {
-	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ScheduleDaemonSetPods, false)()
-
-	validate := func(strategy *apps.DaemonSetUpdateStrategy, expectedEvents int) {
-		podSpec := resourcePodSpec("too-much-mem", "75M", "75m")
-		ds := newDaemonSet("foo")
-		ds.Spec.UpdateStrategy = *strategy
-		ds.Spec.Template.Spec = podSpec
-		manager, podControl, _, err := newTestController(ds)
-		if err != nil {
-			t.Fatalf("error creating DaemonSets controller: %v", err)
-		}
-		node := newNode("too-much-mem", nil)
-		node.Status.Allocatable = allocatableResources("100M", "200m")
-		manager.nodeStore.Add(node)
-		manager.podStore.Add(&v1.Pod{
-			Spec:   podSpec,
-			Status: v1.PodStatus{Phase: v1.PodSucceeded},
-		})
-		manager.dsStore.Add(ds)
-		syncAndValidateDaemonSets(t, manager, ds, podControl, 1, 0, expectedEvents)
+	node1 := newNode("not-enough-resource", nil)
+	node1.Status.Allocatable = allocatableResources("10M", "20m")
+	node2 := newNode("enough-resource", simpleNodeLabel)
+	node2.Status.Allocatable = allocatableResources("100M", "200m")
+	err = manager.nodeStore.Add(node1)
+	if err != nil {
+		t.Fatal(err)
 	}
-
-	tests := []struct {
-		strategy       *apps.DaemonSetUpdateStrategy
-		expectedEvents int
-	}{
-		{
-			strategy:       newOnDeleteStrategy(),
-			expectedEvents: 1,
-		},
-		{
-			strategy:       newRollbackStrategy(),
-			expectedEvents: 2,
-		},
+	err = manager.nodeStore.Add(node2)
+	if err != nil {
+		t.Fatal(err)
 	}
-
-	for _, t := range tests {
-		validate(t.strategy, t.expectedEvents)
+	err = manager.dsStore.Add(ds)
+	if err != nil {
+		t.Fatal(err)
 	}
-}
-
-// When ScheduleDaemonSetPods is disabled, DaemonSets should place onto nodes with sufficient free resources.
-func TestSufficientCapacityNodeDaemonLaunchesPod(t *testing.T) {
-	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ScheduleDaemonSetPods, false)()
-
-	validate := func(strategy *apps.DaemonSetUpdateStrategy, expectedEvents int) {
-		podSpec := resourcePodSpec("not-too-much-mem", "75M", "75m")
-		ds := newDaemonSet("foo")
-		ds.Spec.UpdateStrategy = *strategy
-		ds.Spec.Template.Spec = podSpec
-		manager, podControl, _, err := newTestController(ds)
-		if err != nil {
-			t.Fatalf("error creating DaemonSets controller: %v", err)
-		}
-		node := newNode("not-too-much-mem", nil)
-		node.Status.Allocatable = allocatableResources("200M", "200m")
-		manager.nodeStore.Add(node)
-		manager.podStore.Add(&v1.Pod{
-			Spec: podSpec,
-		})
-		manager.dsStore.Add(ds)
-		syncAndValidateDaemonSets(t, manager, ds, podControl, 1, 0, expectedEvents)
-	}
-
-	tests := []struct {
-		strategy       *apps.DaemonSetUpdateStrategy
-		expectedEvents int
-	}{
-		{
-			strategy:       newOnDeleteStrategy(),
-			expectedEvents: 1,
-		},
-		{
-			strategy:       newRollbackStrategy(),
-			expectedEvents: 2,
-		},
-	}
-
-	for _, t := range tests {
-		validate(t.strategy, t.expectedEvents)
+	expectSyncDaemonSets(t, manager, ds, podControl, 1, 0, 0)
+	// we do not expect any event for insufficient free resource
+	if len(manager.fakeRecorder.Events) != 0 {
+		t.Fatalf("unexpected events, got %v, expected %v: %+v", len(manager.fakeRecorder.Events), 0, manager.fakeRecorder.Events)
 	}
 }
 
 // DaemonSet should launch a pod on a node with taint NetworkUnavailable condition.
 func TestNetworkUnavailableNodeDaemonLaunchesPod(t *testing.T) {
-	for _, f := range []bool{true, false} {
-		defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ScheduleDaemonSetPods, f)()
-		for _, strategy := range updateStrategies() {
-			ds := newDaemonSet("simple")
-			ds.Spec.UpdateStrategy = *strategy
-			manager, podControl, _, err := newTestController(ds)
-			if err != nil {
-				t.Fatalf("error creating DaemonSets controller: %v", err)
-			}
-
-			node := newNode("network-unavailable", nil)
-			node.Status.Conditions = []v1.NodeCondition{
-				{Type: v1.NodeNetworkUnavailable, Status: v1.ConditionTrue},
-			}
-			manager.nodeStore.Add(node)
-			manager.dsStore.Add(ds)
-
-			syncAndValidateDaemonSets(t, manager, ds, podControl, 1, 0, 0)
+	for _, strategy := range updateStrategies() {
+		ds := newDaemonSet("simple")
+		ds.Spec.UpdateStrategy = *strategy
+		_, ctx := ktesting.NewTestContext(t)
+		manager, podControl, _, err := newTestController(ctx, ds)
+		if err != nil {
+			t.Fatalf("error creating DaemonSets controller: %v", err)
 		}
+
+		node := newNode("network-unavailable", nil)
+		node.Status.Conditions = []v1.NodeCondition{
+			{Type: v1.NodeNetworkUnavailable, Status: v1.ConditionTrue},
+		}
+		err = manager.nodeStore.Add(node)
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = manager.dsStore.Add(ds)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		expectSyncDaemonSets(t, manager, ds, podControl, 1, 0, 0)
 	}
 }
 
 // DaemonSets not take any actions when being deleted
 func TestDontDoAnythingIfBeingDeleted(t *testing.T) {
-	for _, f := range []bool{true, false} {
-		defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ScheduleDaemonSetPods, f)()
-		for _, strategy := range updateStrategies() {
-			podSpec := resourcePodSpec("not-too-much-mem", "75M", "75m")
-			ds := newDaemonSet("foo")
-			ds.Spec.UpdateStrategy = *strategy
-			ds.Spec.Template.Spec = podSpec
-			now := metav1.Now()
-			ds.DeletionTimestamp = &now
-			manager, podControl, _, err := newTestController(ds)
-			if err != nil {
-				t.Fatalf("error creating DaemonSets controller: %v", err)
-			}
-			node := newNode("not-too-much-mem", nil)
-			node.Status.Allocatable = allocatableResources("200M", "200m")
-			manager.nodeStore.Add(node)
-			manager.podStore.Add(&v1.Pod{
-				Spec: podSpec,
-			})
-			manager.dsStore.Add(ds)
-			syncAndValidateDaemonSets(t, manager, ds, podControl, 0, 0, 0)
+	for _, strategy := range updateStrategies() {
+		podSpec := resourcePodSpec("not-too-much-mem", "75M", "75m")
+		ds := newDaemonSet("foo")
+		ds.Spec.UpdateStrategy = *strategy
+		ds.Spec.Template.Spec = podSpec
+		now := metav1.Now()
+		ds.DeletionTimestamp = &now
+		_, ctx := ktesting.NewTestContext(t)
+		manager, podControl, _, err := newTestController(ctx, ds)
+		if err != nil {
+			t.Fatalf("error creating DaemonSets controller: %v", err)
 		}
+		node := newNode("not-too-much-mem", nil)
+		node.Status.Allocatable = allocatableResources("200M", "200m")
+		err = manager.nodeStore.Add(node)
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = manager.podStore.Add(&v1.Pod{
+			Spec: podSpec,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = manager.dsStore.Add(ds)
+		if err != nil {
+			t.Fatal(err)
+		}
+		expectSyncDaemonSets(t, manager, ds, podControl, 0, 0, 0)
 	}
 }
 
 func TestDontDoAnythingIfBeingDeletedRace(t *testing.T) {
-	for _, f := range []bool{true, false} {
-		defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ScheduleDaemonSetPods, f)()
-		for _, strategy := range updateStrategies() {
-			// Bare client says it IS deleted.
-			ds := newDaemonSet("foo")
-			ds.Spec.UpdateStrategy = *strategy
-			now := metav1.Now()
-			ds.DeletionTimestamp = &now
-			manager, podControl, _, err := newTestController(ds)
-			if err != nil {
-				t.Fatalf("error creating DaemonSets controller: %v", err)
-			}
-			addNodes(manager.nodeStore, 0, 5, nil)
-
-			// Lister (cache) says it's NOT deleted.
-			ds2 := *ds
-			ds2.DeletionTimestamp = nil
-			manager.dsStore.Add(&ds2)
-
-			// The existence of a matching orphan should block all actions in this state.
-			pod := newPod("pod1-", "node-0", simpleDaemonSetLabel, nil)
-			manager.podStore.Add(pod)
-
-			syncAndValidateDaemonSets(t, manager, ds, podControl, 0, 0, 0)
+	for _, strategy := range updateStrategies() {
+		// Bare client says it IS deleted.
+		ds := newDaemonSet("foo")
+		ds.Spec.UpdateStrategy = *strategy
+		now := metav1.Now()
+		ds.DeletionTimestamp = &now
+		_, ctx := ktesting.NewTestContext(t)
+		manager, podControl, _, err := newTestController(ctx, ds)
+		if err != nil {
+			t.Fatalf("error creating DaemonSets controller: %v", err)
 		}
+		addNodes(manager.nodeStore, 0, 5, nil)
+
+		// Lister (cache) says it's NOT deleted.
+		ds2 := *ds
+		ds2.DeletionTimestamp = nil
+		err = manager.dsStore.Add(&ds2)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// The existence of a matching orphan should block all actions in this state.
+		pod := newPod("pod1-", "node-0", simpleDaemonSetLabel, nil)
+		err = manager.podStore.Add(pod)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		expectSyncDaemonSets(t, manager, ds, podControl, 0, 0, 0)
 	}
 }
 
-// When ScheduleDaemonSetPods is disabled, DaemonSets should not place onto nodes that would cause port conflicts.
-func TestPortConflictNodeDaemonDoesNotLaunchPod(t *testing.T) {
-	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ScheduleDaemonSetPods, false)()
+// Test that if the node is already scheduled with a pod using a host port
+// but belonging to the same daemonset, we don't delete that pod
+//
+// Issue: https://github.com/kubernetes/kubernetes/issues/22309
+func TestPortConflictWithSameDaemonPodDoesNotDeletePod(t *testing.T) {
 	for _, strategy := range updateStrategies() {
 		podSpec := v1.PodSpec{
 			NodeName: "port-conflict",
@@ -1020,93 +1259,75 @@ func TestPortConflictNodeDaemonDoesNotLaunchPod(t *testing.T) {
 				}},
 			}},
 		}
-		manager, podControl, _, err := newTestController()
+		_, ctx := ktesting.NewTestContext(t)
+		manager, podControl, _, err := newTestController(ctx)
 		if err != nil {
 			t.Fatalf("error creating DaemonSets controller: %v", err)
 		}
 		node := newNode("port-conflict", nil)
-		manager.nodeStore.Add(node)
-		manager.podStore.Add(&v1.Pod{
-			Spec: podSpec,
-		})
-
+		err = manager.nodeStore.Add(node)
+		if err != nil {
+			t.Fatal(err)
+		}
 		ds := newDaemonSet("foo")
 		ds.Spec.UpdateStrategy = *strategy
 		ds.Spec.Template.Spec = podSpec
-		manager.dsStore.Add(ds)
-		syncAndValidateDaemonSets(t, manager, ds, podControl, 0, 0, 0)
-	}
-}
-
-// Test that if the node is already scheduled with a pod using a host port
-// but belonging to the same daemonset, we don't delete that pod
-//
-// Issue: https://github.com/kubernetes/kubernetes/issues/22309
-func TestPortConflictWithSameDaemonPodDoesNotDeletePod(t *testing.T) {
-	for _, f := range []bool{true, false} {
-		defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ScheduleDaemonSetPods, f)()
-		for _, strategy := range updateStrategies() {
-			podSpec := v1.PodSpec{
-				NodeName: "port-conflict",
-				Containers: []v1.Container{{
-					Ports: []v1.ContainerPort{{
-						HostPort: 666,
-					}},
-				}},
-			}
-			manager, podControl, _, err := newTestController()
-			if err != nil {
-				t.Fatalf("error creating DaemonSets controller: %v", err)
-			}
-			node := newNode("port-conflict", nil)
-			manager.nodeStore.Add(node)
-			ds := newDaemonSet("foo")
-			ds.Spec.UpdateStrategy = *strategy
-			ds.Spec.Template.Spec = podSpec
-			manager.dsStore.Add(ds)
-			pod := newPod(ds.Name+"-", node.Name, simpleDaemonSetLabel, ds)
-			manager.podStore.Add(pod)
-			syncAndValidateDaemonSets(t, manager, ds, podControl, 0, 0, 0)
+		err = manager.dsStore.Add(ds)
+		if err != nil {
+			t.Fatal(err)
 		}
+		pod := newPod(ds.Name+"-", node.Name, simpleDaemonSetLabel, ds)
+		err = manager.podStore.Add(pod)
+		if err != nil {
+			t.Fatal(err)
+		}
+		expectSyncDaemonSets(t, manager, ds, podControl, 0, 0, 0)
 	}
 }
 
 // DaemonSets should place onto nodes that would not cause port conflicts
 func TestNoPortConflictNodeDaemonLaunchesPod(t *testing.T) {
-	for _, f := range []bool{true, false} {
-		defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ScheduleDaemonSetPods, f)()
-		for _, strategy := range updateStrategies() {
-			podSpec1 := v1.PodSpec{
-				NodeName: "no-port-conflict",
-				Containers: []v1.Container{{
-					Ports: []v1.ContainerPort{{
-						HostPort: 6661,
-					}},
+	for _, strategy := range updateStrategies() {
+		podSpec1 := v1.PodSpec{
+			NodeName: "no-port-conflict",
+			Containers: []v1.Container{{
+				Ports: []v1.ContainerPort{{
+					HostPort: 6661,
 				}},
-			}
-			podSpec2 := v1.PodSpec{
-				NodeName: "no-port-conflict",
-				Containers: []v1.Container{{
-					Ports: []v1.ContainerPort{{
-						HostPort: 6662,
-					}},
-				}},
-			}
-			ds := newDaemonSet("foo")
-			ds.Spec.UpdateStrategy = *strategy
-			ds.Spec.Template.Spec = podSpec2
-			manager, podControl, _, err := newTestController(ds)
-			if err != nil {
-				t.Fatalf("error creating DaemonSets controller: %v", err)
-			}
-			node := newNode("no-port-conflict", nil)
-			manager.nodeStore.Add(node)
-			manager.podStore.Add(&v1.Pod{
-				Spec: podSpec1,
-			})
-			manager.dsStore.Add(ds)
-			syncAndValidateDaemonSets(t, manager, ds, podControl, 1, 0, 0)
+			}},
 		}
+		podSpec2 := v1.PodSpec{
+			NodeName: "no-port-conflict",
+			Containers: []v1.Container{{
+				Ports: []v1.ContainerPort{{
+					HostPort: 6662,
+				}},
+			}},
+		}
+		ds := newDaemonSet("foo")
+		ds.Spec.UpdateStrategy = *strategy
+		ds.Spec.Template.Spec = podSpec2
+		_, ctx := ktesting.NewTestContext(t)
+		manager, podControl, _, err := newTestController(ctx, ds)
+		if err != nil {
+			t.Fatalf("error creating DaemonSets controller: %v", err)
+		}
+		node := newNode("no-port-conflict", nil)
+		err = manager.nodeStore.Add(node)
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = manager.podStore.Add(&v1.Pod{
+			Spec: podSpec1,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = manager.dsStore.Add(ds)
+		if err != nil {
+			t.Fatal(err)
+		}
+		expectSyncDaemonSets(t, manager, ds, podControl, 1, 0, 0)
 	}
 }
 
@@ -1123,360 +1344,379 @@ func TestPodIsNotDeletedByDaemonsetWithEmptyLabelSelector(t *testing.T) {
 	// this case even though it's empty pod selector matches all pods. The DaemonSetController
 	// should detect this misconfiguration and choose not to sync the DaemonSet. We should
 	// not observe a deletion of the pod on node1.
-	for _, f := range []bool{true, false} {
-		defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ScheduleDaemonSetPods, f)()
-		for _, strategy := range updateStrategies() {
-			ds := newDaemonSet("foo")
-			ds.Spec.UpdateStrategy = *strategy
-			ls := metav1.LabelSelector{}
-			ds.Spec.Selector = &ls
-			ds.Spec.Template.Spec.NodeSelector = map[string]string{"foo": "bar"}
+	for _, strategy := range updateStrategies() {
+		ds := newDaemonSet("foo")
+		ds.Spec.UpdateStrategy = *strategy
+		ls := metav1.LabelSelector{}
+		ds.Spec.Selector = &ls
+		ds.Spec.Template.Spec.NodeSelector = map[string]string{"foo": "bar"}
 
-			manager, podControl, _, err := newTestController(ds)
-			if err != nil {
-				t.Fatalf("error creating DaemonSets controller: %v", err)
-			}
-			manager.nodeStore.Add(newNode("node1", nil))
-			// Create pod not controlled by a daemonset.
-			manager.podStore.Add(&v1.Pod{
-				ObjectMeta: metav1.ObjectMeta{
-					Labels:    map[string]string{"bang": "boom"},
-					Namespace: metav1.NamespaceDefault,
-				},
-				Spec: v1.PodSpec{
-					NodeName: "node1",
-				},
-			})
-			manager.dsStore.Add(ds)
-
-			syncAndValidateDaemonSets(t, manager, ds, podControl, 0, 0, 1)
+		_, ctx := ktesting.NewTestContext(t)
+		manager, podControl, _, err := newTestController(ctx, ds)
+		if err != nil {
+			t.Fatalf("error creating DaemonSets controller: %v", err)
 		}
+		err = manager.nodeStore.Add(newNode("node1", nil))
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Create pod not controlled by a daemonset.
+		err = manager.podStore.Add(&v1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Labels:    map[string]string{"bang": "boom"},
+				Namespace: metav1.NamespaceDefault,
+			},
+			Spec: v1.PodSpec{
+				NodeName: "node1",
+			},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = manager.dsStore.Add(ds)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		expectSyncDaemonSets(t, manager, ds, podControl, 0, 0, 1)
 	}
 }
 
 // Controller should not create pods on nodes which have daemon pods, and should remove excess pods from nodes that have extra pods.
 func TestDealsWithExistingPods(t *testing.T) {
-	for _, f := range []bool{true, false} {
-		defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ScheduleDaemonSetPods, f)()
-		for _, strategy := range updateStrategies() {
-			ds := newDaemonSet("foo")
-			ds.Spec.UpdateStrategy = *strategy
-			manager, podControl, _, err := newTestController(ds)
-			if err != nil {
-				t.Fatalf("error creating DaemonSets controller: %v", err)
-			}
-			manager.dsStore.Add(ds)
-			addNodes(manager.nodeStore, 0, 5, nil)
-			addPods(manager.podStore, "node-1", simpleDaemonSetLabel, ds, 1)
-			addPods(manager.podStore, "node-2", simpleDaemonSetLabel, ds, 2)
-			addPods(manager.podStore, "node-3", simpleDaemonSetLabel, ds, 5)
-			addPods(manager.podStore, "node-4", simpleDaemonSetLabel2, ds, 2)
-			syncAndValidateDaemonSets(t, manager, ds, podControl, 2, 5, 0)
+	for _, strategy := range updateStrategies() {
+		ds := newDaemonSet("foo")
+		ds.Spec.UpdateStrategy = *strategy
+		_, ctx := ktesting.NewTestContext(t)
+		manager, podControl, _, err := newTestController(ctx, ds)
+		if err != nil {
+			t.Fatalf("error creating DaemonSets controller: %v", err)
 		}
+		err = manager.dsStore.Add(ds)
+		if err != nil {
+			t.Fatal(err)
+		}
+		addNodes(manager.nodeStore, 0, 5, nil)
+		addPods(manager.podStore, "node-1", simpleDaemonSetLabel, ds, 1)
+		addPods(manager.podStore, "node-2", simpleDaemonSetLabel, ds, 2)
+		addPods(manager.podStore, "node-3", simpleDaemonSetLabel, ds, 5)
+		addPods(manager.podStore, "node-4", simpleDaemonSetLabel2, ds, 2)
+		expectSyncDaemonSets(t, manager, ds, podControl, 2, 5, 0)
 	}
 }
 
 // Daemon with node selector should launch pods on nodes matching selector.
 func TestSelectorDaemonLaunchesPods(t *testing.T) {
-	for _, f := range []bool{true, false} {
-		defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ScheduleDaemonSetPods, f)()
-		for _, strategy := range updateStrategies() {
-			daemon := newDaemonSet("foo")
-			daemon.Spec.UpdateStrategy = *strategy
-			daemon.Spec.Template.Spec.NodeSelector = simpleNodeLabel
-			manager, podControl, _, err := newTestController(daemon)
-			if err != nil {
-				t.Fatalf("error creating DaemonSets controller: %v", err)
-			}
-			addNodes(manager.nodeStore, 0, 4, nil)
-			addNodes(manager.nodeStore, 4, 3, simpleNodeLabel)
-			manager.dsStore.Add(daemon)
-			syncAndValidateDaemonSets(t, manager, daemon, podControl, 3, 0, 0)
-		}
-	}
-}
-
-// Daemon with node selector should delete pods from nodes that do not satisfy selector.
-func TestSelectorDaemonDeletesUnselectedPods(t *testing.T) {
-	for _, f := range []bool{true, false} {
-		defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ScheduleDaemonSetPods, f)()
-		for _, strategy := range updateStrategies() {
-			ds := newDaemonSet("foo")
-			ds.Spec.UpdateStrategy = *strategy
-			ds.Spec.Template.Spec.NodeSelector = simpleNodeLabel
-			manager, podControl, _, err := newTestController(ds)
-			if err != nil {
-				t.Fatalf("error creating DaemonSets controller: %v", err)
-			}
-			manager.dsStore.Add(ds)
-			addNodes(manager.nodeStore, 0, 5, nil)
-			addNodes(manager.nodeStore, 5, 5, simpleNodeLabel)
-			addPods(manager.podStore, "node-0", simpleDaemonSetLabel2, ds, 2)
-			addPods(manager.podStore, "node-1", simpleDaemonSetLabel, ds, 3)
-			addPods(manager.podStore, "node-1", simpleDaemonSetLabel2, ds, 1)
-			addPods(manager.podStore, "node-4", simpleDaemonSetLabel, ds, 1)
-			syncAndValidateDaemonSets(t, manager, ds, podControl, 5, 4, 0)
-		}
-	}
-}
-
-// DaemonSet with node selector should launch pods on nodes matching selector, but also deal with existing pods on nodes.
-func TestSelectorDaemonDealsWithExistingPods(t *testing.T) {
-	for _, f := range []bool{true, false} {
-		defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ScheduleDaemonSetPods, f)()
-		for _, strategy := range updateStrategies() {
-			ds := newDaemonSet("foo")
-			ds.Spec.UpdateStrategy = *strategy
-			ds.Spec.Template.Spec.NodeSelector = simpleNodeLabel
-			manager, podControl, _, err := newTestController(ds)
-			if err != nil {
-				t.Fatalf("error creating DaemonSets controller: %v", err)
-			}
-			manager.dsStore.Add(ds)
-			addNodes(manager.nodeStore, 0, 5, nil)
-			addNodes(manager.nodeStore, 5, 5, simpleNodeLabel)
-			addPods(manager.podStore, "node-0", simpleDaemonSetLabel, ds, 1)
-			addPods(manager.podStore, "node-1", simpleDaemonSetLabel, ds, 3)
-			addPods(manager.podStore, "node-1", simpleDaemonSetLabel2, ds, 2)
-			addPods(manager.podStore, "node-2", simpleDaemonSetLabel, ds, 4)
-			addPods(manager.podStore, "node-6", simpleDaemonSetLabel, ds, 13)
-			addPods(manager.podStore, "node-7", simpleDaemonSetLabel2, ds, 4)
-			addPods(manager.podStore, "node-9", simpleDaemonSetLabel, ds, 1)
-			addPods(manager.podStore, "node-9", simpleDaemonSetLabel2, ds, 1)
-			syncAndValidateDaemonSets(t, manager, ds, podControl, 3, 20, 0)
-		}
-	}
-}
-
-// DaemonSet with node selector which does not match any node labels should not launch pods.
-func TestBadSelectorDaemonDoesNothing(t *testing.T) {
-	for _, f := range []bool{true, false} {
-		defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ScheduleDaemonSetPods, f)()
-		for _, strategy := range updateStrategies() {
-			manager, podControl, _, err := newTestController()
-			if err != nil {
-				t.Fatalf("error creating DaemonSets controller: %v", err)
-			}
-			addNodes(manager.nodeStore, 0, 4, nil)
-			addNodes(manager.nodeStore, 4, 3, simpleNodeLabel)
-			ds := newDaemonSet("foo")
-			ds.Spec.UpdateStrategy = *strategy
-			ds.Spec.Template.Spec.NodeSelector = simpleNodeLabel2
-			manager.dsStore.Add(ds)
-			syncAndValidateDaemonSets(t, manager, ds, podControl, 0, 0, 0)
-		}
-	}
-}
-
-// DaemonSet with node name should launch pod on node with corresponding name.
-func TestNameDaemonSetLaunchesPods(t *testing.T) {
-	for _, f := range []bool{true, false} {
-		defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ScheduleDaemonSetPods, f)()
-		for _, strategy := range updateStrategies() {
-			ds := newDaemonSet("foo")
-			ds.Spec.UpdateStrategy = *strategy
-			ds.Spec.Template.Spec.NodeName = "node-0"
-			manager, podControl, _, err := newTestController(ds)
-			if err != nil {
-				t.Fatalf("error creating DaemonSets controller: %v", err)
-			}
-			addNodes(manager.nodeStore, 0, 5, nil)
-			manager.dsStore.Add(ds)
-			syncAndValidateDaemonSets(t, manager, ds, podControl, 1, 0, 0)
-		}
-	}
-}
-
-// DaemonSet with node name that does not exist should not launch pods.
-func TestBadNameDaemonSetDoesNothing(t *testing.T) {
-	for _, f := range []bool{true, false} {
-		defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ScheduleDaemonSetPods, f)()
-		for _, strategy := range updateStrategies() {
-			ds := newDaemonSet("foo")
-			ds.Spec.UpdateStrategy = *strategy
-			ds.Spec.Template.Spec.NodeName = "node-10"
-			manager, podControl, _, err := newTestController(ds)
-			if err != nil {
-				t.Fatalf("error creating DaemonSets controller: %v", err)
-			}
-			addNodes(manager.nodeStore, 0, 5, nil)
-			manager.dsStore.Add(ds)
-			syncAndValidateDaemonSets(t, manager, ds, podControl, 0, 0, 0)
-		}
-	}
-}
-
-// DaemonSet with node selector, and node name, matching a node, should launch a pod on the node.
-func TestNameAndSelectorDaemonSetLaunchesPods(t *testing.T) {
-	for _, f := range []bool{true, false} {
-		defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ScheduleDaemonSetPods, f)()
-		for _, strategy := range updateStrategies() {
-			ds := newDaemonSet("foo")
-			ds.Spec.UpdateStrategy = *strategy
-			ds.Spec.Template.Spec.NodeSelector = simpleNodeLabel
-			ds.Spec.Template.Spec.NodeName = "node-6"
-			manager, podControl, _, err := newTestController(ds)
-			if err != nil {
-				t.Fatalf("error creating DaemonSets controller: %v", err)
-			}
-			addNodes(manager.nodeStore, 0, 4, nil)
-			addNodes(manager.nodeStore, 4, 3, simpleNodeLabel)
-			manager.dsStore.Add(ds)
-			syncAndValidateDaemonSets(t, manager, ds, podControl, 1, 0, 0)
-		}
-	}
-}
-
-// DaemonSet with node selector that matches some nodes, and node name that matches a different node, should do nothing.
-func TestInconsistentNameSelectorDaemonSetDoesNothing(t *testing.T) {
-	for _, f := range []bool{true, false} {
-		defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ScheduleDaemonSetPods, f)()
-		for _, strategy := range updateStrategies() {
-			ds := newDaemonSet("foo")
-			ds.Spec.UpdateStrategy = *strategy
-			ds.Spec.Template.Spec.NodeSelector = simpleNodeLabel
-			ds.Spec.Template.Spec.NodeName = "node-0"
-			manager, podControl, _, err := newTestController(ds)
-			if err != nil {
-				t.Fatalf("error creating DaemonSets controller: %v", err)
-			}
-			addNodes(manager.nodeStore, 0, 4, nil)
-			addNodes(manager.nodeStore, 4, 3, simpleNodeLabel)
-			manager.dsStore.Add(ds)
-			syncAndValidateDaemonSets(t, manager, ds, podControl, 0, 0, 0)
-		}
-	}
-}
-
-// DaemonSet with node selector, matching some nodes, should launch pods on all the nodes.
-func TestSelectorDaemonSetLaunchesPods(t *testing.T) {
-	for _, f := range []bool{true, false} {
-		defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ScheduleDaemonSetPods, f)()
-		ds := newDaemonSet("foo")
-		ds.Spec.Template.Spec.NodeSelector = simpleNodeLabel
-		manager, podControl, _, err := newTestController(ds)
+	for _, strategy := range updateStrategies() {
+		daemon := newDaemonSet("foo")
+		daemon.Spec.UpdateStrategy = *strategy
+		daemon.Spec.Template.Spec.NodeSelector = simpleNodeLabel
+		_, ctx := ktesting.NewTestContext(t)
+		manager, podControl, _, err := newTestController(ctx, daemon)
 		if err != nil {
 			t.Fatalf("error creating DaemonSets controller: %v", err)
 		}
 		addNodes(manager.nodeStore, 0, 4, nil)
 		addNodes(manager.nodeStore, 4, 3, simpleNodeLabel)
-		manager.dsStore.Add(ds)
-		syncAndValidateDaemonSets(t, manager, ds, podControl, 3, 0, 0)
+		err = manager.dsStore.Add(daemon)
+		if err != nil {
+			t.Fatal(err)
+		}
+		expectSyncDaemonSets(t, manager, daemon, podControl, 3, 0, 0)
 	}
+}
+
+// Daemon with node selector should delete pods from nodes that do not satisfy selector.
+func TestSelectorDaemonDeletesUnselectedPods(t *testing.T) {
+	for _, strategy := range updateStrategies() {
+		ds := newDaemonSet("foo")
+		ds.Spec.UpdateStrategy = *strategy
+		ds.Spec.Template.Spec.NodeSelector = simpleNodeLabel
+		_, ctx := ktesting.NewTestContext(t)
+		manager, podControl, _, err := newTestController(ctx, ds)
+		if err != nil {
+			t.Fatalf("error creating DaemonSets controller: %v", err)
+		}
+		err = manager.dsStore.Add(ds)
+		if err != nil {
+			t.Fatal(err)
+		}
+		addNodes(manager.nodeStore, 0, 5, nil)
+		addNodes(manager.nodeStore, 5, 5, simpleNodeLabel)
+		addPods(manager.podStore, "node-0", simpleDaemonSetLabel2, ds, 2)
+		addPods(manager.podStore, "node-1", simpleDaemonSetLabel, ds, 3)
+		addPods(manager.podStore, "node-1", simpleDaemonSetLabel2, ds, 1)
+		addPods(manager.podStore, "node-4", simpleDaemonSetLabel, ds, 1)
+		expectSyncDaemonSets(t, manager, ds, podControl, 5, 4, 0)
+	}
+}
+
+// DaemonSet with node selector should launch pods on nodes matching selector, but also deal with existing pods on nodes.
+func TestSelectorDaemonDealsWithExistingPods(t *testing.T) {
+	for _, strategy := range updateStrategies() {
+		ds := newDaemonSet("foo")
+		ds.Spec.UpdateStrategy = *strategy
+		ds.Spec.Template.Spec.NodeSelector = simpleNodeLabel
+		_, ctx := ktesting.NewTestContext(t)
+		manager, podControl, _, err := newTestController(ctx, ds)
+		if err != nil {
+			t.Fatalf("error creating DaemonSets controller: %v", err)
+		}
+		err = manager.dsStore.Add(ds)
+		if err != nil {
+			t.Fatal(err)
+		}
+		addNodes(manager.nodeStore, 0, 5, nil)
+		addNodes(manager.nodeStore, 5, 5, simpleNodeLabel)
+		addPods(manager.podStore, "node-0", simpleDaemonSetLabel, ds, 1)
+		addPods(manager.podStore, "node-1", simpleDaemonSetLabel, ds, 3)
+		addPods(manager.podStore, "node-1", simpleDaemonSetLabel2, ds, 2)
+		addPods(manager.podStore, "node-2", simpleDaemonSetLabel, ds, 4)
+		addPods(manager.podStore, "node-6", simpleDaemonSetLabel, ds, 13)
+		addPods(manager.podStore, "node-7", simpleDaemonSetLabel2, ds, 4)
+		addPods(manager.podStore, "node-9", simpleDaemonSetLabel, ds, 1)
+		addPods(manager.podStore, "node-9", simpleDaemonSetLabel2, ds, 1)
+		expectSyncDaemonSets(t, manager, ds, podControl, 3, 20, 0)
+	}
+}
+
+// DaemonSet with node selector which does not match any node labels should not launch pods.
+func TestBadSelectorDaemonDoesNothing(t *testing.T) {
+	for _, strategy := range updateStrategies() {
+		_, ctx := ktesting.NewTestContext(t)
+		manager, podControl, _, err := newTestController(ctx)
+		if err != nil {
+			t.Fatalf("error creating DaemonSets controller: %v", err)
+		}
+		addNodes(manager.nodeStore, 0, 4, nil)
+		addNodes(manager.nodeStore, 4, 3, simpleNodeLabel)
+		ds := newDaemonSet("foo")
+		ds.Spec.UpdateStrategy = *strategy
+		ds.Spec.Template.Spec.NodeSelector = simpleNodeLabel2
+		err = manager.dsStore.Add(ds)
+		if err != nil {
+			t.Fatal(err)
+		}
+		expectSyncDaemonSets(t, manager, ds, podControl, 0, 0, 0)
+	}
+}
+
+// DaemonSet with node name should launch pod on node with corresponding name.
+func TestNameDaemonSetLaunchesPods(t *testing.T) {
+	for _, strategy := range updateStrategies() {
+		ds := newDaemonSet("foo")
+		ds.Spec.UpdateStrategy = *strategy
+		ds.Spec.Template.Spec.NodeName = "node-0"
+		_, ctx := ktesting.NewTestContext(t)
+		manager, podControl, _, err := newTestController(ctx, ds)
+		if err != nil {
+			t.Fatalf("error creating DaemonSets controller: %v", err)
+		}
+		addNodes(manager.nodeStore, 0, 5, nil)
+		err = manager.dsStore.Add(ds)
+		if err != nil {
+			t.Fatal(err)
+		}
+		expectSyncDaemonSets(t, manager, ds, podControl, 1, 0, 0)
+	}
+}
+
+// DaemonSet with node name that does not exist should not launch pods.
+func TestBadNameDaemonSetDoesNothing(t *testing.T) {
+	for _, strategy := range updateStrategies() {
+		ds := newDaemonSet("foo")
+		ds.Spec.UpdateStrategy = *strategy
+		ds.Spec.Template.Spec.NodeName = "node-10"
+		_, ctx := ktesting.NewTestContext(t)
+		manager, podControl, _, err := newTestController(ctx, ds)
+		if err != nil {
+			t.Fatalf("error creating DaemonSets controller: %v", err)
+		}
+		addNodes(manager.nodeStore, 0, 5, nil)
+		err = manager.dsStore.Add(ds)
+		if err != nil {
+			t.Fatal(err)
+		}
+		expectSyncDaemonSets(t, manager, ds, podControl, 0, 0, 0)
+	}
+}
+
+// DaemonSet with node selector, and node name, matching a node, should launch a pod on the node.
+func TestNameAndSelectorDaemonSetLaunchesPods(t *testing.T) {
+	for _, strategy := range updateStrategies() {
+		ds := newDaemonSet("foo")
+		ds.Spec.UpdateStrategy = *strategy
+		ds.Spec.Template.Spec.NodeSelector = simpleNodeLabel
+		ds.Spec.Template.Spec.NodeName = "node-6"
+		_, ctx := ktesting.NewTestContext(t)
+		manager, podControl, _, err := newTestController(ctx, ds)
+		if err != nil {
+			t.Fatalf("error creating DaemonSets controller: %v", err)
+		}
+		addNodes(manager.nodeStore, 0, 4, nil)
+		addNodes(manager.nodeStore, 4, 3, simpleNodeLabel)
+		err = manager.dsStore.Add(ds)
+		if err != nil {
+			t.Fatal(err)
+		}
+		expectSyncDaemonSets(t, manager, ds, podControl, 1, 0, 0)
+	}
+}
+
+// DaemonSet with node selector that matches some nodes, and node name that matches a different node, should do nothing.
+func TestInconsistentNameSelectorDaemonSetDoesNothing(t *testing.T) {
+	for _, strategy := range updateStrategies() {
+		ds := newDaemonSet("foo")
+		ds.Spec.UpdateStrategy = *strategy
+		ds.Spec.Template.Spec.NodeSelector = simpleNodeLabel
+		ds.Spec.Template.Spec.NodeName = "node-0"
+		_, ctx := ktesting.NewTestContext(t)
+		manager, podControl, _, err := newTestController(ctx, ds)
+		if err != nil {
+			t.Fatalf("error creating DaemonSets controller: %v", err)
+		}
+		addNodes(manager.nodeStore, 0, 4, nil)
+		addNodes(manager.nodeStore, 4, 3, simpleNodeLabel)
+		err = manager.dsStore.Add(ds)
+		if err != nil {
+			t.Fatal(err)
+		}
+		expectSyncDaemonSets(t, manager, ds, podControl, 0, 0, 0)
+	}
+}
+
+// DaemonSet with node selector, matching some nodes, should launch pods on all the nodes.
+func TestSelectorDaemonSetLaunchesPods(t *testing.T) {
+	_, ctx := ktesting.NewTestContext(t)
+	ds := newDaemonSet("foo")
+	ds.Spec.Template.Spec.NodeSelector = simpleNodeLabel
+	manager, podControl, _, err := newTestController(ctx, ds)
+	if err != nil {
+		t.Fatalf("error creating DaemonSets controller: %v", err)
+	}
+	addNodes(manager.nodeStore, 0, 4, nil)
+	addNodes(manager.nodeStore, 4, 3, simpleNodeLabel)
+	err = manager.dsStore.Add(ds)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expectSyncDaemonSets(t, manager, ds, podControl, 3, 0, 0)
 }
 
 // Daemon with node affinity should launch pods on nodes matching affinity.
 func TestNodeAffinityDaemonLaunchesPods(t *testing.T) {
-	for _, f := range []bool{true, false} {
-		defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ScheduleDaemonSetPods, f)()
-		for _, strategy := range updateStrategies() {
-			daemon := newDaemonSet("foo")
-			daemon.Spec.UpdateStrategy = *strategy
-			daemon.Spec.Template.Spec.Affinity = &v1.Affinity{
-				NodeAffinity: &v1.NodeAffinity{
-					RequiredDuringSchedulingIgnoredDuringExecution: &v1.NodeSelector{
-						NodeSelectorTerms: []v1.NodeSelectorTerm{
-							{
-								MatchExpressions: []v1.NodeSelectorRequirement{
-									{
-										Key:      "color",
-										Operator: v1.NodeSelectorOpIn,
-										Values:   []string{simpleNodeLabel["color"]},
-									},
+	for _, strategy := range updateStrategies() {
+		daemon := newDaemonSet("foo")
+		daemon.Spec.UpdateStrategy = *strategy
+		daemon.Spec.Template.Spec.Affinity = &v1.Affinity{
+			NodeAffinity: &v1.NodeAffinity{
+				RequiredDuringSchedulingIgnoredDuringExecution: &v1.NodeSelector{
+					NodeSelectorTerms: []v1.NodeSelectorTerm{
+						{
+							MatchExpressions: []v1.NodeSelectorRequirement{
+								{
+									Key:      "color",
+									Operator: v1.NodeSelectorOpIn,
+									Values:   []string{simpleNodeLabel["color"]},
 								},
 							},
 						},
 					},
 				},
-			}
-
-			manager, podControl, _, err := newTestController(daemon)
-			if err != nil {
-				t.Fatalf("rrror creating DaemonSetsController: %v", err)
-			}
-			addNodes(manager.nodeStore, 0, 4, nil)
-			addNodes(manager.nodeStore, 4, 3, simpleNodeLabel)
-			manager.dsStore.Add(daemon)
-			syncAndValidateDaemonSets(t, manager, daemon, podControl, 3, 0, 0)
+			},
 		}
+		_, ctx := ktesting.NewTestContext(t)
+		manager, podControl, _, err := newTestController(ctx, daemon)
+		if err != nil {
+			t.Fatalf("error creating DaemonSetsController: %v", err)
+		}
+		addNodes(manager.nodeStore, 0, 4, nil)
+		addNodes(manager.nodeStore, 4, 3, simpleNodeLabel)
+		err = manager.dsStore.Add(daemon)
+		if err != nil {
+			t.Fatal(err)
+		}
+		expectSyncDaemonSets(t, manager, daemon, podControl, 3, 0, 0)
 	}
 }
 
 func TestNumberReadyStatus(t *testing.T) {
-	for _, f := range []bool{true, false} {
-		defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ScheduleDaemonSetPods, f)()
-		for _, strategy := range updateStrategies() {
-			ds := newDaemonSet("foo")
-			ds.Spec.UpdateStrategy = *strategy
-			manager, podControl, clientset, err := newTestController(ds)
-			if err != nil {
-				t.Fatalf("error creating DaemonSets controller: %v", err)
-			}
-			var updated *apps.DaemonSet
-			clientset.PrependReactor("update", "daemonsets", func(action core.Action) (handled bool, ret runtime.Object, err error) {
-				if action.GetSubresource() != "status" {
-					return false, nil, nil
-				}
-				if u, ok := action.(core.UpdateAction); ok {
-					updated = u.GetObject().(*apps.DaemonSet)
-				}
+	for _, strategy := range updateStrategies() {
+		ds := newDaemonSet("foo")
+		ds.Spec.UpdateStrategy = *strategy
+		_, ctx := ktesting.NewTestContext(t)
+		manager, podControl, clientset, err := newTestController(ctx, ds)
+		if err != nil {
+			t.Fatalf("error creating DaemonSets controller: %v", err)
+		}
+		var updated *apps.DaemonSet
+		clientset.PrependReactor("update", "daemonsets", func(action core.Action) (handled bool, ret runtime.Object, err error) {
+			if action.GetSubresource() != "status" {
 				return false, nil, nil
-			})
-			addNodes(manager.nodeStore, 0, 2, simpleNodeLabel)
-			addPods(manager.podStore, "node-0", simpleDaemonSetLabel, ds, 1)
-			addPods(manager.podStore, "node-1", simpleDaemonSetLabel, ds, 1)
-			manager.dsStore.Add(ds)
-
-			syncAndValidateDaemonSets(t, manager, ds, podControl, 0, 0, 0)
-			if updated.Status.NumberReady != 0 {
-				t.Errorf("Wrong daemon %s status: %v", updated.Name, updated.Status)
 			}
-
-			selector, _ := metav1.LabelSelectorAsSelector(ds.Spec.Selector)
-			daemonPods, _ := manager.podLister.Pods(ds.Namespace).List(selector)
-			for _, pod := range daemonPods {
-				condition := v1.PodCondition{Type: v1.PodReady, Status: v1.ConditionTrue}
-				pod.Status.Conditions = append(pod.Status.Conditions, condition)
+			if u, ok := action.(core.UpdateAction); ok {
+				updated = u.GetObject().(*apps.DaemonSet)
 			}
+			return false, nil, nil
+		})
+		addNodes(manager.nodeStore, 0, 2, simpleNodeLabel)
+		addPods(manager.podStore, "node-0", simpleDaemonSetLabel, ds, 1)
+		addPods(manager.podStore, "node-1", simpleDaemonSetLabel, ds, 1)
+		err = manager.dsStore.Add(ds)
+		if err != nil {
+			t.Fatal(err)
+		}
 
-			syncAndValidateDaemonSets(t, manager, ds, podControl, 0, 0, 0)
-			if updated.Status.NumberReady != 2 {
-				t.Errorf("Wrong daemon %s status: %v", updated.Name, updated.Status)
-			}
+		expectSyncDaemonSets(t, manager, ds, podControl, 0, 0, 0)
+		if updated.Status.NumberReady != 0 {
+			t.Errorf("Wrong daemon %s status: %v", updated.Name, updated.Status)
+		}
+
+		selector, _ := metav1.LabelSelectorAsSelector(ds.Spec.Selector)
+		daemonPods, _ := manager.podLister.Pods(ds.Namespace).List(selector)
+		for _, pod := range daemonPods {
+			condition := v1.PodCondition{Type: v1.PodReady, Status: v1.ConditionTrue}
+			pod.Status.Conditions = append(pod.Status.Conditions, condition)
+		}
+
+		expectSyncDaemonSets(t, manager, ds, podControl, 0, 0, 0)
+		if updated.Status.NumberReady != 2 {
+			t.Errorf("Wrong daemon %s status: %v", updated.Name, updated.Status)
 		}
 	}
 }
 
 func TestObservedGeneration(t *testing.T) {
-	for _, f := range []bool{true, false} {
-		defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ScheduleDaemonSetPods, f)()
-		for _, strategy := range updateStrategies() {
-			ds := newDaemonSet("foo")
-			ds.Spec.UpdateStrategy = *strategy
-			ds.Generation = 1
-			manager, podControl, clientset, err := newTestController(ds)
-			if err != nil {
-				t.Fatalf("error creating DaemonSets controller: %v", err)
-			}
-			var updated *apps.DaemonSet
-			clientset.PrependReactor("update", "daemonsets", func(action core.Action) (handled bool, ret runtime.Object, err error) {
-				if action.GetSubresource() != "status" {
-					return false, nil, nil
-				}
-				if u, ok := action.(core.UpdateAction); ok {
-					updated = u.GetObject().(*apps.DaemonSet)
-				}
+	for _, strategy := range updateStrategies() {
+		ds := newDaemonSet("foo")
+		ds.Spec.UpdateStrategy = *strategy
+		ds.Generation = 1
+		_, ctx := ktesting.NewTestContext(t)
+		manager, podControl, clientset, err := newTestController(ctx, ds)
+		if err != nil {
+			t.Fatalf("error creating DaemonSets controller: %v", err)
+		}
+		var updated *apps.DaemonSet
+		clientset.PrependReactor("update", "daemonsets", func(action core.Action) (handled bool, ret runtime.Object, err error) {
+			if action.GetSubresource() != "status" {
 				return false, nil, nil
-			})
-
-			addNodes(manager.nodeStore, 0, 1, simpleNodeLabel)
-			addPods(manager.podStore, "node-0", simpleDaemonSetLabel, ds, 1)
-			manager.dsStore.Add(ds)
-
-			syncAndValidateDaemonSets(t, manager, ds, podControl, 0, 0, 0)
-			if updated.Status.ObservedGeneration != ds.Generation {
-				t.Errorf("Wrong ObservedGeneration for daemon %s in status. Expected %d, got %d", updated.Name, ds.Generation, updated.Status.ObservedGeneration)
 			}
+			if u, ok := action.(core.UpdateAction); ok {
+				updated = u.GetObject().(*apps.DaemonSet)
+			}
+			return false, nil, nil
+		})
+
+		addNodes(manager.nodeStore, 0, 1, simpleNodeLabel)
+		addPods(manager.podStore, "node-0", simpleDaemonSetLabel, ds, 1)
+		err = manager.dsStore.Add(ds)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		expectSyncDaemonSets(t, manager, ds, podControl, 0, 0, 0)
+		if updated.Status.ObservedGeneration != ds.Generation {
+			t.Errorf("Wrong ObservedGeneration for daemon %s in status. Expected %d, got %d", updated.Name, ds.Generation, updated.Status.ObservedGeneration)
 		}
 	}
 }
@@ -1495,21 +1735,22 @@ func TestDaemonKillFailedPods(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.test, func(t *testing.T) {
-			for _, f := range []bool{true, false} {
-				defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ScheduleDaemonSetPods, f)()
-				for _, strategy := range updateStrategies() {
-					ds := newDaemonSet("foo")
-					ds.Spec.UpdateStrategy = *strategy
-					manager, podControl, _, err := newTestController(ds)
-					if err != nil {
-						t.Fatalf("error creating DaemonSets controller: %v", err)
-					}
-					manager.dsStore.Add(ds)
-					addNodes(manager.nodeStore, 0, 1, nil)
-					addFailedPods(manager.podStore, "node-0", simpleDaemonSetLabel, ds, test.numFailedPods)
-					addPods(manager.podStore, "node-0", simpleDaemonSetLabel, ds, test.numNormalPods)
-					syncAndValidateDaemonSets(t, manager, ds, podControl, test.expectedCreates, test.expectedDeletes, test.expectedEvents)
+			for _, strategy := range updateStrategies() {
+				ds := newDaemonSet("foo")
+				ds.Spec.UpdateStrategy = *strategy
+				_, ctx := ktesting.NewTestContext(t)
+				manager, podControl, _, err := newTestController(ctx, ds)
+				if err != nil {
+					t.Fatalf("error creating DaemonSets controller: %v", err)
 				}
+				err = manager.dsStore.Add(ds)
+				if err != nil {
+					t.Fatal(err)
+				}
+				addNodes(manager.nodeStore, 0, 1, nil)
+				addFailedPods(manager.podStore, "node-0", simpleDaemonSetLabel, ds, test.numFailedPods)
+				addPods(manager.podStore, "node-0", simpleDaemonSetLabel, ds, test.numNormalPods)
+				expectSyncDaemonSets(t, manager, ds, podControl, test.expectedCreates, test.expectedDeletes, test.expectedEvents)
 			}
 		})
 	}
@@ -1517,256 +1758,292 @@ func TestDaemonKillFailedPods(t *testing.T) {
 
 // DaemonSet controller needs to backoff when killing failed pods to avoid hot looping and fighting with kubelet.
 func TestDaemonKillFailedPodsBackoff(t *testing.T) {
-	for _, f := range []bool{true, false} {
-		defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ScheduleDaemonSetPods, f)()
-		for _, strategy := range updateStrategies() {
-			t.Run(string(strategy.Type), func(t *testing.T) {
-				ds := newDaemonSet("foo")
-				ds.Spec.UpdateStrategy = *strategy
+	for _, strategy := range updateStrategies() {
+		t.Run(string(strategy.Type), func(t *testing.T) {
+			_, ctx := ktesting.NewTestContext(t)
+			ds := newDaemonSet("foo")
+			ds.Spec.UpdateStrategy = *strategy
 
-				manager, podControl, _, err := newTestController(ds)
-				if err != nil {
-					t.Fatalf("error creating DaemonSets controller: %v", err)
-				}
+			manager, podControl, _, err := newTestController(ctx, ds)
+			if err != nil {
+				t.Fatalf("error creating DaemonSets controller: %v", err)
+			}
 
-				manager.dsStore.Add(ds)
-				addNodes(manager.nodeStore, 0, 1, nil)
+			err = manager.dsStore.Add(ds)
+			if err != nil {
+				t.Fatal(err)
+			}
+			addNodes(manager.nodeStore, 0, 1, nil)
 
-				nodeName := "node-0"
-				pod := newPod(fmt.Sprintf("%s-", nodeName), nodeName, simpleDaemonSetLabel, ds)
+			nodeName := "node-0"
+			pod := newPod(fmt.Sprintf("%s-", nodeName), nodeName, simpleDaemonSetLabel, ds)
 
-				// Add a failed Pod
-				pod.Status.Phase = v1.PodFailed
-				err = manager.podStore.Add(pod)
-				if err != nil {
-					t.Fatal(err)
-				}
+			// Add a failed Pod
+			pod.Status.Phase = v1.PodFailed
+			err = manager.podStore.Add(pod)
+			if err != nil {
+				t.Fatal(err)
+			}
 
-				backoffKey := failedPodsBackoffKey(ds, nodeName)
+			backoffKey := failedPodsBackoffKey(ds, nodeName)
 
-				// First sync will delete the pod, initializing backoff
-				syncAndValidateDaemonSets(t, manager, ds, podControl, 0, 1, 1)
-				initialDelay := manager.failedPodsBackoff.Get(backoffKey)
-				if initialDelay <= 0 {
-					t.Fatal("Initial delay is expected to be set.")
-				}
+			// First sync will delete the pod, initializing backoff
+			expectSyncDaemonSets(t, manager, ds, podControl, 0, 1, 1)
+			initialDelay := manager.failedPodsBackoff.Get(backoffKey)
+			if initialDelay <= 0 {
+				t.Fatal("Initial delay is expected to be set.")
+			}
 
-				resetCounters(manager)
+			resetCounters(manager)
 
-				// Immediate (second) sync gets limited by the backoff
-				syncAndValidateDaemonSets(t, manager, ds, podControl, 0, 0, 0)
-				delay := manager.failedPodsBackoff.Get(backoffKey)
-				if delay != initialDelay {
-					t.Fatal("Backoff delay shouldn't be raised while waiting.")
-				}
+			// Immediate (second) sync gets limited by the backoff
+			expectSyncDaemonSets(t, manager, ds, podControl, 0, 0, 0)
+			delay := manager.failedPodsBackoff.Get(backoffKey)
+			if delay != initialDelay {
+				t.Fatal("Backoff delay shouldn't be raised while waiting.")
+			}
 
-				resetCounters(manager)
+			resetCounters(manager)
 
-				// Sleep to wait out backoff
-				fakeClock := manager.failedPodsBackoff.Clock
+			// Sleep to wait out backoff
+			fakeClock := manager.failedPodsBackoff.Clock
 
-				// Move just before the backoff end time
-				fakeClock.Sleep(delay - 1*time.Nanosecond)
-				if !manager.failedPodsBackoff.IsInBackOffSinceUpdate(backoffKey, fakeClock.Now()) {
-					t.Errorf("Backoff delay didn't last the whole waitout period.")
-				}
+			// Move just before the backoff end time
+			fakeClock.Sleep(delay - 1*time.Nanosecond)
+			if !manager.failedPodsBackoff.IsInBackOffSinceUpdate(backoffKey, fakeClock.Now()) {
+				t.Errorf("Backoff delay didn't last the whole waitout period.")
+			}
 
-				// Move to the backoff end time
-				fakeClock.Sleep(1 * time.Nanosecond)
-				if manager.failedPodsBackoff.IsInBackOffSinceUpdate(backoffKey, fakeClock.Now()) {
-					t.Fatal("Backoff delay hasn't been reset after the period has passed.")
-				}
+			// Move to the backoff end time
+			fakeClock.Sleep(1 * time.Nanosecond)
+			if manager.failedPodsBackoff.IsInBackOffSinceUpdate(backoffKey, fakeClock.Now()) {
+				t.Fatal("Backoff delay hasn't been reset after the period has passed.")
+			}
 
-				// After backoff time, it will delete the failed pod
-				syncAndValidateDaemonSets(t, manager, ds, podControl, 0, 1, 1)
-			})
-		}
+			// After backoff time, it will delete the failed pod
+			expectSyncDaemonSets(t, manager, ds, podControl, 0, 1, 1)
+		})
 	}
 }
 
 // Daemonset should not remove a running pod from a node if the pod doesn't
 // tolerate the nodes NoSchedule taint
 func TestNoScheduleTaintedDoesntEvicitRunningIntolerantPod(t *testing.T) {
-	for _, f := range []bool{true, false} {
-		defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ScheduleDaemonSetPods, f)()
-		for _, strategy := range updateStrategies() {
-			ds := newDaemonSet("intolerant")
-			ds.Spec.UpdateStrategy = *strategy
-			manager, podControl, _, err := newTestController(ds)
-			if err != nil {
-				t.Fatalf("error creating DaemonSets controller: %v", err)
-			}
-
-			node := newNode("tainted", nil)
-			manager.nodeStore.Add(node)
-			setNodeTaint(node, noScheduleTaints)
-			manager.podStore.Add(newPod("keep-running-me", "tainted", simpleDaemonSetLabel, ds))
-			manager.dsStore.Add(ds)
-
-			syncAndValidateDaemonSets(t, manager, ds, podControl, 0, 0, 0)
+	for _, strategy := range updateStrategies() {
+		ds := newDaemonSet("intolerant")
+		ds.Spec.UpdateStrategy = *strategy
+		_, ctx := ktesting.NewTestContext(t)
+		manager, podControl, _, err := newTestController(ctx, ds)
+		if err != nil {
+			t.Fatalf("error creating DaemonSets controller: %v", err)
 		}
+
+		node := newNode("tainted", nil)
+		err = manager.nodeStore.Add(node)
+		if err != nil {
+			t.Fatal(err)
+		}
+		setNodeTaint(node, noScheduleTaints)
+		err = manager.podStore.Add(newPod("keep-running-me", "tainted", simpleDaemonSetLabel, ds))
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = manager.dsStore.Add(ds)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		expectSyncDaemonSets(t, manager, ds, podControl, 0, 0, 0)
 	}
 }
 
 // Daemonset should remove a running pod from a node if the pod doesn't
 // tolerate the nodes NoExecute taint
 func TestNoExecuteTaintedDoesEvicitRunningIntolerantPod(t *testing.T) {
-	for _, f := range []bool{true, false} {
-		defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ScheduleDaemonSetPods, f)()
-		for _, strategy := range updateStrategies() {
-			ds := newDaemonSet("intolerant")
-			ds.Spec.UpdateStrategy = *strategy
-			manager, podControl, _, err := newTestController(ds)
-			if err != nil {
-				t.Fatalf("error creating DaemonSets controller: %v", err)
-			}
-
-			node := newNode("tainted", nil)
-			manager.nodeStore.Add(node)
-			setNodeTaint(node, noExecuteTaints)
-			manager.podStore.Add(newPod("stop-running-me", "tainted", simpleDaemonSetLabel, ds))
-			manager.dsStore.Add(ds)
-
-			syncAndValidateDaemonSets(t, manager, ds, podControl, 0, 1, 0)
+	for _, strategy := range updateStrategies() {
+		ds := newDaemonSet("intolerant")
+		ds.Spec.UpdateStrategy = *strategy
+		_, ctx := ktesting.NewTestContext(t)
+		manager, podControl, _, err := newTestController(ctx, ds)
+		if err != nil {
+			t.Fatalf("error creating DaemonSets controller: %v", err)
 		}
+
+		node := newNode("tainted", nil)
+		err = manager.nodeStore.Add(node)
+		if err != nil {
+			t.Fatal(err)
+		}
+		setNodeTaint(node, noExecuteTaints)
+		err = manager.podStore.Add(newPod("stop-running-me", "tainted", simpleDaemonSetLabel, ds))
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = manager.dsStore.Add(ds)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		expectSyncDaemonSets(t, manager, ds, podControl, 0, 1, 0)
 	}
 }
 
 // DaemonSet should not launch a pod on a tainted node when the pod doesn't tolerate that taint.
 func TestTaintedNodeDaemonDoesNotLaunchIntolerantPod(t *testing.T) {
-	for _, f := range []bool{true, false} {
-		defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ScheduleDaemonSetPods, f)()
-		for _, strategy := range updateStrategies() {
-			ds := newDaemonSet("intolerant")
-			ds.Spec.UpdateStrategy = *strategy
-			manager, podControl, _, err := newTestController(ds)
-			if err != nil {
-				t.Fatalf("error creating DaemonSets controller: %v", err)
-			}
-
-			node := newNode("tainted", nil)
-			setNodeTaint(node, noScheduleTaints)
-			manager.nodeStore.Add(node)
-			manager.dsStore.Add(ds)
-
-			syncAndValidateDaemonSets(t, manager, ds, podControl, 0, 0, 0)
+	for _, strategy := range updateStrategies() {
+		ds := newDaemonSet("intolerant")
+		ds.Spec.UpdateStrategy = *strategy
+		_, ctx := ktesting.NewTestContext(t)
+		manager, podControl, _, err := newTestController(ctx, ds)
+		if err != nil {
+			t.Fatalf("error creating DaemonSets controller: %v", err)
 		}
+
+		node := newNode("tainted", nil)
+		setNodeTaint(node, noScheduleTaints)
+		err = manager.nodeStore.Add(node)
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = manager.dsStore.Add(ds)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		expectSyncDaemonSets(t, manager, ds, podControl, 0, 0, 0)
 	}
 }
 
 // DaemonSet should launch a pod on a tainted node when the pod can tolerate that taint.
 func TestTaintedNodeDaemonLaunchesToleratePod(t *testing.T) {
-	for _, f := range []bool{true, false} {
-		defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ScheduleDaemonSetPods, f)()
-		for _, strategy := range updateStrategies() {
-			ds := newDaemonSet("tolerate")
-			ds.Spec.UpdateStrategy = *strategy
-			setDaemonSetToleration(ds, noScheduleTolerations)
-			manager, podControl, _, err := newTestController(ds)
-			if err != nil {
-				t.Fatalf("error creating DaemonSets controller: %v", err)
-			}
-
-			node := newNode("tainted", nil)
-			setNodeTaint(node, noScheduleTaints)
-			manager.nodeStore.Add(node)
-			manager.dsStore.Add(ds)
-
-			syncAndValidateDaemonSets(t, manager, ds, podControl, 1, 0, 0)
+	for _, strategy := range updateStrategies() {
+		ds := newDaemonSet("tolerate")
+		ds.Spec.UpdateStrategy = *strategy
+		setDaemonSetToleration(ds, noScheduleTolerations)
+		_, ctx := ktesting.NewTestContext(t)
+		manager, podControl, _, err := newTestController(ctx, ds)
+		if err != nil {
+			t.Fatalf("error creating DaemonSets controller: %v", err)
 		}
+
+		node := newNode("tainted", nil)
+		setNodeTaint(node, noScheduleTaints)
+		err = manager.nodeStore.Add(node)
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = manager.dsStore.Add(ds)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		expectSyncDaemonSets(t, manager, ds, podControl, 1, 0, 0)
 	}
 }
 
 // DaemonSet should launch a pod on a not ready node with taint notReady:NoExecute.
 func TestNotReadyNodeDaemonLaunchesPod(t *testing.T) {
-	for _, f := range []bool{true, false} {
-		defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ScheduleDaemonSetPods, f)()
-		for _, strategy := range updateStrategies() {
-			ds := newDaemonSet("simple")
-			ds.Spec.UpdateStrategy = *strategy
-			manager, podControl, _, err := newTestController(ds)
-			if err != nil {
-				t.Fatalf("error creating DaemonSets controller: %v", err)
-			}
-
-			node := newNode("tainted", nil)
-			setNodeTaint(node, nodeNotReady)
-			node.Status.Conditions = []v1.NodeCondition{
-				{Type: v1.NodeReady, Status: v1.ConditionFalse},
-			}
-			manager.nodeStore.Add(node)
-			manager.dsStore.Add(ds)
-
-			syncAndValidateDaemonSets(t, manager, ds, podControl, 1, 0, 0)
+	for _, strategy := range updateStrategies() {
+		ds := newDaemonSet("simple")
+		ds.Spec.UpdateStrategy = *strategy
+		_, ctx := ktesting.NewTestContext(t)
+		manager, podControl, _, err := newTestController(ctx, ds)
+		if err != nil {
+			t.Fatalf("error creating DaemonSets controller: %v", err)
 		}
+
+		node := newNode("tainted", nil)
+		setNodeTaint(node, nodeNotReady)
+		node.Status.Conditions = []v1.NodeCondition{
+			{Type: v1.NodeReady, Status: v1.ConditionFalse},
+		}
+		err = manager.nodeStore.Add(node)
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = manager.dsStore.Add(ds)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		expectSyncDaemonSets(t, manager, ds, podControl, 1, 0, 0)
 	}
 }
 
 // DaemonSet should launch a pod on an unreachable node with taint unreachable:NoExecute.
 func TestUnreachableNodeDaemonLaunchesPod(t *testing.T) {
-	for _, f := range []bool{true, false} {
-		defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ScheduleDaemonSetPods, f)()
-		for _, strategy := range updateStrategies() {
-			ds := newDaemonSet("simple")
-			ds.Spec.UpdateStrategy = *strategy
-			manager, podControl, _, err := newTestController(ds)
-			if err != nil {
-				t.Fatalf("error creating DaemonSets controller: %v", err)
-			}
-
-			node := newNode("tainted", nil)
-			setNodeTaint(node, nodeUnreachable)
-			node.Status.Conditions = []v1.NodeCondition{
-				{Type: v1.NodeReady, Status: v1.ConditionUnknown},
-			}
-			manager.nodeStore.Add(node)
-			manager.dsStore.Add(ds)
-
-			syncAndValidateDaemonSets(t, manager, ds, podControl, 1, 0, 0)
+	for _, strategy := range updateStrategies() {
+		ds := newDaemonSet("simple")
+		ds.Spec.UpdateStrategy = *strategy
+		_, ctx := ktesting.NewTestContext(t)
+		manager, podControl, _, err := newTestController(ctx, ds)
+		if err != nil {
+			t.Fatalf("error creating DaemonSets controller: %v", err)
 		}
+
+		node := newNode("tainted", nil)
+		setNodeTaint(node, nodeUnreachable)
+		node.Status.Conditions = []v1.NodeCondition{
+			{Type: v1.NodeReady, Status: v1.ConditionUnknown},
+		}
+		err = manager.nodeStore.Add(node)
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = manager.dsStore.Add(ds)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		expectSyncDaemonSets(t, manager, ds, podControl, 1, 0, 0)
 	}
 }
 
 // DaemonSet should launch a pod on an untainted node when the pod has tolerations.
 func TestNodeDaemonLaunchesToleratePod(t *testing.T) {
-	for _, f := range []bool{true, false} {
-		defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ScheduleDaemonSetPods, f)()
-		for _, strategy := range updateStrategies() {
-			ds := newDaemonSet("tolerate")
-			ds.Spec.UpdateStrategy = *strategy
-			setDaemonSetToleration(ds, noScheduleTolerations)
-			manager, podControl, _, err := newTestController(ds)
-			if err != nil {
-				t.Fatalf("error creating DaemonSets controller: %v", err)
-			}
-			addNodes(manager.nodeStore, 0, 1, nil)
-			manager.dsStore.Add(ds)
-
-			syncAndValidateDaemonSets(t, manager, ds, podControl, 1, 0, 0)
+	for _, strategy := range updateStrategies() {
+		ds := newDaemonSet("tolerate")
+		ds.Spec.UpdateStrategy = *strategy
+		setDaemonSetToleration(ds, noScheduleTolerations)
+		_, ctx := ktesting.NewTestContext(t)
+		manager, podControl, _, err := newTestController(ctx, ds)
+		if err != nil {
+			t.Fatalf("error creating DaemonSets controller: %v", err)
 		}
+		addNodes(manager.nodeStore, 0, 1, nil)
+		err = manager.dsStore.Add(ds)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		expectSyncDaemonSets(t, manager, ds, podControl, 1, 0, 0)
 	}
 }
 
 // DaemonSet should launch a pod on a not ready node with taint notReady:NoExecute.
 func TestDaemonSetRespectsTermination(t *testing.T) {
-	for _, f := range []bool{true, false} {
-		defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ScheduleDaemonSetPods, f)()
-		for _, strategy := range updateStrategies() {
-			ds := newDaemonSet("foo")
-			ds.Spec.UpdateStrategy = *strategy
-			manager, podControl, _, err := newTestController(ds)
-			if err != nil {
-				t.Fatalf("error creating DaemonSets controller: %v", err)
-			}
-
-			addNodes(manager.nodeStore, 0, 1, simpleNodeLabel)
-			pod := newPod(fmt.Sprintf("%s-", "node-0"), "node-0", simpleDaemonSetLabel, ds)
-			dt := metav1.Now()
-			pod.DeletionTimestamp = &dt
-			manager.podStore.Add(pod)
-			manager.dsStore.Add(ds)
-			syncAndValidateDaemonSets(t, manager, ds, podControl, 0, 0, 0)
+	for _, strategy := range updateStrategies() {
+		ds := newDaemonSet("foo")
+		ds.Spec.UpdateStrategy = *strategy
+		_, ctx := ktesting.NewTestContext(t)
+		manager, podControl, _, err := newTestController(ctx, ds)
+		if err != nil {
+			t.Fatalf("error creating DaemonSets controller: %v", err)
 		}
+
+		addNodes(manager.nodeStore, 0, 1, simpleNodeLabel)
+		pod := newPod(fmt.Sprintf("%s-", "node-0"), "node-0", simpleDaemonSetLabel, ds)
+		dt := metav1.Now()
+		pod.DeletionTimestamp = &dt
+		err = manager.podStore.Add(pod)
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = manager.dsStore.Add(ds)
+		if err != nil {
+			t.Fatal(err)
+		}
+		expectSyncDaemonSets(t, manager, ds, podControl, 0, 0, 0)
 	}
 }
 
@@ -1780,113 +2057,36 @@ func setDaemonSetToleration(ds *apps.DaemonSet, tolerations []v1.Toleration) {
 
 // DaemonSet should launch a pod even when the node with MemoryPressure/DiskPressure/PIDPressure taints.
 func TestTaintPressureNodeDaemonLaunchesPod(t *testing.T) {
-	for _, f := range []bool{true, false} {
-		defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ScheduleDaemonSetPods, f)()
-		for _, strategy := range updateStrategies() {
-			ds := newDaemonSet("critical")
-			ds.Spec.UpdateStrategy = *strategy
-			setDaemonSetCritical(ds)
-			manager, podControl, _, err := newTestController(ds)
-			if err != nil {
-				t.Fatalf("error creating DaemonSets controller: %v", err)
-			}
-
-			node := newNode("resources-pressure", nil)
-			node.Status.Conditions = []v1.NodeCondition{
-				{Type: v1.NodeDiskPressure, Status: v1.ConditionTrue},
-				{Type: v1.NodeMemoryPressure, Status: v1.ConditionTrue},
-				{Type: v1.NodePIDPressure, Status: v1.ConditionTrue},
-			}
-			node.Spec.Taints = []v1.Taint{
-				{Key: schedulerapi.TaintNodeDiskPressure, Effect: v1.TaintEffectNoSchedule},
-				{Key: schedulerapi.TaintNodeMemoryPressure, Effect: v1.TaintEffectNoSchedule},
-				{Key: schedulerapi.TaintNodePIDPressure, Effect: v1.TaintEffectNoSchedule},
-			}
-			manager.nodeStore.Add(node)
-
-			// Enabling critical pod and taint nodes by condition feature gate should create critical pod
-			defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.TaintNodesByCondition, true)()
-			manager.dsStore.Add(ds)
-			syncAndValidateDaemonSets(t, manager, ds, podControl, 1, 0, 0)
-		}
-	}
-}
-
-// When ScheduleDaemonSetPods is disabled, DaemonSet should launch a critical pod even when the node has insufficient free resource.
-func TestInsufficientCapacityNodeDaemonLaunchesCriticalPod(t *testing.T) {
-	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ScheduleDaemonSetPods, false)()
 	for _, strategy := range updateStrategies() {
-		podSpec := resourcePodSpec("too-much-mem", "75M", "75m")
 		ds := newDaemonSet("critical")
 		ds.Spec.UpdateStrategy = *strategy
-		ds.Spec.Template.Spec = podSpec
 		setDaemonSetCritical(ds)
-
-		manager, podControl, _, err := newTestController(ds)
+		_, ctx := ktesting.NewTestContext(t)
+		manager, podControl, _, err := newTestController(ctx, ds)
 		if err != nil {
 			t.Fatalf("error creating DaemonSets controller: %v", err)
 		}
-		node := newNode("too-much-mem", nil)
-		node.Status.Allocatable = allocatableResources("100M", "200m")
-		manager.nodeStore.Add(node)
-		manager.podStore.Add(&v1.Pod{
-			Spec: podSpec,
-		})
 
-		// Without enabling critical pod annotation feature gate, we shouldn't create critical pod
-		defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ExperimentalCriticalPodAnnotation, false)()
-		manager.dsStore.Add(ds)
-		switch strategy.Type {
-		case apps.OnDeleteDaemonSetStrategyType:
-			syncAndValidateDaemonSets(t, manager, ds, podControl, 0, 0, 2)
-		case apps.RollingUpdateDaemonSetStrategyType:
-			syncAndValidateDaemonSets(t, manager, ds, podControl, 0, 0, 3)
-		default:
-			t.Fatalf("unexpected UpdateStrategy %+v", strategy)
+		node := newNode("resources-pressure", nil)
+		node.Status.Conditions = []v1.NodeCondition{
+			{Type: v1.NodeDiskPressure, Status: v1.ConditionTrue},
+			{Type: v1.NodeMemoryPressure, Status: v1.ConditionTrue},
+			{Type: v1.NodePIDPressure, Status: v1.ConditionTrue},
 		}
-
-		// Enabling critical pod annotation feature gate should create critical pod
-		defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ExperimentalCriticalPodAnnotation, true)()
-		switch strategy.Type {
-		case apps.OnDeleteDaemonSetStrategyType:
-			syncAndValidateDaemonSets(t, manager, ds, podControl, 1, 0, 2)
-		case apps.RollingUpdateDaemonSetStrategyType:
-			syncAndValidateDaemonSets(t, manager, ds, podControl, 1, 0, 3)
-		default:
-			t.Fatalf("unexpected UpdateStrategy %+v", strategy)
+		node.Spec.Taints = []v1.Taint{
+			{Key: v1.TaintNodeDiskPressure, Effect: v1.TaintEffectNoSchedule},
+			{Key: v1.TaintNodeMemoryPressure, Effect: v1.TaintEffectNoSchedule},
+			{Key: v1.TaintNodePIDPressure, Effect: v1.TaintEffectNoSchedule},
 		}
-	}
-}
-
-// When ScheduleDaemonSetPods is disabled, DaemonSets should NOT launch a critical pod when there are port conflicts.
-func TestPortConflictNodeDaemonDoesNotLaunchCriticalPod(t *testing.T) {
-	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ScheduleDaemonSetPods, false)()
-	for _, strategy := range updateStrategies() {
-		podSpec := v1.PodSpec{
-			NodeName: "port-conflict",
-			Containers: []v1.Container{{
-				Ports: []v1.ContainerPort{{
-					HostPort: 666,
-				}},
-			}},
-		}
-		manager, podControl, _, err := newTestController()
+		err = manager.nodeStore.Add(node)
 		if err != nil {
-			t.Fatalf("error creating DaemonSets controller: %v", err)
+			t.Fatal(err)
 		}
-		node := newNode("port-conflict", nil)
-		manager.nodeStore.Add(node)
-		manager.podStore.Add(&v1.Pod{
-			Spec: podSpec,
-		})
-
-		defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ExperimentalCriticalPodAnnotation, true)()
-		ds := newDaemonSet("critical")
-		ds.Spec.UpdateStrategy = *strategy
-		ds.Spec.Template.Spec = podSpec
-		setDaemonSetCritical(ds)
-		manager.dsStore.Add(ds)
-		syncAndValidateDaemonSets(t, manager, ds, podControl, 0, 0, 0)
+		err = manager.dsStore.Add(ds)
+		if err != nil {
+			t.Fatal(err)
+		}
+		expectSyncDaemonSets(t, manager, ds, podControl, 1, 0, 0)
 	}
 }
 
@@ -1895,82 +2095,89 @@ func setDaemonSetCritical(ds *apps.DaemonSet) {
 	if ds.Spec.Template.ObjectMeta.Annotations == nil {
 		ds.Spec.Template.ObjectMeta.Annotations = make(map[string]string)
 	}
-	ds.Spec.Template.ObjectMeta.Annotations[kubelettypes.CriticalPodAnnotationKey] = ""
+	podPriority := scheduling.SystemCriticalPriority
+	ds.Spec.Template.Spec.Priority = &podPriority
 }
 
 func TestNodeShouldRunDaemonPod(t *testing.T) {
-	for _, f := range []bool{true, false} {
-		defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ScheduleDaemonSetPods, f)()
-		var shouldCreate, wantToRun, shouldContinueRunning bool
-		if utilfeature.DefaultFeatureGate.Enabled(features.ScheduleDaemonSetPods) {
-			shouldCreate = true
-			wantToRun = true
-			shouldContinueRunning = true
-		}
-		cases := []struct {
-			predicateName                                  string
-			podsOnNode                                     []*v1.Pod
-			nodeCondition                                  []v1.NodeCondition
-			nodeUnschedulable                              bool
-			ds                                             *apps.DaemonSet
-			wantToRun, shouldCreate, shouldContinueRunning bool
-			err                                            error
-		}{
-			{
-				predicateName: "ShouldRunDaemonPod",
-				ds: &apps.DaemonSet{
-					Spec: apps.DaemonSetSpec{
-						Selector: &metav1.LabelSelector{MatchLabels: simpleDaemonSetLabel},
-						Template: v1.PodTemplateSpec{
-							ObjectMeta: metav1.ObjectMeta{
-								Labels: simpleDaemonSetLabel,
-							},
-							Spec: resourcePodSpec("", "50M", "0.5"),
+	shouldRun := true
+	shouldContinueRunning := true
+	cases := []struct {
+		predicateName                    string
+		podsOnNode                       []*v1.Pod
+		nodeCondition                    []v1.NodeCondition
+		nodeUnschedulable                bool
+		ds                               *apps.DaemonSet
+		shouldRun, shouldContinueRunning bool
+	}{
+		{
+			predicateName: "ShouldRunDaemonPod",
+			ds: &apps.DaemonSet{
+				Spec: apps.DaemonSetSpec{
+					Selector: &metav1.LabelSelector{MatchLabels: simpleDaemonSetLabel},
+					Template: v1.PodTemplateSpec{
+						ObjectMeta: metav1.ObjectMeta{
+							Labels: simpleDaemonSetLabel,
 						},
+						Spec: resourcePodSpec("", "50M", "0.5"),
 					},
 				},
-				wantToRun:             true,
-				shouldCreate:          true,
-				shouldContinueRunning: true,
 			},
-			{
-				predicateName: "InsufficientResourceError",
-				ds: &apps.DaemonSet{
-					Spec: apps.DaemonSetSpec{
-						Selector: &metav1.LabelSelector{MatchLabels: simpleDaemonSetLabel},
-						Template: v1.PodTemplateSpec{
-							ObjectMeta: metav1.ObjectMeta{
-								Labels: simpleDaemonSetLabel,
-							},
-							Spec: resourcePodSpec("", "200M", "0.5"),
+			shouldRun:             true,
+			shouldContinueRunning: true,
+		},
+		{
+			predicateName: "InsufficientResourceError",
+			ds: &apps.DaemonSet{
+				Spec: apps.DaemonSetSpec{
+					Selector: &metav1.LabelSelector{MatchLabels: simpleDaemonSetLabel},
+					Template: v1.PodTemplateSpec{
+						ObjectMeta: metav1.ObjectMeta{
+							Labels: simpleDaemonSetLabel,
 						},
+						Spec: resourcePodSpec("", "200M", "0.5"),
 					},
 				},
-				wantToRun:             true,
-				shouldCreate:          shouldCreate,
-				shouldContinueRunning: true,
 			},
-			{
-				predicateName: "ErrPodNotMatchHostName",
-				ds: &apps.DaemonSet{
-					Spec: apps.DaemonSetSpec{
-						Selector: &metav1.LabelSelector{MatchLabels: simpleDaemonSetLabel},
-						Template: v1.PodTemplateSpec{
-							ObjectMeta: metav1.ObjectMeta{
-								Labels: simpleDaemonSetLabel,
-							},
-							Spec: resourcePodSpec("other-node", "50M", "0.5"),
+			shouldRun:             shouldRun,
+			shouldContinueRunning: true,
+		},
+		{
+			predicateName: "ErrPodNotMatchHostName",
+			ds: &apps.DaemonSet{
+				Spec: apps.DaemonSetSpec{
+					Selector: &metav1.LabelSelector{MatchLabels: simpleDaemonSetLabel},
+					Template: v1.PodTemplateSpec{
+						ObjectMeta: metav1.ObjectMeta{
+							Labels: simpleDaemonSetLabel,
 						},
+						Spec: resourcePodSpec("other-node", "50M", "0.5"),
 					},
 				},
-				wantToRun:             false,
-				shouldCreate:          false,
-				shouldContinueRunning: false,
 			},
-			{
-				predicateName: "ErrPodNotFitsHostPorts",
-				podsOnNode: []*v1.Pod{
-					{
+			shouldRun:             false,
+			shouldContinueRunning: false,
+		},
+		{
+			predicateName: "ErrPodNotFitsHostPorts",
+			podsOnNode: []*v1.Pod{
+				{
+					Spec: v1.PodSpec{
+						Containers: []v1.Container{{
+							Ports: []v1.ContainerPort{{
+								HostPort: 666,
+							}},
+						}},
+					},
+				},
+			},
+			ds: &apps.DaemonSet{
+				Spec: apps.DaemonSetSpec{
+					Selector: &metav1.LabelSelector{MatchLabels: simpleDaemonSetLabel},
+					Template: v1.PodTemplateSpec{
+						ObjectMeta: metav1.ObjectMeta{
+							Labels: simpleDaemonSetLabel,
+						},
 						Spec: v1.PodSpec{
 							Containers: []v1.Container{{
 								Ports: []v1.ContainerPort{{
@@ -1980,144 +2187,122 @@ func TestNodeShouldRunDaemonPod(t *testing.T) {
 						},
 					},
 				},
-				ds: &apps.DaemonSet{
-					Spec: apps.DaemonSetSpec{
-						Selector: &metav1.LabelSelector{MatchLabels: simpleDaemonSetLabel},
-						Template: v1.PodTemplateSpec{
-							ObjectMeta: metav1.ObjectMeta{
-								Labels: simpleDaemonSetLabel,
-							},
-							Spec: v1.PodSpec{
-								Containers: []v1.Container{{
-									Ports: []v1.ContainerPort{{
-										HostPort: 666,
-									}},
-								}},
-							},
-						},
-					},
-				},
-				wantToRun:             wantToRun,
-				shouldCreate:          shouldCreate,
-				shouldContinueRunning: shouldContinueRunning,
 			},
-			{
-				predicateName: "InsufficientResourceError",
-				podsOnNode: []*v1.Pod{
-					{
-						Spec: v1.PodSpec{
-							Containers: []v1.Container{{
-								Ports: []v1.ContainerPort{{
-									HostPort: 666,
-								}},
-								Resources: resourceContainerSpec("50M", "0.5"),
+			shouldRun:             shouldRun,
+			shouldContinueRunning: shouldContinueRunning,
+		},
+		{
+			predicateName: "InsufficientResourceError",
+			podsOnNode: []*v1.Pod{
+				{
+					Spec: v1.PodSpec{
+						Containers: []v1.Container{{
+							Ports: []v1.ContainerPort{{
+								HostPort: 666,
 							}},
-						},
+							Resources: resourceContainerSpec("50M", "0.5"),
+						}},
 					},
 				},
-				ds: &apps.DaemonSet{
-					Spec: apps.DaemonSetSpec{
-						Selector: &metav1.LabelSelector{MatchLabels: simpleDaemonSetLabel},
-						Template: v1.PodTemplateSpec{
-							ObjectMeta: metav1.ObjectMeta{
-								Labels: simpleDaemonSetLabel,
-							},
-							Spec: resourcePodSpec("", "100M", "0.5"),
-						},
-					},
-				},
-				wantToRun:             true,
-				shouldCreate:          shouldCreate, // This is because we don't care about the resource constraints any more and let default scheduler handle it.
-				shouldContinueRunning: true,
 			},
-			{
-				predicateName: "ShouldRunDaemonPod",
-				podsOnNode: []*v1.Pod{
-					{
-						Spec: v1.PodSpec{
-							Containers: []v1.Container{{
-								Ports: []v1.ContainerPort{{
-									HostPort: 666,
-								}},
-								Resources: resourceContainerSpec("50M", "0.5"),
+			ds: &apps.DaemonSet{
+				Spec: apps.DaemonSetSpec{
+					Selector: &metav1.LabelSelector{MatchLabels: simpleDaemonSetLabel},
+					Template: v1.PodTemplateSpec{
+						ObjectMeta: metav1.ObjectMeta{
+							Labels: simpleDaemonSetLabel,
+						},
+						Spec: resourcePodSpec("", "100M", "0.5"),
+					},
+				},
+			},
+			shouldRun:             shouldRun, // This is because we don't care about the resource constraints any more and let default scheduler handle it.
+			shouldContinueRunning: true,
+		},
+		{
+			predicateName: "ShouldRunDaemonPod",
+			podsOnNode: []*v1.Pod{
+				{
+					Spec: v1.PodSpec{
+						Containers: []v1.Container{{
+							Ports: []v1.ContainerPort{{
+								HostPort: 666,
 							}},
-						},
+							Resources: resourceContainerSpec("50M", "0.5"),
+						}},
 					},
 				},
-				ds: &apps.DaemonSet{
-					Spec: apps.DaemonSetSpec{
-						Selector: &metav1.LabelSelector{MatchLabels: simpleDaemonSetLabel},
-						Template: v1.PodTemplateSpec{
-							ObjectMeta: metav1.ObjectMeta{
-								Labels: simpleDaemonSetLabel,
-							},
-							Spec: resourcePodSpec("", "50M", "0.5"),
-						},
-					},
-				},
-				wantToRun:             true,
-				shouldCreate:          true,
-				shouldContinueRunning: true,
 			},
-			{
-				predicateName: "ErrNodeSelectorNotMatch",
-				ds: &apps.DaemonSet{
-					Spec: apps.DaemonSetSpec{
-						Selector: &metav1.LabelSelector{MatchLabels: simpleDaemonSetLabel},
-						Template: v1.PodTemplateSpec{
-							ObjectMeta: metav1.ObjectMeta{
-								Labels: simpleDaemonSetLabel,
-							},
-							Spec: v1.PodSpec{
-								NodeSelector: simpleDaemonSetLabel2,
-							},
+			ds: &apps.DaemonSet{
+				Spec: apps.DaemonSetSpec{
+					Selector: &metav1.LabelSelector{MatchLabels: simpleDaemonSetLabel},
+					Template: v1.PodTemplateSpec{
+						ObjectMeta: metav1.ObjectMeta{
+							Labels: simpleDaemonSetLabel,
+						},
+						Spec: resourcePodSpec("", "50M", "0.5"),
+					},
+				},
+			},
+			shouldRun:             true,
+			shouldContinueRunning: true,
+		},
+		{
+			predicateName: "ErrNodeSelectorNotMatch",
+			ds: &apps.DaemonSet{
+				Spec: apps.DaemonSetSpec{
+					Selector: &metav1.LabelSelector{MatchLabels: simpleDaemonSetLabel},
+					Template: v1.PodTemplateSpec{
+						ObjectMeta: metav1.ObjectMeta{
+							Labels: simpleDaemonSetLabel,
+						},
+						Spec: v1.PodSpec{
+							NodeSelector: simpleDaemonSetLabel2,
 						},
 					},
 				},
-				wantToRun:             false,
-				shouldCreate:          false,
-				shouldContinueRunning: false,
 			},
-			{
-				predicateName: "ShouldRunDaemonPod",
-				ds: &apps.DaemonSet{
-					Spec: apps.DaemonSetSpec{
-						Selector: &metav1.LabelSelector{MatchLabels: simpleDaemonSetLabel},
-						Template: v1.PodTemplateSpec{
-							ObjectMeta: metav1.ObjectMeta{
-								Labels: simpleDaemonSetLabel,
-							},
-							Spec: v1.PodSpec{
-								NodeSelector: simpleDaemonSetLabel,
-							},
+			shouldRun:             false,
+			shouldContinueRunning: false,
+		},
+		{
+			predicateName: "ShouldRunDaemonPod",
+			ds: &apps.DaemonSet{
+				Spec: apps.DaemonSetSpec{
+					Selector: &metav1.LabelSelector{MatchLabels: simpleDaemonSetLabel},
+					Template: v1.PodTemplateSpec{
+						ObjectMeta: metav1.ObjectMeta{
+							Labels: simpleDaemonSetLabel,
+						},
+						Spec: v1.PodSpec{
+							NodeSelector: simpleDaemonSetLabel,
 						},
 					},
 				},
-				wantToRun:             true,
-				shouldCreate:          true,
-				shouldContinueRunning: true,
 			},
-			{
-				predicateName: "ErrPodAffinityNotMatch",
-				ds: &apps.DaemonSet{
-					Spec: apps.DaemonSetSpec{
-						Selector: &metav1.LabelSelector{MatchLabels: simpleDaemonSetLabel},
-						Template: v1.PodTemplateSpec{
-							ObjectMeta: metav1.ObjectMeta{
-								Labels: simpleDaemonSetLabel,
-							},
-							Spec: v1.PodSpec{
-								Affinity: &v1.Affinity{
-									NodeAffinity: &v1.NodeAffinity{
-										RequiredDuringSchedulingIgnoredDuringExecution: &v1.NodeSelector{
-											NodeSelectorTerms: []v1.NodeSelectorTerm{
-												{
-													MatchExpressions: []v1.NodeSelectorRequirement{
-														{
-															Key:      "type",
-															Operator: v1.NodeSelectorOpIn,
-															Values:   []string{"test"},
-														},
+			shouldRun:             true,
+			shouldContinueRunning: true,
+		},
+		{
+			predicateName: "ErrPodAffinityNotMatch",
+			ds: &apps.DaemonSet{
+				Spec: apps.DaemonSetSpec{
+					Selector: &metav1.LabelSelector{MatchLabels: simpleDaemonSetLabel},
+					Template: v1.PodTemplateSpec{
+						ObjectMeta: metav1.ObjectMeta{
+							Labels: simpleDaemonSetLabel,
+						},
+						Spec: v1.PodSpec{
+							Affinity: &v1.Affinity{
+								NodeAffinity: &v1.NodeAffinity{
+									RequiredDuringSchedulingIgnoredDuringExecution: &v1.NodeSelector{
+										NodeSelectorTerms: []v1.NodeSelectorTerm{
+											{
+												MatchExpressions: []v1.NodeSelectorRequirement{
+													{
+														Key:      "type",
+														Operator: v1.NodeSelectorOpIn,
+														Values:   []string{"test"},
 													},
 												},
 											},
@@ -2128,31 +2313,30 @@ func TestNodeShouldRunDaemonPod(t *testing.T) {
 						},
 					},
 				},
-				wantToRun:             false,
-				shouldCreate:          false,
-				shouldContinueRunning: false,
 			},
-			{
-				predicateName: "ShouldRunDaemonPod",
-				ds: &apps.DaemonSet{
-					Spec: apps.DaemonSetSpec{
-						Selector: &metav1.LabelSelector{MatchLabels: simpleDaemonSetLabel},
-						Template: v1.PodTemplateSpec{
-							ObjectMeta: metav1.ObjectMeta{
-								Labels: simpleDaemonSetLabel,
-							},
-							Spec: v1.PodSpec{
-								Affinity: &v1.Affinity{
-									NodeAffinity: &v1.NodeAffinity{
-										RequiredDuringSchedulingIgnoredDuringExecution: &v1.NodeSelector{
-											NodeSelectorTerms: []v1.NodeSelectorTerm{
-												{
-													MatchExpressions: []v1.NodeSelectorRequirement{
-														{
-															Key:      "type",
-															Operator: v1.NodeSelectorOpIn,
-															Values:   []string{"production"},
-														},
+			shouldRun:             false,
+			shouldContinueRunning: false,
+		},
+		{
+			predicateName: "ShouldRunDaemonPod",
+			ds: &apps.DaemonSet{
+				Spec: apps.DaemonSetSpec{
+					Selector: &metav1.LabelSelector{MatchLabels: simpleDaemonSetLabel},
+					Template: v1.PodTemplateSpec{
+						ObjectMeta: metav1.ObjectMeta{
+							Labels: simpleDaemonSetLabel,
+						},
+						Spec: v1.PodSpec{
+							Affinity: &v1.Affinity{
+								NodeAffinity: &v1.NodeAffinity{
+									RequiredDuringSchedulingIgnoredDuringExecution: &v1.NodeSelector{
+										NodeSelectorTerms: []v1.NodeSelectorTerm{
+											{
+												MatchExpressions: []v1.NodeSelectorRequirement{
+													{
+														Key:      "type",
+														Operator: v1.NodeSelectorOpIn,
+														Values:   []string{"production"},
 													},
 												},
 											},
@@ -2163,61 +2347,53 @@ func TestNodeShouldRunDaemonPod(t *testing.T) {
 						},
 					},
 				},
-				wantToRun:             true,
-				shouldCreate:          true,
-				shouldContinueRunning: true,
 			},
-			{
-				predicateName: "ShouldRunDaemonPodOnUnscheduableNode",
-				ds: &apps.DaemonSet{
-					Spec: apps.DaemonSetSpec{
-						Selector: &metav1.LabelSelector{MatchLabels: simpleDaemonSetLabel},
-						Template: v1.PodTemplateSpec{
-							ObjectMeta: metav1.ObjectMeta{
-								Labels: simpleDaemonSetLabel,
-							},
-							Spec: resourcePodSpec("", "50M", "0.5"),
+			shouldRun:             true,
+			shouldContinueRunning: true,
+		},
+		{
+			predicateName: "ShouldRunDaemonPodOnUnschedulableNode",
+			ds: &apps.DaemonSet{
+				Spec: apps.DaemonSetSpec{
+					Selector: &metav1.LabelSelector{MatchLabels: simpleDaemonSetLabel},
+					Template: v1.PodTemplateSpec{
+						ObjectMeta: metav1.ObjectMeta{
+							Labels: simpleDaemonSetLabel,
 						},
+						Spec: resourcePodSpec("", "50M", "0.5"),
 					},
 				},
-				nodeUnschedulable:     true,
-				wantToRun:             true,
-				shouldCreate:          true,
-				shouldContinueRunning: true,
 			},
-		}
+			nodeUnschedulable:     true,
+			shouldRun:             true,
+			shouldContinueRunning: true,
+		},
+	}
 
-		for i, c := range cases {
-			for _, strategy := range updateStrategies() {
-				node := newNode("test-node", simpleDaemonSetLabel)
-				node.Status.Conditions = append(node.Status.Conditions, c.nodeCondition...)
-				node.Status.Allocatable = allocatableResources("100M", "1")
-				node.Spec.Unschedulable = c.nodeUnschedulable
-				manager, _, _, err := newTestController()
-				if err != nil {
-					t.Fatalf("error creating DaemonSets controller: %v", err)
-				}
-				manager.nodeStore.Add(node)
-				for _, p := range c.podsOnNode {
-					manager.podStore.Add(p)
-					p.Spec.NodeName = "test-node"
-					manager.podNodeIndex.Add(p)
-				}
-				c.ds.Spec.UpdateStrategy = *strategy
-				wantToRun, shouldRun, shouldContinueRunning, err := manager.nodeShouldRunDaemonPod(node, c.ds)
+	for i, c := range cases {
+		for _, strategy := range updateStrategies() {
+			node := newNode("test-node", simpleDaemonSetLabel)
+			node.Status.Conditions = append(node.Status.Conditions, c.nodeCondition...)
+			node.Status.Allocatable = allocatableResources("100M", "1")
+			node.Spec.Unschedulable = c.nodeUnschedulable
+			logger, ctx := ktesting.NewTestContext(t)
+			manager, _, _, err := newTestController(ctx)
+			if err != nil {
+				t.Fatalf("error creating DaemonSets controller: %v", err)
+			}
+			manager.nodeStore.Add(node)
+			for _, p := range c.podsOnNode {
+				p.Spec.NodeName = "test-node"
+				manager.podStore.Add(p)
+			}
+			c.ds.Spec.UpdateStrategy = *strategy
+			shouldRun, shouldContinueRunning := NodeShouldRunDaemonPod(logger, node, c.ds)
 
-				if wantToRun != c.wantToRun {
-					t.Errorf("[%v] strategy: %v, predicateName: %v expected wantToRun: %v, got: %v", i, c.ds.Spec.UpdateStrategy.Type, c.predicateName, c.wantToRun, wantToRun)
-				}
-				if shouldRun != c.shouldCreate {
-					t.Errorf("[%v] strategy: %v, predicateName: %v expected shouldRun: %v, got: %v", i, c.ds.Spec.UpdateStrategy.Type, c.predicateName, c.shouldCreate, shouldRun)
-				}
-				if shouldContinueRunning != c.shouldContinueRunning {
-					t.Errorf("[%v] strategy: %v, predicateName: %v expected shouldContinueRunning: %v, got: %v", i, c.ds.Spec.UpdateStrategy.Type, c.predicateName, c.shouldContinueRunning, shouldContinueRunning)
-				}
-				if err != c.err {
-					t.Errorf("[%v] strategy: %v, predicateName: %v expected err: %v, got: %v", i, c.predicateName, c.ds.Spec.UpdateStrategy.Type, c.err, err)
-				}
+			if shouldRun != c.shouldRun {
+				t.Errorf("[%v] strategy: %v, predicateName: %v expected shouldRun: %v, got: %v", i, c.ds.Spec.UpdateStrategy.Type, c.predicateName, c.shouldRun, shouldRun)
+			}
+			if shouldContinueRunning != c.shouldContinueRunning {
+				t.Errorf("[%v] strategy: %v, predicateName: %v expected shouldContinueRunning: %v, got: %v", i, c.ds.Spec.UpdateStrategy.Type, c.predicateName, c.shouldContinueRunning, shouldContinueRunning)
 			}
 		}
 	}
@@ -2226,124 +2402,160 @@ func TestNodeShouldRunDaemonPod(t *testing.T) {
 // DaemonSets should be resynced when node labels or taints changed
 func TestUpdateNode(t *testing.T) {
 	var enqueued bool
-	for _, f := range []bool{true, false} {
-		defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ScheduleDaemonSetPods, f)()
-		cases := []struct {
-			test               string
-			newNode            *v1.Node
-			oldNode            *v1.Node
-			ds                 *apps.DaemonSet
-			expectedEventsFunc func(strategyType apps.DaemonSetUpdateStrategyType) int
-			shouldEnqueue      bool
-			expectedCreates    func() int
-		}{
-			{
-				test:    "Nothing changed, should not enqueue",
-				oldNode: newNode("node1", nil),
-				newNode: newNode("node1", nil),
-				ds: func() *apps.DaemonSet {
-					ds := newDaemonSet("ds")
-					ds.Spec.Template.Spec.NodeSelector = simpleNodeLabel
-					return ds
-				}(),
-				shouldEnqueue:   false,
-				expectedCreates: func() int { return 0 },
-			},
-			{
-				test:    "Node labels changed",
-				oldNode: newNode("node1", nil),
-				newNode: newNode("node1", simpleNodeLabel),
-				ds: func() *apps.DaemonSet {
-					ds := newDaemonSet("ds")
-					ds.Spec.Template.Spec.NodeSelector = simpleNodeLabel
-					return ds
-				}(),
-				shouldEnqueue:   true,
-				expectedCreates: func() int { return 0 },
-			},
-			{
-				test: "Node taints changed",
-				oldNode: func() *v1.Node {
-					node := newNode("node1", nil)
-					setNodeTaint(node, noScheduleTaints)
-					return node
-				}(),
-				newNode:         newNode("node1", nil),
-				ds:              newDaemonSet("ds"),
-				shouldEnqueue:   true,
-				expectedCreates: func() int { return 0 },
-			},
-			{
-				test:    "Node Allocatable changed",
-				oldNode: newNode("node1", nil),
-				newNode: func() *v1.Node {
-					node := newNode("node1", nil)
-					node.Status.Allocatable = allocatableResources("200M", "200m")
-					return node
-				}(),
-				ds: func() *apps.DaemonSet {
-					ds := newDaemonSet("ds")
-					ds.Spec.Template.Spec = resourcePodSpecWithoutNodeName("200M", "200m")
-					return ds
-				}(),
-				expectedEventsFunc: func(strategyType apps.DaemonSetUpdateStrategyType) int {
-					switch strategyType {
-					case apps.OnDeleteDaemonSetStrategyType:
-						if !utilfeature.DefaultFeatureGate.Enabled(features.ScheduleDaemonSetPods) {
-							return 2
-						}
-						return 0
-					case apps.RollingUpdateDaemonSetStrategyType:
-						if !utilfeature.DefaultFeatureGate.Enabled(features.ScheduleDaemonSetPods) {
-							return 3
-						}
-						return 0
-					default:
-						t.Fatalf("unexpected UpdateStrategy %+v", strategyType)
-					}
+	cases := []struct {
+		test               string
+		newNode            *v1.Node
+		oldNode            *v1.Node
+		ds                 *apps.DaemonSet
+		expectedEventsFunc func(strategyType apps.DaemonSetUpdateStrategyType) int
+		shouldEnqueue      bool
+		expectedCreates    func() int
+		// Indicates whether a DaemonSet pod was already present on the node before the node transitioned to Ready and schedulable state.
+		// (In other words, was the DaemonSet pod scheduled before the node lost its readiness / was tainted?)
+		preExistingPod bool
+	}{
+		{
+			test:    "Nothing changed, should not enqueue",
+			oldNode: newNode("node1", nil),
+			newNode: newNode("node1", nil),
+			ds: func() *apps.DaemonSet {
+				ds := newDaemonSet("ds")
+				ds.Spec.Template.Spec.NodeSelector = simpleNodeLabel
+				return ds
+			}(),
+			shouldEnqueue:   false,
+			expectedCreates: func() int { return 0 },
+			preExistingPod:  false,
+		},
+		{
+			test:    "Node labels changed",
+			oldNode: newNode("node1", nil),
+			newNode: newNode("node1", simpleNodeLabel),
+			ds: func() *apps.DaemonSet {
+				ds := newDaemonSet("ds")
+				ds.Spec.Template.Spec.NodeSelector = simpleNodeLabel
+				return ds
+			}(),
+			shouldEnqueue:   true,
+			expectedCreates: func() int { return 0 },
+			preExistingPod:  false,
+		},
+		{
+			test: "Node taints changed",
+			oldNode: func() *v1.Node {
+				node := newNode("node1", nil)
+				setNodeTaint(node, noScheduleTaints)
+				return node
+			}(),
+			newNode:         newNode("node1", nil),
+			ds:              newDaemonSet("ds"),
+			shouldEnqueue:   true,
+			expectedCreates: func() int { return 0 },
+			preExistingPod:  false,
+		},
+		{
+			test:    "Node Allocatable changed",
+			oldNode: newNode("node1", nil),
+			newNode: func() *v1.Node {
+				node := newNode("node1", nil)
+				node.Status.Allocatable = allocatableResources("200M", "200m")
+				return node
+			}(),
+			ds: func() *apps.DaemonSet {
+				ds := newDaemonSet("ds")
+				ds.Spec.Template.Spec = resourcePodSpecWithoutNodeName("200M", "200m")
+				return ds
+			}(),
+			expectedEventsFunc: func(strategyType apps.DaemonSetUpdateStrategyType) int {
+				switch strategyType {
+				case apps.OnDeleteDaemonSetStrategyType:
 					return 0
-				},
-				shouldEnqueue: !utilfeature.DefaultFeatureGate.Enabled(features.ScheduleDaemonSetPods),
-				expectedCreates: func() int {
-					if !utilfeature.DefaultFeatureGate.Enabled(features.ScheduleDaemonSetPods) {
-						return 0
-					} else {
-						return 1
-					}
-				},
+				case apps.RollingUpdateDaemonSetStrategyType:
+					return 0
+				default:
+					t.Fatalf("unexpected UpdateStrategy %+v", strategyType)
+				}
+				return 0
 			},
-		}
-		for _, c := range cases {
-			for _, strategy := range updateStrategies() {
-				manager, podControl, _, err := newTestController()
-				if err != nil {
-					t.Fatalf("error creating DaemonSets controller: %v", err)
-				}
-				manager.nodeStore.Add(c.oldNode)
-				c.ds.Spec.UpdateStrategy = *strategy
-				manager.dsStore.Add(c.ds)
+			shouldEnqueue: false,
+			expectedCreates: func() int {
+				return 1
+			},
+			preExistingPod: false,
+		},
+		{
+			test:    "Pod transitions from misscheduled to scheduled due to node label change",
+			oldNode: newNode("node1", nil),
+			newNode: newNode("node1", simpleNodeLabel),
+			ds: func() *apps.DaemonSet {
+				ds := newDaemonSet("ds")
+				ds.Spec.Template.Spec.NodeSelector = simpleNodeLabel
+				ds.Status.NumberMisscheduled = 1
+				return ds
+			}(),
+			shouldEnqueue:   true,
+			expectedCreates: func() int { return 0 },
+			preExistingPod:  true,
+		},
+	}
+	for _, c := range cases {
+		for _, strategy := range updateStrategies() {
+			logger, ctx := ktesting.NewTestContext(t)
+			manager, podControl, _, err := newTestController(ctx)
+			if err != nil {
+				t.Fatalf("error creating DaemonSets controller: %v", err)
+			}
+			err = manager.nodeStore.Add(c.oldNode)
+			if err != nil {
+				t.Fatal(err)
+			}
+			c.ds.Spec.UpdateStrategy = *strategy
+			err = manager.dsStore.Add(c.ds)
+			if err != nil {
+				t.Fatal(err)
+			}
 
-				expectedEvents := 0
-				if c.expectedEventsFunc != nil {
-					expectedEvents = c.expectedEventsFunc(strategy.Type)
-				}
-				expectedCreates := 0
-				if c.expectedCreates != nil {
-					expectedCreates = c.expectedCreates()
-				}
-				syncAndValidateDaemonSets(t, manager, c.ds, podControl, expectedCreates, 0, expectedEvents)
+			manager.nodeUpdateQueue = workqueue.NewTypedRateLimitingQueueWithConfig(
+				workqueue.DefaultTypedControllerRateLimiter[string](),
+				workqueue.TypedRateLimitingQueueConfig[string]{
+					Name: "test-daemon-node-updates",
+				},
+			)
 
-				manager.enqueueDaemonSet = func(ds *apps.DaemonSet) {
-					if ds.Name == "ds" {
-						enqueued = true
-					}
-				}
+			expectedEvents := 0
+			if c.expectedEventsFunc != nil {
+				expectedEvents = c.expectedEventsFunc(strategy.Type)
+			}
+			expectedCreates := 0
+			if c.expectedCreates != nil {
+				expectedCreates = c.expectedCreates()
+			}
+			expectSyncDaemonSets(t, manager, c.ds, podControl, expectedCreates, 0, expectedEvents)
 
-				enqueued = false
-				manager.updateNode(c.oldNode, c.newNode)
-				if enqueued != c.shouldEnqueue {
-					t.Errorf("Test case: '%s', expected: %t, got: %t", c.test, c.shouldEnqueue, enqueued)
+			if c.preExistingPod {
+				addPods(manager.podStore, c.oldNode.Name, simpleDaemonSetLabel, c.ds, 1)
+			}
+
+			manager.enqueueDaemonSet = func(ds *apps.DaemonSet) {
+				if ds.Name == "ds" {
+					enqueued = true
 				}
+			}
+
+			err = manager.nodeStore.Add(c.newNode)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			enqueued = false
+			manager.updateNode(logger, c.oldNode, c.newNode)
+
+			nodeKeys := getQueuedKeys(manager.nodeUpdateQueue)
+			for _, key := range nodeKeys {
+				manager.syncNodeUpdate(ctx, key)
+			}
+			if enqueued != c.shouldEnqueue {
+				t.Errorf("Test case: '%s', expected: %t, got: %t", c.test, c.shouldEnqueue, enqueued)
 			}
 		}
 	}
@@ -2351,7 +2563,6 @@ func TestUpdateNode(t *testing.T) {
 
 // DaemonSets should be resynced when non-daemon pods was deleted.
 func TestDeleteNoDaemonPod(t *testing.T) {
-
 	var enqueued bool
 
 	cases := []struct {
@@ -2399,7 +2610,7 @@ func TestDeleteNoDaemonPod(t *testing.T) {
 				ds.Spec.Template.Spec = resourcePodSpec("", "50M", "50m")
 				return ds
 			}(),
-			shouldEnqueue: !utilfeature.DefaultFeatureGate.Enabled(features.ScheduleDaemonSetPods),
+			shouldEnqueue: false,
 		},
 		{
 			test: "Deleted non-daemon pods (with controller) to release resources",
@@ -2444,7 +2655,7 @@ func TestDeleteNoDaemonPod(t *testing.T) {
 				ds.Spec.Template.Spec = resourcePodSpec("", "50M", "50m")
 				return ds
 			}(),
-			shouldEnqueue: !utilfeature.DefaultFeatureGate.Enabled(features.ScheduleDaemonSetPods),
+			shouldEnqueue: false,
 		},
 		{
 			test: "Deleted no scheduled pods",
@@ -2492,41 +2703,35 @@ func TestDeleteNoDaemonPod(t *testing.T) {
 
 	for _, c := range cases {
 		for _, strategy := range updateStrategies() {
-			manager, podControl, _, err := newTestController()
+			logger, ctx := ktesting.NewTestContext(t)
+			manager, podControl, _, err := newTestController(ctx)
 			if err != nil {
 				t.Fatalf("error creating DaemonSets controller: %v", err)
 			}
-			manager.nodeStore.Add(c.node)
+			err = manager.nodeStore.Add(c.node)
+			if err != nil {
+				t.Fatal(err)
+			}
 			c.ds.Spec.UpdateStrategy = *strategy
-			manager.dsStore.Add(c.ds)
+			err = manager.dsStore.Add(c.ds)
+			if err != nil {
+				t.Fatal(err)
+			}
 			for _, pod := range c.existPods {
-				manager.podStore.Add(pod)
+				err = manager.podStore.Add(pod)
+				if err != nil {
+					t.Fatal(err)
+				}
 			}
 			switch strategy.Type {
-			case apps.OnDeleteDaemonSetStrategyType:
-				if utilfeature.DefaultFeatureGate.Enabled(features.ScheduleDaemonSetPods) {
-					syncAndValidateDaemonSets(t, manager, c.ds, podControl, 1, 0, 0)
-				} else {
-					syncAndValidateDaemonSets(t, manager, c.ds, podControl, 0, 0, 2)
-				}
-			case apps.RollingUpdateDaemonSetStrategyType:
-				if utilfeature.DefaultFeatureGate.Enabled(features.ScheduleDaemonSetPods) {
-					syncAndValidateDaemonSets(t, manager, c.ds, podControl, 1, 0, 0)
-				} else {
-					syncAndValidateDaemonSets(t, manager, c.ds, podControl, 0, 0, 3)
-				}
+			case apps.OnDeleteDaemonSetStrategyType, apps.RollingUpdateDaemonSetStrategyType:
+				expectSyncDaemonSets(t, manager, c.ds, podControl, 1, 0, 0)
 			default:
 				t.Fatalf("unexpected UpdateStrategy %+v", strategy)
 			}
 
-			manager.enqueueDaemonSetRateLimited = func(ds *apps.DaemonSet) {
-				if ds.Name == "ds" {
-					enqueued = true
-				}
-			}
-
 			enqueued = false
-			manager.deletePod(c.deletedPod)
+			manager.deletePod(logger, c.deletedPod)
 			if enqueued != c.shouldEnqueue {
 				t.Errorf("Test case: '%s', expected: %t, got: %t", c.test, c.shouldEnqueue, enqueued)
 			}
@@ -2535,89 +2740,149 @@ func TestDeleteNoDaemonPod(t *testing.T) {
 }
 
 func TestDeleteUnscheduledPodForNotExistingNode(t *testing.T) {
-	for _, f := range []bool{true, false} {
-		defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ScheduleDaemonSetPods, f)()
-		for _, strategy := range updateStrategies() {
-			ds := newDaemonSet("foo")
-			ds.Spec.UpdateStrategy = *strategy
-			manager, podControl, _, err := newTestController(ds)
-			if err != nil {
-				t.Fatalf("error creating DaemonSets controller: %v", err)
-			}
-			manager.dsStore.Add(ds)
-			addNodes(manager.nodeStore, 0, 1, nil)
-			addPods(manager.podStore, "node-0", simpleDaemonSetLabel, ds, 1)
-			addPods(manager.podStore, "node-1", simpleDaemonSetLabel, ds, 1)
+	for _, strategy := range updateStrategies() {
+		ds := newDaemonSet("foo")
+		ds.Spec.UpdateStrategy = *strategy
+		_, ctx := ktesting.NewTestContext(t)
+		manager, podControl, _, err := newTestController(ctx, ds)
+		if err != nil {
+			t.Fatalf("error creating DaemonSets controller: %v", err)
+		}
+		err = manager.dsStore.Add(ds)
+		if err != nil {
+			t.Fatal(err)
+		}
+		addNodes(manager.nodeStore, 0, 1, nil)
+		addPods(manager.podStore, "node-0", simpleDaemonSetLabel, ds, 1)
+		addPods(manager.podStore, "node-1", simpleDaemonSetLabel, ds, 1)
 
-			podScheduledUsingAffinity := newPod("pod1-node-3", "", simpleDaemonSetLabel, ds)
-			podScheduledUsingAffinity.Spec.Affinity = &v1.Affinity{
-				NodeAffinity: &v1.NodeAffinity{
-					RequiredDuringSchedulingIgnoredDuringExecution: &v1.NodeSelector{
-						NodeSelectorTerms: []v1.NodeSelectorTerm{
-							{
-								MatchFields: []v1.NodeSelectorRequirement{
-									{
-										Key:      schedulerapi.NodeFieldSelectorKeyNodeName,
-										Operator: v1.NodeSelectorOpIn,
-										Values:   []string{"node-2"},
-									},
+		podScheduledUsingAffinity := newPod("pod1-node-3", "", simpleDaemonSetLabel, ds)
+		podScheduledUsingAffinity.Spec.Affinity = &v1.Affinity{
+			NodeAffinity: &v1.NodeAffinity{
+				RequiredDuringSchedulingIgnoredDuringExecution: &v1.NodeSelector{
+					NodeSelectorTerms: []v1.NodeSelectorTerm{
+						{
+							MatchFields: []v1.NodeSelectorRequirement{
+								{
+									Key:      metav1.ObjectNameField,
+									Operator: v1.NodeSelectorOpIn,
+									Values:   []string{"node-2"},
 								},
 							},
 						},
 					},
 				},
-			}
-			manager.podStore.Add(podScheduledUsingAffinity)
-			if f {
-				syncAndValidateDaemonSets(t, manager, ds, podControl, 0, 1, 0)
-			} else {
-				syncAndValidateDaemonSets(t, manager, ds, podControl, 0, 0, 0)
-			}
+			},
 		}
+		err = manager.podStore.Add(podScheduledUsingAffinity)
+		if err != nil {
+			t.Fatal(err)
+		}
+		expectSyncDaemonSets(t, manager, ds, podControl, 0, 1, 0)
 	}
 }
 
 func TestGetNodesToDaemonPods(t *testing.T) {
-	for _, f := range []bool{true, false} {
-		defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ScheduleDaemonSetPods, f)()
-		for _, strategy := range updateStrategies() {
-			ds := newDaemonSet("foo")
-			ds.Spec.UpdateStrategy = *strategy
-			ds2 := newDaemonSet("foo2")
-			ds2.Spec.UpdateStrategy = *strategy
-			manager, _, _, err := newTestController(ds, ds2)
-			if err != nil {
-				t.Fatalf("error creating DaemonSets controller: %v", err)
-			}
-			manager.dsStore.Add(ds)
-			manager.dsStore.Add(ds2)
-			addNodes(manager.nodeStore, 0, 2, nil)
-
-			// These pods should be returned.
-			wantedPods := []*v1.Pod{
+	ds := newDaemonSet("foo")
+	ds2 := newDaemonSet("foo2")
+	cases := map[string]struct {
+		includeDeletedTerminal bool
+		wantedPods             []*v1.Pod
+		ignoredPods            []*v1.Pod
+	}{
+		"exclude deleted terminal pods": {
+			wantedPods: []*v1.Pod{
 				newPod("matching-owned-0-", "node-0", simpleDaemonSetLabel, ds),
 				newPod("matching-orphan-0-", "node-0", simpleDaemonSetLabel, nil),
 				newPod("matching-owned-1-", "node-1", simpleDaemonSetLabel, ds),
 				newPod("matching-orphan-1-", "node-1", simpleDaemonSetLabel, nil),
-			}
-			failedPod := newPod("matching-owned-failed-pod-1-", "node-1", simpleDaemonSetLabel, ds)
-			failedPod.Status = v1.PodStatus{Phase: v1.PodFailed}
-			wantedPods = append(wantedPods, failedPod)
-			for _, pod := range wantedPods {
-				manager.podStore.Add(pod)
-			}
-
-			// These pods should be ignored.
-			ignoredPods := []*v1.Pod{
+				func() *v1.Pod {
+					pod := newPod("matching-owned-succeeded-pod-0-", "node-0", simpleDaemonSetLabel, ds)
+					pod.Status = v1.PodStatus{Phase: v1.PodSucceeded}
+					return pod
+				}(),
+				func() *v1.Pod {
+					pod := newPod("matching-owned-failed-pod-1-", "node-1", simpleDaemonSetLabel, ds)
+					pod.Status = v1.PodStatus{Phase: v1.PodFailed}
+					return pod
+				}(),
+			},
+			ignoredPods: []*v1.Pod{
 				newPod("non-matching-owned-0-", "node-0", simpleDaemonSetLabel2, ds),
 				newPod("non-matching-orphan-1-", "node-1", simpleDaemonSetLabel2, nil),
 				newPod("matching-owned-by-other-0-", "node-0", simpleDaemonSetLabel, ds2),
+				func() *v1.Pod {
+					pod := newPod("matching-owned-succeeded-deleted-pod-0-", "node-0", simpleDaemonSetLabel, ds)
+					now := metav1.Now()
+					pod.DeletionTimestamp = &now
+					pod.Status = v1.PodStatus{Phase: v1.PodSucceeded}
+					return pod
+				}(),
+				func() *v1.Pod {
+					pod := newPod("matching-owned-failed-deleted-pod-1-", "node-1", simpleDaemonSetLabel, ds)
+					now := metav1.Now()
+					pod.DeletionTimestamp = &now
+					pod.Status = v1.PodStatus{Phase: v1.PodFailed}
+					return pod
+				}(),
+			},
+		},
+		"include deleted terminal pods": {
+			includeDeletedTerminal: true,
+			wantedPods: []*v1.Pod{
+				newPod("matching-owned-0-", "node-0", simpleDaemonSetLabel, ds),
+				newPod("matching-orphan-0-", "node-0", simpleDaemonSetLabel, nil),
+				newPod("matching-owned-1-", "node-1", simpleDaemonSetLabel, ds),
+				newPod("matching-orphan-1-", "node-1", simpleDaemonSetLabel, nil),
+				func() *v1.Pod {
+					pod := newPod("matching-owned-succeeded-pod-0-", "node-0", simpleDaemonSetLabel, ds)
+					pod.Status = v1.PodStatus{Phase: v1.PodSucceeded}
+					return pod
+				}(),
+				func() *v1.Pod {
+					pod := newPod("matching-owned-failed-deleted-pod-1-", "node-1", simpleDaemonSetLabel, ds)
+					now := metav1.Now()
+					pod.DeletionTimestamp = &now
+					pod.Status = v1.PodStatus{Phase: v1.PodFailed}
+					return pod
+				}(),
+			},
+			ignoredPods: []*v1.Pod{
+				newPod("non-matching-owned-0-", "node-0", simpleDaemonSetLabel2, ds),
+				newPod("non-matching-orphan-1-", "node-1", simpleDaemonSetLabel2, nil),
+				newPod("matching-owned-by-other-0-", "node-0", simpleDaemonSetLabel, ds2),
+			},
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			_, ctx := ktesting.NewTestContext(t)
+			manager, _, _, err := newTestController(ctx, ds, ds2)
+			if err != nil {
+				t.Fatalf("error creating DaemonSets controller: %v", err)
 			}
-			for _, pod := range ignoredPods {
+			err = manager.dsStore.Add(ds)
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = manager.dsStore.Add(ds2)
+			if err != nil {
+				t.Fatal(err)
+			}
+			addNodes(manager.nodeStore, 0, 2, nil)
+
+			for _, pod := range tc.wantedPods {
 				manager.podStore.Add(pod)
 			}
 
-			nodesToDaemonPods, err := manager.getNodesToDaemonPods(ds)
+			for _, pod := range tc.ignoredPods {
+				err = manager.podStore.Add(pod)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			nodesToDaemonPods, err := manager.getNodesToDaemonPods(context.TODO(), ds, tc.includeDeletedTerminal)
 			if err != nil {
 				t.Fatalf("getNodesToDaemonPods() error: %v", err)
 			}
@@ -2630,7 +2895,7 @@ func TestGetNodesToDaemonPods(t *testing.T) {
 					gotPods[pod.Name] = true
 				}
 			}
-			for _, pod := range wantedPods {
+			for _, pod := range tc.wantedPods {
 				if !gotPods[pod.Name] {
 					t.Errorf("expected pod %v but didn't get it", pod.Name)
 				}
@@ -2639,353 +2904,399 @@ func TestGetNodesToDaemonPods(t *testing.T) {
 			for podName := range gotPods {
 				t.Errorf("unexpected pod %v was returned", podName)
 			}
-		}
+		})
 	}
 }
 
 func TestAddNode(t *testing.T) {
-	for _, f := range []bool{true, false} {
-		defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ScheduleDaemonSetPods, f)()
-		manager, _, _, err := newTestController()
-		if err != nil {
-			t.Fatalf("error creating DaemonSets controller: %v", err)
-		}
-		node1 := newNode("node1", nil)
-		ds := newDaemonSet("ds")
-		ds.Spec.Template.Spec.NodeSelector = simpleNodeLabel
-		manager.dsStore.Add(ds)
+	logger, ctx := ktesting.NewTestContext(t)
+	manager, _, _, err := newTestController(ctx)
+	if err != nil {
+		t.Fatalf("error creating DaemonSets controller: %v", err)
+	}
+	node1 := newNode("node1", nil)
+	ds := newDaemonSet("ds")
+	ds.Spec.Template.Spec.NodeSelector = simpleNodeLabel
+	err = manager.dsStore.Add(ds)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager.addNode(logger, node1)
+	if got, want := manager.nodeUpdateQueue.Len(), 1; got != want {
+		t.Fatalf("queue.Len() = %v, want %v", got, want)
+	}
+	key, done := manager.nodeUpdateQueue.Get()
+	if done {
+		t.Fatal("failed to get item from nodeUpdateQueue")
+	}
+	if key != node1.Name {
+		t.Fatalf("expected node name %v, got %v", node1.Name, key)
+	}
+	manager.nodeUpdateQueue.Done(key)
 
-		manager.addNode(node1)
-		if got, want := manager.queue.Len(), 0; got != want {
-			t.Fatalf("queue.Len() = %v, want %v", got, want)
-		}
-
-		node2 := newNode("node2", simpleNodeLabel)
-		manager.addNode(node2)
-		if got, want := manager.queue.Len(), 1; got != want {
-			t.Fatalf("queue.Len() = %v, want %v", got, want)
-		}
-		key, done := manager.queue.Get()
-		if key == nil || done {
-			t.Fatalf("failed to enqueue controller for node %v", node2.Name)
-		}
+	node2 := newNode("node2", simpleNodeLabel)
+	manager.addNode(logger, node2)
+	if got, want := manager.nodeUpdateQueue.Len(), 1; got != want {
+		t.Fatalf("queue.Len() = %v, want %v", got, want)
+	}
+	key, done = manager.nodeUpdateQueue.Get()
+	if done {
+		t.Fatal("failed to get item from nodeUpdateQueue")
+	}
+	if key != node2.Name {
+		t.Fatalf("expected node name %v, got %v", node2.Name, key)
 	}
 }
 
 func TestAddPod(t *testing.T) {
-	for _, f := range []bool{true, false} {
-		defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ScheduleDaemonSetPods, f)()
-		for _, strategy := range updateStrategies() {
-			manager, _, _, err := newTestController()
-			if err != nil {
-				t.Fatalf("error creating DaemonSets controller: %v", err)
-			}
-			ds1 := newDaemonSet("foo1")
-			ds1.Spec.UpdateStrategy = *strategy
-			ds2 := newDaemonSet("foo2")
-			ds2.Spec.UpdateStrategy = *strategy
-			manager.dsStore.Add(ds1)
-			manager.dsStore.Add(ds2)
+	for _, strategy := range updateStrategies() {
+		logger, ctx := ktesting.NewTestContext(t)
+		manager, _, _, err := newTestController(ctx)
+		if err != nil {
+			t.Fatalf("error creating DaemonSets controller: %v", err)
+		}
+		ds1 := newDaemonSet("foo1")
+		ds1.Spec.UpdateStrategy = *strategy
+		ds2 := newDaemonSet("foo2")
+		ds2.Spec.UpdateStrategy = *strategy
+		err = manager.dsStore.Add(ds1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = manager.dsStore.Add(ds2)
+		if err != nil {
+			t.Fatal(err)
+		}
+		pod1 := newPod("pod1-", "node-0", simpleDaemonSetLabel, ds1)
+		manager.addPod(logger, pod1)
+		if got, want := manager.queue.Len(), 1; got != want {
+			t.Fatalf("queue.Len() = %v, want %v", got, want)
+		}
+		key, done := manager.queue.Get()
+		if key == "" || done {
+			t.Fatalf("failed to enqueue controller for pod %v", pod1.Name)
+		}
+		expectedKey, _ := controller.KeyFunc(ds1)
+		if got, want := key, expectedKey; got != want {
+			t.Errorf("queue.Get() = %v, want %v", got, want)
+		}
 
-			pod1 := newPod("pod1-", "node-0", simpleDaemonSetLabel, ds1)
-			manager.addPod(pod1)
-			if got, want := manager.queue.Len(), 1; got != want {
-				t.Fatalf("queue.Len() = %v, want %v", got, want)
-			}
-			key, done := manager.queue.Get()
-			if key == nil || done {
-				t.Fatalf("failed to enqueue controller for pod %v", pod1.Name)
-			}
-			expectedKey, _ := controller.KeyFunc(ds1)
-			if got, want := key.(string), expectedKey; got != want {
-				t.Errorf("queue.Get() = %v, want %v", got, want)
-			}
-
-			pod2 := newPod("pod2-", "node-0", simpleDaemonSetLabel, ds2)
-			manager.addPod(pod2)
-			if got, want := manager.queue.Len(), 1; got != want {
-				t.Fatalf("queue.Len() = %v, want %v", got, want)
-			}
-			key, done = manager.queue.Get()
-			if key == nil || done {
-				t.Fatalf("failed to enqueue controller for pod %v", pod2.Name)
-			}
-			expectedKey, _ = controller.KeyFunc(ds2)
-			if got, want := key.(string), expectedKey; got != want {
-				t.Errorf("queue.Get() = %v, want %v", got, want)
-			}
+		pod2 := newPod("pod2-", "node-0", simpleDaemonSetLabel, ds2)
+		manager.addPod(logger, pod2)
+		if got, want := manager.queue.Len(), 1; got != want {
+			t.Fatalf("queue.Len() = %v, want %v", got, want)
+		}
+		key, done = manager.queue.Get()
+		if key == "" || done {
+			t.Fatalf("failed to enqueue controller for pod %v", pod2.Name)
+		}
+		expectedKey, _ = controller.KeyFunc(ds2)
+		if got, want := key, expectedKey; got != want {
+			t.Errorf("queue.Get() = %v, want %v", got, want)
 		}
 	}
 }
 
 func TestAddPodOrphan(t *testing.T) {
-	for _, f := range []bool{true, false} {
-		defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ScheduleDaemonSetPods, f)()
-		for _, strategy := range updateStrategies() {
-			manager, _, _, err := newTestController()
-			if err != nil {
-				t.Fatalf("error creating DaemonSets controller: %v", err)
-			}
-			ds1 := newDaemonSet("foo1")
-			ds1.Spec.UpdateStrategy = *strategy
-			ds2 := newDaemonSet("foo2")
-			ds2.Spec.UpdateStrategy = *strategy
-			ds3 := newDaemonSet("foo3")
-			ds3.Spec.UpdateStrategy = *strategy
-			ds3.Spec.Selector.MatchLabels = simpleDaemonSetLabel2
-			manager.dsStore.Add(ds1)
-			manager.dsStore.Add(ds2)
-			manager.dsStore.Add(ds3)
+	for _, strategy := range updateStrategies() {
+		logger, ctx := ktesting.NewTestContext(t)
+		manager, _, _, err := newTestController(ctx)
+		if err != nil {
+			t.Fatalf("error creating DaemonSets controller: %v", err)
+		}
+		ds1 := newDaemonSet("foo1")
+		ds1.Spec.UpdateStrategy = *strategy
+		ds2 := newDaemonSet("foo2")
+		ds2.Spec.UpdateStrategy = *strategy
+		ds3 := newDaemonSet("foo3")
+		ds3.Spec.UpdateStrategy = *strategy
+		ds3.Spec.Selector.MatchLabels = simpleDaemonSetLabel2
+		err = manager.dsStore.Add(ds1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = manager.dsStore.Add(ds2)
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = manager.dsStore.Add(ds3)
+		if err != nil {
+			t.Fatal(err)
+		}
 
-			// Make pod an orphan. Expect matching sets to be queued.
-			pod := newPod("pod1-", "node-0", simpleDaemonSetLabel, nil)
-			manager.addPod(pod)
-			if got, want := manager.queue.Len(), 2; got != want {
-				t.Fatalf("queue.Len() = %v, want %v", got, want)
-			}
-			if got, want := getQueuedKeys(manager.queue), []string{"default/foo1", "default/foo2"}; !reflect.DeepEqual(got, want) {
-				t.Errorf("getQueuedKeys() = %v, want %v", got, want)
-			}
+		// Make pod an orphan. Expect matching sets to be queued.
+		pod := newPod("pod1-", "node-0", simpleDaemonSetLabel, nil)
+		manager.addPod(logger, pod)
+		if got, want := manager.queue.Len(), 2; got != want {
+			t.Fatalf("queue.Len() = %v, want %v", got, want)
+		}
+		if got, want := getQueuedKeys(manager.queue), []string{"default/foo1", "default/foo2"}; !reflect.DeepEqual(got, want) {
+			t.Errorf("getQueuedKeys() = %v, want %v", got, want)
 		}
 	}
 }
 
 func TestUpdatePod(t *testing.T) {
-	for _, f := range []bool{true, false} {
-		defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ScheduleDaemonSetPods, f)()
-		for _, strategy := range updateStrategies() {
-			manager, _, _, err := newTestController()
-			if err != nil {
-				t.Fatalf("error creating DaemonSets controller: %v", err)
-			}
-			ds1 := newDaemonSet("foo1")
-			ds1.Spec.UpdateStrategy = *strategy
-			ds2 := newDaemonSet("foo2")
-			ds2.Spec.UpdateStrategy = *strategy
-			manager.dsStore.Add(ds1)
-			manager.dsStore.Add(ds2)
+	for _, strategy := range updateStrategies() {
+		logger, ctx := ktesting.NewTestContext(t)
+		manager, _, _, err := newTestController(ctx)
+		if err != nil {
+			t.Fatalf("error creating DaemonSets controller: %v", err)
+		}
+		ds1 := newDaemonSet("foo1")
+		ds1.Spec.UpdateStrategy = *strategy
+		ds2 := newDaemonSet("foo2")
+		ds2.Spec.UpdateStrategy = *strategy
+		err = manager.dsStore.Add(ds1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = manager.dsStore.Add(ds2)
+		if err != nil {
+			t.Fatal(err)
+		}
 
-			pod1 := newPod("pod1-", "node-0", simpleDaemonSetLabel, ds1)
-			prev := *pod1
-			bumpResourceVersion(pod1)
-			manager.updatePod(&prev, pod1)
-			if got, want := manager.queue.Len(), 1; got != want {
-				t.Fatalf("queue.Len() = %v, want %v", got, want)
-			}
-			key, done := manager.queue.Get()
-			if key == nil || done {
-				t.Fatalf("failed to enqueue controller for pod %v", pod1.Name)
-			}
-			expectedKey, _ := controller.KeyFunc(ds1)
-			if got, want := key.(string), expectedKey; got != want {
-				t.Errorf("queue.Get() = %v, want %v", got, want)
-			}
+		pod1 := newPod("pod1-", "node-0", simpleDaemonSetLabel, ds1)
+		prev := *pod1
+		bumpResourceVersion(pod1)
+		manager.updatePod(logger, &prev, pod1)
+		if got, want := manager.queue.Len(), 1; got != want {
+			t.Fatalf("queue.Len() = %v, want %v", got, want)
+		}
+		key, done := manager.queue.Get()
+		if key == "" || done {
+			t.Fatalf("failed to enqueue controller for pod %v", pod1.Name)
+		}
+		expectedKey, _ := controller.KeyFunc(ds1)
+		if got, want := key, expectedKey; got != want {
+			t.Errorf("queue.Get() = %v, want %v", got, want)
+		}
 
-			pod2 := newPod("pod2-", "node-0", simpleDaemonSetLabel, ds2)
-			prev = *pod2
-			bumpResourceVersion(pod2)
-			manager.updatePod(&prev, pod2)
-			if got, want := manager.queue.Len(), 1; got != want {
-				t.Fatalf("queue.Len() = %v, want %v", got, want)
-			}
-			key, done = manager.queue.Get()
-			if key == nil || done {
-				t.Fatalf("failed to enqueue controller for pod %v", pod2.Name)
-			}
-			expectedKey, _ = controller.KeyFunc(ds2)
-			if got, want := key.(string), expectedKey; got != want {
-				t.Errorf("queue.Get() = %v, want %v", got, want)
-			}
+		pod2 := newPod("pod2-", "node-0", simpleDaemonSetLabel, ds2)
+		prev = *pod2
+		bumpResourceVersion(pod2)
+		manager.updatePod(logger, &prev, pod2)
+		if got, want := manager.queue.Len(), 1; got != want {
+			t.Fatalf("queue.Len() = %v, want %v", got, want)
+		}
+		key, done = manager.queue.Get()
+		if key == "" || done {
+			t.Fatalf("failed to enqueue controller for pod %v", pod2.Name)
+		}
+		expectedKey, _ = controller.KeyFunc(ds2)
+		if got, want := key, expectedKey; got != want {
+			t.Errorf("queue.Get() = %v, want %v", got, want)
 		}
 	}
 }
 
 func TestUpdatePodOrphanSameLabels(t *testing.T) {
-	for _, f := range []bool{true, false} {
-		defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ScheduleDaemonSetPods, f)()
+	for _, strategy := range updateStrategies() {
+		logger, ctx := ktesting.NewTestContext(t)
+		manager, _, _, err := newTestController(ctx)
+		if err != nil {
+			t.Fatalf("error creating DaemonSets controller: %v", err)
+		}
+		ds1 := newDaemonSet("foo1")
+		ds1.Spec.UpdateStrategy = *strategy
+		ds2 := newDaemonSet("foo2")
+		ds2.Spec.UpdateStrategy = *strategy
+		err = manager.dsStore.Add(ds1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = manager.dsStore.Add(ds2)
+		if err != nil {
+			t.Fatal(err)
+		}
 
-		for _, strategy := range updateStrategies() {
-			manager, _, _, err := newTestController()
-			if err != nil {
-				t.Fatalf("error creating DaemonSets controller: %v", err)
-			}
-			ds1 := newDaemonSet("foo1")
-			ds1.Spec.UpdateStrategy = *strategy
-			ds2 := newDaemonSet("foo2")
-			ds2.Spec.UpdateStrategy = *strategy
-			manager.dsStore.Add(ds1)
-			manager.dsStore.Add(ds2)
-
-			pod := newPod("pod1-", "node-0", simpleDaemonSetLabel, nil)
-			prev := *pod
-			bumpResourceVersion(pod)
-			manager.updatePod(&prev, pod)
-			if got, want := manager.queue.Len(), 0; got != want {
-				t.Fatalf("queue.Len() = %v, want %v", got, want)
-			}
+		pod := newPod("pod1-", "node-0", simpleDaemonSetLabel, nil)
+		prev := *pod
+		bumpResourceVersion(pod)
+		manager.updatePod(logger, &prev, pod)
+		if got, want := manager.queue.Len(), 0; got != want {
+			t.Fatalf("queue.Len() = %v, want %v", got, want)
 		}
 	}
 }
 
 func TestUpdatePodOrphanWithNewLabels(t *testing.T) {
-	for _, f := range []bool{true, false} {
-		defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ScheduleDaemonSetPods, f)()
+	for _, strategy := range updateStrategies() {
+		logger, ctx := ktesting.NewTestContext(t)
+		manager, _, _, err := newTestController(ctx)
+		if err != nil {
+			t.Fatalf("error creating DaemonSets controller: %v", err)
+		}
+		ds1 := newDaemonSet("foo1")
+		ds1.Spec.UpdateStrategy = *strategy
+		ds2 := newDaemonSet("foo2")
+		ds2.Spec.UpdateStrategy = *strategy
+		err = manager.dsStore.Add(ds1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = manager.dsStore.Add(ds2)
+		if err != nil {
+			t.Fatal(err)
+		}
 
-		for _, strategy := range updateStrategies() {
-			manager, _, _, err := newTestController()
-			if err != nil {
-				t.Fatalf("error creating DaemonSets controller: %v", err)
-			}
-			ds1 := newDaemonSet("foo1")
-			ds1.Spec.UpdateStrategy = *strategy
-			ds2 := newDaemonSet("foo2")
-			ds2.Spec.UpdateStrategy = *strategy
-			manager.dsStore.Add(ds1)
-			manager.dsStore.Add(ds2)
-
-			pod := newPod("pod1-", "node-0", simpleDaemonSetLabel, nil)
-			prev := *pod
-			prev.Labels = map[string]string{"foo2": "bar2"}
-			bumpResourceVersion(pod)
-			manager.updatePod(&prev, pod)
-			if got, want := manager.queue.Len(), 2; got != want {
-				t.Fatalf("queue.Len() = %v, want %v", got, want)
-			}
-			if got, want := getQueuedKeys(manager.queue), []string{"default/foo1", "default/foo2"}; !reflect.DeepEqual(got, want) {
-				t.Errorf("getQueuedKeys() = %v, want %v", got, want)
-			}
+		pod := newPod("pod1-", "node-0", simpleDaemonSetLabel, nil)
+		prev := *pod
+		prev.Labels = map[string]string{"foo2": "bar2"}
+		bumpResourceVersion(pod)
+		manager.updatePod(logger, &prev, pod)
+		if got, want := manager.queue.Len(), 2; got != want {
+			t.Fatalf("queue.Len() = %v, want %v", got, want)
+		}
+		if got, want := getQueuedKeys(manager.queue), []string{"default/foo1", "default/foo2"}; !reflect.DeepEqual(got, want) {
+			t.Errorf("getQueuedKeys() = %v, want %v", got, want)
 		}
 	}
 }
 
 func TestUpdatePodChangeControllerRef(t *testing.T) {
-	for _, f := range []bool{true, false} {
-		defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ScheduleDaemonSetPods, f)()
+	for _, strategy := range updateStrategies() {
+		ds := newDaemonSet("foo")
+		ds.Spec.UpdateStrategy = *strategy
+		logger, ctx := ktesting.NewTestContext(t)
+		manager, _, _, err := newTestController(ctx)
+		if err != nil {
+			t.Fatalf("error creating DaemonSets controller: %v", err)
+		}
+		ds1 := newDaemonSet("foo1")
+		ds2 := newDaemonSet("foo2")
+		err = manager.dsStore.Add(ds1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = manager.dsStore.Add(ds2)
+		if err != nil {
+			t.Fatal(err)
+		}
 
-		for _, strategy := range updateStrategies() {
-			ds := newDaemonSet("foo")
-			ds.Spec.UpdateStrategy = *strategy
-			manager, _, _, err := newTestController()
-			if err != nil {
-				t.Fatalf("error creating DaemonSets controller: %v", err)
-			}
-			ds1 := newDaemonSet("foo1")
-			ds2 := newDaemonSet("foo2")
-			manager.dsStore.Add(ds1)
-			manager.dsStore.Add(ds2)
-
-			pod := newPod("pod1-", "node-0", simpleDaemonSetLabel, ds1)
-			prev := *pod
-			prev.OwnerReferences = []metav1.OwnerReference{*metav1.NewControllerRef(ds2, controllerKind)}
-			bumpResourceVersion(pod)
-			manager.updatePod(&prev, pod)
-			if got, want := manager.queue.Len(), 2; got != want {
-				t.Fatalf("queue.Len() = %v, want %v", got, want)
-			}
+		pod := newPod("pod1-", "node-0", simpleDaemonSetLabel, ds1)
+		prev := *pod
+		prev.OwnerReferences = []metav1.OwnerReference{*metav1.NewControllerRef(ds2, controllerKind)}
+		bumpResourceVersion(pod)
+		manager.updatePod(logger, &prev, pod)
+		if got, want := manager.queue.Len(), 2; got != want {
+			t.Fatalf("queue.Len() = %v, want %v", got, want)
 		}
 	}
 }
 
 func TestUpdatePodControllerRefRemoved(t *testing.T) {
-	for _, f := range []bool{true, false} {
-		defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ScheduleDaemonSetPods, f)()
+	for _, strategy := range updateStrategies() {
+		logger, ctx := ktesting.NewTestContext(t)
+		manager, _, _, err := newTestController(ctx)
+		if err != nil {
+			t.Fatalf("error creating DaemonSets controller: %v", err)
+		}
+		ds1 := newDaemonSet("foo1")
+		ds1.Spec.UpdateStrategy = *strategy
+		ds2 := newDaemonSet("foo2")
+		ds2.Spec.UpdateStrategy = *strategy
+		err = manager.dsStore.Add(ds1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = manager.dsStore.Add(ds2)
+		if err != nil {
+			t.Fatal(err)
+		}
 
-		for _, strategy := range updateStrategies() {
-			manager, _, _, err := newTestController()
-			if err != nil {
-				t.Fatalf("error creating DaemonSets controller: %v", err)
-			}
-			ds1 := newDaemonSet("foo1")
-			ds1.Spec.UpdateStrategy = *strategy
-			ds2 := newDaemonSet("foo2")
-			ds2.Spec.UpdateStrategy = *strategy
-			manager.dsStore.Add(ds1)
-			manager.dsStore.Add(ds2)
-
-			pod := newPod("pod1-", "node-0", simpleDaemonSetLabel, ds1)
-			prev := *pod
-			pod.OwnerReferences = nil
-			bumpResourceVersion(pod)
-			manager.updatePod(&prev, pod)
-			if got, want := manager.queue.Len(), 2; got != want {
-				t.Fatalf("queue.Len() = %v, want %v", got, want)
-			}
+		pod := newPod("pod1-", "node-0", simpleDaemonSetLabel, ds1)
+		prev := *pod
+		pod.OwnerReferences = nil
+		bumpResourceVersion(pod)
+		manager.updatePod(logger, &prev, pod)
+		if got, want := manager.queue.Len(), 2; got != want {
+			t.Fatalf("queue.Len() = %v, want %v", got, want)
 		}
 	}
 }
 
 func TestDeletePod(t *testing.T) {
-	for _, f := range []bool{true, false} {
-		defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ScheduleDaemonSetPods, f)()
+	for _, strategy := range updateStrategies() {
+		logger, ctx := ktesting.NewTestContext(t)
+		manager, _, _, err := newTestController(ctx)
+		if err != nil {
+			t.Fatalf("error creating DaemonSets controller: %v", err)
+		}
+		ds1 := newDaemonSet("foo1")
+		ds1.Spec.UpdateStrategy = *strategy
+		ds2 := newDaemonSet("foo2")
+		ds2.Spec.UpdateStrategy = *strategy
+		err = manager.dsStore.Add(ds1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = manager.dsStore.Add(ds2)
+		if err != nil {
+			t.Fatal(err)
+		}
 
-		for _, strategy := range updateStrategies() {
-			manager, _, _, err := newTestController()
-			if err != nil {
-				t.Fatalf("error creating DaemonSets controller: %v", err)
-			}
-			ds1 := newDaemonSet("foo1")
-			ds1.Spec.UpdateStrategy = *strategy
-			ds2 := newDaemonSet("foo2")
-			ds2.Spec.UpdateStrategy = *strategy
-			manager.dsStore.Add(ds1)
-			manager.dsStore.Add(ds2)
+		pod1 := newPod("pod1-", "node-0", simpleDaemonSetLabel, ds1)
+		manager.deletePod(logger, pod1)
+		if got, want := manager.queue.Len(), 1; got != want {
+			t.Fatalf("queue.Len() = %v, want %v", got, want)
+		}
+		key, done := manager.queue.Get()
+		if key == "" || done {
+			t.Fatalf("failed to enqueue controller for pod %v", pod1.Name)
+		}
+		expectedKey, _ := controller.KeyFunc(ds1)
+		if got, want := key, expectedKey; got != want {
+			t.Errorf("queue.Get() = %v, want %v", got, want)
+		}
 
-			pod1 := newPod("pod1-", "node-0", simpleDaemonSetLabel, ds1)
-			manager.deletePod(pod1)
-			if got, want := manager.queue.Len(), 1; got != want {
-				t.Fatalf("queue.Len() = %v, want %v", got, want)
-			}
-			key, done := manager.queue.Get()
-			if key == nil || done {
-				t.Fatalf("failed to enqueue controller for pod %v", pod1.Name)
-			}
-			expectedKey, _ := controller.KeyFunc(ds1)
-			if got, want := key.(string), expectedKey; got != want {
-				t.Errorf("queue.Get() = %v, want %v", got, want)
-			}
-
-			pod2 := newPod("pod2-", "node-0", simpleDaemonSetLabel, ds2)
-			manager.deletePod(pod2)
-			if got, want := manager.queue.Len(), 1; got != want {
-				t.Fatalf("queue.Len() = %v, want %v", got, want)
-			}
-			key, done = manager.queue.Get()
-			if key == nil || done {
-				t.Fatalf("failed to enqueue controller for pod %v", pod2.Name)
-			}
-			expectedKey, _ = controller.KeyFunc(ds2)
-			if got, want := key.(string), expectedKey; got != want {
-				t.Errorf("queue.Get() = %v, want %v", got, want)
-			}
+		pod2 := newPod("pod2-", "node-0", simpleDaemonSetLabel, ds2)
+		manager.deletePod(logger, pod2)
+		if got, want := manager.queue.Len(), 1; got != want {
+			t.Fatalf("queue.Len() = %v, want %v", got, want)
+		}
+		key, done = manager.queue.Get()
+		if key == "" || done {
+			t.Fatalf("failed to enqueue controller for pod %v", pod2.Name)
+		}
+		expectedKey, _ = controller.KeyFunc(ds2)
+		if got, want := key, expectedKey; got != want {
+			t.Errorf("queue.Get() = %v, want %v", got, want)
 		}
 	}
 }
 
 func TestDeletePodOrphan(t *testing.T) {
-	for _, f := range []bool{true, false} {
-		defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ScheduleDaemonSetPods, f)()
+	for _, strategy := range updateStrategies() {
+		logger, ctx := ktesting.NewTestContext(t)
+		manager, _, _, err := newTestController(ctx)
+		if err != nil {
+			t.Fatalf("error creating DaemonSets controller: %v", err)
+		}
+		ds1 := newDaemonSet("foo1")
+		ds1.Spec.UpdateStrategy = *strategy
+		ds2 := newDaemonSet("foo2")
+		ds2.Spec.UpdateStrategy = *strategy
+		ds3 := newDaemonSet("foo3")
+		ds3.Spec.UpdateStrategy = *strategy
+		ds3.Spec.Selector.MatchLabels = simpleDaemonSetLabel2
+		err = manager.dsStore.Add(ds1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = manager.dsStore.Add(ds2)
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = manager.dsStore.Add(ds3)
+		if err != nil {
+			t.Fatal(err)
+		}
 
-		for _, strategy := range updateStrategies() {
-			manager, _, _, err := newTestController()
-			if err != nil {
-				t.Fatalf("error creating DaemonSets controller: %v", err)
-			}
-			ds1 := newDaemonSet("foo1")
-			ds1.Spec.UpdateStrategy = *strategy
-			ds2 := newDaemonSet("foo2")
-			ds2.Spec.UpdateStrategy = *strategy
-			ds3 := newDaemonSet("foo3")
-			ds3.Spec.UpdateStrategy = *strategy
-			ds3.Spec.Selector.MatchLabels = simpleDaemonSetLabel2
-			manager.dsStore.Add(ds1)
-			manager.dsStore.Add(ds2)
-			manager.dsStore.Add(ds3)
-
-			pod := newPod("pod1-", "node-0", simpleDaemonSetLabel, nil)
-			manager.deletePod(pod)
-			if got, want := manager.queue.Len(), 0; got != want {
-				t.Fatalf("queue.Len() = %v, want %v", got, want)
-			}
+		pod := newPod("pod1-", "node-0", simpleDaemonSetLabel, nil)
+		manager.deletePod(logger, pod)
+		if got, want := manager.queue.Len(), 0; got != want {
+			t.Fatalf("queue.Len() = %v, want %v", got, want)
 		}
 	}
 }
@@ -2997,7 +3308,7 @@ func bumpResourceVersion(obj metav1.Object) {
 
 // getQueuedKeys returns a sorted list of keys in the queue.
 // It can be used to quickly check that multiple keys are in there.
-func getQueuedKeys(queue workqueue.RateLimitingInterface) []string {
+func getQueuedKeys(queue workqueue.TypedRateLimitingInterface[string]) []string {
 	var keys []string
 	count := queue.Len()
 	for i := 0; i < count; i++ {
@@ -3005,8 +3316,360 @@ func getQueuedKeys(queue workqueue.RateLimitingInterface) []string {
 		if done {
 			return keys
 		}
-		keys = append(keys, key.(string))
+		keys = append(keys, key)
 	}
 	sort.Strings(keys)
 	return keys
+}
+
+// Controller should not create pods on nodes which have daemon pods, and should remove excess pods from nodes that have extra pods.
+func TestSurgeDealsWithExistingPods(t *testing.T) {
+	_, ctx := ktesting.NewTestContext(t)
+	ds := newDaemonSet("foo")
+	ds.Spec.UpdateStrategy = newUpdateSurge(intstr.FromInt32(1))
+	manager, podControl, _, err := newTestController(ctx, ds)
+	if err != nil {
+		t.Fatalf("error creating DaemonSets controller: %v", err)
+	}
+	manager.dsStore.Add(ds)
+	addNodes(manager.nodeStore, 0, 5, nil)
+	addPods(manager.podStore, "node-1", simpleDaemonSetLabel, ds, 1)
+	addPods(manager.podStore, "node-2", simpleDaemonSetLabel, ds, 2)
+	addPods(manager.podStore, "node-3", simpleDaemonSetLabel, ds, 5)
+	addPods(manager.podStore, "node-4", simpleDaemonSetLabel2, ds, 2)
+	expectSyncDaemonSets(t, manager, ds, podControl, 2, 5, 0)
+}
+
+func TestSurgePreservesReadyOldPods(t *testing.T) {
+	_, ctx := ktesting.NewTestContext(t)
+	ds := newDaemonSet("foo")
+	ds.Spec.UpdateStrategy = newUpdateSurge(intstr.FromInt32(1))
+	manager, podControl, _, err := newTestController(ctx, ds)
+	if err != nil {
+		t.Fatalf("error creating DaemonSets controller: %v", err)
+	}
+	manager.dsStore.Add(ds)
+	addNodes(manager.nodeStore, 0, 5, nil)
+
+	// will be preserved because it's the current hash
+	pod := newPod("node-1-", "node-1", simpleDaemonSetLabel, ds)
+	pod.CreationTimestamp.Time = time.Unix(100, 0)
+	manager.podStore.Add(pod)
+
+	// will be preserved because it's the oldest AND it is ready
+	pod = newPod("node-1-old-", "node-1", simpleDaemonSetLabel, ds)
+	delete(pod.Labels, apps.ControllerRevisionHashLabelKey)
+	pod.CreationTimestamp.Time = time.Unix(50, 0)
+	pod.Status.Conditions = []v1.PodCondition{{Type: v1.PodReady, Status: v1.ConditionTrue}}
+	manager.podStore.Add(pod)
+
+	// will be deleted because it's not the oldest, even though it is ready
+	oldReadyPod := newPod("node-1-delete-", "node-1", simpleDaemonSetLabel, ds)
+	delete(oldReadyPod.Labels, apps.ControllerRevisionHashLabelKey)
+	oldReadyPod.CreationTimestamp.Time = time.Unix(60, 0)
+	oldReadyPod.Status.Conditions = []v1.PodCondition{{Type: v1.PodReady, Status: v1.ConditionTrue}}
+	manager.podStore.Add(oldReadyPod)
+
+	addPods(manager.podStore, "node-2", simpleDaemonSetLabel, ds, 1)
+	expectSyncDaemonSets(t, manager, ds, podControl, 3, 1, 0)
+
+	actual := sets.NewString(podControl.DeletePodName...)
+	expected := sets.NewString(oldReadyPod.Name)
+	if !actual.Equal(expected) {
+		t.Errorf("unexpected deletes\nexpected: %v\n  actual: %v", expected.List(), actual.List())
+	}
+}
+
+func TestSurgeCreatesNewPodWhenAtMaxSurgeAndOldPodDeleted(t *testing.T) {
+	_, ctx := ktesting.NewTestContext(t)
+	ds := newDaemonSet("foo")
+	ds.Spec.UpdateStrategy = newUpdateSurge(intstr.FromInt32(1))
+	manager, podControl, _, err := newTestController(ctx, ds)
+	if err != nil {
+		t.Fatalf("error creating DaemonSets controller: %v", err)
+	}
+	manager.dsStore.Add(ds)
+	addNodes(manager.nodeStore, 0, 5, nil)
+
+	// will be preserved because it has the newest hash, and is also consuming the surge budget
+	pod := newPod("node-0-", "node-0", simpleDaemonSetLabel, ds)
+	pod.CreationTimestamp.Time = time.Unix(100, 0)
+	pod.Status.Conditions = []v1.PodCondition{{Type: v1.PodReady, Status: v1.ConditionFalse}}
+	manager.podStore.Add(pod)
+
+	// will be preserved because it is ready
+	oldPodReady := newPod("node-0-old-ready-", "node-0", simpleDaemonSetLabel, ds)
+	delete(oldPodReady.Labels, apps.ControllerRevisionHashLabelKey)
+	oldPodReady.CreationTimestamp.Time = time.Unix(50, 0)
+	oldPodReady.Status.Conditions = []v1.PodCondition{{Type: v1.PodReady, Status: v1.ConditionTrue}}
+	manager.podStore.Add(oldPodReady)
+
+	// create old ready pods on all other nodes
+	for i := 1; i < 5; i++ {
+		oldPod := newPod(fmt.Sprintf("node-%d-preserve-", i), fmt.Sprintf("node-%d", i), simpleDaemonSetLabel, ds)
+		delete(oldPod.Labels, apps.ControllerRevisionHashLabelKey)
+		oldPod.CreationTimestamp.Time = time.Unix(1, 0)
+		oldPod.Status.Conditions = []v1.PodCondition{{Type: v1.PodReady, Status: v1.ConditionTrue}}
+		manager.podStore.Add(oldPod)
+
+		// mark the last old pod as deleted, which should trigger a creation above surge
+		if i == 4 {
+			thirty := int64(30)
+			timestamp := metav1.Time{Time: time.Unix(1+thirty, 0)}
+			oldPod.DeletionGracePeriodSeconds = &thirty
+			oldPod.DeletionTimestamp = &timestamp
+		}
+	}
+
+	// controller should detect that node-4 has only a deleted pod
+	clearExpectations(t, manager, ds, podControl)
+	expectSyncDaemonSets(t, manager, ds, podControl, 1, 0, 0)
+	clearExpectations(t, manager, ds, podControl)
+}
+
+func TestSurgeDeletesUnreadyOldPods(t *testing.T) {
+	_, ctx := ktesting.NewTestContext(t)
+	ds := newDaemonSet("foo")
+	ds.Spec.UpdateStrategy = newUpdateSurge(intstr.FromInt32(1))
+	manager, podControl, _, err := newTestController(ctx, ds)
+	if err != nil {
+		t.Fatalf("error creating DaemonSets controller: %v", err)
+	}
+	manager.dsStore.Add(ds)
+	addNodes(manager.nodeStore, 0, 5, nil)
+
+	// will be preserved because it has the newest hash
+	pod := newPod("node-1-", "node-1", simpleDaemonSetLabel, ds)
+	pod.CreationTimestamp.Time = time.Unix(100, 0)
+	manager.podStore.Add(pod)
+
+	// will be deleted because it is unready
+	oldUnreadyPod := newPod("node-1-old-unready-", "node-1", simpleDaemonSetLabel, ds)
+	delete(oldUnreadyPod.Labels, apps.ControllerRevisionHashLabelKey)
+	oldUnreadyPod.CreationTimestamp.Time = time.Unix(50, 0)
+	oldUnreadyPod.Status.Conditions = []v1.PodCondition{{Type: v1.PodReady, Status: v1.ConditionFalse}}
+	manager.podStore.Add(oldUnreadyPod)
+
+	// will be deleted because it is not the oldest
+	oldReadyPod := newPod("node-1-delete-", "node-1", simpleDaemonSetLabel, ds)
+	delete(oldReadyPod.Labels, apps.ControllerRevisionHashLabelKey)
+	oldReadyPod.CreationTimestamp.Time = time.Unix(60, 0)
+	oldReadyPod.Status.Conditions = []v1.PodCondition{{Type: v1.PodReady, Status: v1.ConditionTrue}}
+	manager.podStore.Add(oldReadyPod)
+
+	addPods(manager.podStore, "node-2", simpleDaemonSetLabel, ds, 1)
+	expectSyncDaemonSets(t, manager, ds, podControl, 3, 2, 0)
+
+	actual := sets.NewString(podControl.DeletePodName...)
+	expected := sets.NewString(oldReadyPod.Name, oldUnreadyPod.Name)
+	if !actual.Equal(expected) {
+		t.Errorf("unexpected deletes\nexpected: %v\n  actual: %v", expected.List(), actual.List())
+	}
+}
+
+func TestSurgePreservesOldReadyWithUnsatisfiedMinReady(t *testing.T) {
+	_, ctx := ktesting.NewTestContext(t)
+	ds := newDaemonSet("foo")
+	ds.Spec.MinReadySeconds = 15
+	ds.Spec.UpdateStrategy = newUpdateSurge(intstr.FromInt32(1))
+	manager, podControl, _, err := newTestController(ctx, ds)
+	if err != nil {
+		t.Fatalf("error creating DaemonSets controller: %v", err)
+	}
+	manager.dsStore.Add(ds)
+	addNodes(manager.nodeStore, 0, 5, nil)
+
+	// the clock will be set 10s after the newest pod on node-1 went ready, which is not long enough to be available
+	manager.DaemonSetsController.failedPodsBackoff.Clock = testingclock.NewFakeClock(time.Unix(50+10, 0))
+
+	// will be preserved because it has the newest hash
+	pod := newPod("node-1-", "node-1", simpleDaemonSetLabel, ds)
+	pod.CreationTimestamp.Time = time.Unix(100, 0)
+	pod.Status.Conditions = []v1.PodCondition{{Type: v1.PodReady, Status: v1.ConditionTrue, LastTransitionTime: metav1.Time{Time: time.Unix(50, 0)}}}
+	manager.podStore.Add(pod)
+
+	// will be preserved because it is ready AND the newest pod is not yet available for long enough
+	oldReadyPod := newPod("node-1-old-ready-", "node-1", simpleDaemonSetLabel, ds)
+	delete(oldReadyPod.Labels, apps.ControllerRevisionHashLabelKey)
+	oldReadyPod.CreationTimestamp.Time = time.Unix(50, 0)
+	oldReadyPod.Status.Conditions = []v1.PodCondition{{Type: v1.PodReady, Status: v1.ConditionTrue}}
+	manager.podStore.Add(oldReadyPod)
+
+	// will be deleted because it is not the oldest
+	oldExcessReadyPod := newPod("node-1-delete-", "node-1", simpleDaemonSetLabel, ds)
+	delete(oldExcessReadyPod.Labels, apps.ControllerRevisionHashLabelKey)
+	oldExcessReadyPod.CreationTimestamp.Time = time.Unix(60, 0)
+	oldExcessReadyPod.Status.Conditions = []v1.PodCondition{{Type: v1.PodReady, Status: v1.ConditionTrue}}
+	manager.podStore.Add(oldExcessReadyPod)
+
+	addPods(manager.podStore, "node-2", simpleDaemonSetLabel, ds, 1)
+	expectSyncDaemonSets(t, manager, ds, podControl, 3, 1, 0)
+
+	actual := sets.NewString(podControl.DeletePodName...)
+	expected := sets.NewString(oldExcessReadyPod.Name)
+	if !actual.Equal(expected) {
+		t.Errorf("unexpected deletes\nexpected: %v\n  actual: %v", expected.List(), actual.List())
+	}
+}
+
+func TestSurgeDeletesOldReadyWithUnsatisfiedMinReady(t *testing.T) {
+	_, ctx := ktesting.NewTestContext(t)
+	ds := newDaemonSet("foo")
+	ds.Spec.MinReadySeconds = 15
+	ds.Spec.UpdateStrategy = newUpdateSurge(intstr.FromInt32(1))
+	manager, podControl, _, err := newTestController(ctx, ds)
+	if err != nil {
+		t.Fatalf("error creating DaemonSets controller: %v", err)
+	}
+	manager.dsStore.Add(ds)
+	addNodes(manager.nodeStore, 0, 5, nil)
+
+	// the clock will be set 20s after the newest pod on node-1 went ready, which is not long enough to be available
+	manager.DaemonSetsController.failedPodsBackoff.Clock = testingclock.NewFakeClock(time.Unix(50+20, 0))
+
+	// will be preserved because it has the newest hash
+	pod := newPod("node-1-", "node-1", simpleDaemonSetLabel, ds)
+	pod.CreationTimestamp.Time = time.Unix(100, 0)
+	pod.Status.Conditions = []v1.PodCondition{{Type: v1.PodReady, Status: v1.ConditionTrue, LastTransitionTime: metav1.Time{Time: time.Unix(50, 0)}}}
+	manager.podStore.Add(pod)
+
+	// will be preserved because it is ready AND the newest pod is not yet available for long enough
+	oldReadyPod := newPod("node-1-old-ready-", "node-1", simpleDaemonSetLabel, ds)
+	delete(oldReadyPod.Labels, apps.ControllerRevisionHashLabelKey)
+	oldReadyPod.CreationTimestamp.Time = time.Unix(50, 0)
+	oldReadyPod.Status.Conditions = []v1.PodCondition{{Type: v1.PodReady, Status: v1.ConditionTrue}}
+	manager.podStore.Add(oldReadyPod)
+
+	// will be deleted because it is not the oldest
+	oldExcessReadyPod := newPod("node-1-delete-", "node-1", simpleDaemonSetLabel, ds)
+	delete(oldExcessReadyPod.Labels, apps.ControllerRevisionHashLabelKey)
+	oldExcessReadyPod.CreationTimestamp.Time = time.Unix(60, 0)
+	oldExcessReadyPod.Status.Conditions = []v1.PodCondition{{Type: v1.PodReady, Status: v1.ConditionTrue}}
+	manager.podStore.Add(oldExcessReadyPod)
+
+	addPods(manager.podStore, "node-2", simpleDaemonSetLabel, ds, 1)
+	expectSyncDaemonSets(t, manager, ds, podControl, 3, 2, 0)
+
+	actual := sets.NewString(podControl.DeletePodName...)
+	expected := sets.NewString(oldExcessReadyPod.Name, oldReadyPod.Name)
+	if !actual.Equal(expected) {
+		t.Errorf("unexpected deletes\nexpected: %v\n  actual: %v", expected.List(), actual.List())
+	}
+}
+
+func TestStoreDaemonSetStatus(t *testing.T) {
+	getError := fmt.Errorf("fake get error")
+	updateError := fmt.Errorf("fake update error")
+	tests := []struct {
+		name                 string
+		updateErrorNum       int
+		getErrorNum          int
+		expectedUpdateCalled int
+		expectedGetCalled    int
+		expectedError        error
+	}{
+		{
+			name:                 "succeed immediately",
+			updateErrorNum:       0,
+			getErrorNum:          0,
+			expectedUpdateCalled: 1,
+			expectedGetCalled:    0,
+			expectedError:        nil,
+		},
+		{
+			name:                 "succeed after one update failure",
+			updateErrorNum:       1,
+			getErrorNum:          0,
+			expectedUpdateCalled: 2,
+			expectedGetCalled:    1,
+			expectedError:        nil,
+		},
+		{
+			name:                 "fail after two update failures",
+			updateErrorNum:       2,
+			getErrorNum:          0,
+			expectedUpdateCalled: 2,
+			expectedGetCalled:    1,
+			expectedError:        updateError,
+		},
+		{
+			name:                 "fail after one update failure and one get failure",
+			updateErrorNum:       1,
+			getErrorNum:          1,
+			expectedUpdateCalled: 1,
+			expectedGetCalled:    1,
+			expectedError:        getError,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ds := newDaemonSet("foo")
+			fakeClient := &fake.Clientset{}
+			getCalled := 0
+			fakeClient.AddReactor("get", "daemonsets", func(action core.Action) (bool, runtime.Object, error) {
+				getCalled += 1
+				if getCalled <= tt.getErrorNum {
+					return true, nil, getError
+				}
+				return true, ds, nil
+			})
+			updateCalled := 0
+			fakeClient.AddReactor("update", "daemonsets", func(action core.Action) (bool, runtime.Object, error) {
+				updateCalled += 1
+				if updateCalled <= tt.updateErrorNum {
+					return true, nil, updateError
+				}
+				return true, ds, nil
+			})
+			if _, err := storeDaemonSetStatus(context.TODO(), fakeClient.AppsV1().DaemonSets("default"), ds, 2, 2, 2, 2, 2, 2, 2, true); !errors.Is(err, tt.expectedError) {
+				t.Errorf("storeDaemonSetStatus() got %v, expected %v", err, tt.expectedError)
+			}
+			if getCalled != tt.expectedGetCalled {
+				t.Errorf("Get() was called %v times, expected %v times", getCalled, tt.expectedGetCalled)
+			}
+			if updateCalled != tt.expectedUpdateCalled {
+				t.Errorf("UpdateStatus() was called %v times, expected %v times", updateCalled, tt.expectedUpdateCalled)
+			}
+		})
+	}
+}
+
+func TestShouldIgnoreNodeUpdate(t *testing.T) {
+	cases := []struct {
+		name           string
+		newNode        *v1.Node
+		oldNode        *v1.Node
+		expectedResult bool
+	}{
+		{
+			name:           "Nothing changed",
+			oldNode:        newNode("node1", nil),
+			newNode:        newNode("node1", nil),
+			expectedResult: true,
+		},
+		{
+			name:           "Node labels changed",
+			oldNode:        newNode("node1", nil),
+			newNode:        newNode("node1", simpleNodeLabel),
+			expectedResult: false,
+		},
+		{
+			name: "Node taints changed",
+			oldNode: func() *v1.Node {
+				node := newNode("node1", nil)
+				setNodeTaint(node, noScheduleTaints)
+				return node
+			}(),
+			newNode:        newNode("node1", nil),
+			expectedResult: false,
+		},
+	}
+
+	for _, c := range cases {
+		result := shouldIgnoreNodeUpdate(*c.oldNode, *c.newNode)
+
+		if result != c.expectedResult {
+			t.Errorf("[%s] unexpected results: %v", c.name, result)
+		}
+	}
 }

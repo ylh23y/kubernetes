@@ -13,6 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# This script checks whether e2e test code which contains `Expect()` but not use
+# the e2e framework exists or not.
+# Usage: `hack/verify-test-code.sh`.
+
 set -o errexit
 set -o nounset
 set -o pipefail
@@ -31,14 +35,20 @@ do
     then
         errors_expect_no_error+=( "${file}" )
     fi
+    if grep -E "Expect\(err\)\.To\(gomega\.BeNil\(\)\)" "${file}" > /dev/null
+    then
+        errors_expect_no_error+=( "${file}" )
+    fi
 done
 
-errors_expect_error=()
-for file in "${all_e2e_files[@]}"
+all_e2e_framework_files=()
+kube::util::read-array all_e2e_framework_files < <(find test/e2e/framework/ -name '*.go' | grep -v "_test.go")
+errors_framework_contains_tests=()
+for file in "${all_e2e_framework_files[@]}"
 do
-    if grep "Expect(.*)\.To(.*HaveOccurred()" "${file}" > /dev/null
+    if grep -E "(ConformanceIt\(.*, func\(\) {|ginkgo.It\(.*, func\(\) {)" "${file}" > /dev/null
     then
-        errors_expect_error+=( "${file}" )
+        errors_framework_contains_tests+=( "${file}" )
     fi
 done
 
@@ -52,19 +62,20 @@ if [ ${#errors_expect_no_error[@]} -ne 0 ]; then
     echo 'The above files need to use framework.ExpectNoError(err) instead of '
     echo 'Expect(err).NotTo(HaveOccurred()) or gomega.Expect(err).NotTo(gomega.HaveOccurred())'
     echo
+    echo 'See https://github.com/kubernetes/community/blob/master/contributors/devel/sig-testing/writing-good-e2e-tests.md for more guidance'
   } >&2
   exit 1
 fi
 
-if [ ${#errors_expect_error[@]} -ne 0 ]; then
+if [ ${#errors_framework_contains_tests[@]} -ne 0 ]; then
   {
     echo "Errors:"
-    for err in "${errors_expect_error[@]}"; do
+    for err in "${errors_framework_contains_tests[@]}"; do
       echo "$err"
     done
     echo
-    echo 'The above files need to use framework.ExpectError(err) instead of '
-    echo 'Expect(err).To(HaveOccurred()) or gomega.Expect(err).To(gomega.HaveOccurred())'
+    echo 'The above e2e framework files should not contain any e2e tests which are implemented '
+    echo 'with framework.ConformanceIt() or ginkgo.It()'
     echo
   } >&2
   exit 1

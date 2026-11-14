@@ -17,6 +17,7 @@ limitations under the License.
 package testutil
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -25,28 +26,29 @@ import (
 	"testing"
 	"time"
 
+	v1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/strategicpatch"
 	"k8s.io/apimachinery/pkg/watch"
-
-	"k8s.io/apimachinery/pkg/util/clock"
-	ref "k8s.io/client-go/tools/reference"
-
-	"k8s.io/api/core/v1"
+	v1apply "k8s.io/client-go/applyconfigurations/core/v1"
 	"k8s.io/client-go/kubernetes/fake"
 	v1core "k8s.io/client-go/kubernetes/typed/core/v1"
 	"k8s.io/client-go/tools/cache"
+	ref "k8s.io/client-go/tools/reference"
+	utilnode "k8s.io/component-helpers/node/topology"
+	"k8s.io/klog/v2"
 	"k8s.io/kubernetes/pkg/api/legacyscheme"
 	api "k8s.io/kubernetes/pkg/apis/core"
-	utilnode "k8s.io/kubernetes/pkg/util/node"
+	"k8s.io/utils/clock"
+	testingclock "k8s.io/utils/clock/testing"
 
-	jsonpatch "github.com/evanphx/json-patch"
-	"k8s.io/klog"
+	jsonpatch "gopkg.in/evanphx/json-patch.v4"
 )
 
 var (
@@ -63,6 +65,7 @@ type FakeNodeHandler struct {
 	// Input: Hooks determine if request is valid or not
 	CreateHook func(*FakeNodeHandler, *v1.Node) bool
 	Existing   []*v1.Node
+	AsyncCalls []func(*FakeNodeHandler)
 
 	// Output
 	CreatedNodes        []*v1.Node
@@ -88,9 +91,7 @@ func (m *FakeNodeHandler) GetUpdatedNodesCopy() []*v1.Node {
 	m.lock.Lock()
 	defer m.lock.Unlock()
 	updatedNodesCopy := make([]*v1.Node, len(m.UpdatedNodes), len(m.UpdatedNodes))
-	for i, ptr := range m.UpdatedNodes {
-		updatedNodesCopy[i] = ptr
-	}
+	copy(updatedNodesCopy, m.UpdatedNodes)
 	return updatedNodesCopy
 }
 
@@ -110,7 +111,7 @@ func (m *FakeLegacyHandler) Nodes() v1core.NodeInterface {
 }
 
 // Create adds a new Node to the fake store.
-func (m *FakeNodeHandler) Create(node *v1.Node) (*v1.Node, error) {
+func (m *FakeNodeHandler) Create(_ context.Context, node *v1.Node, _ metav1.CreateOptions) (*v1.Node, error) {
 	m.lock.Lock()
 	defer func() {
 		m.RequestCount++
@@ -130,10 +131,11 @@ func (m *FakeNodeHandler) Create(node *v1.Node) (*v1.Node, error) {
 }
 
 // Get returns a Node from the fake store.
-func (m *FakeNodeHandler) Get(name string, opts metav1.GetOptions) (*v1.Node, error) {
+func (m *FakeNodeHandler) Get(ctx context.Context, name string, opts metav1.GetOptions) (*v1.Node, error) {
 	m.lock.Lock()
 	defer func() {
 		m.RequestCount++
+		m.runAsyncCalls()
 		m.lock.Unlock()
 	}()
 	for i := range m.UpdatedNodes {
@@ -148,11 +150,17 @@ func (m *FakeNodeHandler) Get(name string, opts metav1.GetOptions) (*v1.Node, er
 			return &nodeCopy, nil
 		}
 	}
-	return nil, nil
+	return nil, apierrors.NewNotFound(schema.GroupResource{Resource: "nodes"}, name)
+}
+
+func (m *FakeNodeHandler) runAsyncCalls() {
+	for _, a := range m.AsyncCalls {
+		a(m)
+	}
 }
 
 // List returns a list of Nodes from the fake store.
-func (m *FakeNodeHandler) List(opts metav1.ListOptions) (*v1.NodeList, error) {
+func (m *FakeNodeHandler) List(_ context.Context, opts metav1.ListOptions) (*v1.NodeList, error) {
 	m.lock.Lock()
 	defer func() {
 		m.RequestCount++
@@ -182,7 +190,7 @@ func (m *FakeNodeHandler) List(opts metav1.ListOptions) (*v1.NodeList, error) {
 }
 
 // Delete deletes a Node from the fake store.
-func (m *FakeNodeHandler) Delete(id string, opt *metav1.DeleteOptions) error {
+func (m *FakeNodeHandler) Delete(_ context.Context, id string, opt metav1.DeleteOptions) error {
 	m.lock.Lock()
 	defer func() {
 		m.RequestCount++
@@ -195,13 +203,18 @@ func (m *FakeNodeHandler) Delete(id string, opt *metav1.DeleteOptions) error {
 	return nil
 }
 
+// DeleteWithResult deletes the status of a Node from the fake store.
+func (m *FakeNodeHandler) DeleteWithResult(_ context.Context, name string, _ metav1.DeleteOptions) (metav1.APIResult, error) {
+	return nil, nil
+}
+
 // DeleteCollection deletes a collection of Nodes from the fake store.
-func (m *FakeNodeHandler) DeleteCollection(opt *metav1.DeleteOptions, listOpts metav1.ListOptions) error {
+func (m *FakeNodeHandler) DeleteCollection(_ context.Context, opt metav1.DeleteOptions, listOpts metav1.ListOptions) error {
 	return nil
 }
 
 // Update updates a Node in the fake store.
-func (m *FakeNodeHandler) Update(node *v1.Node) (*v1.Node, error) {
+func (m *FakeNodeHandler) Update(_ context.Context, node *v1.Node, _ metav1.UpdateOptions) (*v1.Node, error) {
 	m.lock.Lock()
 	defer func() {
 		m.RequestCount++
@@ -211,6 +224,9 @@ func (m *FakeNodeHandler) Update(node *v1.Node) (*v1.Node, error) {
 	nodeCopy := *node
 	for i, updateNode := range m.UpdatedNodes {
 		if updateNode.Name == nodeCopy.Name {
+			if updateNode.GetObjectMeta().GetResourceVersion() != nodeCopy.GetObjectMeta().GetResourceVersion() {
+				return nil, apierrors.NewConflict(schema.GroupResource{}, "fake conflict", nil)
+			}
 			m.UpdatedNodes[i] = &nodeCopy
 			return node, nil
 		}
@@ -220,7 +236,7 @@ func (m *FakeNodeHandler) Update(node *v1.Node) (*v1.Node, error) {
 }
 
 // UpdateStatus updates a status of a Node in the fake store.
-func (m *FakeNodeHandler) UpdateStatus(node *v1.Node) (*v1.Node, error) {
+func (m *FakeNodeHandler) UpdateStatus(_ context.Context, node *v1.Node, _ metav1.UpdateOptions) (*v1.Node, error) {
 	m.lock.Lock()
 	defer func() {
 		m.RequestCount++
@@ -263,18 +279,19 @@ func (m *FakeNodeHandler) UpdateStatus(node *v1.Node) (*v1.Node, error) {
 }
 
 // PatchStatus patches a status of a Node in the fake store.
-func (m *FakeNodeHandler) PatchStatus(nodeName string, data []byte) (*v1.Node, error) {
+func (m *FakeNodeHandler) PatchStatus(ctx context.Context, nodeName string, data []byte) (*v1.Node, error) {
 	m.RequestCount++
-	return m.Patch(nodeName, types.StrategicMergePatchType, data, "status")
+	return m.Patch(ctx, nodeName, types.StrategicMergePatchType, data, metav1.PatchOptions{}, "status")
 }
 
 // Watch watches Nodes in a fake store.
-func (m *FakeNodeHandler) Watch(opts metav1.ListOptions) (watch.Interface, error) {
-	return watch.NewFake(), nil
+func (m *FakeNodeHandler) Watch(ctx context.Context, opts metav1.ListOptions) (watch.Interface, error) {
+	logger := klog.FromContext(ctx)
+	return watch.NewFakeWithOptions(watch.FakeOptions{Logger: &logger}), nil
 }
 
 // Patch patches a Node in the fake store.
-func (m *FakeNodeHandler) Patch(name string, pt types.PatchType, data []byte, subresources ...string) (*v1.Node, error) {
+func (m *FakeNodeHandler) Patch(ctx context.Context, name string, pt types.PatchType, data []byte, _ metav1.PatchOptions, subresources ...string) (*v1.Node, error) {
 	m.lock.Lock()
 	defer func() {
 		m.RequestCount++
@@ -299,12 +316,12 @@ func (m *FakeNodeHandler) Patch(name string, pt types.PatchType, data []byte, su
 
 	originalObjJS, err := json.Marshal(nodeCopy)
 	if err != nil {
-		klog.Errorf("Failed to marshal %v", nodeCopy)
+		klog.FromContext(ctx).Error(nil, "Failed to marshal", "node", klog.KObj(&nodeCopy))
 		return nil, nil
 	}
 	var originalNode v1.Node
 	if err = json.Unmarshal(originalObjJS, &originalNode); err != nil {
-		klog.Errorf("Failed to unmarshal original object: %v", err)
+		klog.FromContext(ctx).Error(err, "Failed to unmarshal original object")
 		return nil, nil
 	}
 
@@ -313,41 +330,74 @@ func (m *FakeNodeHandler) Patch(name string, pt types.PatchType, data []byte, su
 	case types.JSONPatchType:
 		patchObj, err := jsonpatch.DecodePatch(data)
 		if err != nil {
-			klog.Error(err.Error())
+			klog.FromContext(ctx).Error(err, "")
 			return nil, nil
 		}
 		if patchedObjJS, err = patchObj.Apply(originalObjJS); err != nil {
-			klog.Error(err.Error())
+			klog.FromContext(ctx).Error(err, "")
 			return nil, nil
 		}
 	case types.MergePatchType:
 		if patchedObjJS, err = jsonpatch.MergePatch(originalObjJS, data); err != nil {
-			klog.Error(err.Error())
+			klog.FromContext(ctx).Error(err, "")
 			return nil, nil
 		}
 	case types.StrategicMergePatchType:
 		if patchedObjJS, err = strategicpatch.StrategicMergePatch(originalObjJS, data, originalNode); err != nil {
-			klog.Error(err.Error())
+			klog.FromContext(ctx).Error(err, "")
 			return nil, nil
 		}
 	default:
-		klog.Errorf("unknown Content-Type header for patch: %v", pt)
+		klog.FromContext(ctx).Error(nil, "Unknown Content-Type header", "patch", pt)
 		return nil, nil
 	}
 
 	var updatedNode v1.Node
 	if err = json.Unmarshal(patchedObjJS, &updatedNode); err != nil {
-		klog.Errorf("Failed to unmarshal patched object: %v", err)
+		klog.FromContext(ctx).Error(err, "Failed to unmarshal patched object")
 		return nil, nil
 	}
 
 	if updatedNodeIndex < 0 {
 		m.UpdatedNodes = append(m.UpdatedNodes, &updatedNode)
 	} else {
+		if updatedNode.GetObjectMeta().GetResourceVersion() != m.UpdatedNodes[updatedNodeIndex].GetObjectMeta().GetResourceVersion() {
+			return nil, apierrors.NewConflict(schema.GroupResource{}, "fake conflict", nil)
+		}
 		m.UpdatedNodes[updatedNodeIndex] = &updatedNode
 	}
 
 	return &updatedNode, nil
+}
+
+// Apply applies a NodeApplyConfiguration to a Node in the fake store.
+func (m *FakeNodeHandler) Apply(ctx context.Context, node *v1apply.NodeApplyConfiguration, opts metav1.ApplyOptions) (*v1.Node, error) {
+	patchOpts := opts.ToPatchOptions()
+	data, err := json.Marshal(node)
+	if err != nil {
+		return nil, err
+	}
+	name := node.Name
+	if name == nil {
+		return nil, fmt.Errorf("deployment.Name must be provided to Apply")
+	}
+
+	return m.Patch(ctx, *name, types.ApplyPatchType, data, patchOpts)
+}
+
+// ApplyStatus applies a status of a Node in the fake store.
+func (m *FakeNodeHandler) ApplyStatus(ctx context.Context, node *v1apply.NodeApplyConfiguration, opts metav1.ApplyOptions) (*v1.Node, error) {
+	patchOpts := opts.ToPatchOptions()
+	data, err := json.Marshal(node)
+	if err != nil {
+		return nil, err
+	}
+	name := node.Name
+	if name == nil {
+		return nil, fmt.Errorf("deployment.Name must be provided to Apply")
+	}
+
+	return m.Patch(ctx, *name, types.ApplyPatchType, data, patchOpts, "status")
 }
 
 // FakeRecorder is used as a fake during testing.
@@ -368,10 +418,6 @@ func (f *FakeRecorder) Eventf(obj runtime.Object, eventtype, reason, messageFmt 
 	f.Event(obj, eventtype, reason, fmt.Sprintf(messageFmt, args...))
 }
 
-// PastEventf is a no-op
-func (f *FakeRecorder) PastEventf(obj runtime.Object, timestamp metav1.Time, eventtype, reason, messageFmt string, args ...interface{}) {
-}
-
 // AnnotatedEventf emits a fake formatted event to the fake recorder
 func (f *FakeRecorder) AnnotatedEventf(obj runtime.Object, annotations map[string]string, eventtype, reason, messageFmt string, args ...interface{}) {
 	f.Eventf(obj, eventtype, reason, messageFmt, args...)
@@ -380,9 +426,10 @@ func (f *FakeRecorder) AnnotatedEventf(obj runtime.Object, annotations map[strin
 func (f *FakeRecorder) generateEvent(obj runtime.Object, timestamp metav1.Time, eventtype, reason, message string) {
 	f.Lock()
 	defer f.Unlock()
+	ctx := context.TODO()
 	ref, err := ref.GetReference(legacyscheme.Scheme, obj)
 	if err != nil {
-		klog.Errorf("Encountered error while getting reference: %v", err)
+		klog.FromContext(ctx).Error(err, "Encountered error while getting reference")
 		return
 	}
 	event := f.makeEvent(ref, eventtype, reason, message)
@@ -429,7 +476,7 @@ func NewFakeRecorder() *FakeRecorder {
 	return &FakeRecorder{
 		source: v1.EventSource{Component: "nodeControllerTest"},
 		Events: []*v1.Event{},
-		clock:  clock.NewFakeClock(time.Now()),
+		clock:  testingclock.NewFakeClock(time.Now()),
 	}
 }
 
@@ -480,7 +527,7 @@ func contains(node *v1.Node, nodes []*v1.Node) bool {
 
 // GetZones returns list of zones for all Nodes stored in FakeNodeHandler
 func GetZones(nodeHandler *FakeNodeHandler) []string {
-	nodes, _ := nodeHandler.List(metav1.ListOptions{})
+	nodes, _ := nodeHandler.List(context.TODO(), metav1.ListOptions{})
 	zones := sets.NewString()
 	for _, node := range nodes.Items {
 		zones.Insert(utilnode.GetZoneKey(&node))
@@ -496,6 +543,7 @@ func CreateZoneID(region, zone string) string {
 // GetKey is a helper function used by controllers unit tests to get the
 // key for a given kubernetes resource.
 func GetKey(obj interface{}, t *testing.T) string {
+	t.Helper()
 	tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
 	if ok {
 		// if tombstone , try getting the value from tombstone.Obj
@@ -503,15 +551,13 @@ func GetKey(obj interface{}, t *testing.T) string {
 	}
 	val := reflect.ValueOf(obj).Elem()
 	name := val.FieldByName("Name").String()
-	kind := val.FieldByName("Kind").String()
-	// Note kind is not always set in the tests, so ignoring that for now
-	if len(name) == 0 || len(kind) == 0 {
+	if len(name) == 0 {
 		t.Errorf("Unexpected object %v", obj)
 	}
 
 	key, err := keyFunc(obj)
 	if err != nil {
-		t.Errorf("Unexpected error getting key for %v %v: %v", kind, name, err)
+		t.Errorf("Unexpected error getting key for %T %v: %v", val.Interface(), name, err)
 		return ""
 	}
 	return key

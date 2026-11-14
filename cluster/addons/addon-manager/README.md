@@ -23,6 +23,10 @@ treated as "reconcile class addons" for now.
 - Resources under `$ADDON_PATH` need to have either one of these two labels.
 Otherwise it will be omitted.
 
+#### Images
+
+addon-manager images are pushed to `registry.k8s.io`. As addon-manager is built for multiple architectures, there is an image per architecture in the format - `registry.k8s.io/addon-manager/kube-addon-manager-$(ARCH):$(VERSION)`.
+
 #### How to release
 
 The `addon-manager` is built for multiple architectures.
@@ -36,23 +40,20 @@ The `addon-manager` is built for multiple architectures.
 ```console
 # Build for linux/amd64 (default)
 $ make push ARCH=amd64
-# ---> staging-k8s.gcr.io/kube-addon-manager-amd64:VERSION
-# ---> staging-k8s.gcr.io/kube-addon-manager:VERSION (image with backwards-compatible naming)
+# ---> staging-k8s.gcr.io/addon-manager/kube-addon-manager-amd64:VERSION
+# ---> staging-k8s.gcr.io/addon-manager/kube-addon-manager:VERSION (image with backwards-compatible naming)
 
 $ make push ARCH=arm
-# ---> staging-k8s.gcr.io/kube-addon-manager-arm:VERSION
+# ---> staging-k8s.gcr.io/addon-manager/kube-addon-manager-arm:VERSION
 
 $ make push ARCH=arm64
-# ---> staging-k8s.gcr.io/kube-addon-manager-arm64:VERSION
+# ---> staging-k8s.gcr.io/addon-manager/kube-addon-manager-arm64:VERSION
 
 $ make push ARCH=ppc64le
-# ---> staging-k8s.gcr.io/kube-addon-manager-ppc64le:VERSION
+# ---> staging-k8s.gcr.io/addon-manager/kube-addon-manager-ppc64le:VERSION
 
 $ make push ARCH=s390x
-# ---> staging-k8s.gcr.io/kube-addon-manager-s390x:VERSION
+# ---> staging-k8s.gcr.io/addon-manager/kube-addon-manager-s390x:VERSION
 ```
 
 If you don't want to push the images, run `make` or `make build` instead
-
-
-[![Analytics](https://kubernetes-site.appspot.com/UA-36037335-10/GitHub/cluster/addons/addon-manager/README.md?pixel)]()

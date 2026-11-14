@@ -20,7 +20,8 @@ import (
 	"reflect"
 	"testing"
 
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
+	"k8s.io/utils/ptr"
 )
 
 func TestAddNoNewPrivileges(t *testing.T) {
@@ -72,11 +73,11 @@ func TestConvertToRuntimeMaskedPaths(t *testing.T) {
 	}{
 		"procMount nil": {
 			pm:     nil,
-			expect: defaultMaskedPaths,
+			expect: defaultMaskedPaths(),
 		},
 		"procMount default": {
 			pm:     &dPM,
-			expect: defaultMaskedPaths,
+			expect: defaultMaskedPaths(),
 		},
 		"procMount unmasked": {
 			pm:     &uPM,
@@ -118,5 +119,128 @@ func TestConvertToRuntimeReadonlyPaths(t *testing.T) {
 		if !reflect.DeepEqual(actual, v.expect) {
 			t.Errorf("%s failed, expected %#v but received %#v", k, v.expect, actual)
 		}
+	}
+}
+
+func TestDetermineEffectiveSecurityContextCgroupOptions(t *testing.T) {
+	readWrite := v1.CgroupMountModeReadWrite
+	containerSc := &v1.SecurityContext{CgroupOptions: &v1.CgroupOptions{MountMode: &readWrite}}
+
+	tests := []struct {
+		name   string
+		podSc  *v1.PodSecurityContext
+		expect *v1.CgroupOptions
+	}{
+		{
+			name:   "no pod security context",
+			podSc:  nil,
+			expect: &v1.CgroupOptions{MountMode: &readWrite},
+		},
+		{
+			name:   "pod security context set",
+			podSc:  &v1.PodSecurityContext{RunAsNonRoot: new(true)},
+			expect: &v1.CgroupOptions{MountMode: &readWrite},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			pod := &v1.Pod{Spec: v1.PodSpec{SecurityContext: tc.podSc}}
+			container := &v1.Container{Name: "test", SecurityContext: containerSc}
+
+			effectiveSc := DetermineEffectiveSecurityContext(pod, container)
+			if !reflect.DeepEqual(effectiveSc.CgroupOptions, tc.expect) {
+				t.Errorf("expected cgroupOptions %v, got %v", tc.expect, effectiveSc.CgroupOptions)
+			}
+		})
+	}
+}
+
+func TestDetermineEffectiveRunAsUser(t *testing.T) {
+	tests := []struct {
+		desc          string
+		pod           *v1.Pod
+		container     *v1.Container
+		wantRunAsUser *int64
+	}{
+		{
+			desc: "no securityContext in pod, no securityContext in container",
+			pod: &v1.Pod{
+				Spec: v1.PodSpec{},
+			},
+			container:     &v1.Container{},
+			wantRunAsUser: nil,
+		},
+		{
+			desc: "no runAsUser in pod, no runAsUser in container",
+			pod: &v1.Pod{
+				Spec: v1.PodSpec{
+					SecurityContext: &v1.PodSecurityContext{},
+				},
+			},
+			container: &v1.Container{
+				SecurityContext: &v1.SecurityContext{},
+			},
+			wantRunAsUser: nil,
+		},
+		{
+			desc: "runAsUser in pod, no runAsUser in container",
+			pod: &v1.Pod{
+				Spec: v1.PodSpec{
+					SecurityContext: &v1.PodSecurityContext{
+						RunAsUser: new(int64),
+					},
+				},
+			},
+			container: &v1.Container{
+				SecurityContext: &v1.SecurityContext{},
+			},
+			wantRunAsUser: new(int64),
+		},
+		{
+			desc: "no runAsUser in pod, runAsUser in container",
+			pod: &v1.Pod{
+				Spec: v1.PodSpec{
+					SecurityContext: &v1.PodSecurityContext{},
+				},
+			},
+			container: &v1.Container{
+				SecurityContext: &v1.SecurityContext{
+					RunAsUser: new(int64),
+				},
+			},
+			wantRunAsUser: new(int64),
+		},
+		{
+			desc: "no runAsUser in pod, runAsUser in container",
+			pod: &v1.Pod{
+				Spec: v1.PodSpec{
+					SecurityContext: &v1.PodSecurityContext{
+						RunAsUser: new(int64),
+					},
+				},
+			},
+			container: &v1.Container{
+				SecurityContext: &v1.SecurityContext{
+					RunAsUser: ptr.To[int64](1),
+				},
+			},
+			wantRunAsUser: ptr.To[int64](1),
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.desc, func(t *testing.T) {
+			runAsUser, ok := DetermineEffectiveRunAsUser(test.pod, test.container)
+			if !ok && test.wantRunAsUser != nil {
+				t.Errorf("DetermineEffectiveRunAsUser(%v, %v) = %v, want %d", test.pod, test.container, runAsUser, *test.wantRunAsUser)
+			}
+			if ok && test.wantRunAsUser == nil {
+				t.Errorf("DetermineEffectiveRunAsUser(%v, %v) = %d, want %v", test.pod, test.container, *runAsUser, test.wantRunAsUser)
+			}
+			if ok && test.wantRunAsUser != nil && *runAsUser != *test.wantRunAsUser {
+				t.Errorf("DetermineEffectiveRunAsUser(%v, %v) = %d, want %d", test.pod, test.container, *runAsUser, *test.wantRunAsUser)
+			}
+		})
 	}
 }

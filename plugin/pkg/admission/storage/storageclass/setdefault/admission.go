@@ -17,21 +17,19 @@ limitations under the License.
 package setdefault
 
 import (
+	"context"
 	"fmt"
 	"io"
+	"k8s.io/kubernetes/pkg/volume/util"
 
-	"k8s.io/klog"
+	"k8s.io/klog/v2"
 
-	storagev1 "k8s.io/api/storage/v1"
-	"k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apiserver/pkg/admission"
 	genericadmissioninitializer "k8s.io/apiserver/pkg/admission/initializer"
 	"k8s.io/client-go/informers"
 	storagev1listers "k8s.io/client-go/listers/storage/v1"
 	api "k8s.io/kubernetes/pkg/apis/core"
 	"k8s.io/kubernetes/pkg/apis/core/helper"
-	storageutil "k8s.io/kubernetes/pkg/apis/storage/util"
 )
 
 const (
@@ -85,7 +83,7 @@ func (a *claimDefaulterPlugin) ValidateInitialization() error {
 // 1.  Find available StorageClasses.
 // 2.  Figure which is the default
 // 3.  Write to the PVClaim
-func (a *claimDefaulterPlugin) Admit(attr admission.Attributes, o admission.ObjectInterfaces) error {
+func (a *claimDefaulterPlugin) Admit(ctx context.Context, attr admission.Attributes, o admission.ObjectInterfaces) error {
 	if attr.GetResource().GroupResource() != api.Resource("persistentvolumeclaims") {
 		return nil
 	}
@@ -107,7 +105,7 @@ func (a *claimDefaulterPlugin) Admit(attr admission.Attributes, o admission.Obje
 
 	klog.V(4).Infof("no storage class for claim %s (generate: %s)", pvc.Name, pvc.GenerateName)
 
-	def, err := getDefaultClass(a.lister)
+	def, err := util.GetDefaultClass(a.lister)
 	if err != nil {
 		return admission.NewForbidden(attr, err)
 	}
@@ -119,29 +117,4 @@ func (a *claimDefaulterPlugin) Admit(attr admission.Attributes, o admission.Obje
 	klog.V(4).Infof("defaulting storage class for claim %s (generate: %s) to %s", pvc.Name, pvc.GenerateName, def.Name)
 	pvc.Spec.StorageClassName = &def.Name
 	return nil
-}
-
-// getDefaultClass returns the default StorageClass from the store, or nil.
-func getDefaultClass(lister storagev1listers.StorageClassLister) (*storagev1.StorageClass, error) {
-	list, err := lister.List(labels.Everything())
-	if err != nil {
-		return nil, err
-	}
-
-	defaultClasses := []*storagev1.StorageClass{}
-	for _, class := range list {
-		if storageutil.IsDefaultAnnotation(class.ObjectMeta) {
-			defaultClasses = append(defaultClasses, class)
-			klog.V(4).Infof("getDefaultClass added: %s", class.Name)
-		}
-	}
-
-	if len(defaultClasses) == 0 {
-		return nil, nil
-	}
-	if len(defaultClasses) > 1 {
-		klog.V(4).Infof("getDefaultClass %d defaults found", len(defaultClasses))
-		return nil, errors.NewInternalError(fmt.Errorf("%d default StorageClasses were found", len(defaultClasses)))
-	}
-	return defaultClasses[0], nil
 }

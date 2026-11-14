@@ -1,4 +1,4 @@
-// +build !windows
+//go:build !windows
 
 /*
 Copyright 2018 The Kubernetes Authors.
@@ -18,6 +18,8 @@ limitations under the License.
 
 package app
 
-func initForOS(service bool) error {
+import "context"
+
+func initForOS(ctx context.Context, service bool, priorityClass string) error {
 	return nil
 }

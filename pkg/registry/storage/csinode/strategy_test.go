@@ -17,6 +17,7 @@ limitations under the License.
 package csinode
 
 import (
+	"context"
 	"reflect"
 	"testing"
 
@@ -27,7 +28,7 @@ import (
 	featuregatetesting "k8s.io/component-base/featuregate/testing"
 	"k8s.io/kubernetes/pkg/apis/storage"
 	"k8s.io/kubernetes/pkg/features"
-	utilpointer "k8s.io/utils/pointer"
+	ptr "k8s.io/utils/ptr"
 )
 
 func TestPrepareForCreate(t *testing.T) {
@@ -47,7 +48,7 @@ func TestPrepareForCreate(t *testing.T) {
 		},
 	}
 
-	volumeLimitsEnabledCases := []struct {
+	volumeLimitsCases := []struct {
 		name     string
 		obj      *storage.CSINode
 		expected *storage.CSINode
@@ -64,32 +65,7 @@ func TestPrepareForCreate(t *testing.T) {
 		},
 	}
 
-	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.AttachVolumeLimit, true)()
-	for _, test := range volumeLimitsEnabledCases {
-		t.Run(test.name, func(t *testing.T) {
-			testPrepareForCreate(t, test.obj, test.expected)
-		})
-	}
-
-	volumeLimitsDisabledCases := []struct {
-		name     string
-		obj      *storage.CSINode
-		expected *storage.CSINode
-	}{
-		{
-			"empty allocatable",
-			emptyAllocatable,
-			emptyAllocatable,
-		},
-		{
-			"drop allocatable",
-			valid,
-			emptyAllocatable,
-		},
-	}
-
-	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.AttachVolumeLimit, false)()
-	for _, test := range volumeLimitsDisabledCases {
+	for _, test := range volumeLimitsCases {
 		t.Run(test.name, func(t *testing.T) {
 			testPrepareForCreate(t, test.obj, test.expected)
 		})
@@ -120,7 +96,7 @@ func TestPrepareForUpdate(t *testing.T) {
 					Name:         "valid-driver-name",
 					NodeID:       "valid-node",
 					TopologyKeys: []string{"company.com/zone1", "company.com/zone2"},
-					Allocatable:  &storage.VolumeNodeResources{Count: utilpointer.Int32Ptr(20)},
+					Allocatable:  &storage.VolumeNodeResources{Count: ptr.To[int32](20)},
 				},
 			},
 		},
@@ -140,7 +116,7 @@ func TestPrepareForUpdate(t *testing.T) {
 		},
 	}
 
-	volumeLimitsEnabledCases := []struct {
+	volumeLimitsCases := []struct {
 		name     string
 		old      *storage.CSINode
 		new      *storage.CSINode
@@ -166,35 +142,7 @@ func TestPrepareForUpdate(t *testing.T) {
 		},
 	}
 
-	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.AttachVolumeLimit, true)()
-	for _, test := range volumeLimitsEnabledCases {
-		t.Run(test.name, func(t *testing.T) {
-			testPrepareForUpdate(t, test.new, test.old, test.expected)
-		})
-	}
-
-	volumeLimitsDisabledCases := []struct {
-		name     string
-		old      *storage.CSINode
-		new      *storage.CSINode
-		expected *storage.CSINode
-	}{
-		{
-			"allow empty allocatable when it's not set",
-			emptyAllocatable,
-			emptyAllocatable,
-			emptyAllocatable,
-		},
-		{
-			"drop allocatable when it's not set",
-			emptyAllocatable,
-			valid,
-			emptyAllocatable,
-		},
-	}
-
-	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.AttachVolumeLimit, false)()
-	for _, test := range volumeLimitsDisabledCases {
+	for _, test := range volumeLimitsCases {
 		t.Run(test.name, func(t *testing.T) {
 			testPrepareForUpdate(t, test.new, test.old, test.expected)
 		})
@@ -222,7 +170,7 @@ func TestCSINodeStrategy(t *testing.T) {
 	if Strategy.NamespaceScoped() {
 		t.Errorf("CSINode must not be namespace scoped")
 	}
-	if Strategy.AllowCreateOnUpdate() {
+	if Strategy.AllowCreateOnUpdate(context.Background()) {
 		t.Errorf("CSINode should not allow create on update")
 	}
 
@@ -307,7 +255,7 @@ func TestCSINodeValidation(t *testing.T) {
 							Name:         "$csi-driver@",
 							NodeID:       "valid-node",
 							TopologyKeys: []string{"company.com/zone1", "company.com/zone2"},
-							Allocatable:  &storage.VolumeNodeResources{Count: utilpointer.Int32Ptr(10)},
+							Allocatable:  &storage.VolumeNodeResources{Count: ptr.To[int32](10)},
 						},
 					},
 				},
@@ -326,7 +274,7 @@ func TestCSINodeValidation(t *testing.T) {
 							Name:         "valid-driver-name",
 							NodeID:       "",
 							TopologyKeys: []string{"company.com/zone1", "company.com/zone2"},
-							Allocatable:  &storage.VolumeNodeResources{Count: utilpointer.Int32Ptr(10)},
+							Allocatable:  &storage.VolumeNodeResources{Count: ptr.To[int32](10)},
 						},
 					},
 				},
@@ -345,7 +293,7 @@ func TestCSINodeValidation(t *testing.T) {
 							Name:         "valid-driver-name",
 							NodeID:       "valid-node",
 							TopologyKeys: []string{"company.com/zone1", "company.com/zone2"},
-							Allocatable:  &storage.VolumeNodeResources{Count: utilpointer.Int32Ptr(-1)},
+							Allocatable:  &storage.VolumeNodeResources{Count: ptr.To[int32](-1)},
 						},
 					},
 				},
@@ -364,7 +312,7 @@ func TestCSINodeValidation(t *testing.T) {
 							Name:         "valid-driver-name",
 							NodeID:       "valid-node",
 							TopologyKeys: []string{"company.com/zone1", ""},
-							Allocatable:  &storage.VolumeNodeResources{Count: utilpointer.Int32Ptr(10)},
+							Allocatable:  &storage.VolumeNodeResources{Count: ptr.To[int32](10)},
 						},
 					},
 				},
@@ -407,9 +355,129 @@ func getValidCSINode(name string) *storage.CSINode {
 					Name:         "valid-driver-name",
 					NodeID:       "valid-node",
 					TopologyKeys: []string{"company.com/zone1", "company.com/zone2"},
-					Allocatable:  &storage.VolumeNodeResources{Count: utilpointer.Int32Ptr(10)},
+					Allocatable:  &storage.VolumeNodeResources{Count: ptr.To[int32](10)},
 				},
 			},
 		},
+	}
+}
+
+func getCSINodeWithStatus() *storage.CSINode {
+	node := getValidCSINode("foo")
+	node.Status = storage.CSINodeStatus{
+		StorageHealth: []storage.StorageHealth{
+			{
+				Name: "valid-driver-name",
+				HealthConditions: []storage.StorageHealthCondition{
+					{Status: storage.StorageUnreachable, Reason: "BackendDown"},
+				},
+			},
+		},
+	}
+	return node
+}
+
+func TestPrepareForCreate_ClearsStatus(t *testing.T) {
+	featuregatetesting.SetFeatureGatesDuringTest(t, utilfeature.DefaultFeatureGate, featuregatetesting.FeatureOverrides{
+		features.CSIVolumeHealth: true,
+	})
+	ctx := genericapirequest.WithRequestInfo(genericapirequest.NewContext(), &genericapirequest.RequestInfo{
+		APIGroup:   "storage.k8s.io",
+		APIVersion: "v1",
+		Resource:   "csinodes",
+	})
+	obj := getCSINodeWithStatus()
+	Strategy.PrepareForCreate(ctx, obj)
+	if len(obj.Status.StorageHealth) != 0 {
+		t.Errorf("expected status to be cleared on create, got %v", obj.Status)
+	}
+}
+
+func TestPrepareForUpdate_PreservesStatus(t *testing.T) {
+	featuregatetesting.SetFeatureGatesDuringTest(t, utilfeature.DefaultFeatureGate, featuregatetesting.FeatureOverrides{
+		features.CSIVolumeHealth: true,
+	})
+	ctx := genericapirequest.WithRequestInfo(genericapirequest.NewContext(), &genericapirequest.RequestInfo{
+		APIGroup:   "storage.k8s.io",
+		APIVersion: "v1",
+		Resource:   "csinodes",
+	})
+	oldObj := getCSINodeWithStatus()
+	newObj := getValidCSINode("foo")
+	Strategy.PrepareForUpdate(ctx, newObj, oldObj)
+	if !reflect.DeepEqual(newObj.Status, oldObj.Status) {
+		t.Errorf("expected status to be preserved on spec update, got %v", newObj.Status)
+	}
+}
+
+func TestStatusPrepareForUpdate_PreservesSpec(t *testing.T) {
+	featuregatetesting.SetFeatureGatesDuringTest(t, utilfeature.DefaultFeatureGate, featuregatetesting.FeatureOverrides{
+		features.CSIVolumeHealth: true,
+	})
+	ctx := genericapirequest.WithRequestInfo(genericapirequest.NewContext(), &genericapirequest.RequestInfo{
+		APIGroup:   "storage.k8s.io",
+		APIVersion: "v1",
+		Resource:   "csinodes",
+	})
+	oldObj := getValidCSINode("foo")
+	newObj := getCSINodeWithStatus()
+	newObj.Spec.Drivers = nil // Try to change spec via status update
+	StatusStrategy.PrepareForUpdate(ctx, newObj, oldObj)
+	if !reflect.DeepEqual(newObj.Spec, oldObj.Spec) {
+		t.Errorf("expected spec to be preserved on status update, got %v", newObj.Spec)
+	}
+	if len(newObj.Status.StorageHealth) == 0 {
+		t.Errorf("expected status to be set after status update")
+	}
+}
+
+func TestDropDisabledCSINodeFields_GateOff(t *testing.T) {
+	featuregatetesting.SetFeatureGatesDuringTest(t, utilfeature.DefaultFeatureGate, featuregatetesting.FeatureOverrides{
+		features.CSIVolumeHealth: false,
+	})
+	ctx := genericapirequest.WithRequestInfo(genericapirequest.NewContext(), &genericapirequest.RequestInfo{
+		APIGroup:   "storage.k8s.io",
+		APIVersion: "v1",
+		Resource:   "csinodes",
+	})
+
+	tests := []struct {
+		name          string
+		newObj        *storage.CSINode
+		oldObj        *storage.CSINode
+		expectHealthy bool
+	}{
+		{
+			name:          "gate=off, old=nil; should drop",
+			newObj:        getCSINodeWithStatus(),
+			oldObj:        nil,
+			expectHealthy: false,
+		},
+		{
+			name:          "gate=off, old=no status; should drop",
+			newObj:        getCSINodeWithStatus(),
+			oldObj:        getValidCSINode("foo"),
+			expectHealthy: false,
+		},
+		{
+			name:          "gate=off, old=has status; should keep (backward compat)",
+			newObj:        getCSINodeWithStatus(),
+			oldObj:        getCSINodeWithStatus(),
+			expectHealthy: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.oldObj == nil {
+				Strategy.PrepareForCreate(ctx, tt.newObj)
+			} else {
+				StatusStrategy.PrepareForUpdate(ctx, tt.newObj, tt.oldObj)
+			}
+			hasHealth := len(tt.newObj.Status.StorageHealth) > 0
+			if hasHealth != tt.expectHealthy {
+				t.Errorf("expected storageHealth present=%v, got %v", tt.expectHealthy, hasHealth)
+			}
+		})
 	}
 }

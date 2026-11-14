@@ -17,16 +17,18 @@ limitations under the License.
 package projected
 
 import (
+	"bytes"
+	"context"
 	"fmt"
 
 	authenticationv1 "k8s.io/api/authentication/v1"
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
-	"k8s.io/klog"
+	"k8s.io/klog/v2"
 	"k8s.io/kubernetes/pkg/features"
 	"k8s.io/kubernetes/pkg/volume"
 	"k8s.io/kubernetes/pkg/volume/configmap"
@@ -47,6 +49,7 @@ const (
 
 type projectedPlugin struct {
 	host                      volume.VolumeHost
+	kvHost                    volume.KubeletVolumeHost
 	getSecret                 func(namespace, name string) (*v1.Secret, error)
 	getConfigMap              func(namespace, name string) (*v1.ConfigMap, error)
 	getServiceAccountToken    func(namespace, name string, tr *authenticationv1.TokenRequest) (*authenticationv1.TokenRequest, error)
@@ -71,6 +74,7 @@ func getPath(uid types.UID, volName string, host volume.VolumeHost) string {
 
 func (plugin *projectedPlugin) Init(host volume.VolumeHost) error {
 	plugin.host = host
+	plugin.kvHost = host.(volume.KubeletVolumeHost)
 	plugin.getSecret = host.GetSecretFunc()
 	plugin.getConfigMap = host.GetConfigMapFunc()
 	plugin.getServiceAccountToken = host.GetServiceAccountTokenFunc()
@@ -95,11 +99,7 @@ func (plugin *projectedPlugin) CanSupport(spec *volume.Spec) bool {
 	return spec.Volume != nil && spec.Volume.Projected != nil
 }
 
-func (plugin *projectedPlugin) IsMigratedToCSI() bool {
-	return false
-}
-
-func (plugin *projectedPlugin) RequiresRemount() bool {
+func (plugin *projectedPlugin) RequiresRemount(spec *volume.Spec) bool {
 	return true
 }
 
@@ -107,11 +107,11 @@ func (plugin *projectedPlugin) SupportsMountOption() bool {
 	return false
 }
 
-func (plugin *projectedPlugin) SupportsBulkVolumeVerification() bool {
-	return false
+func (plugin *projectedPlugin) SupportsSELinuxContextMount(spec *volume.Spec) (bool, error) {
+	return false, nil
 }
 
-func (plugin *projectedPlugin) NewMounter(spec *volume.Spec, pod *v1.Pod, opts volume.VolumeOptions) (volume.Mounter, error) {
+func (plugin *projectedPlugin) NewMounter(spec *volume.Spec, pod *v1.Pod) (volume.Mounter, error) {
 	return &projectedVolumeMounter{
 		projectedVolume: &projectedVolume{
 			volName:         spec.Name(),
@@ -122,7 +122,6 @@ func (plugin *projectedPlugin) NewMounter(spec *volume.Spec, pod *v1.Pod, opts v
 		},
 		source: *spec.Volume.Projected,
 		pod:    pod,
-		opts:   &opts,
 	}, nil
 }
 
@@ -137,7 +136,7 @@ func (plugin *projectedPlugin) NewUnmounter(volName string, podUID types.UID) (v
 	}, nil
 }
 
-func (plugin *projectedPlugin) ConstructVolumeSpec(volumeName, mountPath string) (*volume.Spec, error) {
+func (plugin *projectedPlugin) ConstructVolumeSpec(volumeName, mountPath string) (volume.ReconstructedVolume, error) {
 	projectedVolume := &v1.Volume{
 		Name: volumeName,
 		VolumeSource: v1.VolumeSource{
@@ -145,7 +144,9 @@ func (plugin *projectedPlugin) ConstructVolumeSpec(volumeName, mountPath string)
 		},
 	}
 
-	return volume.NewSpecFromVolume(projectedVolume), nil
+	return volume.ReconstructedVolume{
+		Spec: volume.NewSpecFromVolume(projectedVolume),
+	}, nil
 }
 
 type projectedVolume struct {
@@ -167,25 +168,17 @@ type projectedVolumeMounter struct {
 
 	source v1.ProjectedVolumeSource
 	pod    *v1.Pod
-	opts   *volume.VolumeOptions
 }
 
 var _ volume.Mounter = &projectedVolumeMounter{}
 
 func (sv *projectedVolume) GetAttributes() volume.Attributes {
 	return volume.Attributes{
-		ReadOnly:        true,
-		Managed:         true,
-		SupportsSELinux: true,
+		ReadOnly:       true,
+		Managed:        true,
+		SELinuxRelabel: true,
 	}
 
-}
-
-// Checks prior to mount operations to verify that the required components (binaries, etc.)
-// to mount the volume are available on the underlying node.
-// If not, it returns an error
-func (s *projectedVolumeMounter) CanMount() error {
-	return nil
 }
 
 func (s *projectedVolumeMounter) SetUp(mounterArgs volume.MounterArgs) error {
@@ -195,12 +188,12 @@ func (s *projectedVolumeMounter) SetUp(mounterArgs volume.MounterArgs) error {
 func (s *projectedVolumeMounter) SetUpAt(dir string, mounterArgs volume.MounterArgs) error {
 	klog.V(3).Infof("Setting up volume %v for pod %v at %v", s.volName, s.pod.UID, dir)
 
-	wrapped, err := s.plugin.host.NewWrapperMounter(s.volName, wrappedVolumeSpec(), s.pod, *s.opts)
+	wrapped, err := s.plugin.host.NewWrapperMounter(s.volName, wrappedVolumeSpec(), s.pod)
 	if err != nil {
 		return err
 	}
 
-	data, err := s.collectData()
+	data, err := s.collectData(mounterArgs)
 	if err != nil {
 		klog.Errorf("Error preparing data for projected volume %v for pod %v/%v: %s", s.volName, s.pod.Namespace, s.pod.Name, err.Error())
 		return err
@@ -225,7 +218,7 @@ func (s *projectedVolumeMounter) SetUpAt(dir string, mounterArgs volume.MounterA
 			}
 			tearDownErr := unmounter.TearDown()
 			if tearDownErr != nil {
-				klog.Errorf("error tearing down volume %s with : %v", s.volName, tearDownErr)
+				klog.Errorf("error tearing down volume %s: %v", s.volName, tearDownErr)
 			}
 		}
 	}()
@@ -237,34 +230,35 @@ func (s *projectedVolumeMounter) SetUpAt(dir string, mounterArgs volume.MounterA
 		return err
 	}
 
-	err = writer.Write(data)
+	setPerms := func(_ string) error {
+		// This may be the first time writing and new files get created outside the timestamp subdirectory:
+		// change the permissions on the whole volume and not only in the timestamp directory.
+		ownershipChanger := volume.NewVolumeOwnership(s, dir, mounterArgs.FsGroup, nil /*fsGroupChangePolicy*/, volumeutil.FSGroupCompleteHook(s.plugin, nil))
+		return ownershipChanger.ChangePermissions()
+	}
+	err = writer.Write(data, setPerms)
 	if err != nil {
 		klog.Errorf("Error writing payload to dir: %v", err)
 		return err
 	}
 
-	err = volume.SetVolumeOwnership(s, mounterArgs.FsGroup)
-	if err != nil {
-		klog.Errorf("Error applying volume ownership settings for group: %v", mounterArgs.FsGroup)
-		return err
-	}
 	setupSuccess = true
 	return nil
 }
 
-func (s *projectedVolumeMounter) collectData() (map[string]volumeutil.FileProjection, error) {
+func (s *projectedVolumeMounter) collectData(mounterArgs volume.MounterArgs) (map[string]volumeutil.FileProjection, error) {
 	if s.source.DefaultMode == nil {
-		return nil, fmt.Errorf("No defaultMode used, not even the default value for it")
+		return nil, fmt.Errorf("no defaultMode used, not even the default value for it")
 	}
 
 	kubeClient := s.plugin.host.GetKubeClient()
 	if kubeClient == nil {
-		return nil, fmt.Errorf("Cannot setup projected volume %v because kube client is not configured", s.volName)
+		return nil, fmt.Errorf("cannot setup projected volume %v because kube client is not configured", s.volName)
 	}
 
 	errlist := []error{}
 	payload := make(map[string]volumeutil.FileProjection)
-	for _, source := range s.source.Sources {
+	for sourceIndex, source := range s.source.Sources {
 		switch {
 		case source.Secret != nil:
 			optional := source.Secret.Optional != nil && *source.Secret.Optional
@@ -282,7 +276,7 @@ func (s *projectedVolumeMounter) collectData() (map[string]volumeutil.FileProjec
 					},
 				}
 			}
-			secretPayload, err := secret.MakePayload(source.Secret.Items, secretapi, s.source.DefaultMode, optional)
+			secretPayload, err := secret.MakePayload(source.Secret.Items, secretapi, s.source.DefaultMode, s.source.DefaultUser, optional)
 			if err != nil {
 				klog.Errorf("Couldn't get secret payload %v/%v: %v", s.pod.Namespace, source.Secret.Name, err)
 				errlist = append(errlist, err)
@@ -307,7 +301,7 @@ func (s *projectedVolumeMounter) collectData() (map[string]volumeutil.FileProjec
 					},
 				}
 			}
-			configMapPayload, err := configmap.MakePayload(source.ConfigMap.Items, configMap, s.source.DefaultMode, optional)
+			configMapPayload, err := configmap.MakePayload(source.ConfigMap.Items, configMap, s.source.DefaultMode, s.source.DefaultUser, optional)
 			if err != nil {
 				klog.Errorf("Couldn't get configMap payload %v/%v: %v", s.pod.Namespace, source.ConfigMap.Name, err)
 				errlist = append(errlist, err)
@@ -317,7 +311,7 @@ func (s *projectedVolumeMounter) collectData() (map[string]volumeutil.FileProjec
 				payload[k] = v
 			}
 		case source.DownwardAPI != nil:
-			downwardAPIPayload, err := downwardapi.CollectData(source.DownwardAPI.Items, s.pod, s.plugin.host, s.source.DefaultMode)
+			downwardAPIPayload, err := downwardapi.CollectData(source.DownwardAPI.Items, s.pod, s.plugin.host, s.source.DefaultMode, s.source.DefaultUser)
 			if err != nil {
 				errlist = append(errlist, err)
 				continue
@@ -326,11 +320,15 @@ func (s *projectedVolumeMounter) collectData() (map[string]volumeutil.FileProjec
 				payload[k] = v
 			}
 		case source.ServiceAccountToken != nil:
-			if !utilfeature.DefaultFeatureGate.Enabled(features.TokenRequestProjection) {
-				errlist = append(errlist, fmt.Errorf("pod request ServiceAccountToken projection but the TokenRequestProjection feature was not enabled"))
-				continue
-			}
 			tp := source.ServiceAccountToken
+			fsUser := resolveFsUser(mounterArgs, s.source.DefaultUser, tp.User)
+
+			// When FsGroup is set, we depend on SetVolumeOwnership to
+			// change from 0600 to 0640.
+			mode := *s.source.DefaultMode
+			if fsUser != nil || mounterArgs.FsGroup != nil {
+				mode = 0600
+			}
 
 			var auds []string
 			if len(tp.Audience) != 0 {
@@ -353,9 +351,85 @@ func (s *projectedVolumeMounter) collectData() (map[string]volumeutil.FileProjec
 				continue
 			}
 			payload[tp.Path] = volumeutil.FileProjection{
-				Data: []byte(tr.Status.Token),
-				Mode: 0600,
+				Data:   []byte(tr.Status.Token),
+				Mode:   mode,
+				FsUser: fsUser,
 			}
+		case source.ClusterTrustBundle != nil:
+			allowEmpty := false
+			if source.ClusterTrustBundle.Optional != nil && *source.ClusterTrustBundle.Optional {
+				allowEmpty = true
+			}
+
+			var trustAnchors []byte
+			if source.ClusterTrustBundle.Name != nil {
+				var err error
+				trustAnchors, err = s.plugin.kvHost.GetTrustAnchorsByName(context.TODO(), *source.ClusterTrustBundle.Name, allowEmpty)
+				if err != nil {
+					errlist = append(errlist, err)
+					continue
+				}
+			} else if source.ClusterTrustBundle.SignerName != nil {
+				var err error
+				trustAnchors, err = s.plugin.kvHost.GetTrustAnchorsBySigner(context.TODO(), *source.ClusterTrustBundle.SignerName, source.ClusterTrustBundle.LabelSelector, allowEmpty)
+				if err != nil {
+					errlist = append(errlist, err)
+					continue
+				}
+			} else {
+				errlist = append(errlist, fmt.Errorf("ClusterTrustBundle projection requires either name or signerName to be set"))
+				continue
+			}
+
+			fsUser := resolveFsUser(mounterArgs, s.source.DefaultUser, source.ClusterTrustBundle.User)
+			mode := *s.source.DefaultMode
+			if fsUser != nil || mounterArgs.FsGroup != nil {
+				mode = 0600
+			}
+
+			payload[source.ClusterTrustBundle.Path] = volumeutil.FileProjection{
+				Data:   trustAnchors,
+				Mode:   mode,
+				FsUser: fsUser,
+			}
+		case source.PodCertificate != nil:
+			key, certificates, err := s.plugin.kvHost.GetPodCertificateCredentialBundle(context.TODO(), s.pod.ObjectMeta.Namespace, s.pod.ObjectMeta.Name, string(s.pod.ObjectMeta.UID), s.volName, sourceIndex)
+			if err != nil {
+				errlist = append(errlist, err)
+				continue
+			}
+
+			fsUser := resolveFsUser(mounterArgs, s.source.DefaultUser, source.PodCertificate.User)
+			mode := *s.source.DefaultMode
+			if fsUser != nil || mounterArgs.FsGroup != nil {
+				mode = 0600
+			}
+
+			if source.PodCertificate.CredentialBundlePath != "" {
+				credentialBundle := bytes.Buffer{}
+				credentialBundle.Write(key)
+				credentialBundle.Write(certificates)
+				payload[source.PodCertificate.CredentialBundlePath] = volumeutil.FileProjection{
+					Data:   credentialBundle.Bytes(),
+					Mode:   mode,
+					FsUser: fsUser,
+				}
+			}
+			if source.PodCertificate.KeyPath != "" {
+				payload[source.PodCertificate.KeyPath] = volumeutil.FileProjection{
+					Data:   key,
+					Mode:   mode,
+					FsUser: fsUser,
+				}
+			}
+			if source.PodCertificate.CertificateChainPath != "" {
+				payload[source.PodCertificate.CertificateChainPath] = volumeutil.FileProjection{
+					Data:   certificates,
+					Mode:   mode,
+					FsUser: fsUser,
+				}
+			}
+
 		}
 	}
 	return payload, utilerrors.NewAggregate(errlist)
@@ -383,6 +457,7 @@ func (c *projectedVolumeUnmounter) TearDownAt(dir string) error {
 	}
 
 	c.plugin.deleteServiceAccountToken(c.podUID)
+
 	return nil
 }
 
@@ -391,5 +466,21 @@ func getVolumeSource(spec *volume.Spec) (*v1.ProjectedVolumeSource, bool, error)
 		return spec.Volume.Projected, spec.ReadOnly, nil
 	}
 
-	return nil, false, fmt.Errorf("Spec does not reference a projected volume type")
+	return nil, false, fmt.Errorf("spec does not reference a projected volume type")
+}
+
+// resolvesFsUser resolves file owner UID using a fallback mechanism described in KEP-5936.
+// Returns nil when the feature gate is disabled.
+func resolveFsUser(mounterArgs volume.MounterArgs, defaultUser, itemUser *int64) *int64 {
+	fsUser := mounterArgs.FsUser
+
+	if utilfeature.DefaultFeatureGate.Enabled(features.AtomicWriteVolumeUserFields) {
+		if defaultUser != nil {
+			fsUser = defaultUser
+		}
+		if itemUser != nil {
+			fsUser = itemUser
+		}
+	}
+	return fsUser
 }

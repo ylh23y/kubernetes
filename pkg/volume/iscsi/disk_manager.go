@@ -19,8 +19,9 @@ package iscsi
 import (
 	"os"
 
-	"k8s.io/klog"
-	"k8s.io/kubernetes/pkg/util/mount"
+	"k8s.io/klog/v2"
+	"k8s.io/mount-utils"
+
 	"k8s.io/kubernetes/pkg/volume"
 	"k8s.io/kubernetes/pkg/volume/util"
 )
@@ -40,7 +41,9 @@ type diskManager interface {
 // utility to mount a disk based filesystem
 // globalPDPath: global mount path like, /var/lib/kubelet/plugins/kubernetes.io/iscsi/{ifaceName}/{portal-some_iqn-lun-lun_id}
 // volPath: pod volume dir path like, /var/lib/kubelet/pods/{podUID}/volumes/kubernetes.io~iscsi/{volumeName}
-func diskSetUp(manager diskManager, b iscsiDiskMounter, volPath string, mounter mount.Interface, fsGroup *int64) error {
+func diskSetUp(manager diskManager, b iscsiDiskMounter, volPath string, mounter mount.Interface, mounterArgs volume.MounterArgs) error {
+	fsGroup := mounterArgs.FsGroup
+	fsGroupChangePolicy := mounterArgs.FSGroupChangePolicy
 	notMnt, err := mounter.IsLikelyNotMountPoint(volPath)
 	if err != nil && !os.IsNotExist(err) {
 		klog.Errorf("cannot validate mountpoint: %s", volPath)
@@ -64,8 +67,14 @@ func diskSetUp(manager diskManager, b iscsiDiskMounter, volPath string, mounter 
 		b.iscsiDisk.Iface = b.iscsiDisk.Portals[0] + ":" + b.iscsiDisk.VolName
 	}
 	globalPDPath := manager.MakeGlobalPDName(*b.iscsiDisk)
+
+	pluginDir := b.plugin.host.GetPluginDir(iscsiPluginName)
+	if err := validateISCSIPluginPath(globalPDPath, pluginDir); err != nil {
+		return err
+	}
+
 	mountOptions := util.JoinMountOptions(b.mountOptions, options)
-	err = mounter.Mount(globalPDPath, volPath, "", mountOptions)
+	err = mounter.MountSensitiveWithoutSystemd(globalPDPath, volPath, "", mountOptions, nil)
 	if err != nil {
 		klog.Errorf("Failed to bind mount: source:%s, target:%s, err:%v", globalPDPath, volPath, err)
 		noMnt, mntErr := b.mounter.IsLikelyNotMountPoint(volPath)
@@ -94,7 +103,9 @@ func diskSetUp(manager diskManager, b iscsiDiskMounter, volPath string, mounter 
 	}
 
 	if !b.readOnly {
-		volume.SetVolumeOwnership(&b, fsGroup)
+		// This code requires larger refactor to monitor progress of ownership change
+		ownershipChanger := volume.NewVolumeOwnership(&b, volPath, fsGroup, fsGroupChangePolicy, util.FSGroupCompleteHook(b.plugin, nil))
+		_ = ownershipChanger.ChangePermissions()
 	}
 
 	return nil

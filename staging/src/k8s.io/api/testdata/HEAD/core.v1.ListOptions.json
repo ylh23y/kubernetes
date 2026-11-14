@@ -1,11 +1,15 @@
 {
   "kind": "ListOptions",
   "apiVersion": "v1",
-  "labelSelector": "2",
-  "fieldSelector": "3",
+  "labelSelector": "labelSelectorValue",
+  "fieldSelector": "fieldSelectorValue",
   "watch": true,
-  "resourceVersion": "4",
-  "timeoutSeconds": 1002466899136229878,
-  "limit": 5339971464584210463,
-  "continue": "5"
+  "allowWatchBookmarks": true,
+  "resourceVersion": "resourceVersionValue",
+  "resourceVersionMatch": "resourceVersionMatchValue",
+  "timeoutSeconds": 5,
+  "limit": 7,
+  "continue": "continueValue",
+  "sendInitialEvents": true,
+  "shardSelector": "shardSelectorValue"
 }

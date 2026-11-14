@@ -18,9 +18,7 @@ package metrics
 
 var interestingAPIServerMetrics = []string{
 	"apiserver_request_total",
-	// TODO(krzysied): apiserver_request_latencies_summary is a deprecated metric.
-	// It should be replaced with new metric.
-	"apiserver_request_latencies_summary",
+	"apiserver_request_latency_seconds",
 	"apiserver_init_events_total",
 }
 
@@ -48,6 +46,7 @@ var interestingKubeletMetrics = []string{
 	"kubelet_docker_operations_errors_total",
 	"kubelet_docker_operations_duration_seconds",
 	"kubelet_pod_start_duration_seconds",
+	"kubelet_pod_start_sli_duration_seconds",
 	"kubelet_pod_worker_duration_seconds",
 	"kubelet_pod_worker_start_duration_seconds",
 }

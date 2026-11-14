@@ -17,474 +17,843 @@ limitations under the License.
 // Package app implements a server that runs a set of active
 // components.  This includes replication controllers, service endpoints and
 // nodes.
-//
 package app
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"net"
-	"net/http"
 	"strings"
 	"time"
 
-	"k8s.io/klog"
-
 	v1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/runtime/schema"
-	utilfeature "k8s.io/apiserver/pkg/util/feature"
-	cacheddiscovery "k8s.io/client-go/discovery/cached/memory"
-	clientset "k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/metadata"
-	restclient "k8s.io/client-go/rest"
-	"k8s.io/kubernetes/pkg/controller"
-	cloudcontroller "k8s.io/kubernetes/pkg/controller/cloud"
+	genericfeatures "k8s.io/apiserver/pkg/features"
+	"k8s.io/apiserver/pkg/quota/v1/generic"
+	"k8s.io/client-go/discovery"
+	"k8s.io/component-base/featuregate"
+	"k8s.io/controller-manager/controller"
+	csitrans "k8s.io/csi-translation-lib"
+	"k8s.io/klog/v2"
+	"k8s.io/kubernetes/cmd/kube-controller-manager/names"
+	pkgcontroller "k8s.io/kubernetes/pkg/controller"
 	endpointcontroller "k8s.io/kubernetes/pkg/controller/endpoint"
 	"k8s.io/kubernetes/pkg/controller/garbagecollector"
 	namespacecontroller "k8s.io/kubernetes/pkg/controller/namespace"
 	nodeipamcontroller "k8s.io/kubernetes/pkg/controller/nodeipam"
+	nodeipamconfig "k8s.io/kubernetes/pkg/controller/nodeipam/config"
 	"k8s.io/kubernetes/pkg/controller/nodeipam/ipam"
 	lifecyclecontroller "k8s.io/kubernetes/pkg/controller/nodelifecycle"
 	"k8s.io/kubernetes/pkg/controller/podgc"
 	replicationcontroller "k8s.io/kubernetes/pkg/controller/replication"
 	resourcequotacontroller "k8s.io/kubernetes/pkg/controller/resourcequota"
-	routecontroller "k8s.io/kubernetes/pkg/controller/route"
-	servicecontroller "k8s.io/kubernetes/pkg/controller/service"
 	serviceaccountcontroller "k8s.io/kubernetes/pkg/controller/serviceaccount"
+	"k8s.io/kubernetes/pkg/controller/storageversiongc"
+	"k8s.io/kubernetes/pkg/controller/tainteviction"
 	ttlcontroller "k8s.io/kubernetes/pkg/controller/ttl"
 	"k8s.io/kubernetes/pkg/controller/ttlafterfinished"
 	"k8s.io/kubernetes/pkg/controller/volume/attachdetach"
+	"k8s.io/kubernetes/pkg/controller/volume/ephemeral"
 	"k8s.io/kubernetes/pkg/controller/volume/expand"
 	persistentvolumecontroller "k8s.io/kubernetes/pkg/controller/volume/persistentvolume"
 	"k8s.io/kubernetes/pkg/controller/volume/pvcprotection"
 	"k8s.io/kubernetes/pkg/controller/volume/pvprotection"
+	"k8s.io/kubernetes/pkg/controller/volume/selinuxwarning"
+	"k8s.io/kubernetes/pkg/controller/volume/vacprotection"
 	"k8s.io/kubernetes/pkg/features"
-	kubefeatures "k8s.io/kubernetes/pkg/features"
-	"k8s.io/kubernetes/pkg/quota/v1/generic"
 	quotainstall "k8s.io/kubernetes/pkg/quota/v1/install"
-	"k8s.io/kubernetes/pkg/util/metrics"
+	"k8s.io/kubernetes/pkg/volume/csimigration"
+	"k8s.io/utils/clock"
 	netutils "k8s.io/utils/net"
 )
 
-func startServiceController(ctx ControllerContext) (http.Handler, bool, error) {
-	serviceController, err := servicecontroller.New(
-		ctx.Cloud,
-		ctx.ClientBuilder.ClientOrDie("service-controller"),
-		ctx.InformerFactory.Core().V1().Services(),
-		ctx.InformerFactory.Core().V1().Nodes(),
-		ctx.ComponentConfig.KubeCloudShared.ClusterName,
-	)
-	if err != nil {
-		// This error shouldn't fail. It lives like this as a legacy.
-		klog.Errorf("Failed to start service controller: %v", err)
-		return nil, false, nil
+const (
+	// defaultNodeMaskCIDRIPv4 is default mask size for IPv4 node cidr
+	defaultNodeMaskCIDRIPv4 = 24
+	// defaultNodeMaskCIDRIPv6 is default mask size for IPv6 node cidr
+	defaultNodeMaskCIDRIPv6 = 64
+)
+
+func newNodeIpamControllerDescriptor() *ControllerDescriptor {
+	return &ControllerDescriptor{
+		name:        names.NodeIpamController,
+		aliases:     []string{"nodeipam"},
+		constructor: newNodeIpamController,
 	}
-	go serviceController.Run(ctx.Stop, int(ctx.ComponentConfig.ServiceController.ConcurrentServiceSyncs))
-	return nil, true, nil
 }
-func startNodeIpamController(ctx ControllerContext) (http.Handler, bool, error) {
-	var serviceCIDR *net.IPNet
 
-	// should we start nodeIPAM
-	if !ctx.ComponentConfig.KubeCloudShared.AllocateNodeCIDRs {
-		return nil, false, nil
+func newNodeIpamController(ctx context.Context, controllerContext ControllerContext, controllerName string) (Controller, error) {
+	if !controllerContext.ComponentConfig.KubeCloudShared.AllocateNodeCIDRs {
+		return nil, nil
+	}
+	if controllerContext.ComponentConfig.KubeCloudShared.CIDRAllocatorType == string(ipam.CloudAllocatorType) {
+		// Cannot run cloud ipam controller if cloud provider is nil (--cloud-provider not set or set to 'external')
+		return nil, errors.New("--cidr-allocator-type is set to 'CloudAllocator' but cloud provider is not configured")
 	}
 
-	// failure: bad cidrs in config
-	clusterCIDRs, dualStack, err := processCIDRs(ctx.ComponentConfig.KubeCloudShared.ClusterCIDR)
+	clusterCIDRs, err := validateCIDRs(controllerContext.ComponentConfig.KubeCloudShared.ClusterCIDR)
 	if err != nil {
-		return nil, false, err
-	}
-
-	// failure: more than one cidr and dual stack is not enabled
-	if len(clusterCIDRs) > 1 && !utilfeature.DefaultFeatureGate.Enabled(kubefeatures.IPv6DualStack) {
-		return nil, false, fmt.Errorf("len of ClusterCIDRs==%v and dualstack feature is not enabled", len(clusterCIDRs))
-	}
-
-	// failure: more than one cidr but they are not configured as dual stack
-	if len(clusterCIDRs) > 1 && !dualStack {
-		return nil, false, fmt.Errorf("len of ClusterCIDRs==%v and they are not configured as dual stack (at least one from each IPFamily", len(clusterCIDRs))
-	}
-
-	// failure: more than cidrs is not allowed even with dual stack
-	if len(clusterCIDRs) > 2 {
-		return nil, false, fmt.Errorf("len of clusters is:%v > more than max allowed of 2", len(clusterCIDRs))
+		return nil, err
 	}
 
 	// service cidr processing
-	if len(strings.TrimSpace(ctx.ComponentConfig.NodeIPAMController.ServiceCIDR)) != 0 {
-		_, serviceCIDR, err = net.ParseCIDR(ctx.ComponentConfig.NodeIPAMController.ServiceCIDR)
+	var serviceCIDR *net.IPNet
+	var secondaryServiceCIDR *net.IPNet
+	logger := klog.FromContext(ctx)
+	if len(strings.TrimSpace(controllerContext.ComponentConfig.NodeIPAMController.ServiceCIDR)) != 0 {
+		_, serviceCIDR, err = netutils.ParseCIDRSloppy(controllerContext.ComponentConfig.NodeIPAMController.ServiceCIDR)
 		if err != nil {
-			klog.Warningf("Unsuccessful parsing of service CIDR %v: %v", ctx.ComponentConfig.NodeIPAMController.ServiceCIDR, err)
+			logger.Info("Warning: unsuccessful parsing of service CIDR", "CIDR", controllerContext.ComponentConfig.NodeIPAMController.ServiceCIDR, "err", err)
 		}
+	}
+
+	if len(strings.TrimSpace(controllerContext.ComponentConfig.NodeIPAMController.SecondaryServiceCIDR)) != 0 {
+		_, secondaryServiceCIDR, err = netutils.ParseCIDRSloppy(controllerContext.ComponentConfig.NodeIPAMController.SecondaryServiceCIDR)
+		if err != nil {
+			logger.Info("Warning: unsuccessful parsing of service CIDR", "CIDR", controllerContext.ComponentConfig.NodeIPAMController.SecondaryServiceCIDR, "err", err)
+		}
+	}
+
+	// the following checks are triggered if both serviceCIDR and secondaryServiceCIDR are provided
+	if serviceCIDR != nil && secondaryServiceCIDR != nil {
+		// should be dual stack (from different IPFamilies)
+		dualstackServiceCIDR, err := netutils.IsDualStackCIDRs([]*net.IPNet{serviceCIDR, secondaryServiceCIDR})
+		if err != nil {
+			return nil, fmt.Errorf("failed to perform dualstack check on serviceCIDR and secondaryServiceCIDR error: %w", err)
+		}
+		if !dualstackServiceCIDR {
+			return nil, fmt.Errorf("serviceCIDR and secondaryServiceCIDR are not dualstack (from different IPfamiles)")
+		}
+	}
+
+	// only --node-cidr-mask-size-ipv4 and --node-cidr-mask-size-ipv6 supported with dual stack clusters.
+	// --node-cidr-mask-size flag is incompatible with dual stack clusters.
+	nodeCIDRMaskSizes, err := setNodeCIDRMaskSizes(controllerContext.ComponentConfig.NodeIPAMController, clusterCIDRs)
+	if err != nil {
+		return nil, err
+	}
+
+	client, err := controllerContext.NewClient("node-controller")
+	if err != nil {
+		return nil, err
 	}
 
 	nodeIpamController, err := nodeipamcontroller.NewNodeIpamController(
-		ctx.InformerFactory.Core().V1().Nodes(),
-		ctx.Cloud,
-		ctx.ClientBuilder.ClientOrDie("node-controller"),
+		ctx,
+		controllerContext.InformerFactory.Core().V1().Nodes(),
+		nil, // no cloud provider on kube-controller-manager since v1.31 (KEP-2395)
+		client,
 		clusterCIDRs,
 		serviceCIDR,
-		int(ctx.ComponentConfig.NodeIPAMController.NodeCIDRMaskSize),
-		ipam.CIDRAllocatorType(ctx.ComponentConfig.KubeCloudShared.CIDRAllocatorType),
+		secondaryServiceCIDR,
+		nodeCIDRMaskSizes,
+		ipam.CIDRAllocatorType(controllerContext.ComponentConfig.KubeCloudShared.CIDRAllocatorType),
 	)
 	if err != nil {
-		return nil, true, err
+		return nil, err
 	}
-	go nodeIpamController.Run(ctx.Stop)
-	return nil, true, nil
+
+	return newControllerLoop(func(ctx context.Context) {
+		nodeIpamController.RunWithMetrics(ctx, controllerContext.ControllerManagerMetrics)
+	}, controllerName), nil
 }
 
-func startNodeLifecycleController(ctx ControllerContext) (http.Handler, bool, error) {
-	lifecycleController, err := lifecyclecontroller.NewNodeLifecycleController(
-		ctx.InformerFactory.Coordination().V1beta1().Leases(),
-		ctx.InformerFactory.Core().V1().Pods(),
-		ctx.InformerFactory.Core().V1().Nodes(),
-		ctx.InformerFactory.Apps().V1().DaemonSets(),
+func newNodeLifecycleControllerDescriptor() *ControllerDescriptor {
+	return &ControllerDescriptor{
+		name:        names.NodeLifecycleController,
+		aliases:     []string{"nodelifecycle"},
+		constructor: newNodeLifecycleController,
+	}
+}
+
+func newNodeLifecycleController(ctx context.Context, controllerContext ControllerContext, controllerName string) (Controller, error) {
+	client, err := controllerContext.NewClient("node-controller")
+	if err != nil {
+		return nil, err
+	}
+
+	nlc, err := lifecyclecontroller.NewNodeLifecycleController(
+		ctx,
+		controllerContext.InformerFactory.Coordination().V1().Leases(),
+		controllerContext.InformerFactory.Core().V1().Pods(),
+		controllerContext.InformerFactory.Core().V1().Nodes(),
+		controllerContext.InformerFactory.Apps().V1().DaemonSets(),
 		// node lifecycle controller uses existing cluster role from node-controller
-		ctx.ClientBuilder.ClientOrDie("node-controller"),
-		ctx.ComponentConfig.KubeCloudShared.NodeMonitorPeriod.Duration,
-		ctx.ComponentConfig.NodeLifecycleController.NodeStartupGracePeriod.Duration,
-		ctx.ComponentConfig.NodeLifecycleController.NodeMonitorGracePeriod.Duration,
-		ctx.ComponentConfig.NodeLifecycleController.PodEvictionTimeout.Duration,
-		ctx.ComponentConfig.NodeLifecycleController.NodeEvictionRate,
-		ctx.ComponentConfig.NodeLifecycleController.SecondaryNodeEvictionRate,
-		ctx.ComponentConfig.NodeLifecycleController.LargeClusterSizeThreshold,
-		ctx.ComponentConfig.NodeLifecycleController.UnhealthyZoneThreshold,
-		ctx.ComponentConfig.NodeLifecycleController.EnableTaintManager,
-		utilfeature.DefaultFeatureGate.Enabled(features.TaintBasedEvictions),
-		utilfeature.DefaultFeatureGate.Enabled(features.TaintNodesByCondition),
+		client,
+		controllerContext.ComponentConfig.NodeLifecycleController.NodeMonitorPeriod.Duration,
+		controllerContext.ComponentConfig.NodeLifecycleController.NodeStartupGracePeriod.Duration,
+		controllerContext.ComponentConfig.NodeLifecycleController.NodeMonitorGracePeriod.Duration,
+		controllerContext.ComponentConfig.NodeLifecycleController.NodeEvictionRate,
+		controllerContext.ComponentConfig.NodeLifecycleController.SecondaryNodeEvictionRate,
+		controllerContext.ComponentConfig.NodeLifecycleController.LargeClusterSizeThreshold,
+		controllerContext.ComponentConfig.NodeLifecycleController.UnhealthyZoneThreshold,
 	)
 	if err != nil {
-		return nil, true, err
+		return nil, err
 	}
-	go lifecycleController.Run(ctx.Stop)
-	return nil, true, nil
+
+	return newControllerLoop(func(ctx context.Context) {
+		nlc.Run(ctx)
+	}, controllerName), nil
 }
 
-func startCloudNodeLifecycleController(ctx ControllerContext) (http.Handler, bool, error) {
-	cloudNodeLifecycleController, err := cloudcontroller.NewCloudNodeLifecycleController(
-		ctx.InformerFactory.Core().V1().Nodes(),
-		// cloud node lifecycle controller uses existing cluster role from node-controller
-		ctx.ClientBuilder.ClientOrDie("node-controller"),
-		ctx.Cloud,
-		ctx.ComponentConfig.KubeCloudShared.NodeMonitorPeriod.Duration,
+func newTaintEvictionControllerDescriptor() *ControllerDescriptor {
+	return &ControllerDescriptor{
+		name:        names.TaintEvictionController,
+		constructor: newTaintEvictionController,
+	}
+}
+
+func newTaintEvictionController(ctx context.Context, controllerContext ControllerContext, controllerName string) (Controller, error) {
+	// taint-manager uses existing cluster role from node-controller
+	client, err := controllerContext.NewClient("node-controller")
+	if err != nil {
+		return nil, err
+	}
+
+	tec, err := tainteviction.New(
+		ctx,
+		client,
+		controllerContext.InformerFactory.Core().V1().Pods(),
+		controllerContext.InformerFactory.Core().V1().Nodes(),
+		controllerName,
 	)
 	if err != nil {
-		// the controller manager should continue to run if the "Instances" interface is not
-		// supported, though it's unlikely for a cloud provider to not support it
-		klog.Errorf("failed to start cloud node lifecycle controller: %v", err)
-		return nil, false, nil
+		return nil, err
 	}
 
-	go cloudNodeLifecycleController.Run(ctx.Stop)
-	return nil, true, nil
+	return newControllerLoop(tec.Run, controllerName), nil
 }
 
-func startRouteController(ctx ControllerContext) (http.Handler, bool, error) {
-	if !ctx.ComponentConfig.KubeCloudShared.AllocateNodeCIDRs || !ctx.ComponentConfig.KubeCloudShared.ConfigureCloudRoutes {
-		klog.Infof("Will not configure cloud provider routes for allocate-node-cidrs: %v, configure-cloud-routes: %v.", ctx.ComponentConfig.KubeCloudShared.AllocateNodeCIDRs, ctx.ComponentConfig.KubeCloudShared.ConfigureCloudRoutes)
-		return nil, false, nil
+func newPersistentVolumeBinderControllerDescriptor() *ControllerDescriptor {
+	return &ControllerDescriptor{
+		name:        names.PersistentVolumeBinderController,
+		aliases:     []string{"persistentvolume-binder"},
+		constructor: newPersistentVolumeBinderController,
 	}
-	if ctx.Cloud == nil {
-		klog.Warning("configure-cloud-routes is set, but no cloud provider specified. Will not configure cloud provider routes.")
-		return nil, false, nil
-	}
-	routes, ok := ctx.Cloud.Routes()
-	if !ok {
-		klog.Warning("configure-cloud-routes is set, but cloud provider does not support routes. Will not configure cloud provider routes.")
-		return nil, false, nil
-	}
+}
 
-	// failure: bad cidrs in config
-	clusterCIDRs, dualStack, err := processCIDRs(ctx.ComponentConfig.KubeCloudShared.ClusterCIDR)
+func newPersistentVolumeBinderController(ctx context.Context, controllerContext ControllerContext, controllerName string) (Controller, error) {
+	logger := klog.FromContext(ctx)
+	plugins, err := ProbeProvisionableRecyclableVolumePlugins(logger, controllerContext.ComponentConfig.PersistentVolumeBinderController.VolumeConfiguration)
 	if err != nil {
-		return nil, false, err
+		return nil, fmt.Errorf("failed to probe volume plugins when starting persistentvolume controller: %w", err)
 	}
 
-	// failure: more than one cidr and dual stack is not enabled
-	if len(clusterCIDRs) > 1 && !utilfeature.DefaultFeatureGate.Enabled(kubefeatures.IPv6DualStack) {
-		return nil, false, fmt.Errorf("len of ClusterCIDRs==%v and dualstack feature is not enabled", len(clusterCIDRs))
+	metricsPlugins, err := ProbePersistentVolumePlugins(logger, controllerContext.ComponentConfig.PersistentVolumeBinderController.VolumeConfiguration)
+	if err != nil {
+		return nil, fmt.Errorf("failed to probe metrics volume plugins when starting persistentvolume controller: %w", err)
 	}
 
-	// failure: more than one cidr but they are not configured as dual stack
-	if len(clusterCIDRs) > 1 && !dualStack {
-		return nil, false, fmt.Errorf("len of ClusterCIDRs==%v and they are not configured as dual stack (at least one from each IPFamily", len(clusterCIDRs))
+	client, err := controllerContext.NewClient("persistent-volume-binder")
+	if err != nil {
+		return nil, err
 	}
 
-	// failure: more than cidrs is not allowed even with dual stack
-	if len(clusterCIDRs) > 2 {
-		return nil, false, fmt.Errorf("length of clusterCIDRs is:%v more than max allowed of 2", len(clusterCIDRs))
-	}
-
-	routeController := routecontroller.New(routes,
-		ctx.ClientBuilder.ClientOrDie("route-controller"),
-		ctx.InformerFactory.Core().V1().Nodes(),
-		ctx.ComponentConfig.KubeCloudShared.ClusterName,
-		clusterCIDRs)
-	go routeController.Run(ctx.Stop, ctx.ComponentConfig.KubeCloudShared.RouteReconciliationPeriod.Duration)
-	return nil, true, nil
-}
-
-func startPersistentVolumeBinderController(ctx ControllerContext) (http.Handler, bool, error) {
 	params := persistentvolumecontroller.ControllerParameters{
-		KubeClient:                ctx.ClientBuilder.ClientOrDie("persistent-volume-binder"),
-		SyncPeriod:                ctx.ComponentConfig.PersistentVolumeBinderController.PVClaimBinderSyncPeriod.Duration,
-		VolumePlugins:             ProbeControllerVolumePlugins(ctx.Cloud, ctx.ComponentConfig.PersistentVolumeBinderController.VolumeConfiguration),
-		Cloud:                     ctx.Cloud,
-		ClusterName:               ctx.ComponentConfig.KubeCloudShared.ClusterName,
-		VolumeInformer:            ctx.InformerFactory.Core().V1().PersistentVolumes(),
-		ClaimInformer:             ctx.InformerFactory.Core().V1().PersistentVolumeClaims(),
-		ClassInformer:             ctx.InformerFactory.Storage().V1().StorageClasses(),
-		PodInformer:               ctx.InformerFactory.Core().V1().Pods(),
-		NodeInformer:              ctx.InformerFactory.Core().V1().Nodes(),
-		EnableDynamicProvisioning: ctx.ComponentConfig.PersistentVolumeBinderController.VolumeConfiguration.EnableDynamicProvisioning,
+		KubeClient:                client,
+		SyncPeriod:                controllerContext.ComponentConfig.PersistentVolumeBinderController.PVClaimBinderSyncPeriod.Duration,
+		VolumePlugins:             plugins,
+		MetricsVolumePlugins:      metricsPlugins,
+		VolumeInformer:            controllerContext.InformerFactory.Core().V1().PersistentVolumes(),
+		ClaimInformer:             controllerContext.InformerFactory.Core().V1().PersistentVolumeClaims(),
+		ClassInformer:             controllerContext.InformerFactory.Storage().V1().StorageClasses(),
+		PodInformer:               controllerContext.InformerFactory.Core().V1().Pods(),
+		NodeInformer:              controllerContext.InformerFactory.Core().V1().Nodes(),
+		EnableDynamicProvisioning: controllerContext.ComponentConfig.PersistentVolumeBinderController.VolumeConfiguration.EnableDynamicProvisioning,
 	}
-	volumeController, volumeControllerErr := persistentvolumecontroller.NewController(params)
-	if volumeControllerErr != nil {
-		return nil, true, fmt.Errorf("failed to construct persistentvolume controller: %v", volumeControllerErr)
+	volumeController, err := persistentvolumecontroller.NewController(ctx, params)
+	if err != nil {
+		return nil, fmt.Errorf("failed to construct persistentvolume controller: %w", err)
 	}
-	go volumeController.Run(ctx.Stop)
-	return nil, true, nil
+
+	return newControllerLoop(volumeController.Run, controllerName), nil
 }
 
-func startAttachDetachController(ctx ControllerContext) (http.Handler, bool, error) {
-	if ctx.ComponentConfig.AttachDetachController.ReconcilerSyncLoopPeriod.Duration < time.Second {
-		return nil, true, fmt.Errorf("duration time must be greater than one second as set via command line option reconcile-sync-loop-period")
+func newPersistentVolumeAttachDetachControllerDescriptor() *ControllerDescriptor {
+	return &ControllerDescriptor{
+		name:        names.PersistentVolumeAttachDetachController,
+		aliases:     []string{"attachdetach"},
+		constructor: newPersistentVolumeAttachDetachController,
 	}
-
-	attachDetachController, attachDetachControllerErr :=
-		attachdetach.NewAttachDetachController(
-			ctx.ClientBuilder.ClientOrDie("attachdetach-controller"),
-			ctx.InformerFactory.Core().V1().Pods(),
-			ctx.InformerFactory.Core().V1().Nodes(),
-			ctx.InformerFactory.Core().V1().PersistentVolumeClaims(),
-			ctx.InformerFactory.Core().V1().PersistentVolumes(),
-			ctx.InformerFactory.Storage().V1beta1().CSINodes(),
-			ctx.InformerFactory.Storage().V1beta1().CSIDrivers(),
-			ctx.Cloud,
-			ProbeAttachableVolumePlugins(),
-			GetDynamicPluginProber(ctx.ComponentConfig.PersistentVolumeBinderController.VolumeConfiguration),
-			ctx.ComponentConfig.AttachDetachController.DisableAttachDetachReconcilerSync,
-			ctx.ComponentConfig.AttachDetachController.ReconcilerSyncLoopPeriod.Duration,
-			attachdetach.DefaultTimerConfig,
-		)
-	if attachDetachControllerErr != nil {
-		return nil, true, fmt.Errorf("failed to start attach/detach controller: %v", attachDetachControllerErr)
-	}
-	go attachDetachController.Run(ctx.Stop)
-	return nil, true, nil
 }
 
-func startVolumeExpandController(ctx ControllerContext) (http.Handler, bool, error) {
-	if utilfeature.DefaultFeatureGate.Enabled(features.ExpandPersistentVolumes) {
-		expandController, expandControllerErr := expand.NewExpandController(
-			ctx.ClientBuilder.ClientOrDie("expand-controller"),
-			ctx.InformerFactory.Core().V1().PersistentVolumeClaims(),
-			ctx.InformerFactory.Core().V1().PersistentVolumes(),
-			ctx.InformerFactory.Storage().V1().StorageClasses(),
-			ctx.Cloud,
-			ProbeExpandableVolumePlugins(ctx.ComponentConfig.PersistentVolumeBinderController.VolumeConfiguration))
+func newPersistentVolumeAttachDetachController(ctx context.Context, controllerContext ControllerContext, controllerName string) (Controller, error) {
+	logger := klog.FromContext(ctx)
+	csiNodeInformer := controllerContext.InformerFactory.Storage().V1().CSINodes()
+	csiDriverInformer := controllerContext.InformerFactory.Storage().V1().CSIDrivers()
 
-		if expandControllerErr != nil {
-			return nil, true, fmt.Errorf("failed to start volume expand controller : %v", expandControllerErr)
-		}
-		go expandController.Run(ctx.Stop)
-		return nil, true, nil
+	plugins, err := ProbeAttachableVolumePlugins(logger, controllerContext.ComponentConfig.PersistentVolumeBinderController.VolumeConfiguration)
+	if err != nil {
+		return nil, fmt.Errorf("failed to probe volume plugins when starting attach/detach controller: %w", err)
 	}
-	return nil, false, nil
+
+	client, err := controllerContext.NewClient("attachdetach-controller")
+	if err != nil {
+		return nil, err
+	}
+
+	ctx = klog.NewContext(ctx, logger)
+	attachDetachController, err := attachdetach.NewAttachDetachController(
+		ctx,
+		client,
+		controllerContext.InformerFactory.Core().V1().Pods(),
+		controllerContext.InformerFactory.Core().V1().Nodes(),
+		controllerContext.InformerFactory.Core().V1().PersistentVolumeClaims(),
+		controllerContext.InformerFactory.Core().V1().PersistentVolumes(),
+		csiNodeInformer,
+		csiDriverInformer,
+		controllerContext.InformerFactory.Storage().V1().VolumeAttachments(),
+		plugins,
+		GetDynamicPluginProber(ctx, controllerContext.ComponentConfig.PersistentVolumeBinderController.VolumeConfiguration),
+		controllerContext.ComponentConfig.AttachDetachController.DisableAttachDetachReconcilerSync,
+		controllerContext.ComponentConfig.AttachDetachController.ReconcilerSyncLoopPeriod.Duration,
+		controllerContext.ComponentConfig.AttachDetachController.DisableForceDetachOnTimeout,
+		attachdetach.DefaultTimerConfig,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to start attach/detach controller: %w", err)
+	}
+
+	return newControllerLoop(attachDetachController.Run, controllerName), nil
 }
 
-func startEndpointController(ctx ControllerContext) (http.Handler, bool, error) {
-	go endpointcontroller.NewEndpointController(
-		ctx.InformerFactory.Core().V1().Pods(),
-		ctx.InformerFactory.Core().V1().Services(),
-		ctx.InformerFactory.Core().V1().Endpoints(),
-		ctx.ClientBuilder.ClientOrDie("endpoint-controller"),
-		ctx.ComponentConfig.EndpointController.EndpointUpdatesBatchPeriod.Duration,
-	).Run(int(ctx.ComponentConfig.EndpointController.ConcurrentEndpointSyncs), ctx.Stop)
-	return nil, true, nil
+func newPersistentVolumeExpanderControllerDescriptor() *ControllerDescriptor {
+	return &ControllerDescriptor{
+		name:        names.PersistentVolumeExpanderController,
+		aliases:     []string{"persistentvolume-expander"},
+		constructor: newPersistentVolumeExpanderController,
+	}
 }
 
-func startReplicationController(ctx ControllerContext) (http.Handler, bool, error) {
-	go replicationcontroller.NewReplicationManager(
-		ctx.InformerFactory.Core().V1().Pods(),
-		ctx.InformerFactory.Core().V1().ReplicationControllers(),
-		ctx.ClientBuilder.ClientOrDie("replication-controller"),
+func newPersistentVolumeExpanderController(ctx context.Context, controllerContext ControllerContext, controllerName string) (Controller, error) {
+	logger := klog.FromContext(ctx)
+	plugins, err := ProbeExpandableVolumePlugins(logger, controllerContext.ComponentConfig.PersistentVolumeBinderController.VolumeConfiguration)
+	if err != nil {
+		return nil, fmt.Errorf("failed to probe volume plugins when starting volume expand controller: %w", err)
+	}
+	csiTranslator := csitrans.New()
+
+	client, err := controllerContext.NewClient("expand-controller")
+	if err != nil {
+		return nil, err
+	}
+
+	expandController, err := expand.NewExpandController(
+		ctx,
+		client,
+		controllerContext.InformerFactory.Core().V1().PersistentVolumeClaims(),
+		plugins,
+		csiTranslator,
+		csimigration.NewPluginManager(csiTranslator),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to init volume expand controller: %w", err)
+	}
+
+	return newControllerLoop(expandController.Run, controllerName), nil
+}
+
+func newEphemeralVolumeControllerDescriptor() *ControllerDescriptor {
+	return &ControllerDescriptor{
+		name:        names.EphemeralVolumeController,
+		aliases:     []string{"ephemeral-volume"},
+		constructor: newEphemeralVolumeController,
+	}
+}
+
+func newEphemeralVolumeController(ctx context.Context, controllerContext ControllerContext, controllerName string) (Controller, error) {
+	client, err := controllerContext.NewClient("ephemeral-volume-controller")
+	if err != nil {
+		return nil, err
+	}
+
+	ephemeralController, err := ephemeral.NewController(
+		ctx,
+		client,
+		controllerContext.InformerFactory.Core().V1().Pods(),
+		controllerContext.InformerFactory.Core().V1().PersistentVolumeClaims())
+	if err != nil {
+		return nil, fmt.Errorf("failed to init ephemeral volume controller: %w", err)
+	}
+
+	return newControllerLoop(func(ctx context.Context) {
+		ephemeralController.Run(ctx, int(controllerContext.ComponentConfig.EphemeralVolumeController.ConcurrentEphemeralVolumeSyncs))
+	}, controllerName), nil
+}
+
+func newEndpointsControllerDescriptor() *ControllerDescriptor {
+	return &ControllerDescriptor{
+		name:        names.EndpointsController,
+		aliases:     []string{"endpoint"},
+		constructor: newEndpointsController,
+	}
+}
+
+func newEndpointsController(ctx context.Context, controllerContext ControllerContext, controllerName string) (Controller, error) {
+	client, err := controllerContext.NewClient("endpoint-controller")
+	if err != nil {
+		return nil, err
+	}
+
+	ec := endpointcontroller.NewEndpointController(
+		ctx,
+		controllerContext.InformerFactory.Core().V1().Pods(),
+		controllerContext.InformerFactory.Core().V1().Services(),
+		controllerContext.InformerFactory.Core().V1().Endpoints(),
+		client,
+		controllerContext.ComponentConfig.EndpointController.EndpointUpdatesBatchPeriod.Duration,
+	)
+	return newControllerLoop(func(ctx context.Context) {
+		ec.Run(ctx, int(controllerContext.ComponentConfig.EndpointController.ConcurrentEndpointSyncs))
+	}, controllerName), nil
+}
+
+func newReplicationControllerDescriptor() *ControllerDescriptor {
+	return &ControllerDescriptor{
+		name:        names.ReplicationControllerController,
+		aliases:     []string{"replicationcontroller"},
+		constructor: newReplicationController,
+	}
+}
+
+func newReplicationController(ctx context.Context, controllerContext ControllerContext, controllerName string) (Controller, error) {
+	client, err := controllerContext.NewClient("replication-controller")
+	if err != nil {
+		return nil, err
+	}
+
+	rc := replicationcontroller.NewReplicationManager(
+		ctx,
+		controllerContext.InformerFactory.Core().V1().Pods(),
+		controllerContext.InformerFactory.Core().V1().ReplicationControllers(),
+		client,
 		replicationcontroller.BurstReplicas,
-	).Run(int(ctx.ComponentConfig.ReplicationController.ConcurrentRCSyncs), ctx.Stop)
-	return nil, true, nil
+	)
+
+	return newControllerLoop(func(ctx context.Context) {
+		rc.Run(ctx, int(controllerContext.ComponentConfig.ReplicationController.ConcurrentRCSyncs))
+	}, controllerName), nil
 }
 
-func startPodGCController(ctx ControllerContext) (http.Handler, bool, error) {
-	go podgc.NewPodGC(
-		ctx.ClientBuilder.ClientOrDie("pod-garbage-collector"),
-		ctx.InformerFactory.Core().V1().Pods(),
-		int(ctx.ComponentConfig.PodGCController.TerminatedPodGCThreshold),
-	).Run(ctx.Stop)
-	return nil, true, nil
+func newPodGarbageCollectorControllerDescriptor() *ControllerDescriptor {
+	return &ControllerDescriptor{
+		name:        names.PodGarbageCollectorController,
+		aliases:     []string{"podgc"},
+		constructor: newPodGarbageCollectorController,
+	}
 }
 
-func startResourceQuotaController(ctx ControllerContext) (http.Handler, bool, error) {
-	resourceQuotaControllerClient := ctx.ClientBuilder.ClientOrDie("resourcequota-controller")
-	discoveryFunc := resourceQuotaControllerClient.Discovery().ServerPreferredNamespacedResources
-	listerFuncForResource := generic.ListerFuncForResourceFunc(ctx.InformerFactory.ForResource)
-	quotaConfiguration := quotainstall.NewQuotaConfigurationForControllers(listerFuncForResource)
+func newPodGarbageCollectorController(ctx context.Context, controllerContext ControllerContext, controllerName string) (Controller, error) {
+	client, err := controllerContext.NewClient("pod-garbage-collector")
+	if err != nil {
+		return nil, err
+	}
 
-	resourceQuotaControllerOptions := &resourcequotacontroller.ResourceQuotaControllerOptions{
+	pgcc := podgc.NewPodGC(
+		ctx,
+		client,
+		controllerContext.InformerFactory.Core().V1().Pods(),
+		controllerContext.InformerFactory.Core().V1().Nodes(),
+		int(controllerContext.ComponentConfig.PodGCController.TerminatedPodGCThreshold),
+	)
+	return newControllerLoop(pgcc.Run, controllerName), nil
+}
+
+func newResourceQuotaControllerDescriptor() *ControllerDescriptor {
+	return &ControllerDescriptor{
+		name:        names.ResourceQuotaController,
+		aliases:     []string{"resourcequota"},
+		constructor: newResourceQuotaController,
+	}
+}
+
+func newResourceQuotaController(ctx context.Context, controllerContext ControllerContext, controllerName string) (Controller, error) {
+	resourceQuotaControllerClient, err := controllerContext.NewClient("resourcequota-controller")
+	if err != nil {
+		return nil, err
+	}
+
+	resourceQuotaControllerDiscoveryClient, err := controllerContext.ClientBuilder.DiscoveryClient("resourcequota-controller")
+	if err != nil {
+		return nil, fmt.Errorf("failed to create the discovery client: %w", err)
+	}
+
+	discoveryFunc := resourceQuotaControllerDiscoveryClient.ServerPreferredNamespacedResources
+	listerFuncForResource := generic.ListerFuncForResourceFunc(controllerContext.InformerFactory.ForResource)
+	quotaConfiguration, err := quotainstall.NewQuotaConfigurationForControllers(listerFuncForResource, controllerContext.InformerFactory)
+	if err != nil {
+		return nil, err
+	}
+
+	resourceQuotaControllerOptions := &resourcequotacontroller.ControllerOptions{
 		QuotaClient:               resourceQuotaControllerClient.CoreV1(),
-		ResourceQuotaInformer:     ctx.InformerFactory.Core().V1().ResourceQuotas(),
-		ResyncPeriod:              controller.StaticResyncPeriodFunc(ctx.ComponentConfig.ResourceQuotaController.ResourceQuotaSyncPeriod.Duration),
-		InformerFactory:           ctx.ObjectOrMetadataInformerFactory,
-		ReplenishmentResyncPeriod: ctx.ResyncPeriod,
+		ResourceQuotaInformer:     controllerContext.InformerFactory.Core().V1().ResourceQuotas(),
+		ResyncPeriod:              pkgcontroller.StaticResyncPeriodFunc(controllerContext.ComponentConfig.ResourceQuotaController.ResourceQuotaSyncPeriod.Duration),
+		InformerFactory:           controllerContext.ObjectOrMetadataInformerFactory,
+		ReplenishmentResyncPeriod: controllerContext.ResyncPeriod,
 		DiscoveryFunc:             discoveryFunc,
 		IgnoredResourcesFunc:      quotaConfiguration.IgnoredResources,
-		InformersStarted:          ctx.InformersStarted,
+		InformersStarted:          controllerContext.InformersStarted,
 		Registry:                  generic.NewRegistry(quotaConfiguration.Evaluators()),
+		UpdateFilter:              quotainstall.DefaultUpdateFilter(),
 	}
-	if resourceQuotaControllerClient.CoreV1().RESTClient().GetRateLimiter() != nil {
-		if err := metrics.RegisterMetricAndTrackRateLimiterUsage("resource_quota_controller", resourceQuotaControllerClient.CoreV1().RESTClient().GetRateLimiter()); err != nil {
-			return nil, true, err
-		}
-	}
-
-	resourceQuotaController, err := resourcequotacontroller.NewResourceQuotaController(resourceQuotaControllerOptions)
+	resourceQuotaController, err := resourcequotacontroller.NewController(ctx, resourceQuotaControllerOptions)
 	if err != nil {
-		return nil, false, err
+		return nil, err
 	}
-	go resourceQuotaController.Run(int(ctx.ComponentConfig.ResourceQuotaController.ConcurrentResourceQuotaSyncs), ctx.Stop)
 
-	// Periodically the quota controller to detect new resource types
-	go resourceQuotaController.Sync(discoveryFunc, 30*time.Second, ctx.Stop)
-
-	return nil, true, nil
+	return newControllerLoop(concurrentRun(
+		func(ctx context.Context) {
+			resourceQuotaController.Run(ctx, int(controllerContext.ComponentConfig.ResourceQuotaController.ConcurrentResourceQuotaSyncs))
+		},
+		func(ctx context.Context) {
+			resourceQuotaController.Sync(ctx, discoveryFunc, 30*time.Second)
+		},
+	), controllerName), nil
 }
 
-func startNamespaceController(ctx ControllerContext) (http.Handler, bool, error) {
+func newNamespaceControllerDescriptor() *ControllerDescriptor {
+	return &ControllerDescriptor{
+		name:        names.NamespaceController,
+		aliases:     []string{"namespace"},
+		constructor: newNamespaceController,
+	}
+}
+
+func newNamespaceController(ctx context.Context, controllerContext ControllerContext, controllerName string) (Controller, error) {
 	// the namespace cleanup controller is very chatty.  It makes lots of discovery calls and then it makes lots of delete calls
 	// the ratelimiter negatively affects its speed.  Deleting 100 total items in a namespace (that's only a few of each resource
 	// including events), takes ~10 seconds by default.
-	nsKubeconfig := ctx.ClientBuilder.ConfigOrDie("namespace-controller")
-	nsKubeconfig.QPS *= 20
-	nsKubeconfig.Burst *= 100
-	namespaceKubeClient := clientset.NewForConfigOrDie(nsKubeconfig)
-	return startModifiedNamespaceController(ctx, namespaceKubeClient, nsKubeconfig)
-}
+	clientConnection := controllerContext.ComponentConfig.Generic.ClientConnection
+	nsClientBuilder := controllerContext.ClientBuilder.WithRateLimits(clientConnection.QPS*20, int(clientConnection.Burst)*100)
 
-func startModifiedNamespaceController(ctx ControllerContext, namespaceKubeClient clientset.Interface, nsKubeconfig *restclient.Config) (http.Handler, bool, error) {
-
-	metadataClient, err := metadata.NewForConfig(nsKubeconfig)
+	namespaceKubeClient, err := nsClientBuilder.Client("namespace-controller")
 	if err != nil {
-		return nil, true, err
+		return nil, err
+	}
+
+	metadataClient, err := nsClientBuilder.MetadataClient("namespace-controller")
+	if err != nil {
+		return nil, err
 	}
 
 	discoverResourcesFn := namespaceKubeClient.Discovery().ServerPreferredNamespacedResources
 
 	namespaceController := namespacecontroller.NewNamespaceController(
+		ctx,
 		namespaceKubeClient,
 		metadataClient,
 		discoverResourcesFn,
-		ctx.InformerFactory.Core().V1().Namespaces(),
-		ctx.ComponentConfig.NamespaceController.NamespaceSyncPeriod.Duration,
+		controllerContext.InformerFactory.Core().V1().Namespaces(),
+		controllerContext.ComponentConfig.NamespaceController.NamespaceSyncPeriod.Duration,
 		v1.FinalizerKubernetes,
 	)
-	go namespaceController.Run(int(ctx.ComponentConfig.NamespaceController.ConcurrentNamespaceSyncs), ctx.Stop)
-
-	return nil, true, nil
+	return newPausableControllerLoop(func(ctx context.Context) {
+		namespaceController.Run(ctx, int(controllerContext.ComponentConfig.NamespaceController.ConcurrentNamespaceSyncs))
+	}, controllerName, namespaceController), nil
 }
 
-func startServiceAccountController(ctx ControllerContext) (http.Handler, bool, error) {
+func newServiceAccountControllerDescriptor() *ControllerDescriptor {
+	return &ControllerDescriptor{
+		name:        names.ServiceAccountController,
+		aliases:     []string{"serviceaccount"},
+		constructor: newServiceAccountController,
+	}
+}
+
+func newServiceAccountController(ctx context.Context, controllerContext ControllerContext, controllerName string) (Controller, error) {
+	client, err := controllerContext.NewClient("service-account-controller")
+	if err != nil {
+		return nil, err
+	}
+
 	sac, err := serviceaccountcontroller.NewServiceAccountsController(
-		ctx.InformerFactory.Core().V1().ServiceAccounts(),
-		ctx.InformerFactory.Core().V1().Namespaces(),
-		ctx.ClientBuilder.ClientOrDie("service-account-controller"),
+		ctx,
+		controllerContext.InformerFactory.Core().V1().ServiceAccounts(),
+		controllerContext.InformerFactory.Core().V1().Namespaces(),
+		client,
 		serviceaccountcontroller.DefaultServiceAccountsControllerOptions(),
 	)
 	if err != nil {
-		return nil, true, fmt.Errorf("error creating ServiceAccount controller: %v", err)
-	}
-	go sac.Run(1, ctx.Stop)
-	return nil, true, nil
-}
-
-func startTTLController(ctx ControllerContext) (http.Handler, bool, error) {
-	go ttlcontroller.NewTTLController(
-		ctx.InformerFactory.Core().V1().Nodes(),
-		ctx.ClientBuilder.ClientOrDie("ttl-controller"),
-	).Run(5, ctx.Stop)
-	return nil, true, nil
-}
-
-func startGarbageCollectorController(ctx ControllerContext) (http.Handler, bool, error) {
-	if !ctx.ComponentConfig.GarbageCollectorController.EnableGarbageCollector {
-		return nil, false, nil
+		return nil, fmt.Errorf("error creating ServiceAccount controller: %w", err)
 	}
 
-	gcClientset := ctx.ClientBuilder.ClientOrDie("generic-garbage-collector")
-	discoveryClient := cacheddiscovery.NewMemCacheClient(gcClientset.Discovery())
+	return newControllerLoop(func(ctx context.Context) {
+		sac.Run(ctx, 1)
+	}, controllerName), nil
+}
 
-	config := ctx.ClientBuilder.ConfigOrDie("generic-garbage-collector")
-	metadataClient, err := metadata.NewForConfig(config)
+func newTTLControllerDescriptor() *ControllerDescriptor {
+	return &ControllerDescriptor{
+		name:        names.TTLController,
+		aliases:     []string{"ttl"},
+		constructor: newTTLController,
+	}
+}
+
+func newTTLController(ctx context.Context, controllerContext ControllerContext, controllerName string) (Controller, error) {
+	client, err := controllerContext.NewClient("ttl-controller")
 	if err != nil {
-		return nil, true, err
+		return nil, err
 	}
 
-	// Get an initial set of deletable resources to prime the garbage collector.
-	deletableResources := garbagecollector.GetDeletableResources(discoveryClient)
-	ignoredResources := make(map[schema.GroupResource]struct{})
-	for _, r := range ctx.ComponentConfig.GarbageCollectorController.GCIgnoredResources {
-		ignoredResources[schema.GroupResource{Group: r.Group, Resource: r.Resource}] = struct{}{}
+	ttlc := ttlcontroller.NewTTLController(
+		ctx,
+		controllerContext.InformerFactory.Core().V1().Nodes(),
+		client,
+	)
+	return newControllerLoop(func(ctx context.Context) {
+		ttlc.Run(ctx, 5)
+	}, controllerName), nil
+}
+
+func newGarbageCollectorControllerDescriptor() *ControllerDescriptor {
+	return &ControllerDescriptor{
+		name:        names.GarbageCollectorController,
+		aliases:     []string{"garbagecollector"},
+		constructor: newGarbageCollectorController,
 	}
-	garbageCollector, err := garbagecollector.NewGarbageCollector(
+}
+
+type garbageCollectorController struct {
+	*garbagecollector.GarbageCollector
+	controllerContext ControllerContext
+	controllerName    string
+	discoveryClient   discovery.DiscoveryInterface
+}
+
+// Make sure we are propagating properly.
+var _ controller.Debuggable = (*garbageCollectorController)(nil)
+
+func newGarbageCollectorController(ctx context.Context, controllerContext ControllerContext, controllerName string) (Controller, error) {
+	if !controllerContext.ComponentConfig.GarbageCollectorController.EnableGarbageCollector {
+		return nil, nil
+	}
+
+	client, err := controllerContext.NewClient("generic-garbage-collector")
+	if err != nil {
+		return nil, err
+	}
+
+	discoveryClient, err := controllerContext.ClientBuilder.DiscoveryClient("generic-garbage-collector")
+	if err != nil {
+		return nil, fmt.Errorf("failed to create the discovery client: %w", err)
+	}
+
+	// Increase garbage collector controller's throughput: each object deletion takes two API calls,
+	// so to get |config.QPS| deletion rate we need to allow 2x more requests for this controller.
+	clientConnection := controllerContext.ComponentConfig.Generic.ClientConnection
+	metadataClient, err := controllerContext.ClientBuilder.WithRateLimits(clientConnection.QPS*2, int(clientConnection.Burst)).MetadataClient("generic-garbage-collector")
+	if err != nil {
+		return nil, err
+	}
+
+	garbageCollector, err := garbagecollector.NewComposedGarbageCollector(
+		ctx,
+		client,
 		metadataClient,
-		ctx.RESTMapper,
-		deletableResources,
-		ignoredResources,
-		ctx.ObjectOrMetadataInformerFactory,
-		ctx.InformersStarted,
+		controllerContext.RESTMapper,
+		controllerContext.GraphBuilder,
 	)
 	if err != nil {
-		return nil, true, fmt.Errorf("failed to start the generic garbage collector: %v", err)
+		return nil, fmt.Errorf("failed to init the generic garbage collector: %w", err)
 	}
 
-	// Start the garbage collector.
-	workers := int(ctx.ComponentConfig.GarbageCollectorController.ConcurrentGCSyncs)
-	go garbageCollector.Run(workers, ctx.Stop)
-
-	// Periodically refresh the RESTMapper with new discovery information and sync
-	// the garbage collector.
-	go garbageCollector.Sync(gcClientset.Discovery(), 30*time.Second, ctx.Stop)
-
-	return garbagecollector.NewDebugHandler(garbageCollector), true, nil
+	return &garbageCollectorController{
+		GarbageCollector:  garbageCollector,
+		controllerName:    controllerName,
+		controllerContext: controllerContext,
+		discoveryClient:   discoveryClient,
+	}, nil
 }
 
-func startPVCProtectionController(ctx ControllerContext) (http.Handler, bool, error) {
-	go pvcprotection.NewPVCProtectionController(
-		ctx.InformerFactory.Core().V1().PersistentVolumeClaims(),
-		ctx.InformerFactory.Core().V1().Pods(),
-		ctx.ClientBuilder.ClientOrDie("pvc-protection-controller"),
-		utilfeature.DefaultFeatureGate.Enabled(features.StorageObjectInUseProtection),
-	).Run(1, ctx.Stop)
-	return nil, true, nil
+// Name must be implemented explicitly as it collides with the embedded controller.
+func (c *garbageCollectorController) Name() string {
+	return c.controllerName
 }
 
-func startPVProtectionController(ctx ControllerContext) (http.Handler, bool, error) {
-	go pvprotection.NewPVProtectionController(
-		ctx.InformerFactory.Core().V1().PersistentVolumes(),
-		ctx.ClientBuilder.ClientOrDie("pv-protection-controller"),
-		utilfeature.DefaultFeatureGate.Enabled(features.StorageObjectInUseProtection),
-	).Run(1, ctx.Stop)
-	return nil, true, nil
+func (c *garbageCollectorController) Run(ctx context.Context) {
+	workers := int(c.controllerContext.ComponentConfig.GarbageCollectorController.ConcurrentGCSyncs)
+	const syncPeriod = 30 * time.Second
+
+	concurrentRun(
+		func(ctx context.Context) {
+			c.GarbageCollector.Run(ctx, workers, syncPeriod)
+		},
+		func(ctx context.Context) {
+			// Periodically refresh the RESTMapper with new discovery information and sync the garbage collector.
+			c.Sync(ctx, c.discoveryClient, syncPeriod)
+		},
+	)(ctx)
 }
 
-func startTTLAfterFinishedController(ctx ControllerContext) (http.Handler, bool, error) {
-	if !utilfeature.DefaultFeatureGate.Enabled(features.TTLAfterFinished) {
-		return nil, false, nil
+func newPersistentVolumeClaimProtectionControllerDescriptor() *ControllerDescriptor {
+	return &ControllerDescriptor{
+		name:        names.PersistentVolumeClaimProtectionController,
+		aliases:     []string{"pvc-protection"},
+		constructor: newPersistentVolumeClaimProtectionController,
 	}
-	go ttlafterfinished.New(
-		ctx.InformerFactory.Batch().V1().Jobs(),
-		ctx.ClientBuilder.ClientOrDie("ttl-after-finished-controller"),
-	).Run(int(ctx.ComponentConfig.TTLAfterFinishedController.ConcurrentTTLSyncs), ctx.Stop)
-	return nil, true, nil
+}
+
+func newPersistentVolumeClaimProtectionController(ctx context.Context, controllerContext ControllerContext, controllerName string) (Controller, error) {
+	client, err := controllerContext.NewClient("pvc-protection-controller")
+	if err != nil {
+		return nil, err
+	}
+
+	pvcProtectionController, err := pvcprotection.NewPVCProtectionController(
+		ctx,
+		controllerContext.InformerFactory.Core().V1().PersistentVolumeClaims(),
+		controllerContext.InformerFactory.Core().V1().Pods(),
+		client,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to init the pvc protection controller: %w", err)
+	}
+
+	return newControllerLoop(func(ctx context.Context) {
+		pvcProtectionController.Run(ctx, 1)
+	}, controllerName), nil
+}
+
+func newPersistentVolumeProtectionControllerDescriptor() *ControllerDescriptor {
+	return &ControllerDescriptor{
+		name:        names.PersistentVolumeProtectionController,
+		aliases:     []string{"pv-protection"},
+		constructor: newPersistentVolumeProtectionController,
+	}
+}
+
+func newPersistentVolumeProtectionController(ctx context.Context, controllerContext ControllerContext, controllerName string) (Controller, error) {
+	client, err := controllerContext.NewClient("pv-protection-controller")
+	if err != nil {
+		return nil, err
+	}
+
+	pvpc, err := pvprotection.NewPVProtectionController(
+		ctx,
+		controllerContext.InformerFactory.Core().V1().PersistentVolumes(),
+		client,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return newControllerLoop(func(ctx context.Context) {
+		pvpc.Run(ctx, 1)
+	}, controllerName), nil
+}
+
+func newVolumeAttributesClassProtectionControllerDescriptor() *ControllerDescriptor {
+	return &ControllerDescriptor{
+		name:        names.VolumeAttributesClassProtectionController,
+		constructor: newVolumeAttributesClassProtectionController,
+		requiredFeatureGates: []featuregate.Feature{
+			features.VolumeAttributesClass,
+		},
+	}
+}
+
+func newVolumeAttributesClassProtectionController(ctx context.Context, controllerContext ControllerContext, controllerName string) (Controller, error) {
+	client, err := controllerContext.NewClient("volumeattributesclass-protection-controller")
+	if err != nil {
+		return nil, err
+	}
+
+	vacProtectionController, err := vacprotection.NewVACProtectionController(
+		ctx,
+		client,
+		controllerContext.InformerFactory.Core().V1().PersistentVolumeClaims(),
+		controllerContext.InformerFactory.Core().V1().PersistentVolumes(),
+		controllerContext.InformerFactory.Storage().V1().VolumeAttributesClasses(),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to init the vac protection controller: %w", err)
+	}
+
+	return newControllerLoop(func(ctx context.Context) {
+		vacProtectionController.Run(ctx, 1)
+	}, controllerName), nil
+}
+
+func newTTLAfterFinishedControllerDescriptor() *ControllerDescriptor {
+	return &ControllerDescriptor{
+		name:        names.TTLAfterFinishedController,
+		aliases:     []string{"ttl-after-finished"},
+		constructor: newTTLAfterFinishedController,
+	}
+}
+
+func newTTLAfterFinishedController(ctx context.Context, controllerContext ControllerContext, controllerName string) (Controller, error) {
+	client, err := controllerContext.NewClient("ttl-after-finished-controller")
+	if err != nil {
+		return nil, err
+	}
+
+	ttlc := ttlafterfinished.New(
+		ctx,
+		controllerContext.InformerFactory.Batch().V1().Jobs(),
+		client,
+	)
+	return newControllerLoop(func(ctx context.Context) {
+		ttlc.Run(ctx, int(controllerContext.ComponentConfig.TTLAfterFinishedController.ConcurrentTTLSyncs))
+	}, controllerName), nil
+}
+
+func newLegacyServiceAccountTokenCleanerControllerDescriptor() *ControllerDescriptor {
+	return &ControllerDescriptor{
+		name:        names.LegacyServiceAccountTokenCleanerController,
+		aliases:     []string{"legacy-service-account-token-cleaner"},
+		constructor: newLegacyServiceAccountTokenCleanerController,
+	}
+}
+
+func newLegacyServiceAccountTokenCleanerController(ctx context.Context, controllerContext ControllerContext, controllerName string) (Controller, error) {
+	client, err := controllerContext.NewClient("legacy-service-account-token-cleaner")
+	if err != nil {
+		return nil, err
+	}
+
+	cleanUpPeriod := controllerContext.ComponentConfig.LegacySATokenCleaner.CleanUpPeriod.Duration
+	legacySATokenCleaner, err := serviceaccountcontroller.NewLegacySATokenCleaner(
+		controllerContext.InformerFactory.Core().V1().ServiceAccounts(),
+		controllerContext.InformerFactory.Core().V1().Secrets(),
+		controllerContext.InformerFactory.Core().V1().Pods(),
+		client,
+		clock.RealClock{},
+		serviceaccountcontroller.LegacySATokenCleanerOptions{
+			CleanUpPeriod: cleanUpPeriod,
+			SyncInterval:  serviceaccountcontroller.DefaultCleanerSyncInterval,
+		},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to init the legacy service account token cleaner: %w", err)
+	}
+
+	return newControllerLoop(legacySATokenCleaner.Run, controllerName), nil
+}
+
+// processCIDRs is a helper function that works on a comma separated cidrs and returns
+// a list of typed cidrs
+// error if failed to parse any of the cidrs or invalid length of cidrs
+func validateCIDRs(cidrsList string) ([]*net.IPNet, error) {
+	// failure: bad cidrs in config
+	clusterCIDRs, dualStack, err := processCIDRs(cidrsList)
+	if err != nil {
+		return nil, err
+	}
+
+	// failure: more than one cidr but they are not configured as dual stack
+	if len(clusterCIDRs) > 1 && !dualStack {
+		return nil, fmt.Errorf("len of ClusterCIDRs==%v and they are not configured as dual stack (at least one from each IPFamily", len(clusterCIDRs))
+	}
+
+	// failure: more than cidrs is not allowed even with dual stack
+	if len(clusterCIDRs) > 2 {
+		return nil, fmt.Errorf("length of clusterCIDRs is:%v more than max allowed of 2", len(clusterCIDRs))
+	}
+
+	return clusterCIDRs, nil
 }
 
 // processCIDRs is a helper function that works on a comma separated cidrs and returns
@@ -504,4 +873,148 @@ func processCIDRs(cidrsList string) ([]*net.IPNet, bool, error) {
 	dualstack, _ := netutils.IsDualStackCIDRs(cidrs)
 
 	return cidrs, dualstack, nil
+}
+
+// setNodeCIDRMaskSizes returns the IPv4 and IPv6 node cidr mask sizes to the value provided
+// for --node-cidr-mask-size-ipv4 and --node-cidr-mask-size-ipv6 respectively. If value not provided,
+// then it will return default IPv4 and IPv6 cidr mask sizes.
+func setNodeCIDRMaskSizes(cfg nodeipamconfig.NodeIPAMControllerConfiguration, clusterCIDRs []*net.IPNet) ([]int, error) {
+
+	sortedSizes := func(maskSizeIPv4, maskSizeIPv6 int) []int {
+		nodeMaskCIDRs := make([]int, len(clusterCIDRs))
+
+		for idx, clusterCIDR := range clusterCIDRs {
+			if netutils.IsIPv6CIDR(clusterCIDR) {
+				nodeMaskCIDRs[idx] = maskSizeIPv6
+			} else {
+				nodeMaskCIDRs[idx] = maskSizeIPv4
+			}
+		}
+		return nodeMaskCIDRs
+	}
+
+	// --node-cidr-mask-size flag is incompatible with dual stack clusters.
+	ipv4Mask, ipv6Mask := defaultNodeMaskCIDRIPv4, defaultNodeMaskCIDRIPv6
+	isDualstack := len(clusterCIDRs) > 1
+
+	// case one: cluster is dualstack (i.e, more than one cidr)
+	if isDualstack {
+		// if --node-cidr-mask-size then fail, user must configure the correct dual-stack mask sizes (or use default)
+		if cfg.NodeCIDRMaskSize != 0 {
+			return nil, errors.New("usage of --node-cidr-mask-size is not allowed with dual-stack clusters")
+
+		}
+
+		if cfg.NodeCIDRMaskSizeIPv4 != 0 {
+			ipv4Mask = int(cfg.NodeCIDRMaskSizeIPv4)
+		}
+		if cfg.NodeCIDRMaskSizeIPv6 != 0 {
+			ipv6Mask = int(cfg.NodeCIDRMaskSizeIPv6)
+		}
+		return sortedSizes(ipv4Mask, ipv6Mask), nil
+	}
+
+	maskConfigured := cfg.NodeCIDRMaskSize != 0
+	maskV4Configured := cfg.NodeCIDRMaskSizeIPv4 != 0
+	maskV6Configured := cfg.NodeCIDRMaskSizeIPv6 != 0
+	isSingleStackIPv6 := netutils.IsIPv6CIDR(clusterCIDRs[0])
+
+	// original flag is set
+	if maskConfigured {
+		// original mask flag is still the main reference.
+		if maskV4Configured || maskV6Configured {
+			return nil, errors.New("usage of --node-cidr-mask-size-ipv4 and --node-cidr-mask-size-ipv6 is not allowed if --node-cidr-mask-size is set. For dual-stack clusters please unset it and use IPFamily specific flags")
+		}
+
+		mask := int(cfg.NodeCIDRMaskSize)
+		return sortedSizes(mask, mask), nil
+	}
+
+	if maskV4Configured {
+		if isSingleStackIPv6 {
+			return nil, errors.New("usage of --node-cidr-mask-size-ipv4 is not allowed for a single-stack IPv6 cluster")
+		}
+
+		ipv4Mask = int(cfg.NodeCIDRMaskSizeIPv4)
+	}
+
+	// !maskV4Configured && !maskConfigured && maskV6Configured
+	if maskV6Configured {
+		if !isSingleStackIPv6 {
+			return nil, errors.New("usage of --node-cidr-mask-size-ipv6 is not allowed for a single-stack IPv4 cluster")
+		}
+
+		ipv6Mask = int(cfg.NodeCIDRMaskSizeIPv6)
+	}
+	return sortedSizes(ipv4Mask, ipv6Mask), nil
+}
+
+func newStorageVersionGarbageCollectorControllerDescriptor() *ControllerDescriptor {
+	return &ControllerDescriptor{
+		name:        names.StorageVersionGarbageCollectorController,
+		aliases:     []string{"storage-version-gc"},
+		constructor: newStorageVersionGarbageCollectorController,
+		requiredFeatureGates: []featuregate.Feature{
+			genericfeatures.APIServerIdentity,
+			genericfeatures.StorageVersionAPI,
+		},
+	}
+}
+
+func newStorageVersionGarbageCollectorController(ctx context.Context, controllerContext ControllerContext, controllerName string) (Controller, error) {
+	client, err := controllerContext.NewClient("storage-version-garbage-collector")
+	if err != nil {
+		return nil, err
+	}
+
+	svgcc := storageversiongc.NewStorageVersionGC(
+		ctx,
+		client,
+		controllerContext.InformerFactory.Coordination().V1().Leases(),
+		controllerContext.InformerFactory.Internal().V1alpha1().StorageVersions(),
+	)
+	return newControllerLoop(svgcc.Run, controllerName), nil
+}
+
+func newSELinuxWarningControllerDescriptor() *ControllerDescriptor {
+	return &ControllerDescriptor{
+		name:                names.SELinuxWarningController,
+		constructor:         newSELinuxWarningController,
+		isDisabledByDefault: true,
+		requiredFeatureGates: []featuregate.Feature{
+			features.SELinuxChangePolicy,
+		},
+	}
+}
+
+func newSELinuxWarningController(ctx context.Context, controllerContext ControllerContext, controllerName string) (Controller, error) {
+	client, err := controllerContext.NewClient(controllerName)
+	if err != nil {
+		return nil, err
+	}
+
+	logger := klog.FromContext(ctx)
+	csiDriverInformer := controllerContext.InformerFactory.Storage().V1().CSIDrivers()
+	plugins, err := ProbePersistentVolumePlugins(logger, controllerContext.ComponentConfig.PersistentVolumeBinderController.VolumeConfiguration)
+	if err != nil {
+		return nil, fmt.Errorf("failed to probe volume plugins when starting SELinux warning controller: %w", err)
+	}
+
+	seLinuxController, err := selinuxwarning.NewController(
+		ctx,
+		client,
+		controllerContext.InformerFactory.Core().V1().Pods(),
+		controllerContext.InformerFactory.Core().V1().PersistentVolumeClaims(),
+		controllerContext.InformerFactory.Core().V1().PersistentVolumes(),
+		csiDriverInformer,
+		plugins,
+		GetDynamicPluginProber(ctx, controllerContext.ComponentConfig.PersistentVolumeBinderController.VolumeConfiguration),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to start SELinux warning controller: %w", err)
+	}
+
+	return newControllerLoop(func(ctx context.Context) {
+		seLinuxController.Run(ctx, 1)
+	}, controllerName), nil
 }

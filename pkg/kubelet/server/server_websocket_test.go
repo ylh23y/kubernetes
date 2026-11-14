@@ -29,7 +29,8 @@ import (
 	"golang.org/x/net/websocket"
 
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/kubernetes/pkg/kubelet/server/portforward"
+	"k8s.io/cri-streaming/pkg/streaming/portforward"
+	"k8s.io/ktesting"
 )
 
 const (
@@ -38,6 +39,7 @@ const (
 )
 
 func TestServeWSPortForward(t *testing.T) {
+	tCtx := ktesting.Init(t)
 	tests := map[string]struct {
 		port          string
 		uid           bool
@@ -60,13 +62,13 @@ func TestServeWSPortForward(t *testing.T) {
 	podNamespace := "other"
 	podName := "foo"
 
-	for desc, test := range tests {
-		test := test
+	for desc := range tests {
+		test := tests[desc]
 		t.Run(desc, func(t *testing.T) {
 			ss, err := newTestStreamingServer(0)
 			require.NoError(t, err)
 			defer ss.testHTTPServer.Close()
-			fw := newServerTestWithDebug(true, false, ss)
+			fw := newServerTestWithDebug(tCtx, true, ss)
 			defer fw.testHTTPServer.Close()
 
 			portForwardFuncDone := make(chan struct{})
@@ -150,6 +152,7 @@ func TestServeWSPortForward(t *testing.T) {
 }
 
 func TestServeWSMultiplePortForward(t *testing.T) {
+	tCtx := ktesting.Init(t)
 	portsText := []string{"7000,8000", "9000"}
 	ports := []uint16{7000, 8000, 9000}
 	podNamespace := "other"
@@ -158,7 +161,7 @@ func TestServeWSMultiplePortForward(t *testing.T) {
 	ss, err := newTestStreamingServer(0)
 	require.NoError(t, err)
 	defer ss.testHTTPServer.Close()
-	fw := newServerTestWithDebug(true, false, ss)
+	fw := newServerTestWithDebug(tCtx, true, ss)
 	defer fw.testHTTPServer.Close()
 
 	portForwardWG := sync.WaitGroup{}

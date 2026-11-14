@@ -17,17 +17,19 @@ limitations under the License.
 package upgrade
 
 import (
+	"context"
 	"fmt"
-	"io"
 
-	"github.com/pkg/errors"
-
-	"k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	versionutil "k8s.io/apimachinery/pkg/util/version"
 	clientset "k8s.io/client-go/kubernetes"
+	"k8s.io/component-base/version"
+
+	"k8s.io/kubernetes/cmd/kubeadm/app/constants"
+	"k8s.io/kubernetes/cmd/kubeadm/app/phases/addons/dns"
 	kubeadmutil "k8s.io/kubernetes/cmd/kubeadm/app/util"
-	"k8s.io/kubernetes/cmd/kubeadm/app/version"
+	"k8s.io/kubernetes/cmd/kubeadm/app/util/errors"
+	"k8s.io/kubernetes/cmd/kubeadm/app/util/image"
 )
 
 // VersionGetter defines an interface for fetching different versions.
@@ -39,21 +41,23 @@ type VersionGetter interface {
 	KubeadmVersion() (string, *versionutil.Version, error)
 	// VersionFromCILabel should resolve CI labels like `latest`, `stable`, `stable-1.8`, etc. to real versions
 	VersionFromCILabel(string, string) (string, *versionutil.Version, error)
-	// KubeletVersions should return a map with a version and a number that describes how many kubelets there are for that version
-	KubeletVersions() (map[string]uint16, error)
+	// KubeletVersions should return a map with a version and a list of node names that describes how many kubelets there are for that version
+	KubeletVersions() (map[string][]string, error)
+	// ComponentVersions should return a map with a version and a list of node names that describes how many a given control-plane components there are for that version
+	ComponentVersions(string) (map[string][]string, error)
+	// DNSAddonVersion returns, if deployed, the CoreDNS image tag
+	DNSAddonVersion() (string, error)
 }
 
 // KubeVersionGetter handles the version-fetching mechanism from external sources
 type KubeVersionGetter struct {
 	client clientset.Interface
-	w      io.Writer
 }
 
 // NewKubeVersionGetter returns a new instance of KubeVersionGetter
-func NewKubeVersionGetter(client clientset.Interface, writer io.Writer) VersionGetter {
+func NewKubeVersionGetter(client clientset.Interface) VersionGetter {
 	return &KubeVersionGetter{
 		client: client,
-		w:      writer,
 	}
 }
 
@@ -61,13 +65,12 @@ func NewKubeVersionGetter(client clientset.Interface, writer io.Writer) VersionG
 func (g *KubeVersionGetter) ClusterVersion() (string, *versionutil.Version, error) {
 	clusterVersionInfo, err := g.client.Discovery().ServerVersion()
 	if err != nil {
-		return "", nil, errors.Wrap(err, "Couldn't fetch cluster version from the API Server")
+		return "", nil, errors.Wrap(err, "couldn't fetch cluster version from the API server")
 	}
-	fmt.Fprintf(g.w, "[upgrade/versions] Cluster version: %s\n", clusterVersionInfo.String())
 
 	clusterVersion, err := versionutil.ParseSemantic(clusterVersionInfo.String())
 	if err != nil {
-		return "", nil, errors.Wrap(err, "Couldn't parse cluster version")
+		return "", nil, errors.Wrap(err, "couldn't parse cluster version")
 	}
 	return clusterVersionInfo.String(), clusterVersion, nil
 }
@@ -75,11 +78,10 @@ func (g *KubeVersionGetter) ClusterVersion() (string, *versionutil.Version, erro
 // KubeadmVersion gets kubeadm version
 func (g *KubeVersionGetter) KubeadmVersion() (string, *versionutil.Version, error) {
 	kubeadmVersionInfo := version.Get()
-	fmt.Fprintf(g.w, "[upgrade/versions] kubeadm version: %s\n", kubeadmVersionInfo.String())
 
 	kubeadmVersion, err := versionutil.ParseSemantic(kubeadmVersionInfo.String())
 	if err != nil {
-		return "", nil, errors.Wrap(err, "Couldn't parse kubeadm version")
+		return "", nil, errors.Wrap(err, "couldn't parse kubeadm version")
 	}
 	return kubeadmVersionInfo.String(), kubeadmVersion, nil
 }
@@ -88,41 +90,57 @@ func (g *KubeVersionGetter) KubeadmVersion() (string, *versionutil.Version, erro
 func (g *KubeVersionGetter) VersionFromCILabel(ciVersionLabel, description string) (string, *versionutil.Version, error) {
 	versionStr, err := kubeadmutil.KubernetesReleaseVersion(ciVersionLabel)
 	if err != nil {
-		return "", nil, errors.Wrapf(err, "Couldn't fetch latest %s from the internet", description)
-	}
-
-	if description != "" {
-		fmt.Fprintf(g.w, "[upgrade/versions] Latest %s: %s\n", description, versionStr)
+		return "", nil, errors.Wrapf(err, "couldn't fetch latest %s from the internet", description)
 	}
 
 	ver, err := versionutil.ParseSemantic(versionStr)
 	if err != nil {
-		return "", nil, errors.Wrapf(err, "Couldn't parse latest %s", description)
+		return "", nil, errors.Wrapf(err, "couldn't parse latest %s", description)
 	}
 	return versionStr, ver, nil
 }
 
-// KubeletVersions gets the versions of the kubelets in the cluster
-func (g *KubeVersionGetter) KubeletVersions() (map[string]uint16, error) {
-	nodes, err := g.client.CoreV1().Nodes().List(metav1.ListOptions{})
+// KubeletVersions gets the versions of the kubelets in the cluster.
+func (g *KubeVersionGetter) KubeletVersions() (map[string][]string, error) {
+	nodes, err := g.client.CoreV1().Nodes().List(context.TODO(), metav1.ListOptions{})
 	if err != nil {
 		return nil, errors.New("couldn't list all nodes in cluster")
 	}
-	return computeKubeletVersions(nodes.Items), nil
+
+	// map kubelet version to a list of node names
+	kubeletVersions := make(map[string][]string)
+	for _, node := range nodes.Items {
+		kver := node.Status.NodeInfo.KubeletVersion
+		kubeletVersions[kver] = append(kubeletVersions[kver], node.Name)
+	}
+	return kubeletVersions, nil
 }
 
-// computeKubeletVersions returns a string-int map that describes how many nodes are of a specific version
-func computeKubeletVersions(nodes []v1.Node) map[string]uint16 {
-	kubeletVersions := map[string]uint16{}
-	for _, node := range nodes {
-		kver := node.Status.NodeInfo.KubeletVersion
-		if _, found := kubeletVersions[kver]; !found {
-			kubeletVersions[kver] = 1
-			continue
-		}
-		kubeletVersions[kver]++
+// DNSAddonVersion returns the CoreDNS image deployed in the cluster, or an error in case of multiple instances.
+func (g *KubeVersionGetter) DNSAddonVersion() (string, error) {
+	return dns.DeployedDNSAddon(g.client)
+}
+
+// ComponentVersions gets the versions of the control-plane components in the cluster.
+// The name parameter is the name of the component to get the versions for.
+// The function returns a map with the version as the key and a list of node names as the value.
+func (g *KubeVersionGetter) ComponentVersions(name string) (map[string][]string, error) {
+	podList, err := g.client.CoreV1().Pods(metav1.NamespaceSystem).List(
+		context.TODO(),
+		metav1.ListOptions{
+			LabelSelector: fmt.Sprintf("component=%s,tier=%s", name, constants.ControlPlaneTier),
+		},
+	)
+	if err != nil {
+		return nil, errors.Wrap(err, "couldn't list pods in cluster")
 	}
-	return kubeletVersions
+
+	componentVersions := make(map[string][]string)
+	for _, pod := range podList.Items {
+		tag := convertImageTagMetadataToSemver(image.TagFromImage(pod.Spec.Containers[0].Image))
+		componentVersions[tag] = append(componentVersions[tag], pod.Spec.NodeName)
+	}
+	return componentVersions, nil
 }
 
 // OfflineVersionGetter will use the version provided or
@@ -147,7 +165,7 @@ func (o *OfflineVersionGetter) VersionFromCILabel(ciVersionLabel, description st
 	}
 	ver, err := versionutil.ParseSemantic(o.version)
 	if err != nil {
-		return "", nil, errors.Wrapf(err, "Couldn't parse version %s", description)
+		return "", nil, errors.Wrapf(err, "couldn't parse version %s", description)
 	}
 	return o.version, ver, nil
 }

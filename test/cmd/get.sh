@@ -96,38 +96,34 @@ run_kubectl_get_tests() {
   # Post-condition: POD abc should error since it doesn't exist
   kube::test::if_has_string "${output_message}" 'pods "abc" not found'
   # Post-condition: make sure we don't display an empty List
-  if kube::test::if_has_string "${output_message}" 'List'; then
-    echo 'Unexpected List output'
-    echo "${LINENO} $(basename "$0")"
-    exit 1
-  fi
+  kube::test::if_has_not_string "${output_message}" 'List'
 
   ### Test kubectl get all
   output_message=$(kubectl --v=6 --namespace default get all --chunk-size=0 2>&1 "${kube_flags[@]}")
   # Post-condition: Check if we get 200 OK from all the url(s)
-  kube::test::if_has_string "${output_message}" "/api/v1/namespaces/default/pods 200 OK"
-  kube::test::if_has_string "${output_message}" "/api/v1/namespaces/default/replicationcontrollers 200 OK"
-  kube::test::if_has_string "${output_message}" "/api/v1/namespaces/default/services 200 OK"
-  kube::test::if_has_string "${output_message}" "/apis/apps/v1/namespaces/default/daemonsets 200 OK"
-  kube::test::if_has_string "${output_message}" "/apis/apps/v1/namespaces/default/deployments 200 OK"
-  kube::test::if_has_string "${output_message}" "/apis/apps/v1/namespaces/default/replicasets 200 OK"
-  kube::test::if_has_string "${output_message}" "/apis/apps/v1/namespaces/default/statefulsets 200 OK"
-  kube::test::if_has_string "${output_message}" "/apis/autoscaling/v1/namespaces/default/horizontalpodautoscalers 200"
-  kube::test::if_has_string "${output_message}" "/apis/batch/v1/namespaces/default/jobs 200 OK"
-  kube::test::if_has_not_string "${output_message}" "/apis/extensions/v1beta1/namespaces/default/daemonsets 200 OK"
-  kube::test::if_has_not_string "${output_message}" "/apis/extensions/v1beta1/namespaces/default/deployments 200 OK"
-  kube::test::if_has_not_string "${output_message}" "/apis/extensions/v1beta1/namespaces/default/replicasets 200 OK"
+  kube::test::if_has_string "${output_message}" '"Response" verb="GET" url=".*/api/v1/namespaces/default/pods" status="200 OK"'
+  kube::test::if_has_string "${output_message}" '"Response" verb="GET" url=".*/api/v1/namespaces/default/replicationcontrollers" status="200 OK"'
+  kube::test::if_has_string "${output_message}" '"Response" verb="GET" url=".*/api/v1/namespaces/default/services" status="200 OK"'
+  kube::test::if_has_string "${output_message}" '"Response" verb="GET" url=".*/apis/apps/v1/namespaces/default/daemonsets" status="200 OK"'
+  kube::test::if_has_string "${output_message}" '"Response" verb="GET" url=".*/apis/apps/v1/namespaces/default/deployments" status="200 OK"'
+  kube::test::if_has_string "${output_message}" '"Response" verb="GET" url=".*/apis/apps/v1/namespaces/default/replicasets" status="200 OK"'
+  kube::test::if_has_string "${output_message}" '"Response" verb="GET" url=".*/apis/apps/v1/namespaces/default/statefulsets" status="200 OK"'
+  kube::test::if_has_string "${output_message}" '"Response" verb="GET" url=".*/apis/autoscaling/v2/namespaces/default/horizontalpodautoscalers" status="200 OK"'
+  kube::test::if_has_string "${output_message}" '"Response" verb="GET" url=".*/apis/batch/v1/namespaces/default/jobs" status="200 OK"'
+  kube::test::if_has_not_string "${output_message}" '"Response" verb="GET" url=".*/apis/extensions/v1beta1/namespaces/default/daemonsets" status="200 OK"'
+  kube::test::if_has_not_string "${output_message}" '"Response" verb="GET" url=".*/apis/extensions/v1beta1/namespaces/default/deployments" status="200 OK"'
+  kube::test::if_has_not_string "${output_message}" '"Response" verb="GET" url=".*/apis/extensions/v1beta1/namespaces/default/replicasets" status="200 OK"'
 
   ### Test kubectl get chunk size
   output_message=$(kubectl --v=6 get clusterrole --chunk-size=10 2>&1 "${kube_flags[@]}")
   # Post-condition: Check if we get a limit and continue
-  kube::test::if_has_string "${output_message}" "/clusterroles?limit=10 200 OK"
-  kube::test::if_has_string "${output_message}" "/v1/clusterroles?continue="
+  kube::test::if_has_string "${output_message}" '"Response" verb="GET" url=".*/clusterroles?limit=10" status="200 OK"'
+  kube::test::if_has_string "${output_message}" '"Response" verb="GET" url=".*/v1/clusterroles?continue=.*'
 
   ### Test kubectl get chunk size defaults to 500
   output_message=$(kubectl --v=6 get clusterrole 2>&1 "${kube_flags[@]}")
   # Post-condition: Check if we get a limit and continue
-  kube::test::if_has_string "${output_message}" "/clusterroles?limit=500 200 OK"
+  kube::test::if_has_string "${output_message}" '"Response" verb="GET" url=".*/clusterroles?limit=500" status="200 OK"'
 
   ### Test kubectl get accumulates pages
   output_message=$(kubectl get namespaces --chunk-size=1 --no-headers "${kube_flags[@]}")
@@ -138,9 +134,9 @@ run_kubectl_get_tests() {
 
   ### Test kubectl get chunk size does not result in a --watch error when resource list is served in multiple chunks
   # Pre-condition: ConfigMap one two tree does not exist
-  kube::test::get_object_assert 'configmaps' "{{range.items}}{{ if eq $id_field \\\"one\\\" }}found{{end}}{{end}}:" ':'
-  kube::test::get_object_assert 'configmaps' "{{range.items}}{{ if eq $id_field \\\"two\\\" }}found{{end}}{{end}}:" ':'
-  kube::test::get_object_assert 'configmaps' "{{range.items}}{{ if eq $id_field \\\"three\\\" }}found{{end}}{{end}}:" ':'
+  kube::test::get_object_assert 'configmaps' "{{range.items}}{{ if eq $id_field \"one\" }}found{{end}}{{end}}:" ':'
+  kube::test::get_object_assert 'configmaps' "{{range.items}}{{ if eq $id_field \"two\" }}found{{end}}{{end}}:" ':'
+  kube::test::get_object_assert 'configmaps' "{{range.items}}{{ if eq $id_field \"three\" }}found{{end}}{{end}}:" ':'
 
   # Post-condition: Create three configmaps and ensure that we can --watch them with a --chunk-size of 1
   kubectl create cm one "${kube_flags[@]}"
@@ -179,6 +175,14 @@ run_kubectl_get_tests() {
   output_message=$(! kubectl get pod valid-pod --allow-missing-template-keys=false -o go-template='{{.missing}}' "${kube_flags[@]}")
   kube::test::if_has_string "${output_message}" 'map has no entry for key "missing"'
 
+  ## check --subresource=status works
+  output_message=$(kubectl get "${kube_flags[@]}" pod valid-pod --subresource=status)
+  kube::test::if_has_string "${output_message}" 'valid-pod'
+
+   ## check --subresource=scale returns an error for pods
+  output_message=$(! kubectl get pod valid-pod --subresource=scale 2>&1 "${kube_flags[@]:?}")
+  kube::test::if_has_string "${output_message}" 'the server could not find the requested resource'
+
   ### Test kubectl get watch
   output_message=$(kubectl get pods -w --request-timeout=1 "${kube_flags[@]}")
   kube::test::if_has_string "${output_message}" 'STATUS'    # headers
@@ -210,8 +214,8 @@ run_kubectl_get_tests() {
   kubectl delete pods redis-master valid-pod "${kube_flags[@]}"
 
   ### Test 'kubectl get -k <dir>' prints all the items built from a kustomization directory
-  # Pre-condition: no ConfigMap, Deployment, Service exist
-  kube::test::get_object_assert configmaps "{{range.items}}{{$id_field}}:{{end}}" ''
+  # Pre-Condition: No configmaps with name=test-the-map, no Deployment, Service exist
+  kube::test::get_object_assert 'configmaps --field-selector=metadata.name=test-the-map' "{{range.items}}{{${id_field:?}}}:{{end}}" ''
   kube::test::get_object_assert deployment "{{range.items}}{{$id_field}}:{{end}}" ''
   kube::test::get_object_assert services "{{range.items}}{{$id_field}}:{{end}}" ''
   # Command
@@ -228,7 +232,7 @@ run_kubectl_get_tests() {
   kubectl delete -k hack/testdata/kustomize
 
   # Check that all items in the list are deleted
-  kube::test::get_object_assert configmaps "{{range.items}}{{$id_field}}:{{end}}" ''
+  kube::test::get_object_assert 'configmaps --field-selector=metadata.name=test-the-map' "{{range.items}}{{${id_field:?}}}:{{end}}" ''
   kube::test::get_object_assert deployment "{{range.items}}{{$id_field}}:{{end}}" ''
   kube::test::get_object_assert services "{{range.items}}{{$id_field}}:{{end}}" ''
 
@@ -244,6 +248,48 @@ run_retrieve_multiple_tests() {
   kubectl config set-context "${CONTEXT}" --namespace=""
   kube::log::status "Testing kubectl(v1:multiget)"
   kube::test::get_object_assert 'nodes/127.0.0.1 service/kubernetes' "{{range.items}}{{$id_field}}:{{end}}" '127.0.0.1:kubernetes:'
+
+  set +o nounset
+  set +o errexit
+}
+
+run_kubectl_response_compression_tests() {
+  set -o nounset
+  set -o errexit
+
+  create_and_use_new_namespace
+  kube::log::status "Testing kubectl get objects with/without response compression"
+
+  ### Test creation of large configmap objects
+  # Pre-condition: no configmaps exists
+  kube::test::get_object_assert configmaps "{{range.items}}{{${id_field:?}}}:{{end}}" ''
+  # Commands to create 3 configmaps each of size 50KB. Sum of their sizes should be >128KB (defaultGzipThresholdBytes)
+  # for apiserver to allow gzip compression of the response. This is required to test the disable-compression option
+  # from client-side
+  some_string=$(dd status=none if=/dev/urandom bs=1K count=50 2>/dev/null | base64)
+  kubectl create configmap "cm-one" --from-literal=somekey="${some_string}"
+  kubectl create configmap "cm-two" --from-literal=somekey="${some_string}"
+  kubectl create configmap "cm-three" --from-literal=somekey="${some_string}"
+  output_message=$(kubectl get configmaps 2>&1 "${kube_flags[@]:?}")
+  # Post-condition: All configmaps should be created
+  kube::test::if_has_string "${output_message}" "cm-one"
+  kube::test::if_has_string "${output_message}" "cm-two"
+  kube::test::if_has_string "${output_message}" "cm-three"
+
+  ### Test list call WITH compression
+  output_message=$(kubectl get configmaps --v=8 2>&1 "${kube_flags[@]:?}")
+  # Post-condition: Response headers should include "accept-encoding" header
+  kube::test::if_has_string "${output_message}" "Vary: Accept-Encoding"
+
+  ### Test list call WITHOUT compression
+  output_message=$(kubectl get configmaps --disable-compression=true --v=8 2>&1 "${kube_flags[@]:?}")
+  # Post-condition: Response headers should NOT include "accept-encoding" header
+  kube::test::if_has_not_string "${output_message}" "Vary: Accept-Encoding"
+
+  # cleanup
+  kubectl delete configmap "cm-one"
+  kubectl delete configmap "cm-two"
+  kubectl delete configmap "cm-three"
 
   set +o nounset
   set +o errexit
@@ -319,6 +365,22 @@ run_kubectl_sort_by_tests() {
   output_message=$(kubectl get pods --sort-by="{metadata.creationTimestamp}")
   kube::test::if_sort_by_has_correct_order "${output_message}" "sorted-pod1:sorted-pod2:sorted-pod3:"
 
+  # ensure sorting by resource memory request works
+  output_message=$(kubectl get pods --sort-by="{.spec.containers[0].resources.requests.memory}")
+  kube::test::if_sort_by_has_correct_order "${output_message}" "sorted-pod3:sorted-pod1:sorted-pod2:"
+
+  # ensure sorting by resource cpu request works
+  output_message=$(kubectl get pods --sort-by="{.spec.containers[0].resources.requests.cpu}")
+  kube::test::if_sort_by_has_correct_order "${output_message}" "sorted-pod3:sorted-pod1:sorted-pod2:"
+
+  # ensure sorting by resource memory limit works
+  output_message=$(kubectl get pods --sort-by="{.spec.containers[0].resources.limits.memory}")
+  kube::test::if_sort_by_has_correct_order "${output_message}" "sorted-pod3:sorted-pod1:sorted-pod2:"
+
+  # ensure sorting by resource cpu limit works
+   output_message=$(kubectl get pods --sort-by="{.spec.containers[0].resources.limits.cpu}")
+  kube::test::if_sort_by_has_correct_order "${output_message}" "sorted-pod3:sorted-pod1:sorted-pod2:"
+
   # ensure sorting using fallback codepath still works
   output_message=$(kubectl get pods --sort-by="{spec.containers[0].name}" --server-print=false --v=8 2>&1)
   kube::test::if_sort_by_has_correct_order "${output_message}" "sorted-pod2:sorted-pod1:sorted-pod3:"
@@ -343,7 +405,7 @@ run_kubectl_all_namespace_tests() {
   kube::log::status "Testing kubectl --all-namespace"
 
   # Pre-condition: the "default" namespace exists
-  kube::test::get_object_assert namespaces "{{range.items}}{{if eq $id_field \\\"default\\\"}}{{$id_field}}:{{end}}{{end}}" 'default:'
+  kube::test::get_object_assert namespaces "{{range.items}}{{if eq $id_field \"default\"}}{{$id_field}}:{{end}}{{end}}" 'default:'
 
   ### Create POD
   # Pre-condition: no POD exists
@@ -390,6 +452,83 @@ run_kubectl_all_namespace_tests() {
   output_message=$(kubectl get nodes --all-namespaces 2>&1)
   # Post-condition: output with no NAMESPACE field
   kube::test::if_has_not_string "${output_message}" "NAMESPACE"
+
+  set +o nounset
+  set +o errexit
+}
+
+
+run_deprecated_api_tests() {
+  set -o nounset
+  set -o errexit
+
+  kube::log::status "Testing deprecated APIs"
+
+  # Create deprecated CRD
+  kubectl "${kube_flags_with_token[@]:?}" create -f - << __EOF__
+{
+  "kind": "CustomResourceDefinition",
+  "apiVersion": "apiextensions.k8s.io/v1",
+  "metadata": {
+    "name": "deprecated.example.com"
+  },
+  "spec": {
+    "group": "example.com",
+    "scope": "Namespaced",
+    "names": {
+      "plural": "deprecated",
+      "kind": "DeprecatedKind"
+    },
+    "versions": [
+      {
+        "name": "v1",
+        "served": true,
+        "storage": true,
+        "schema": {
+          "openAPIV3Schema": {
+            "x-kubernetes-preserve-unknown-fields": true,
+            "type": "object"
+          }
+        }
+      },
+      {
+        "name": "v1beta1",
+        "deprecated": true,
+        "served": true,
+        "storage": false,
+        "schema": {
+          "openAPIV3Schema": {
+            "x-kubernetes-preserve-unknown-fields": true,
+            "type": "object"
+          }
+        }
+      }
+    ]
+  }
+}
+__EOF__
+
+  # Ensure the API server has recognized and started serving the associated CR API
+  local tries=5
+  for i in $(seq 1 $tries); do
+      local output
+      output=$(kubectl "${kube_flags[@]:?}" api-resources --api-group example.com -oname || true)
+      if kube::test::if_has_string "$output" deprecated.example.com; then
+          break
+      fi
+      echo "${i}: Waiting for CR API to be available"
+      sleep "$i"
+  done
+
+  # Test deprecated API request output
+  output_message=$(kubectl get deprecated.v1beta1.example.com 2>&1 "${kube_flags[@]}")
+  kube::test::if_has_string "${output_message}" 'example.com/v1beta1 DeprecatedKind is deprecated'
+  output_message=$(! kubectl get deprecated.v1beta1.example.com --warnings-as-errors 2>&1 "${kube_flags[@]}")
+  kube::test::if_has_string "${output_message}" 'example.com/v1beta1 DeprecatedKind is deprecated'
+  kube::test::if_has_string "${output_message}" 'error: 1 warning received'
+
+  # Delete deprecated CRD
+  kubectl delete "${kube_flags[@]}" crd deprecated.example.com
 
   set +o nounset
   set +o errexit

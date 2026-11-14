@@ -19,15 +19,18 @@ package configmap
 import (
 	"fmt"
 
-	"k8s.io/api/core/v1"
+	"k8s.io/klog/v2"
+	"k8s.io/mount-utils"
+	utilstrings "k8s.io/utils/strings"
+
+	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/klog"
-	"k8s.io/kubernetes/pkg/util/mount"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	"k8s.io/kubernetes/pkg/features"
 	"k8s.io/kubernetes/pkg/volume"
 	volumeutil "k8s.io/kubernetes/pkg/volume/util"
-	utilstrings "k8s.io/utils/strings"
 )
 
 // ProbeVolumePlugins is the entry point for plugin detection in a package.
@@ -77,11 +80,7 @@ func (plugin *configMapPlugin) CanSupport(spec *volume.Spec) bool {
 	return spec.Volume != nil && spec.Volume.ConfigMap != nil
 }
 
-func (plugin *configMapPlugin) IsMigratedToCSI() bool {
-	return false
-}
-
-func (plugin *configMapPlugin) RequiresRemount() bool {
+func (plugin *configMapPlugin) RequiresRemount(spec *volume.Spec) bool {
 	return true
 }
 
@@ -89,22 +88,21 @@ func (plugin *configMapPlugin) SupportsMountOption() bool {
 	return false
 }
 
-func (plugin *configMapPlugin) SupportsBulkVolumeVerification() bool {
-	return false
+func (plugin *configMapPlugin) SupportsSELinuxContextMount(spec *volume.Spec) (bool, error) {
+	return false, nil
 }
 
-func (plugin *configMapPlugin) NewMounter(spec *volume.Spec, pod *v1.Pod, opts volume.VolumeOptions) (volume.Mounter, error) {
+func (plugin *configMapPlugin) NewMounter(spec *volume.Spec, pod *v1.Pod) (volume.Mounter, error) {
 	return &configMapVolumeMounter{
 		configMapVolume: &configMapVolume{
 			spec.Name(),
 			pod.UID,
 			plugin,
-			plugin.host.GetMounter(plugin.GetPluginName()),
+			plugin.host.GetMounter(),
 			volume.NewCachedMetrics(volume.NewMetricsDu(getPath(pod.UID, spec.Name(), plugin.host))),
 		},
 		source:       *spec.Volume.ConfigMap,
 		pod:          *pod,
-		opts:         &opts,
 		getConfigMap: plugin.getConfigMap,
 	}, nil
 }
@@ -115,20 +113,22 @@ func (plugin *configMapPlugin) NewUnmounter(volName string, podUID types.UID) (v
 			volName,
 			podUID,
 			plugin,
-			plugin.host.GetMounter(plugin.GetPluginName()),
+			plugin.host.GetMounter(),
 			volume.NewCachedMetrics(volume.NewMetricsDu(getPath(podUID, volName, plugin.host))),
 		},
 	}, nil
 }
 
-func (plugin *configMapPlugin) ConstructVolumeSpec(volumeName, mountPath string) (*volume.Spec, error) {
+func (plugin *configMapPlugin) ConstructVolumeSpec(volumeName, mountPath string) (volume.ReconstructedVolume, error) {
 	configMapVolume := &v1.Volume{
 		Name: volumeName,
 		VolumeSource: v1.VolumeSource{
 			ConfigMap: &v1.ConfigMapVolumeSource{},
 		},
 	}
-	return volume.NewSpecFromVolume(configMapVolume), nil
+	return volume.ReconstructedVolume{
+		Spec: volume.NewSpecFromVolume(configMapVolume),
+	}, nil
 }
 
 type configMapVolume struct {
@@ -152,7 +152,6 @@ type configMapVolumeMounter struct {
 
 	source       v1.ConfigMapVolumeSource
 	pod          v1.Pod
-	opts         *volume.VolumeOptions
 	getConfigMap func(namespace, name string) (*v1.ConfigMap, error)
 }
 
@@ -160,9 +159,9 @@ var _ volume.Mounter = &configMapVolumeMounter{}
 
 func (sv *configMapVolume) GetAttributes() volume.Attributes {
 	return volume.Attributes{
-		ReadOnly:        true,
-		Managed:         true,
-		SupportsSELinux: true,
+		ReadOnly:       true,
+		Managed:        true,
+		SELinuxRelabel: true,
 	}
 }
 
@@ -176,13 +175,6 @@ func wrappedVolumeSpec() volume.Spec {
 	}
 }
 
-// Checks prior to mount operations to verify that the required components (binaries, etc.)
-// to mount the volume are available on the underlying node.
-// If not, it returns an error
-func (b *configMapVolumeMounter) CanMount() error {
-	return nil
-}
-
 func (b *configMapVolumeMounter) SetUp(mounterArgs volume.MounterArgs) error {
 	return b.SetUpAt(b.GetPath(), mounterArgs)
 }
@@ -191,7 +183,7 @@ func (b *configMapVolumeMounter) SetUpAt(dir string, mounterArgs volume.MounterA
 	klog.V(3).Infof("Setting up volume %v for pod %v at %v", b.volName, b.pod.UID, dir)
 
 	// Wrap EmptyDir, let it do the setup.
-	wrapped, err := b.plugin.host.NewWrapperMounter(b.volName, wrappedVolumeSpec(), &b.pod, *b.opts)
+	wrapped, err := b.plugin.host.NewWrapperMounter(b.volName, wrappedVolumeSpec(), &b.pod)
 	if err != nil {
 		return err
 	}
@@ -218,7 +210,7 @@ func (b *configMapVolumeMounter) SetUpAt(dir string, mounterArgs volume.MounterA
 		len(configMap.Data)+len(configMap.BinaryData),
 		totalBytes)
 
-	payload, err := MakePayload(b.source.Items, configMap, b.source.DefaultMode, optional)
+	payload, err := MakePayload(b.source.Items, configMap, b.source.DefaultMode, b.source.DefaultUser, optional)
 	if err != nil {
 		return err
 	}
@@ -241,7 +233,7 @@ func (b *configMapVolumeMounter) SetUpAt(dir string, mounterArgs volume.MounterA
 			}
 			tearDownErr := unmounter.TearDown()
 			if tearDownErr != nil {
-				klog.Errorf("Error tearing down volume %s with : %v", b.volName, tearDownErr)
+				klog.Errorf("error tearing down volume %s: %v", b.volName, tearDownErr)
 			}
 		}
 	}()
@@ -253,25 +245,26 @@ func (b *configMapVolumeMounter) SetUpAt(dir string, mounterArgs volume.MounterA
 		return err
 	}
 
-	err = writer.Write(payload)
+	setPerms := func(_ string) error {
+		// This may be the first time writing and new files get created outside the timestamp subdirectory:
+		// change the permissions on the whole volume and not only in the timestamp directory.
+		ownerShipChanger := volume.NewVolumeOwnership(b, dir, mounterArgs.FsGroup, nil /*fsGroupChangePolicy*/, volumeutil.FSGroupCompleteHook(b.plugin, nil))
+		return ownerShipChanger.ChangePermissions()
+	}
+	err = writer.Write(payload, setPerms)
 	if err != nil {
 		klog.Errorf("Error writing payload to dir: %v", err)
 		return err
 	}
 
-	err = volume.SetVolumeOwnership(b, mounterArgs.FsGroup)
-	if err != nil {
-		klog.Errorf("Error applying volume ownership settings for group: %v", mounterArgs.FsGroup)
-		return err
-	}
 	setupSuccess = true
 	return nil
 }
 
 // MakePayload function is exported so that it can be called from the projection volume driver
-func MakePayload(mappings []v1.KeyToPath, configMap *v1.ConfigMap, defaultMode *int32, optional bool) (map[string]volumeutil.FileProjection, error) {
+func MakePayload(mappings []v1.KeyToPath, configMap *v1.ConfigMap, defaultMode *int32, defaultUser *int64, optional bool) (map[string]volumeutil.FileProjection, error) {
 	if defaultMode == nil {
-		return nil, fmt.Errorf("No defaultMode used, not even the default value for it")
+		return nil, fmt.Errorf("no defaultMode used, not even the default value for it")
 	}
 
 	payload := make(map[string]volumeutil.FileProjection, (len(configMap.Data) + len(configMap.BinaryData)))
@@ -281,11 +274,17 @@ func MakePayload(mappings []v1.KeyToPath, configMap *v1.ConfigMap, defaultMode *
 		for name, data := range configMap.Data {
 			fileProjection.Data = []byte(data)
 			fileProjection.Mode = *defaultMode
+			if utilfeature.DefaultFeatureGate.Enabled(features.AtomicWriteVolumeUserFields) {
+				fileProjection.FsUser = defaultUser
+			}
 			payload[name] = fileProjection
 		}
 		for name, data := range configMap.BinaryData {
 			fileProjection.Data = data
 			fileProjection.Mode = *defaultMode
+			if utilfeature.DefaultFeatureGate.Enabled(features.AtomicWriteVolumeUserFields) {
+				fileProjection.FsUser = defaultUser
+			}
 			payload[name] = fileProjection
 		}
 	} else {
@@ -301,11 +300,13 @@ func MakePayload(mappings []v1.KeyToPath, configMap *v1.ConfigMap, defaultMode *
 				return nil, fmt.Errorf("configmap references non-existent config key: %s", ktp.Key)
 			}
 
+			fileProjection.FsUser = volumeutil.ResolvesFsUser(defaultUser, ktp.User)
 			if ktp.Mode != nil {
 				fileProjection.Mode = *ktp.Mode
 			} else {
 				fileProjection.Mode = *defaultMode
 			}
+
 			payload[ktp.Path] = fileProjection
 		}
 	}

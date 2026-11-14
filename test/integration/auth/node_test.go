@@ -17,53 +17,51 @@ limitations under the License.
 package auth
 
 import (
+	"context"
 	"fmt"
-	"io/ioutil"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	authenticationv1 "k8s.io/api/authentication/v1"
 	coordination "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
-	policy "k8s.io/api/policy/v1beta1"
+	policy "k8s.io/api/policy/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
+	resourceapi "k8s.io/api/resource/v1"
 	storagev1 "k8s.io/api/storage/v1"
-	storagev1beta1 "k8s.io/api/storage/v1beta1"
-	apiextensionsv1beta1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1beta1"
-	"k8s.io/apimachinery/pkg/api/errors"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/rand"
 	"k8s.io/apimachinery/pkg/util/wait"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	clientset "k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/clientcmd"
 	featuregatetesting "k8s.io/component-base/featuregate/testing"
 	kubeapiservertesting "k8s.io/kubernetes/cmd/kube-apiserver/app/testing"
+	kubecontrollermanagertesting "k8s.io/kubernetes/cmd/kube-controller-manager/app/testing"
 	"k8s.io/kubernetes/pkg/features"
 	"k8s.io/kubernetes/test/integration/framework"
-	"k8s.io/utils/pointer"
+	"k8s.io/kubernetes/test/utils/kubeconfig"
+	"k8s.io/utils/ptr"
 )
 
 func TestNodeAuthorizer(t *testing.T) {
 	const (
 		// Define credentials
+		// Fake values for testing.
 		tokenMaster      = "master-token"
 		tokenNodeUnknown = "unknown-token"
 		tokenNode1       = "node1-token"
 		tokenNode2       = "node2-token"
 	)
 
-	// Enable DynamicKubeletConfig feature so that Node.Spec.ConfigSource can be set
-	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.DynamicKubeletConfig, true)()
-
-	// Enable NodeLease feature so that nodes can create leases
-	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.NodeLease, true)()
-
-	// Enable CSINodeInfo feature so that nodes can create CSINode objects.
-	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.CSINodeInfo, true)()
-
-	tokenFile, err := ioutil.TempFile("", "kubeconfig")
+	tokenFile, err := os.CreateTemp("", "kubeconfig")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -76,6 +74,7 @@ func TestNodeAuthorizer(t *testing.T) {
 	tokenFile.Close()
 
 	server := kubeapiservertesting.StartTestServerOrDie(t, nil, []string{
+		"--runtime-config=api/all=true",
 		"--authorization-mode", "Node,RBAC",
 		"--token-auth-file", tokenFile.Name(),
 		"--enable-admission-plugins", "NodeRestriction",
@@ -89,56 +88,55 @@ func TestNodeAuthorizer(t *testing.T) {
 	clientConfig := server.ClientConfig
 	superuserClient, superuserClientExternal := clientsetForToken(tokenMaster, clientConfig)
 
-	// Wait for a healthy server
-	for {
-		result := superuserClient.CoreV1().RESTClient().Get().AbsPath("/healthz").Do()
-		_, err := result.Raw()
-		if err == nil {
-			break
-		}
-		t.Log(err)
-		time.Sleep(time.Second)
-	}
-
 	// Create objects
-	if _, err := superuserClient.CoreV1().Namespaces().Create(&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "ns"}}); err != nil {
+	if _, err := superuserClient.CoreV1().Namespaces().Create(context.TODO(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "ns"}}, metav1.CreateOptions{}); err != nil {
 		t.Fatal(err)
 	}
 
-	if _, err := superuserClient.CoreV1().Secrets("ns").Create(&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "mysecret"}}); err != nil {
+	if _, err := superuserClient.CoreV1().Secrets("ns").Create(context.TODO(), &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "mysecret"}}, metav1.CreateOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := superuserClient.CoreV1().Secrets("ns").Create(&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "mypvsecret"}}); err != nil {
+	if _, err := superuserClient.CoreV1().Secrets("ns").Create(context.TODO(), &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "mypvsecret"}}, metav1.CreateOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := superuserClient.CoreV1().ConfigMaps("ns").Create(&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "myconfigmap"}}); err != nil {
+	if _, err := superuserClient.CoreV1().ConfigMaps("ns").Create(context.TODO(), &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "myconfigmap"}}, metav1.CreateOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := superuserClient.CoreV1().ConfigMaps("ns").Create(&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "myconfigmapconfigsource"}}); err != nil {
+	if _, err := superuserClient.ResourceV1().ResourceClaims("ns").Create(context.TODO(), &resourceapi.ResourceClaim{ObjectMeta: metav1.ObjectMeta{Name: "mynamedresourceclaim"}}, metav1.CreateOptions{}); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := superuserClient.ResourceV1().ResourceClaims("ns").Create(context.TODO(), &resourceapi.ResourceClaim{ObjectMeta: metav1.ObjectMeta{Name: "mytemplatizedresourceclaim"}}, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := superuserClient.ResourceV1().ResourceSlices().Create(context.TODO(), &resourceapi.ResourceSlice{ObjectMeta: metav1.ObjectMeta{Name: "myslice1"}, Spec: resourceapi.ResourceSliceSpec{NodeName: ptr.To("node1"), Driver: "dra.example.com", Pool: resourceapi.ResourcePool{Name: "node1-slice", ResourceSliceCount: 1}}}, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := superuserClient.ResourceV1().ResourceSlices().Create(context.TODO(), &resourceapi.ResourceSlice{ObjectMeta: metav1.ObjectMeta{Name: "myslice2"}, Spec: resourceapi.ResourceSliceSpec{NodeName: ptr.To("node2"), Driver: "dra.example.com", Pool: resourceapi.ResourcePool{Name: "node2-slice", ResourceSliceCount: 1}}}, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
 	pvName := "mypv"
-	if _, err := superuserClientExternal.StorageV1().VolumeAttachments().Create(&storagev1.VolumeAttachment{
+	if _, err := superuserClientExternal.StorageV1().VolumeAttachments().Create(context.TODO(), &storagev1.VolumeAttachment{
 		ObjectMeta: metav1.ObjectMeta{Name: "myattachment"},
 		Spec: storagev1.VolumeAttachmentSpec{
 			Attacher: "foo",
 			Source:   storagev1.VolumeAttachmentSource{PersistentVolumeName: &pvName},
 			NodeName: "node2",
 		},
-	}); err != nil {
+	}, metav1.CreateOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := superuserClient.CoreV1().PersistentVolumeClaims("ns").Create(&corev1.PersistentVolumeClaim{
+	if _, err := superuserClient.CoreV1().PersistentVolumeClaims("ns").Create(context.TODO(), &corev1.PersistentVolumeClaim{
 		ObjectMeta: metav1.ObjectMeta{Name: "mypvc"},
 		Spec: corev1.PersistentVolumeClaimSpec{
 			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadOnlyMany},
-			Resources:   corev1.ResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("1")}},
+			Resources:   corev1.VolumeResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("1")}},
 		},
-	}); err != nil {
+	}, metav1.CreateOptions{}); err != nil {
 		t.Fatal(err)
 	}
 
-	if _, err := superuserClient.CoreV1().PersistentVolumes().Create(&corev1.PersistentVolume{
+	if _, err := superuserClient.CoreV1().PersistentVolumes().Create(context.TODO(), &corev1.PersistentVolume{
 		ObjectMeta: metav1.ObjectMeta{Name: "mypv"},
 		Spec: corev1.PersistentVolumeSpec{
 			AccessModes:            []corev1.PersistentVolumeAccessMode{corev1.ReadOnlyMany},
@@ -146,56 +144,89 @@ func TestNodeAuthorizer(t *testing.T) {
 			ClaimRef:               &corev1.ObjectReference{Namespace: "ns", Name: "mypvc"},
 			PersistentVolumeSource: corev1.PersistentVolumeSource{AzureFile: &corev1.AzureFilePersistentVolumeSource{ShareName: "default", SecretName: "mypvsecret"}},
 		},
-	}); err != nil {
+	}, metav1.CreateOptions{}); err != nil {
 		t.Fatal(err)
 	}
 
 	getSecret := func(client clientset.Interface) func() error {
 		return func() error {
-			_, err := client.CoreV1().Secrets("ns").Get("mysecret", metav1.GetOptions{})
+			_, err := client.CoreV1().Secrets("ns").Get(context.TODO(), "mysecret", metav1.GetOptions{})
 			return err
 		}
 	}
 	getPVSecret := func(client clientset.Interface) func() error {
 		return func() error {
-			_, err := client.CoreV1().Secrets("ns").Get("mypvsecret", metav1.GetOptions{})
+			_, err := client.CoreV1().Secrets("ns").Get(context.TODO(), "mypvsecret", metav1.GetOptions{})
 			return err
 		}
 	}
 	getConfigMap := func(client clientset.Interface) func() error {
 		return func() error {
-			_, err := client.CoreV1().ConfigMaps("ns").Get("myconfigmap", metav1.GetOptions{})
-			return err
-		}
-	}
-	getConfigMapConfigSource := func(client clientset.Interface) func() error {
-		return func() error {
-			_, err := client.CoreV1().ConfigMaps("ns").Get("myconfigmapconfigsource", metav1.GetOptions{})
+			_, err := client.CoreV1().ConfigMaps("ns").Get(context.TODO(), "myconfigmap", metav1.GetOptions{})
 			return err
 		}
 	}
 	getPVC := func(client clientset.Interface) func() error {
 		return func() error {
-			_, err := client.CoreV1().PersistentVolumeClaims("ns").Get("mypvc", metav1.GetOptions{})
+			_, err := client.CoreV1().PersistentVolumeClaims("ns").Get(context.TODO(), "mypvc", metav1.GetOptions{})
 			return err
 		}
 	}
 	getPV := func(client clientset.Interface) func() error {
 		return func() error {
-			_, err := client.CoreV1().PersistentVolumes().Get("mypv", metav1.GetOptions{})
+			_, err := client.CoreV1().PersistentVolumes().Get(context.TODO(), "mypv", metav1.GetOptions{})
 			return err
 		}
 	}
 	getVolumeAttachment := func(client clientset.Interface) func() error {
 		return func() error {
-			_, err := client.StorageV1().VolumeAttachments().Get("myattachment", metav1.GetOptions{})
+			_, err := client.StorageV1().VolumeAttachments().Get(context.TODO(), "myattachment", metav1.GetOptions{})
+			return err
+		}
+	}
+	getResourceClaim := func(client clientset.Interface) func() error {
+		return func() error {
+			_, err := client.ResourceV1().ResourceClaims("ns").Get(context.TODO(), "mynamedresourceclaim", metav1.GetOptions{})
+			return err
+		}
+	}
+	getResourceClaimTemplate := func(client clientset.Interface) func() error {
+		return func() error {
+			_, err := client.ResourceV1().ResourceClaims("ns").Get(context.TODO(), "mytemplatizedresourceclaim", metav1.GetOptions{})
+			return err
+		}
+	}
+	deleteResourceSliceCollection := func(client clientset.Interface, nodeName *string) func() error {
+		return func() error {
+			var listOptions metav1.ListOptions
+			if nodeName != nil {
+				listOptions.FieldSelector = resourceapi.ResourceSliceSelectorNodeName + "=" + *nodeName
+			}
+			return client.ResourceV1().ResourceSlices().DeleteCollection(context.TODO(), metav1.DeleteOptions{}, listOptions)
+		}
+	}
+	addResourceClaimTemplateReference := func(client clientset.Interface) func() error {
+		return func() error {
+			_, err := client.CoreV1().Pods("ns").Patch(context.TODO(), "node2normalpod", types.MergePatchType,
+				[]byte(`{"status":{"resourceClaimStatuses":[{"name":"templateclaim","resourceClaimName":"mytemplatizedresourceclaim"}]}}`),
+				metav1.PatchOptions{}, "status")
+			return err
+		}
+	}
+	removeResourceClaimReference := func(client clientset.Interface) func() error {
+		return func() error {
+			// An explicit empty slice clears the field; null would be
+			// treated as an omitted field and preserved by the apiserver.
+			_, err := client.CoreV1().Pods("ns").Patch(context.TODO(), "node2normalpod", types.MergePatchType,
+				[]byte(`{"status":{"resourceClaimStatuses":[]}}`),
+				metav1.PatchOptions{}, "status")
 			return err
 		}
 	}
 
 	createNode2NormalPod := func(client clientset.Interface) func() error {
 		return func() error {
-			_, err := client.CoreV1().Pods("ns").Create(&corev1.Pod{
+			_, err := client.CoreV1().Pods("ns").Create(context.TODO(), &corev1.Pod{
 				ObjectMeta: metav1.ObjectMeta{Name: "node2normalpod"},
 				Spec: corev1.PodSpec{
 					NodeName:   "node2",
@@ -205,104 +236,93 @@ func TestNodeAuthorizer(t *testing.T) {
 						{Name: "cm", VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{LocalObjectReference: corev1.LocalObjectReference{Name: "myconfigmap"}}}},
 						{Name: "pvc", VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: "mypvc"}}},
 					},
+					ResourceClaims: []corev1.PodResourceClaim{
+						{Name: "namedclaim", ResourceClaimName: ptr.To("mynamedresourceclaim")},
+						{Name: "templateclaim", ResourceClaimTemplateName: ptr.To("myresourceclaimtemplate")},
+					},
 				},
-			})
+			}, metav1.CreateOptions{})
 			return err
 		}
 	}
 	updateNode2NormalPodStatus := func(client clientset.Interface) func() error {
 		return func() error {
 			startTime := metav1.NewTime(time.Now())
-			_, err := client.CoreV1().Pods("ns").UpdateStatus(&corev1.Pod{
+			_, err := client.CoreV1().Pods("ns").UpdateStatus(context.TODO(), &corev1.Pod{
 				ObjectMeta: metav1.ObjectMeta{Name: "node2normalpod"},
 				Status:     corev1.PodStatus{StartTime: &startTime},
-			})
+			}, metav1.UpdateOptions{})
 			return err
 		}
 	}
 	deleteNode2NormalPod := func(client clientset.Interface) func() error {
 		return func() error {
 			zero := int64(0)
-			return client.CoreV1().Pods("ns").Delete("node2normalpod", &metav1.DeleteOptions{GracePeriodSeconds: &zero})
+			return client.CoreV1().Pods("ns").Delete(context.TODO(), "node2normalpod", metav1.DeleteOptions{GracePeriodSeconds: &zero})
 		}
 	}
 
 	createNode2MirrorPod := func(client clientset.Interface) func() error {
 		return func() error {
-			_, err := client.CoreV1().Pods("ns").Create(&corev1.Pod{
+			const nodeName = "node2"
+			node, err := client.CoreV1().Nodes().Get(context.TODO(), nodeName, metav1.GetOptions{})
+			if err != nil {
+				return err
+			}
+			controller := true
+			_, err = client.CoreV1().Pods("ns").Create(context.TODO(), &corev1.Pod{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:        "node2mirrorpod",
 					Annotations: map[string]string{corev1.MirrorPodAnnotationKey: "true"},
+					OwnerReferences: []metav1.OwnerReference{{
+						APIVersion: corev1.SchemeGroupVersion.String(),
+						Kind:       "Node",
+						Name:       nodeName,
+						UID:        node.UID,
+						Controller: &controller,
+					}},
 				},
 				Spec: corev1.PodSpec{
-					NodeName:   "node2",
+					NodeName:   nodeName,
 					Containers: []corev1.Container{{Name: "image", Image: "busybox"}},
 				},
-			})
+			}, metav1.CreateOptions{})
 			return err
 		}
 	}
 	deleteNode2MirrorPod := func(client clientset.Interface) func() error {
 		return func() error {
 			zero := int64(0)
-			return client.CoreV1().Pods("ns").Delete("node2mirrorpod", &metav1.DeleteOptions{GracePeriodSeconds: &zero})
+			return client.CoreV1().Pods("ns").Delete(context.TODO(), "node2mirrorpod", metav1.DeleteOptions{GracePeriodSeconds: &zero})
 		}
 	}
 
 	createNode2 := func(client clientset.Interface) func() error {
 		return func() error {
-			_, err := client.CoreV1().Nodes().Create(&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node2"}})
-			return err
-		}
-	}
-	setNode2ConfigSource := func(client clientset.Interface) func() error {
-		return func() error {
-			node2, err := client.CoreV1().Nodes().Get("node2", metav1.GetOptions{})
-			if err != nil {
-				return err
-			}
-			node2.Spec.ConfigSource = &corev1.NodeConfigSource{
-				ConfigMap: &corev1.ConfigMapNodeConfigSource{
-					Namespace:        "ns",
-					Name:             "myconfigmapconfigsource",
-					KubeletConfigKey: "kubelet",
-				},
-			}
-			_, err = client.CoreV1().Nodes().Update(node2)
-			return err
-		}
-	}
-	unsetNode2ConfigSource := func(client clientset.Interface) func() error {
-		return func() error {
-			node2, err := client.CoreV1().Nodes().Get("node2", metav1.GetOptions{})
-			if err != nil {
-				return err
-			}
-			node2.Spec.ConfigSource = nil
-			_, err = client.CoreV1().Nodes().Update(node2)
+			_, err := client.CoreV1().Nodes().Create(context.TODO(), &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node2"}}, metav1.CreateOptions{})
 			return err
 		}
 	}
 	updateNode2Status := func(client clientset.Interface) func() error {
 		return func() error {
-			_, err := client.CoreV1().Nodes().UpdateStatus(&corev1.Node{
+			_, err := client.CoreV1().Nodes().UpdateStatus(context.TODO(), &corev1.Node{
 				ObjectMeta: metav1.ObjectMeta{Name: "node2"},
 				Status:     corev1.NodeStatus{},
-			})
+			}, metav1.UpdateOptions{})
 			return err
 		}
 	}
 	deleteNode2 := func(client clientset.Interface) func() error {
 		return func() error {
-			return client.CoreV1().Nodes().Delete("node2", nil)
+			return client.CoreV1().Nodes().Delete(context.TODO(), "node2", metav1.DeleteOptions{})
 		}
 	}
 	createNode2NormalPodEviction := func(client clientset.Interface) func() error {
 		return func() error {
 			zero := int64(0)
-			return client.PolicyV1beta1().Evictions("ns").Evict(&policy.Eviction{
+			return client.PolicyV1().Evictions("ns").Evict(context.TODO(), &policy.Eviction{
 				TypeMeta: metav1.TypeMeta{
-					APIVersion: "policy/v1beta1",
+					APIVersion: "policy/v1",
 					Kind:       "Eviction",
 				},
 				ObjectMeta: metav1.ObjectMeta{
@@ -316,9 +336,9 @@ func TestNodeAuthorizer(t *testing.T) {
 	createNode2MirrorPodEviction := func(client clientset.Interface) func() error {
 		return func() error {
 			zero := int64(0)
-			return client.PolicyV1beta1().Evictions("ns").Evict(&policy.Eviction{
+			return client.PolicyV1().Evictions("ns").Evict(context.TODO(), &policy.Eviction{
 				TypeMeta: metav1.TypeMeta{
-					APIVersion: "policy/v1beta1",
+					APIVersion: "policy/v1",
 					Kind:       "Eviction",
 				},
 				ObjectMeta: metav1.ObjectMeta{
@@ -336,7 +356,7 @@ func TestNodeAuthorizer(t *testing.T) {
 			capacity++
 			statusString := fmt.Sprintf("{\"status\": {\"capacity\": {\"storage\": \"%dG\"}}}", capacity)
 			patchBytes := []byte(statusString)
-			_, err := client.CoreV1().PersistentVolumeClaims("ns").Patch("mypvc", types.StrategicMergePatchType, patchBytes, "status")
+			_, err := client.CoreV1().PersistentVolumeClaims("ns").Patch(context.TODO(), "mypvc", types.StrategicMergePatchType, patchBytes, metav1.PatchOptions{}, "status")
 			return err
 		}
 	}
@@ -344,14 +364,14 @@ func TestNodeAuthorizer(t *testing.T) {
 	updatePVCPhase := func(client clientset.Interface) func() error {
 		return func() error {
 			patchBytes := []byte(`{"status":{"phase": "Bound"}}`)
-			_, err := client.CoreV1().PersistentVolumeClaims("ns").Patch("mypvc", types.StrategicMergePatchType, patchBytes, "status")
+			_, err := client.CoreV1().PersistentVolumeClaims("ns").Patch(context.TODO(), "mypvc", types.StrategicMergePatchType, patchBytes, metav1.PatchOptions{}, "status")
 			return err
 		}
 	}
 
 	getNode1Lease := func(client clientset.Interface) func() error {
 		return func() error {
-			_, err := client.CoordinationV1().Leases(corev1.NamespaceNodeLease).Get("node1", metav1.GetOptions{})
+			_, err := client.CoordinationV1().Leases(corev1.NamespaceNodeLease).Get(context.TODO(), "node1", metav1.GetOptions{})
 			return err
 		}
 	}
@@ -363,23 +383,23 @@ func TestNodeAuthorizer(t *testing.T) {
 					Name: "node1",
 				},
 				Spec: coordination.LeaseSpec{
-					HolderIdentity:       pointer.StringPtr("node1"),
-					LeaseDurationSeconds: pointer.Int32Ptr(node1LeaseDurationSeconds),
+					HolderIdentity:       ptr.To("node1"),
+					LeaseDurationSeconds: ptr.To[int32](node1LeaseDurationSeconds),
 					RenewTime:            &metav1.MicroTime{Time: time.Now()},
 				},
 			}
-			_, err := client.CoordinationV1().Leases(corev1.NamespaceNodeLease).Create(lease)
+			_, err := client.CoordinationV1().Leases(corev1.NamespaceNodeLease).Create(context.TODO(), lease, metav1.CreateOptions{})
 			return err
 		}
 	}
 	updateNode1Lease := func(client clientset.Interface) func() error {
 		return func() error {
-			lease, err := client.CoordinationV1().Leases(corev1.NamespaceNodeLease).Get("node1", metav1.GetOptions{})
+			lease, err := client.CoordinationV1().Leases(corev1.NamespaceNodeLease).Get(context.TODO(), "node1", metav1.GetOptions{})
 			if err != nil {
 				return err
 			}
 			lease.Spec.RenewTime = &metav1.MicroTime{Time: time.Now()}
-			_, err = client.CoordinationV1().Leases(corev1.NamespaceNodeLease).Update(lease)
+			_, err = client.CoordinationV1().Leases(corev1.NamespaceNodeLease).Update(context.TODO(), lease, metav1.UpdateOptions{})
 			return err
 		}
 	}
@@ -387,30 +407,30 @@ func TestNodeAuthorizer(t *testing.T) {
 		return func() error {
 			node1LeaseDurationSeconds++
 			bs := []byte(fmt.Sprintf(`{"spec": {"leaseDurationSeconds": %d}}`, node1LeaseDurationSeconds))
-			_, err := client.CoordinationV1().Leases(corev1.NamespaceNodeLease).Patch("node1", types.StrategicMergePatchType, bs)
+			_, err := client.CoordinationV1().Leases(corev1.NamespaceNodeLease).Patch(context.TODO(), "node1", types.StrategicMergePatchType, bs, metav1.PatchOptions{})
 			return err
 		}
 	}
 	deleteNode1Lease := func(client clientset.Interface) func() error {
 		return func() error {
-			return client.CoordinationV1().Leases(corev1.NamespaceNodeLease).Delete("node1", &metav1.DeleteOptions{})
+			return client.CoordinationV1().Leases(corev1.NamespaceNodeLease).Delete(context.TODO(), "node1", metav1.DeleteOptions{})
 		}
 	}
 
 	getNode1CSINode := func(client clientset.Interface) func() error {
 		return func() error {
-			_, err := client.StorageV1beta1().CSINodes().Get("node1", metav1.GetOptions{})
+			_, err := client.StorageV1().CSINodes().Get(context.TODO(), "node1", metav1.GetOptions{})
 			return err
 		}
 	}
 	createNode1CSINode := func(client clientset.Interface) func() error {
 		return func() error {
-			nodeInfo := &storagev1beta1.CSINode{
+			nodeInfo := &storagev1.CSINode{
 				ObjectMeta: metav1.ObjectMeta{
 					Name: "node1",
 				},
-				Spec: storagev1beta1.CSINodeSpec{
-					Drivers: []storagev1beta1.CSINodeDriver{
+				Spec: storagev1.CSINodeSpec{
+					Drivers: []storagev1.CSINodeDriver{
 						{
 							Name:         "com.example.csi.driver1",
 							NodeID:       "com.example.csi/node1",
@@ -419,24 +439,24 @@ func TestNodeAuthorizer(t *testing.T) {
 					},
 				},
 			}
-			_, err := client.StorageV1beta1().CSINodes().Create(nodeInfo)
+			_, err := client.StorageV1().CSINodes().Create(context.TODO(), nodeInfo, metav1.CreateOptions{})
 			return err
 		}
 	}
 	updateNode1CSINode := func(client clientset.Interface) func() error {
 		return func() error {
-			nodeInfo, err := client.StorageV1beta1().CSINodes().Get("node1", metav1.GetOptions{})
+			nodeInfo, err := client.StorageV1().CSINodes().Get(context.TODO(), "node1", metav1.GetOptions{})
 			if err != nil {
 				return err
 			}
-			nodeInfo.Spec.Drivers = []storagev1beta1.CSINodeDriver{
+			nodeInfo.Spec.Drivers = []storagev1.CSINodeDriver{
 				{
 					Name:         "com.example.csi.driver2",
 					NodeID:       "com.example.csi/node1",
 					TopologyKeys: []string{"com.example.csi/rack"},
 				},
 			}
-			_, err = client.StorageV1beta1().CSINodes().Update(nodeInfo)
+			_, err = client.StorageV1().CSINodes().Update(context.TODO(), nodeInfo, metav1.UpdateOptions{})
 			return err
 		}
 	}
@@ -444,13 +464,13 @@ func TestNodeAuthorizer(t *testing.T) {
 		return func() error {
 			bs := []byte(fmt.Sprintf(`{"csiDrivers": [ { "driver": "net.example.storage.driver2", "nodeID": "net.example.storage/node1", "topologyKeys": [ "net.example.storage/region" ] } ] }`))
 			// StrategicMergePatch is unsupported by CRs. Falling back to MergePatch
-			_, err := client.StorageV1beta1().CSINodes().Patch("node1", types.MergePatchType, bs)
+			_, err := client.StorageV1().CSINodes().Patch(context.TODO(), "node1", types.MergePatchType, bs, metav1.PatchOptions{})
 			return err
 		}
 	}
 	deleteNode1CSINode := func(client clientset.Interface) func() error {
 		return func() error {
-			return client.StorageV1beta1().CSINodes().Delete("node1", &metav1.DeleteOptions{})
+			return client.StorageV1().CSINodes().Delete(context.TODO(), "node1", metav1.DeleteOptions{})
 		}
 	}
 
@@ -466,10 +486,10 @@ func TestNodeAuthorizer(t *testing.T) {
 	expectForbidden(t, getConfigMap(nodeanonClient))
 	expectForbidden(t, getPVC(nodeanonClient))
 	expectForbidden(t, getPV(nodeanonClient))
+	expectForbidden(t, getResourceClaim(nodeanonClient))
+	expectForbidden(t, getResourceClaimTemplate(nodeanonClient))
 	expectForbidden(t, createNode2NormalPod(nodeanonClient))
-	expectForbidden(t, createNode2MirrorPod(nodeanonClient))
 	expectForbidden(t, deleteNode2NormalPod(nodeanonClient))
-	expectForbidden(t, deleteNode2MirrorPod(nodeanonClient))
 	expectForbidden(t, createNode2MirrorPodEviction(nodeanonClient))
 	expectForbidden(t, createNode2(nodeanonClient))
 	expectForbidden(t, updateNode2Status(nodeanonClient))
@@ -480,12 +500,12 @@ func TestNodeAuthorizer(t *testing.T) {
 	expectForbidden(t, getConfigMap(node1Client))
 	expectForbidden(t, getPVC(node1Client))
 	expectForbidden(t, getPV(node1Client))
+	expectForbidden(t, getResourceClaim(node1Client))
+	expectForbidden(t, getResourceClaimTemplate(node1Client))
 	expectForbidden(t, createNode2NormalPod(nodeanonClient))
-	expectForbidden(t, createNode2MirrorPod(node1Client))
-	expectNotFound(t, deleteNode2MirrorPod(node1Client))
 	expectNotFound(t, createNode2MirrorPodEviction(node1Client))
 	expectForbidden(t, createNode2(node1Client))
-	expectForbidden(t, updateNode2Status(node1Client))
+	expectNotFound(t, updateNode2Status(node1Client))
 	expectForbidden(t, deleteNode2(node1Client))
 
 	// related object requests from node2 fail
@@ -494,22 +514,28 @@ func TestNodeAuthorizer(t *testing.T) {
 	expectForbidden(t, getConfigMap(node2Client))
 	expectForbidden(t, getPVC(node2Client))
 	expectForbidden(t, getPV(node2Client))
+	expectForbidden(t, getResourceClaim(node2Client))
+	expectForbidden(t, getResourceClaimTemplate(node2Client))
 
 	expectForbidden(t, createNode2NormalPod(nodeanonClient))
 	// mirror pod and self node lifecycle is allowed
+	expectAllowed(t, createNode2(node2Client))
+	expectAllowed(t, updateNode2Status(node2Client))
+	expectForbidden(t, createNode2MirrorPod(nodeanonClient))
+	expectForbidden(t, deleteNode2MirrorPod(nodeanonClient))
+	expectForbidden(t, createNode2MirrorPod(node1Client))
+	expectNotFound(t, deleteNode2MirrorPod(node1Client))
+	// create a pod as an admin to add object references
+	expectAllowed(t, createNode2NormalPod(superuserClient))
+
 	expectAllowed(t, createNode2MirrorPod(node2Client))
 	expectAllowed(t, deleteNode2MirrorPod(node2Client))
 	expectAllowed(t, createNode2MirrorPod(node2Client))
 	expectAllowed(t, createNode2MirrorPodEviction(node2Client))
-	expectAllowed(t, createNode2(node2Client))
-	expectAllowed(t, updateNode2Status(node2Client))
 	// self deletion is not allowed
 	expectForbidden(t, deleteNode2(node2Client))
-	// clean up node2
-	expectAllowed(t, deleteNode2(superuserClient))
-
-	// create a pod as an admin to add object references
-	expectAllowed(t, createNode2NormalPod(superuserClient))
+	// modification of another node's status is not allowed
+	expectForbidden(t, updateNode2Status(node1Client))
 
 	// unidentifiable node and node1 are still forbidden
 	expectForbidden(t, getSecret(nodeanonClient))
@@ -517,6 +543,8 @@ func TestNodeAuthorizer(t *testing.T) {
 	expectForbidden(t, getConfigMap(nodeanonClient))
 	expectForbidden(t, getPVC(nodeanonClient))
 	expectForbidden(t, getPV(nodeanonClient))
+	expectForbidden(t, getResourceClaim(nodeanonClient))
+	expectForbidden(t, getResourceClaimTemplate(nodeanonClient))
 	expectForbidden(t, createNode2NormalPod(nodeanonClient))
 	expectForbidden(t, updateNode2NormalPodStatus(nodeanonClient))
 	expectForbidden(t, deleteNode2NormalPod(nodeanonClient))
@@ -530,6 +558,8 @@ func TestNodeAuthorizer(t *testing.T) {
 	expectForbidden(t, getConfigMap(node1Client))
 	expectForbidden(t, getPVC(node1Client))
 	expectForbidden(t, getPV(node1Client))
+	expectForbidden(t, getResourceClaim(node1Client))
+	expectForbidden(t, getResourceClaimTemplate(node1Client))
 	expectForbidden(t, createNode2NormalPod(node1Client))
 	expectForbidden(t, updateNode2NormalPodStatus(node1Client))
 	expectForbidden(t, deleteNode2NormalPod(node1Client))
@@ -545,6 +575,26 @@ func TestNodeAuthorizer(t *testing.T) {
 	expectAllowed(t, getPVC(node2Client))
 	expectAllowed(t, getPV(node2Client))
 
+	// node2 can only get direct claim references
+	expectAllowed(t, getResourceClaim(node2Client))
+	expectForbidden(t, getResourceClaimTemplate(node2Client))
+
+	// node cannot add a claim reference
+	expectForbidden(t, addResourceClaimTemplateReference(node2Client))
+	// superuser can add a claim reference
+	expectAllowed(t, addResourceClaimTemplateReference(superuserClient))
+	// node can get direct and template claim references
+	expectAllowed(t, getResourceClaim(node2Client))
+	expectAllowed(t, getResourceClaimTemplate(node2Client))
+
+	// node cannot remove a claim reference
+	expectForbidden(t, removeResourceClaimReference(node2Client))
+	// superuser can remove a claim reference
+	expectAllowed(t, removeResourceClaimReference(superuserClient))
+	// node2 can only get direct claim references
+	expectAllowed(t, getResourceClaim(node2Client))
+	expectForbidden(t, getResourceClaimTemplate(node2Client))
+
 	expectForbidden(t, createNode2NormalPod(node2Client))
 	expectAllowed(t, updateNode2NormalPodStatus(node2Client))
 	expectAllowed(t, deleteNode2NormalPod(node2Client))
@@ -556,17 +606,12 @@ func TestNodeAuthorizer(t *testing.T) {
 	expectAllowed(t, createNode2MirrorPod(superuserClient))
 	expectAllowed(t, createNode2NormalPodEviction(node2Client))
 	expectAllowed(t, createNode2MirrorPodEviction(node2Client))
+	// clean up node2
+	expectAllowed(t, deleteNode2(superuserClient))
 
 	// re-create a pod as an admin to add object references
 	expectAllowed(t, createNode2NormalPod(superuserClient))
 
-	// ExpandPersistentVolumes feature disabled
-	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ExpandPersistentVolumes, false)()
-	expectForbidden(t, updatePVCCapacity(node1Client))
-	expectForbidden(t, updatePVCCapacity(node2Client))
-
-	// ExpandPersistentVolumes feature enabled
-	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ExpandPersistentVolumes, true)()
 	expectForbidden(t, updatePVCCapacity(node1Client))
 	expectAllowed(t, updatePVCCapacity(node2Client))
 	expectForbidden(t, updatePVCPhase(node2Client))
@@ -577,24 +622,8 @@ func TestNodeAuthorizer(t *testing.T) {
 
 	// create node2 again
 	expectAllowed(t, createNode2(node2Client))
-	// node2 can not set its own config source
-	expectForbidden(t, setNode2ConfigSource(node2Client))
-	// node2 can not access the configmap config source yet
-	expectForbidden(t, getConfigMapConfigSource(node2Client))
-	// superuser can access the configmap config source
-	expectAllowed(t, getConfigMapConfigSource(superuserClient))
-	// superuser can set node2's config source
-	expectAllowed(t, setNode2ConfigSource(superuserClient))
-	// node2 can now get the configmap assigned as its config source
-	expectAllowed(t, getConfigMapConfigSource(node2Client))
-	// superuser can unset node2's config source
-	expectAllowed(t, unsetNode2ConfigSource(superuserClient))
-	// node2 can no longer get the configmap after it is unassigned as its config source
-	expectForbidden(t, getConfigMapConfigSource(node2Client))
 	// clean up node2
 	expectAllowed(t, deleteNode2(superuserClient))
-
-	//TODO(mikedanese): integration test node restriction of TokenRequest
 
 	// node1 allowed to operate on its own lease
 	expectAllowed(t, createNode1Lease(node1Client))
@@ -621,6 +650,32 @@ func TestNodeAuthorizer(t *testing.T) {
 	expectForbidden(t, updateNode1CSINode(csiNode2Client))
 	expectForbidden(t, patchNode1CSINode(csiNode2Client))
 	expectForbidden(t, deleteNode1CSINode(csiNode2Client))
+
+	// Always allowed. Permission to delete specific objects is checked per object.
+	// Beware, this is destructive!
+	expectAllowed(t, deleteResourceSliceCollection(csiNode1Client, ptr.To("node1")))
+
+	// One slice must have been deleted, the other not.
+	slices, err := superuserClient.ResourceV1().ResourceSlices().List(context.TODO(), metav1.ListOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(slices.Items) != 1 {
+		t.Fatalf("unexpected slices: %v", slices.Items)
+	}
+	if ptr.Deref(slices.Items[0].Spec.NodeName, "") != "node2" {
+		t.Fatal("wrong slice deleted")
+	}
+
+	// Superuser can delete.
+	expectAllowed(t, deleteResourceSliceCollection(superuserClient, nil))
+	slices, err = superuserClient.ResourceV1().ResourceSlices().List(context.TODO(), metav1.ListOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(slices.Items) != 0 {
+		t.Fatalf("unexpected slices: %v", slices.Items)
+	}
 }
 
 // expect executes a function a set number of times until it either returns the
@@ -642,14 +697,14 @@ func expect(t *testing.T, f func() error, wantErr func(error) bool) (timeout boo
 
 func expectForbidden(t *testing.T, f func() error) {
 	t.Helper()
-	if ok, err := expect(t, f, errors.IsForbidden); !ok {
+	if ok, err := expect(t, f, apierrors.IsForbidden); !ok {
 		t.Errorf("Expected forbidden error, got %v", err)
 	}
 }
 
 func expectNotFound(t *testing.T, f func() error) {
 	t.Helper()
-	if ok, err := expect(t, f, errors.IsNotFound); !ok {
+	if ok, err := expect(t, f, apierrors.IsNotFound); !ok {
 		t.Errorf("Expected notfound error, got %v", err)
 	}
 }
@@ -661,16 +716,904 @@ func expectAllowed(t *testing.T, f func() error) {
 	}
 }
 
-// crdFromManifest reads a .json/yaml file and returns the CRD in it.
-func crdFromManifest(filename string) (*apiextensionsv1beta1.CustomResourceDefinition, error) {
-	var crd apiextensionsv1beta1.CustomResourceDefinition
-	data, err := ioutil.ReadFile(filename)
+func checkNilError(t *testing.T, err error) {
+	t.Helper()
 	if err != nil {
-		return nil, err
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func expectedForbiddenMessage(t *testing.T, f func() error, expectedMessage string) {
+	t.Helper()
+	if ok, err := expect(t, f, func(e error) bool { return apierrors.IsForbidden(e) && strings.Contains(e.Error(), expectedMessage) }); !ok {
+		t.Errorf("Expected forbidden error with message %q, got %v", expectedMessage, err)
+	}
+}
+
+// TestNodeRestrictionServiceAccount is an integration test to verify that
+// the NodeRestriction admission plugin
+// - forbids kubelet to request a token for a service account token that's not bound to a pod
+// - forbids kubelet to request a token for a service account token when pod is not found
+// - kubelet successfully requests a token for a service account token when pod is found and uid matches
+// This test is run with the ServiceAccountNodeAudienceRestriction feature disabled
+// to validate the default behavior of the NodeRestriction admission plugin.
+func TestNodeRestrictionServiceAccount(t *testing.T) {
+	const (
+		// Define credentials
+		// Fake values for testing.
+		tokenMaster = "master-token"
+		tokenNode1  = "node1-token"
+		tokenNode2  = "node2-token"
+	)
+
+	tokenFile, err := os.CreateTemp("", "kubeconfig")
+	checkNilError(t, err)
+
+	_, err = tokenFile.WriteString(strings.Join([]string{
+		fmt.Sprintf(`%s,admin,uid1,"system:masters"`, tokenMaster),
+		fmt.Sprintf(`%s,system:node:node1,uid3,"system:nodes"`, tokenNode1),
+		fmt.Sprintf(`%s,system:node:node2,uid4,"system:nodes"`, tokenNode2),
+	}, "\n"))
+	checkNilError(t, err)
+	checkNilError(t, tokenFile.Close())
+
+	featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ServiceAccountNodeAudienceRestriction, false)
+
+	server := kubeapiservertesting.StartTestServerOrDie(t, nil, []string{
+		"--runtime-config=api/all=true",
+		"--authorization-mode", "Node,RBAC",
+		"--token-auth-file", tokenFile.Name(),
+		"--enable-admission-plugins", "NodeRestriction",
+		"--disable-admission-plugins", "ServiceAccount,TaintNodesByCondition",
+	}, framework.SharedEtcd())
+	defer server.TearDownFn()
+
+	// Build client config and superuser clientset
+	clientConfig := server.ClientConfig
+	superuserClient, _ := clientsetForToken(tokenMaster, clientConfig)
+
+	if _, err := superuserClient.CoreV1().Namespaces().Create(context.TODO(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "ns"}}, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
 	}
 
-	if err := runtime.DecodeInto(scheme.Codecs.UniversalDecoder(), data, &crd); err != nil {
-		return nil, err
+	// RBAC permissions are required to test service account token requests
+	// using the node client because we cannot rely on the node authorizer since we have not
+	// configured the references needed for it to work.  This test is focused on exercising
+	// the node admission logic, not the node authorizer logic.  We want to know what happens
+	// in admission if the request was already authorized.
+	configureRBACForServiceAccountToken(t, superuserClient)
+
+	createTokenRequestNodeNotBoundToPod := func(client clientset.Interface) func() error {
+		return func() error {
+			_, err := client.CoreV1().ServiceAccounts("ns").CreateToken(context.TODO(), "default", &authenticationv1.TokenRequest{}, metav1.CreateOptions{})
+			return err
+		}
 	}
-	return &crd, nil
+
+	node1Client, _ := clientsetForToken(tokenNode1, clientConfig)
+	createNode(t, node1Client, "node1")
+	node2Client, _ := clientsetForToken(tokenNode2, clientConfig)
+
+	t.Run("service account token request is forbidden when not bound to a pod", func(t *testing.T) {
+		expectedForbiddenMessage(t, createTokenRequestNodeNotBoundToPod(node1Client), "node requested token not bound to a pod")
+	})
+
+	t.Run("service account token request is forbidden when pod is not found", func(t *testing.T) {
+		expectNotFound(t, createTokenRequest(node1Client, "uid1", tokenRequestWithAudiences("")))
+	})
+
+	t.Run("uid in token request does not match pod uid is forbidden", func(t *testing.T) {
+		createPod(t, superuserClient, nil)
+		expectedForbiddenMessage(t, createTokenRequest(node1Client, "random-uid", tokenRequestWithAudiences("")), "the UID in the bound object reference (random-uid) does not match the UID in record. The object might have been deleted and then recreated")
+		deletePod(t, superuserClient, "pod1")
+	})
+
+	t.Run("node requesting token for pod bound to different node is forbidden", func(t *testing.T) {
+		pod := createPod(t, superuserClient, nil)
+		expectedForbiddenMessage(t, createTokenRequest(node2Client, pod.UID, tokenRequestWithAudiences("")), "node requested token bound to a pod scheduled on a different node")
+		deletePod(t, superuserClient, "pod1")
+	})
+
+	t.Run("service account token request is successful", func(t *testing.T) {
+		// create a pod as an admin to add object references
+		pod := createPod(t, superuserClient, nil)
+		createServiceAccount(t, superuserClient, "ns", "default")
+		expectAllowed(t, createTokenRequest(node1Client, pod.UID, tokenRequestWithAudiences("")))
+	})
+}
+
+// TestNodeRestrictionServiceAccountAudience is an integration test to verify that
+// the NodeRestriction admission plugin
+// - allows kubelet to request a token for a service account that's in the pod spec
+//  1. pod --> ephemeral --> pvc --> pv --> csi --> driver --> tokenrequest with audience
+//  2. pod --> pvc --> pv --> csi --> driver --> tokenrequest with audience
+//  3. pod --> csi --> driver --> tokenrequest with audience
+//  4. pod --> projected --> service account token with audience
+//
+// - allows kubelet to request a token for a service account based on subjectacccessreview
+//  1. clusterrole and clusterrolebinding allowing a node to request specific audience for a service account
+//  2. clusterrole and rolebinding allowing a node to request specific audience for a service account
+//  3. role and rolebinding allowing a node to request specific audience for a service account in a namespace
+//  4. clusterrole and rolebinding allowing a node to request specific audience for any service account in a namespace
+//  5. clusterrole and rolebinding allowing any node to request any audience for a service account in a namespace
+//  6. clusterrole and rolebinding allowing any node to request any audience for any service account in a namespace
+//  7. api server audience "" configured with rbac role
+//
+// - forbids kubelet to request a token for a service account that's not in the pod spec
+// when the ServiceAccountNodeAudienceRestriction feature is enabled.
+func TestNodeRestrictionServiceAccountAudience(t *testing.T) {
+	const (
+		// Define credentials
+		// Fake values for testing.
+		tokenMaster = "master-token"
+		tokenNode1  = "node1-token"
+	)
+
+	tokenFile, err := os.CreateTemp("", "kubeconfig")
+	checkNilError(t, err)
+
+	_, err = tokenFile.WriteString(strings.Join([]string{
+		fmt.Sprintf(`%s,admin,uid1,"system:masters"`, tokenMaster),
+		fmt.Sprintf(`%s,system:node:node1,uid3,"system:nodes"`, tokenNode1),
+	}, "\n"))
+	checkNilError(t, err)
+	checkNilError(t, tokenFile.Close())
+
+	featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ServiceAccountNodeAudienceRestriction, true)
+
+	server := kubeapiservertesting.StartTestServerOrDie(t, nil, []string{
+		"--runtime-config=api/all=true",
+		"--authorization-mode", "Node,RBAC",
+		"--token-auth-file", tokenFile.Name(),
+		"--enable-admission-plugins", "NodeRestriction",
+		"--disable-admission-plugins", "TaintNodesByCondition",
+	}, framework.SharedEtcd())
+	defer server.TearDownFn()
+
+	kubeConfigFile := createKubeConfigFileForRestConfig(t, server.ClientConfig)
+
+	ctx := testContext(t)
+
+	kcm := kubecontrollermanagertesting.StartTestServerOrDie(t, ctx, []string{
+		"--kubeconfig=" + kubeConfigFile,
+		"--controllers=ephemeral-volume-controller", // we need this controller to test the ephemeral volume source in the pod
+		"--leader-elect=false",                      // KCM leader election calls os.Exit when it ends, so it is easier to just turn it off altogether
+	})
+	defer kcm.TearDownFn()
+
+	// Build client config and superuser clientset
+	clientConfig := server.ClientConfig
+	superuserClient, _ := clientsetForToken(tokenMaster, clientConfig)
+
+	if _, err := superuserClient.CoreV1().Namespaces().Create(context.TODO(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "ns"}}, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	// RBAC permissions are required to test service account token requests
+	// using the node client because we cannot rely on the node authorizer since we have not
+	// configured the references needed for it to work.  This test is focused on exercising
+	// the node admission logic, not the node authorizer logic.  We want to know what happens
+	// in admission if the request was already authorized.
+	configureRBACForServiceAccountToken(t, superuserClient)
+
+	_, err = superuserClient.CoreV1().PersistentVolumeClaims("ns").Create(context.TODO(), &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{Name: "mypvc"},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadOnlyMany},
+			Resources:   corev1.VolumeResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("1")}},
+			VolumeName:  "mypv",
+		},
+	}, metav1.CreateOptions{})
+	checkNilError(t, err)
+
+	_, err = superuserClient.CoreV1().PersistentVolumes().Create(context.TODO(), &corev1.PersistentVolume{
+		ObjectMeta: metav1.ObjectMeta{Name: "mypv"},
+		Spec: corev1.PersistentVolumeSpec{
+			AccessModes:            []corev1.PersistentVolumeAccessMode{corev1.ReadOnlyMany},
+			Capacity:               corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("1")},
+			ClaimRef:               &corev1.ObjectReference{Namespace: "ns", Name: "mypvc"},
+			PersistentVolumeSource: corev1.PersistentVolumeSource{CSI: &corev1.CSIPersistentVolumeSource{Driver: "com.example.csi.mydriver", VolumeHandle: "handle"}},
+		},
+	}, metav1.CreateOptions{})
+	checkNilError(t, err)
+
+	_, err = superuserClient.CoreV1().PersistentVolumeClaims("ns").Create(context.TODO(), &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{Name: "mypvc-azurefile"},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadOnlyMany},
+			Resources:   corev1.VolumeResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("1")}},
+			VolumeName:  "mypv-azurefile",
+		},
+	}, metav1.CreateOptions{})
+	checkNilError(t, err)
+
+	_, err = superuserClient.CoreV1().PersistentVolumes().Create(context.TODO(), &corev1.PersistentVolume{
+		ObjectMeta: metav1.ObjectMeta{Name: "mypv-azurefile"},
+		Spec: corev1.PersistentVolumeSpec{
+			AccessModes:            []corev1.PersistentVolumeAccessMode{corev1.ReadOnlyMany},
+			Capacity:               corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("1")},
+			ClaimRef:               &corev1.ObjectReference{Namespace: "ns", Name: "mypvc-azurefile"},
+			PersistentVolumeSource: corev1.PersistentVolumeSource{AzureFile: &corev1.AzureFilePersistentVolumeSource{ShareName: "share", SecretName: "secret"}},
+		},
+	}, metav1.CreateOptions{})
+	checkNilError(t, err)
+
+	node1Client, _ := clientsetForToken(tokenNode1, clientConfig)
+	createNode(t, node1Client, "node1")
+	createServiceAccount(t, superuserClient, "ns", "default")
+
+	t.Run("projected volume source with empty audience works", func(t *testing.T) {
+		projectedVolumeSourceEmptyAudience := &corev1.ProjectedVolumeSource{Sources: []corev1.VolumeProjection{{ServiceAccountToken: &corev1.ServiceAccountTokenProjection{Audience: "", Path: "path"}}}}
+		pod := createPod(t, superuserClient, []corev1.Volume{{Name: "foo", VolumeSource: corev1.VolumeSource{Projected: projectedVolumeSourceEmptyAudience}}})
+		expectAllowed(t, createTokenRequest(node1Client, pod.UID, tokenRequestWithAudiences("")))
+		deletePod(t, superuserClient, "pod1")
+	})
+
+	t.Run("projected volume source with non-empty audience works", func(t *testing.T) {
+		projectedVolumeSource := &corev1.ProjectedVolumeSource{Sources: []corev1.VolumeProjection{{ServiceAccountToken: &corev1.ServiceAccountTokenProjection{Audience: "projected-audience", Path: "path"}}}}
+		pod := createPod(t, superuserClient, []corev1.Volume{{Name: "foo", VolumeSource: corev1.VolumeSource{Projected: projectedVolumeSource}}})
+		expectAllowed(t, createTokenRequest(node1Client, pod.UID, tokenRequestWithAudiences("projected-audience")))
+		deletePod(t, superuserClient, "pod1")
+	})
+
+	t.Run("pod --> csi --> driver --> tokenrequest with audience forbidden - CSI driver not found", func(t *testing.T) {
+		csiDriverVolumeSource := &corev1.CSIVolumeSource{Driver: "com.example.csi.mydriver"}
+		pod := createPod(t, superuserClient, []corev1.Volume{{Name: "foo", VolumeSource: corev1.VolumeSource{CSI: csiDriverVolumeSource}}})
+		expectedForbiddenMessage(t, createTokenRequest(node1Client, pod.UID, tokenRequestWithAudiences("csidrivernotfound-audience")), `error validating audience "csidrivernotfound-audience": csidriver.storage.k8s.io "com.example.csi.mydriver" not found`)
+		deletePod(t, superuserClient, "pod1")
+	})
+
+	t.Run("pod --> csi --> driver --> tokenrequest with audience allowed via authz bypass even when CSI driver not found", func(t *testing.T) {
+		cr := &rbacv1.ClusterRole{
+			ObjectMeta: metav1.ObjectMeta{Name: "audience-access-for-node1"},
+			Rules: []rbacv1.PolicyRule{{
+				APIGroups:     []string{""},
+				Resources:     []string{"csidrivernotfound-bypass-audience"},
+				Verbs:         []string{"request-serviceaccounts-token-audience"},
+				ResourceNames: []string{},
+			}},
+		}
+		crb := &rbacv1.ClusterRoleBinding{
+			ObjectMeta: metav1.ObjectMeta{Name: "audience-access-for-node1"},
+			Subjects:   []rbacv1.Subject{{Kind: "User", Name: "system:node:node1"}},
+			RoleRef:    rbacv1.RoleRef{APIGroup: rbacv1.GroupName, Kind: "ClusterRole", Name: "audience-access-for-node1"},
+		}
+
+		csiDriverVolumeSource := &corev1.CSIVolumeSource{Driver: "com.example.csi.mydriver"}
+		pod := createPod(t, superuserClient, []corev1.Volume{{Name: "foo", VolumeSource: corev1.VolumeSource{CSI: csiDriverVolumeSource}}})
+
+		// Without the authz grant, the missing CSI driver makes the request fail
+		// with the underlying lookup error.
+		expectedForbiddenMessage(t, createTokenRequest(node1Client, pod.UID, tokenRequestWithAudiences("csidrivernotfound-bypass-audience")), `error validating audience "csidrivernotfound-bypass-audience": csidriver.storage.k8s.io "com.example.csi.mydriver" not found`)
+
+		createRBACClusterRole(t, cr, superuserClient)
+		createRBACClusterRoleBinding(t, crb, superuserClient)
+
+		// The authz bypass must still take effect on the error path.
+		expectAllowed(t, createTokenRequest(node1Client, pod.UID, tokenRequestWithAudiences("csidrivernotfound-bypass-audience")))
+
+		deleteRBACClusterRole(t, cr, superuserClient)
+		deleteRBACClusterRoleBinding(t, crb, superuserClient)
+		// After the delete use a expectedForbiddenMessage to wait for the RBAC authorizer to catch up.
+		expectedForbiddenMessage(t, createTokenRequest(node1Client, pod.UID, tokenRequestWithAudiences("csidrivernotfound-bypass-audience")), `error validating audience "csidrivernotfound-bypass-audience": csidriver.storage.k8s.io "com.example.csi.mydriver" not found`)
+		deletePod(t, superuserClient, "pod1")
+	})
+
+	t.Run("pod --> csi --> driver --> tokenrequest with audience works", func(t *testing.T) {
+		createCSIDriver(t, superuserClient, "csidriver-audience", "com.example.csi.mydriver")
+		csiDriverVolumeSource := &corev1.CSIVolumeSource{Driver: "com.example.csi.mydriver"}
+		pod := createPod(t, superuserClient, []corev1.Volume{{Name: "foo", VolumeSource: corev1.VolumeSource{CSI: csiDriverVolumeSource}}})
+		expectAllowed(t, createTokenRequest(node1Client, pod.UID, tokenRequestWithAudiences("csidriver-audience")))
+		deletePod(t, superuserClient, "pod1")
+		deleteCSIDriver(t, superuserClient, "com.example.csi.mydriver")
+	})
+
+	t.Run("pod --> pvc --> pv --> csi --> driver --> tokenrequest with audience forbidden - CSI driver not found", func(t *testing.T) {
+		persistentVolumeClaimVolumeSource := &corev1.PersistentVolumeClaimVolumeSource{ClaimName: "mypvc"}
+		pod := createPod(t, superuserClient, []corev1.Volume{{Name: "foo", VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: persistentVolumeClaimVolumeSource}}})
+		expectedForbiddenMessage(t, createTokenRequest(node1Client, pod.UID, tokenRequestWithAudiences("pvc-csidrivernotfound-audience")), `error validating audience "pvc-csidrivernotfound-audience": csidriver.storage.k8s.io "com.example.csi.mydriver" not found`)
+		deletePod(t, superuserClient, "pod1")
+	})
+
+	t.Run("pod --> pvc --> pv --> csi --> driver --> tokenrequest with audience forbidden - pvc not found", func(t *testing.T) {
+		createCSIDriver(t, superuserClient, "pvcnotfound-audience", "com.example.csi.mydriver")
+		persistentVolumeClaimVolumeSource := &corev1.PersistentVolumeClaimVolumeSource{ClaimName: "mypvc1"}
+		pod := createPod(t, superuserClient, []corev1.Volume{{Name: "foo", VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: persistentVolumeClaimVolumeSource}}})
+		expectedForbiddenMessage(t, createTokenRequest(node1Client, pod.UID, tokenRequestWithAudiences("pvcnotfound-audience")), `error validating audience "pvcnotfound-audience": persistentvolumeclaim "mypvc1" not found`)
+		deletePod(t, superuserClient, "pod1")
+		deleteCSIDriver(t, superuserClient, "com.example.csi.mydriver")
+	})
+
+	t.Run("pod --> pvc --> pv --> csi --> driver --> tokenrequest with audience works", func(t *testing.T) {
+		createCSIDriver(t, superuserClient, "pvccsidriver-audience", "com.example.csi.mydriver")
+		persistentVolumeClaimVolumeSource := &corev1.PersistentVolumeClaimVolumeSource{ClaimName: "mypvc"}
+		pod := createPod(t, superuserClient, []corev1.Volume{{Name: "foo", VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: persistentVolumeClaimVolumeSource}}})
+		expectAllowed(t, createTokenRequest(node1Client, pod.UID, tokenRequestWithAudiences("pvccsidriver-audience")))
+		deletePod(t, superuserClient, "pod1")
+		deleteCSIDriver(t, superuserClient, "com.example.csi.mydriver")
+	})
+
+	t.Run("pod --> ephemeral --> pvc --> pv --> csi --> driver --> tokenrequest with audience forbidden - CSI driver not found", func(t *testing.T) {
+		ephemeralVolumeSource := &corev1.EphemeralVolumeSource{VolumeClaimTemplate: &corev1.PersistentVolumeClaimTemplate{
+			Spec: corev1.PersistentVolumeClaimSpec{
+				AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadOnlyMany},
+				Resources:   corev1.VolumeResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("1")}},
+				VolumeName:  "mypv",
+			}}}
+		pod := createPod(t, superuserClient, []corev1.Volume{{Name: "foo", VolumeSource: corev1.VolumeSource{Ephemeral: ephemeralVolumeSource}}})
+		expectedForbiddenMessage(t, createTokenRequest(node1Client, pod.UID, tokenRequestWithAudiences("ephemeral-csidrivernotfound-audience")), `error validating audience "ephemeral-csidrivernotfound-audience": csidriver.storage.k8s.io "com.example.csi.mydriver" not found`)
+		deletePod(t, superuserClient, "pod1")
+	})
+
+	t.Run("pod --> ephemeral --> pvc --> pv --> csi --> driver --> tokenrequest with audience works", func(t *testing.T) {
+		createCSIDriver(t, superuserClient, "ephemeralcsidriver-audience", "com.example.csi.mydriver")
+		ephemeralVolumeSource := &corev1.EphemeralVolumeSource{VolumeClaimTemplate: &corev1.PersistentVolumeClaimTemplate{
+			Spec: corev1.PersistentVolumeClaimSpec{
+				AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadOnlyMany},
+				Resources:   corev1.VolumeResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("1")}},
+				VolumeName:  "mypv",
+			}}}
+		pod := createPod(t, superuserClient, []corev1.Volume{{Name: "foo", VolumeSource: corev1.VolumeSource{Ephemeral: ephemeralVolumeSource}}})
+		expectAllowed(t, createTokenRequest(node1Client, pod.UID, tokenRequestWithAudiences("ephemeralcsidriver-audience")))
+		deletePod(t, superuserClient, "pod1")
+		deleteCSIDriver(t, superuserClient, "com.example.csi.mydriver")
+	})
+
+	t.Run("csidriver exists but tokenrequest audience not found should be forbidden", func(t *testing.T) {
+		createCSIDriver(t, superuserClient, "csidriver-audience", "com.example.csi.mydriver")
+		pod := createPod(t, superuserClient, nil)
+		expectedForbiddenMessage(t, createTokenRequest(node1Client, pod.UID, tokenRequestWithAudiences("csidriver-audience-not-found")), `is not authorized to request tokens for audience "csidriver-audience-not-found"`)
+		deletePod(t, superuserClient, "pod1")
+		deleteCSIDriver(t, superuserClient, "com.example.csi.mydriver")
+	})
+
+	t.Run("pvc and csidriver exists but tokenrequest audience not found should be forbidden", func(t *testing.T) {
+		createCSIDriver(t, superuserClient, "csidriver-audience", "com.example.csi.mydriver")
+		persistentVolumeClaimVolumeSource := &corev1.PersistentVolumeClaimVolumeSource{ClaimName: "mypvc"}
+		pod := createPod(t, superuserClient, []corev1.Volume{{Name: "foo", VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: persistentVolumeClaimVolumeSource}}})
+		expectedForbiddenMessage(t, createTokenRequest(node1Client, pod.UID, tokenRequestWithAudiences("csidriver-audience-not-found")), `is not authorized to request tokens for audience "csidriver-audience-not-found"`)
+		deletePod(t, superuserClient, "pod1")
+		deleteCSIDriver(t, superuserClient, "com.example.csi.mydriver")
+	})
+
+	t.Run("ephemeral volume source with audience not found should be forbidden", func(t *testing.T) {
+		createCSIDriver(t, superuserClient, "csidriver-audience", "com.example.csi.mydriver")
+		ephemeralVolumeSource := &corev1.EphemeralVolumeSource{VolumeClaimTemplate: &corev1.PersistentVolumeClaimTemplate{
+			Spec: corev1.PersistentVolumeClaimSpec{
+				AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadOnlyMany},
+				Resources:   corev1.VolumeResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("1")}},
+				VolumeName:  "mypv",
+			}}}
+		pod := createPod(t, superuserClient, []corev1.Volume{{Name: "foo", VolumeSource: corev1.VolumeSource{Ephemeral: ephemeralVolumeSource}}})
+		expectedForbiddenMessage(t, createTokenRequest(node1Client, pod.UID, tokenRequestWithAudiences("csidriver-audience-not-found")), `is not authorized to request tokens for audience "csidriver-audience-not-found"`)
+		deletePod(t, superuserClient, "pod1")
+		deleteCSIDriver(t, superuserClient, "com.example.csi.mydriver")
+	})
+
+	t.Run("intree pv to csi migration, pod --> csi --> driver --> tokenrequest with audience works", func(t *testing.T) {
+		createCSIDriver(t, superuserClient, "csidriver-audience", "file.csi.azure.com")
+		pod := createPod(t, superuserClient, []corev1.Volume{{Name: "foo", VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: "mypvc-azurefile"}}}})
+		expectAllowed(t, createTokenRequest(node1Client, pod.UID, tokenRequestWithAudiences("csidriver-audience")))
+		deletePod(t, superuserClient, "pod1")
+		deleteCSIDriver(t, superuserClient, "file.csi.azure.com")
+	})
+
+	t.Run("intree inline volume to csi migration, pod --> csi --> driver --> tokenrequest with audience works", func(t *testing.T) {
+		createCSIDriver(t, superuserClient, "csidriver-audience", "file.csi.azure.com")
+		pod := createPod(t, superuserClient, []corev1.Volume{{Name: "foo", VolumeSource: corev1.VolumeSource{AzureFile: &corev1.AzureFileVolumeSource{ShareName: "default", SecretName: "mypvsecret"}}}})
+		expectAllowed(t, createTokenRequest(node1Client, pod.UID, tokenRequestWithAudiences("csidriver-audience")))
+		deletePod(t, superuserClient, "pod1")
+		deleteCSIDriver(t, superuserClient, "file.csi.azure.com")
+	})
+
+	t.Run("token request with multiple audiences should be forbidden", func(t *testing.T) {
+		pod := createPod(t, superuserClient, nil)
+		expectedForbiddenMessage(t, createTokenRequest(node1Client, pod.UID, tokenRequestWithAudiences("audience1", "audience2")), "node may only request 0 or 1 audiences")
+		deletePod(t, superuserClient, "pod1")
+	})
+
+	t.Run("clusterrole and clusterrolebinding allowing node1 to request audience1 should work", func(t *testing.T) {
+		cr := &rbacv1.ClusterRole{
+			ObjectMeta: metav1.ObjectMeta{Name: "audience-access-for-node1"},
+			Rules: []rbacv1.PolicyRule{{
+				APIGroups:     []string{""},
+				Resources:     []string{"audience1"},
+				Verbs:         []string{"request-serviceaccounts-token-audience"},
+				ResourceNames: []string{"some-random-name"},
+			}},
+		}
+		crb := &rbacv1.ClusterRoleBinding{
+			ObjectMeta: metav1.ObjectMeta{Name: "audience-access-for-node1"},
+			Subjects:   []rbacv1.Subject{{Kind: "User", Name: "system:node:node1"}},
+			RoleRef:    rbacv1.RoleRef{APIGroup: rbacv1.GroupName, Kind: "ClusterRole", Name: "audience-access-for-node1"},
+		}
+
+		createServiceAccount(t, superuserClient, "ns", "some-random-name")
+		pod := createPod(t, superuserClient, nil, podWithServiceAccountName("some-random-name"))
+		expectedForbiddenMessage(t, createTokenRequest(node1Client, pod.UID, tokenRequestWithAudiences("audience1"), tokenRequestWithName("some-random-name")), `system:node:node1 is not authorized to request tokens for audience "audience1"`)
+		expectedForbiddenMessage(t, createTokenRequest(node1Client, pod.UID, tokenRequestWithAudiences("audience2"), tokenRequestWithName("some-random-name")), `system:node:node1 is not authorized to request tokens for audience "audience2"`)
+
+		createRBACClusterRole(t, cr, superuserClient)
+		createRBACClusterRoleBinding(t, crb, superuserClient)
+
+		expectAllowed(t, createTokenRequest(node1Client, pod.UID, tokenRequestWithAudiences("audience1"), tokenRequestWithName("some-random-name")))
+		expectedForbiddenMessage(t, createTokenRequest(node1Client, pod.UID, tokenRequestWithAudiences("audience2"), tokenRequestWithName("some-random-name")), `system:node:node1 is not authorized to request tokens for audience "audience2"`)
+
+		deleteRBACClusterRole(t, cr, superuserClient)
+		deleteRBACClusterRoleBinding(t, crb, superuserClient)
+		// After the delete use a expectedForbiddenMessage to wait for the RBAC authorizer to catch up.
+		expectedForbiddenMessage(t, createTokenRequest(node1Client, pod.UID, tokenRequestWithAudiences("audience1"), tokenRequestWithName("some-random-name")), `system:node:node1 is not authorized to request tokens for audience "audience1"`)
+		deletePod(t, superuserClient, "pod1")
+		deleteServiceAccount(t, superuserClient, "ns", "some-random-name")
+	})
+
+	t.Run("clusterrole and rolebinding in a namespace allowing node1 to request audience1 should work", func(t *testing.T) {
+		cr := &rbacv1.ClusterRole{
+			ObjectMeta: metav1.ObjectMeta{Name: "audience-access-for-node1"},
+			Rules: []rbacv1.PolicyRule{{
+				APIGroups:     []string{""},
+				Resources:     []string{"audience1"},
+				Verbs:         []string{"request-serviceaccounts-token-audience"},
+				ResourceNames: []string{"default"},
+			}},
+		}
+		rb := &rbacv1.RoleBinding{
+			ObjectMeta: metav1.ObjectMeta{Name: "audience-access-for-node1", Namespace: "ns"},
+			Subjects:   []rbacv1.Subject{{Kind: "User", Name: "system:node:node1"}},
+			RoleRef:    rbacv1.RoleRef{APIGroup: rbacv1.GroupName, Kind: "ClusterRole", Name: "audience-access-for-node1"},
+		}
+
+		pod := createPod(t, superuserClient, nil)
+		expectedForbiddenMessage(t, createTokenRequest(node1Client, pod.UID, tokenRequestWithAudiences("audience1")), `system:node:node1 is not authorized to request tokens for audience "audience1"`)
+		expectedForbiddenMessage(t, createTokenRequest(node1Client, pod.UID, tokenRequestWithAudiences("audience2")), `system:node:node1 is not authorized to request tokens for audience "audience2"`)
+
+		createRBACClusterRole(t, cr, superuserClient)
+		createRBACRoleBinding(t, rb, superuserClient)
+
+		expectAllowed(t, createTokenRequest(node1Client, pod.UID, tokenRequestWithAudiences("audience1")))
+		expectedForbiddenMessage(t, createTokenRequest(node1Client, pod.UID, tokenRequestWithAudiences("audience2")), `system:node:node1 is not authorized to request tokens for audience "audience2"`)
+
+		deleteRBACClusterRole(t, cr, superuserClient)
+		deleteRBACRoleBinding(t, rb, superuserClient)
+		// After the delete use a expectedForbiddenMessage to wait for the RBAC authorizer to catch up.
+		expectedForbiddenMessage(t, createTokenRequest(node1Client, pod.UID, tokenRequestWithAudiences("audience1")), `system:node:node1 is not authorized to request tokens for audience "audience1"`)
+		deletePod(t, superuserClient, "pod1")
+	})
+
+	t.Run("role and rolebinding in a namespace allowing node1 to request audience1 should work", func(t *testing.T) {
+		role := &rbacv1.Role{
+			ObjectMeta: metav1.ObjectMeta{Name: "audience-access-for-node1", Namespace: "ns"},
+			Rules: []rbacv1.PolicyRule{{
+				APIGroups:     []string{""},
+				Resources:     []string{"audience1"},
+				Verbs:         []string{"request-serviceaccounts-token-audience"},
+				ResourceNames: []string{"default"},
+			}},
+		}
+		rb := &rbacv1.RoleBinding{
+			ObjectMeta: metav1.ObjectMeta{Name: "audience-access-for-node1", Namespace: "ns"},
+			Subjects:   []rbacv1.Subject{{Kind: "User", Name: "system:node:node1"}},
+			RoleRef:    rbacv1.RoleRef{APIGroup: rbacv1.GroupName, Kind: "Role", Name: "audience-access-for-node1"},
+		}
+
+		pod := createPod(t, superuserClient, nil)
+		expectedForbiddenMessage(t, createTokenRequest(node1Client, pod.UID, tokenRequestWithAudiences("audience1")), `system:node:node1 is not authorized to request tokens for audience "audience1"`)
+		expectedForbiddenMessage(t, createTokenRequest(node1Client, pod.UID, tokenRequestWithAudiences("audience2")), `system:node:node1 is not authorized to request tokens for audience "audience2"`)
+
+		createRBACRole(t, role, superuserClient)
+		createRBACRoleBinding(t, rb, superuserClient)
+
+		expectAllowed(t, createTokenRequest(node1Client, pod.UID, tokenRequestWithAudiences("audience1")))
+		expectedForbiddenMessage(t, createTokenRequest(node1Client, pod.UID, tokenRequestWithAudiences("audience2")), `system:node:node1 is not authorized to request tokens for audience "audience2"`)
+
+		deleteRBACRole(t, role, superuserClient)
+		deleteRBACRoleBinding(t, rb, superuserClient)
+		// After the delete use a expectedForbiddenMessage to wait for the RBAC authorizer to catch up.
+		expectedForbiddenMessage(t, createTokenRequest(node1Client, pod.UID, tokenRequestWithAudiences("audience1")), `system:node:node1 is not authorized to request tokens for audience "audience1"`)
+		deletePod(t, superuserClient, "pod1")
+	})
+
+	t.Run("clusterrole and rolebinding in a namespace allowing node1 to request audience1, wildcard for service account names", func(t *testing.T) {
+		role := &rbacv1.Role{
+			ObjectMeta: metav1.ObjectMeta{Name: "audience-access-for-node1", Namespace: "ns"},
+			Rules: []rbacv1.PolicyRule{{
+				APIGroups:     []string{""},
+				Resources:     []string{"audience1"},
+				Verbs:         []string{"request-serviceaccounts-token-audience"},
+				ResourceNames: []string{}, // resource name empty means all service accounts
+			}},
+		}
+		rb := &rbacv1.RoleBinding{
+			ObjectMeta: metav1.ObjectMeta{Name: "audience-access-for-node1", Namespace: "ns"},
+			Subjects:   []rbacv1.Subject{{Kind: "User", Name: "system:node:node1"}},
+			RoleRef:    rbacv1.RoleRef{APIGroup: rbacv1.GroupName, Kind: "Role", Name: "audience-access-for-node1"},
+		}
+
+		createServiceAccount(t, superuserClient, "ns", "custom-sa")
+		pod := createPod(t, superuserClient, nil, podWithServiceAccountName("custom-sa"))
+		expectedForbiddenMessage(t, createTokenRequest(node1Client, pod.UID, tokenRequestWithAudiences("audience1"), tokenRequestWithName("custom-sa")), `system:node:node1 is not authorized to request tokens for audience "audience1"`)
+		expectedForbiddenMessage(t, createTokenRequest(node1Client, pod.UID, tokenRequestWithAudiences("audience2"), tokenRequestWithName("custom-sa")), `system:node:node1 is not authorized to request tokens for audience "audience2"`)
+
+		createRBACRole(t, role, superuserClient)
+		createRBACRoleBinding(t, rb, superuserClient)
+
+		expectAllowed(t, createTokenRequest(node1Client, pod.UID, tokenRequestWithAudiences("audience1"), tokenRequestWithName("custom-sa")))
+		expectedForbiddenMessage(t, createTokenRequest(node1Client, pod.UID, tokenRequestWithAudiences("audience2"), tokenRequestWithName("custom-sa")), `system:node:node1 is not authorized to request tokens for audience "audience2"`)
+
+		deleteRBACRole(t, role, superuserClient)
+		deleteRBACRoleBinding(t, rb, superuserClient)
+		// After the delete use a expectedForbiddenMessage to wait for the RBAC authorizer to catch up.
+		expectedForbiddenMessage(t, createTokenRequest(node1Client, pod.UID, tokenRequestWithAudiences("audience1"), tokenRequestWithName("custom-sa")), `system:node:node1 is not authorized to request tokens for audience "audience1"`)
+		deletePod(t, superuserClient, "pod1")
+		deleteServiceAccount(t, superuserClient, "ns", "custom-sa")
+	})
+
+	t.Run("clusterrole and rolebinding in a namespace allowing nodes to request any audience, wildcard for audiences", func(t *testing.T) {
+		role := &rbacv1.Role{
+			ObjectMeta: metav1.ObjectMeta{Name: "audience-access-for-nodes", Namespace: "ns"},
+			Rules: []rbacv1.PolicyRule{{
+				APIGroups:     []string{""},
+				Resources:     []string{"*"}, // wildcard for audiences
+				Verbs:         []string{"request-serviceaccounts-token-audience"},
+				ResourceNames: []string{"default"},
+			}},
+		}
+		rb := &rbacv1.RoleBinding{
+			ObjectMeta: metav1.ObjectMeta{Name: "audience-access-for-node1", Namespace: "ns"},
+			Subjects:   []rbacv1.Subject{{Kind: "Group", Name: "system:nodes"}},
+			RoleRef:    rbacv1.RoleRef{APIGroup: rbacv1.GroupName, Kind: "Role", Name: "audience-access-for-nodes"},
+		}
+
+		pod := createPod(t, superuserClient, nil)
+
+		expectedForbiddenMessage(t, createTokenRequest(node1Client, pod.UID, tokenRequestWithAudiences("audience1")), `system:node:node1 is not authorized to request tokens for audience "audience1"`)
+		expectedForbiddenMessage(t, createTokenRequest(node1Client, pod.UID, tokenRequestWithAudiences("audience2")), `system:node:node1 is not authorized to request tokens for audience "audience2"`)
+		randomAudience := rand.String(10)
+		expectedForbiddenMessage(t, createTokenRequest(node1Client, pod.UID, tokenRequestWithAudiences(randomAudience)), `system:node:node1 is not authorized to request tokens for audience "`+randomAudience+`"`)
+
+		createRBACRole(t, role, superuserClient)
+		createRBACRoleBinding(t, rb, superuserClient)
+
+		expectAllowed(t, createTokenRequest(node1Client, pod.UID, tokenRequestWithAudiences("audience1")))
+		expectAllowed(t, createTokenRequest(node1Client, pod.UID, tokenRequestWithAudiences("audience2")))
+		expectAllowed(t, createTokenRequest(node1Client, pod.UID, tokenRequestWithAudiences("")))
+		expectAllowed(t, createTokenRequest(node1Client, pod.UID, tokenRequestWithAudiences(randomAudience)))
+
+		deleteRBACRole(t, role, superuserClient)
+		deleteRBACRoleBinding(t, rb, superuserClient)
+		// After the delete use a expectedForbiddenMessage to wait for the RBAC authorizer to catch up.
+		expectedForbiddenMessage(t, createTokenRequest(node1Client, pod.UID, tokenRequestWithAudiences("audience1")), `system:node:node1 is not authorized to request tokens for audience "audience1"`)
+		deletePod(t, superuserClient, "pod1")
+	})
+
+	t.Run("clusterrole and rolebinding in a namespace allowing nodes to request any audience, any service account, wildcard for audiences", func(t *testing.T) {
+		role := &rbacv1.Role{
+			ObjectMeta: metav1.ObjectMeta{Name: "audience-access-for-nodes", Namespace: "ns"},
+			Rules: []rbacv1.PolicyRule{{
+				APIGroups:     []string{""},
+				Resources:     []string{"*"}, // wildcard for audiences
+				Verbs:         []string{"request-serviceaccounts-token-audience"},
+				ResourceNames: []string{}, // empty resource name means all service accounts
+			}},
+		}
+		rb := &rbacv1.RoleBinding{
+			ObjectMeta: metav1.ObjectMeta{Name: "audience-access-for-node1", Namespace: "ns"},
+			Subjects:   []rbacv1.Subject{{Kind: "Group", Name: "system:nodes"}},
+			RoleRef:    rbacv1.RoleRef{APIGroup: rbacv1.GroupName, Kind: "Role", Name: "audience-access-for-nodes"},
+		}
+
+		pod := createPod(t, superuserClient, nil)
+
+		expectedForbiddenMessage(t, createTokenRequest(node1Client, pod.UID, tokenRequestWithAudiences("audience1")), `system:node:node1 is not authorized to request tokens for audience "audience1"`)
+		expectedForbiddenMessage(t, createTokenRequest(node1Client, pod.UID, tokenRequestWithAudiences("audience2")), `system:node:node1 is not authorized to request tokens for audience "audience2"`)
+
+		createRBACRole(t, role, superuserClient)
+		createRBACRoleBinding(t, rb, superuserClient)
+
+		expectAllowed(t, createTokenRequest(node1Client, pod.UID, tokenRequestWithAudiences("audience1")))
+		expectAllowed(t, createTokenRequest(node1Client, pod.UID, tokenRequestWithAudiences("audience2")))
+
+		deleteRBACRole(t, role, superuserClient)
+		deleteRBACRoleBinding(t, rb, superuserClient)
+		// After the delete use a expectedForbiddenMessage to wait for the RBAC authorizer to catch up.
+		expectedForbiddenMessage(t, createTokenRequest(node1Client, pod.UID, tokenRequestWithAudiences("audience1")), `system:node:node1 is not authorized to request tokens for audience "audience1"`)
+		deletePod(t, superuserClient, "pod1")
+	})
+
+	t.Run("api server audience configured with rbac role", func(t *testing.T) {
+		role := &rbacv1.Role{
+			ObjectMeta: metav1.ObjectMeta{Name: "audience-access-for-nodes", Namespace: "ns"},
+			Rules: []rbacv1.PolicyRule{{
+				APIGroups:     []string{""},
+				Resources:     []string{""},
+				Verbs:         []string{"request-serviceaccounts-token-audience"},
+				ResourceNames: []string{}, // empty resource name means all service accounts
+			}},
+		}
+		rb := &rbacv1.RoleBinding{
+			ObjectMeta: metav1.ObjectMeta{Name: "audience-access-for-node1", Namespace: "ns"},
+			Subjects:   []rbacv1.Subject{{Kind: "Group", Name: "system:nodes"}},
+			RoleRef:    rbacv1.RoleRef{APIGroup: rbacv1.GroupName, Kind: "Role", Name: "audience-access-for-nodes"},
+		}
+
+		pod := createPod(t, superuserClient, nil, podWithAutoMountServiceAccountToken(false))
+		expectedForbiddenMessage(t, createTokenRequest(node1Client, pod.UID, tokenRequestWithAudiences("")), `system:node:node1 is not authorized to request tokens for audience ""`)
+		expectedForbiddenMessage(t, createTokenRequest(node1Client, pod.UID, tokenRequestWithAudiences("audience1")), `system:node:node1 is not authorized to request tokens for audience "audience1"`)
+
+		createRBACRole(t, role, superuserClient)
+		createRBACRoleBinding(t, rb, superuserClient)
+
+		expectAllowed(t, createTokenRequest(node1Client, pod.UID, tokenRequestWithAudiences("")))
+		expectedForbiddenMessage(t, createTokenRequest(node1Client, pod.UID, tokenRequestWithAudiences("audience1")), `system:node:node1 is not authorized to request tokens for audience "audience1"`)
+
+		deleteRBACRole(t, role, superuserClient)
+		deleteRBACRoleBinding(t, rb, superuserClient)
+		// After the delete use a expectedForbiddenMessage to wait for the RBAC authorizer to catch up.
+		expectedForbiddenMessage(t, createTokenRequest(node1Client, pod.UID, tokenRequestWithAudiences("")), `system:node:node1 is not authorized to request tokens for audience ""`)
+		deletePod(t, superuserClient, "pod1")
+	})
+
+	t.Run("audience with : and '/' configured with rbac role", func(t *testing.T) {
+		role := &rbacv1.Role{
+			ObjectMeta: metav1.ObjectMeta{Name: "audience-access-for-nodes", Namespace: "ns"},
+			Rules: []rbacv1.PolicyRule{{
+				APIGroups:     []string{""},
+				Resources:     []string{"myaud://audience1/audience2.com"},
+				Verbs:         []string{"request-serviceaccounts-token-audience"},
+				ResourceNames: []string{}, // empty resource name means all service accounts
+			}},
+		}
+		rb := &rbacv1.RoleBinding{
+			ObjectMeta: metav1.ObjectMeta{Name: "audience-access-for-node1", Namespace: "ns"},
+			Subjects:   []rbacv1.Subject{{Kind: "Group", Name: "system:nodes"}},
+			RoleRef:    rbacv1.RoleRef{APIGroup: rbacv1.GroupName, Kind: "Role", Name: "audience-access-for-nodes"},
+		}
+
+		pod := createPod(t, superuserClient, nil, podWithAutoMountServiceAccountToken(false))
+		expectedForbiddenMessage(t, createTokenRequest(node1Client, pod.UID, tokenRequestWithAudiences("myaud://audience1/audience2.com")), `system:node:node1 is not authorized to request tokens for audience "myaud://audience1/audience2.com"`)
+		expectedForbiddenMessage(t, createTokenRequest(node1Client, pod.UID, tokenRequestWithAudiences("audience1")), `system:node:node1 is not authorized to request tokens for audience "audience1"`)
+
+		createRBACRole(t, role, superuserClient)
+		createRBACRoleBinding(t, rb, superuserClient)
+
+		expectAllowed(t, createTokenRequest(node1Client, pod.UID, tokenRequestWithAudiences("myaud://audience1/audience2.com")))
+		expectedForbiddenMessage(t, createTokenRequest(node1Client, pod.UID, tokenRequestWithAudiences("audience1")), `system:node:node1 is not authorized to request tokens for audience "audience1"`)
+
+		deleteRBACRole(t, role, superuserClient)
+		deleteRBACRoleBinding(t, rb, superuserClient)
+		// After the delete use a expectedForbiddenMessage to wait for the RBAC authorizer to catch up.
+		expectedForbiddenMessage(t, createTokenRequest(node1Client, pod.UID, tokenRequestWithAudiences("myaud://audience1/audience2.com")), `system:node:node1 is not authorized to request tokens for audience "myaud://audience1/audience2.com"`)
+		deletePod(t, superuserClient, "pod1")
+	})
+}
+
+func createKubeConfigFileForRestConfig(t *testing.T, restConfig *rest.Config) string {
+	t.Helper()
+
+	clientConfig := kubeconfig.CreateKubeConfig(restConfig)
+
+	kubeConfigFile := filepath.Join(t.TempDir(), "kubeconfig.yaml")
+	if err := clientcmd.WriteToFile(*clientConfig, kubeConfigFile); err != nil {
+		t.Fatal(err)
+	}
+	return kubeConfigFile
+}
+
+type podOptions struct {
+	serviceAccountName           string
+	autoMountServiceAccountToken *bool
+}
+
+type podOption func(*podOptions)
+
+func podWithServiceAccountName(name string) podOption {
+	return func(opts *podOptions) {
+		opts.serviceAccountName = name
+	}
+}
+
+func podWithAutoMountServiceAccountToken(autoMount bool) podOption {
+	return func(opts *podOptions) {
+		opts.autoMountServiceAccountToken = ptr.To(autoMount)
+	}
+}
+
+func createPod(t *testing.T, client clientset.Interface, volumes []corev1.Volume, opts ...podOption) *corev1.Pod {
+	t.Helper()
+
+	options := &podOptions{
+		serviceAccountName:           "default",
+		autoMountServiceAccountToken: ptr.To(true),
+	}
+
+	for _, opt := range opts {
+		opt(options)
+	}
+
+	pod, err := client.CoreV1().Pods("ns").Create(context.TODO(), &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "pod1",
+		},
+		Spec: corev1.PodSpec{
+			NodeName:                     "node1",
+			Containers:                   []corev1.Container{{Name: "image", Image: "busybox"}},
+			ServiceAccountName:           options.serviceAccountName,
+			Volumes:                      volumes,
+			AutomountServiceAccountToken: options.autoMountServiceAccountToken,
+		},
+	}, metav1.CreateOptions{})
+	checkNilError(t, err)
+	return pod
+}
+
+func deletePod(t *testing.T, client clientset.Interface, podName string) {
+	t.Helper()
+
+	checkNilError(t, client.CoreV1().Pods("ns").Delete(context.TODO(), podName, metav1.DeleteOptions{GracePeriodSeconds: ptr.To[int64](0)}))
+}
+
+func createNode(t *testing.T, client clientset.Interface, nodeName string) {
+	t.Helper()
+
+	_, err := client.CoreV1().Nodes().Create(context.TODO(), &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: nodeName}}, metav1.CreateOptions{})
+	checkNilError(t, err)
+}
+
+type tokenRequestOptions struct {
+	name      string
+	audiences []string
+}
+
+type tokenRequestOption func(*tokenRequestOptions)
+
+func tokenRequestWithName(name string) tokenRequestOption {
+	return func(opts *tokenRequestOptions) {
+		opts.name = name
+	}
+}
+
+func tokenRequestWithAudiences(audiences ...string) tokenRequestOption {
+	return func(opts *tokenRequestOptions) {
+		opts.audiences = audiences
+	}
+}
+
+func createTokenRequest(client clientset.Interface, uid types.UID, opts ...tokenRequestOption) func() error {
+	options := &tokenRequestOptions{
+		name:      "default",
+		audiences: []string{},
+	}
+
+	for _, opt := range opts {
+		opt(options)
+	}
+
+	return func() error {
+		_, err := client.CoreV1().ServiceAccounts("ns").CreateToken(context.TODO(), options.name, &authenticationv1.TokenRequest{
+			Spec: authenticationv1.TokenRequestSpec{
+				BoundObjectRef: &authenticationv1.BoundObjectReference{
+					Kind:       "Pod",
+					Name:       "pod1",
+					APIVersion: "v1",
+					UID:        uid,
+				},
+				Audiences: options.audiences,
+			},
+		}, metav1.CreateOptions{})
+		return err
+	}
+}
+
+func createCSIDriver(t *testing.T, client clientset.Interface, audience, driverName string) {
+	t.Helper()
+
+	_, err := client.StorageV1().CSIDrivers().Create(context.TODO(), &storagev1.CSIDriver{
+		ObjectMeta: metav1.ObjectMeta{Name: driverName},
+		Spec: storagev1.CSIDriverSpec{
+			TokenRequests: []storagev1.TokenRequest{{Audience: audience}},
+		},
+	}, metav1.CreateOptions{})
+	checkNilError(t, err)
+}
+
+func deleteCSIDriver(t *testing.T, client clientset.Interface, driverName string) {
+	t.Helper()
+
+	checkNilError(t, client.StorageV1().CSIDrivers().Delete(context.TODO(), driverName, metav1.DeleteOptions{GracePeriodSeconds: ptr.To[int64](0)}))
+}
+
+func createServiceAccount(t *testing.T, client clientset.Interface, namespace, name string) {
+	t.Helper()
+
+	_, err := client.CoreV1().ServiceAccounts(namespace).Create(context.TODO(), &corev1.ServiceAccount{
+		ObjectMeta: metav1.ObjectMeta{Name: name},
+	}, metav1.CreateOptions{})
+	checkNilError(t, err)
+}
+
+func deleteServiceAccount(t *testing.T, client clientset.Interface, namespace, name string) {
+	t.Helper()
+
+	checkNilError(t, client.CoreV1().ServiceAccounts(namespace).Delete(context.TODO(), name, metav1.DeleteOptions{GracePeriodSeconds: ptr.To[int64](0)}))
+}
+
+func configureRBACForServiceAccountToken(t *testing.T, client clientset.Interface) {
+	t.Helper()
+
+	_, err := client.RbacV1().ClusterRoles().Update(context.TODO(), &rbacv1.ClusterRole{
+		ObjectMeta: metav1.ObjectMeta{Name: "system:node:node1"},
+		Rules: []rbacv1.PolicyRule{{
+			APIGroups: []string{""},
+			Resources: []string{"serviceaccounts/token"},
+			Verbs:     []string{"create"},
+		}},
+	}, metav1.UpdateOptions{})
+	checkNilError(t, err)
+
+	_, err = client.RbacV1().ClusterRoleBindings().Update(context.TODO(), &rbacv1.ClusterRoleBinding{
+		ObjectMeta: metav1.ObjectMeta{Name: "system:node"},
+		Subjects: []rbacv1.Subject{{
+			APIGroup: rbacv1.GroupName,
+			Kind:     "Group",
+			Name:     "system:nodes",
+		}},
+		RoleRef: rbacv1.RoleRef{
+			APIGroup: rbacv1.GroupName,
+			Kind:     "ClusterRole",
+			Name:     "system:node",
+		},
+	}, metav1.UpdateOptions{})
+	checkNilError(t, err)
+}
+
+func createRBACClusterRole(t *testing.T, clusterrole *rbacv1.ClusterRole, client clientset.Interface) {
+	t.Helper()
+
+	_, err := client.RbacV1().ClusterRoles().Create(context.TODO(), clusterrole, metav1.CreateOptions{})
+	checkNilError(t, err)
+}
+
+func createRBACClusterRoleBinding(t *testing.T, clusterrolebinding *rbacv1.ClusterRoleBinding, client clientset.Interface) {
+	t.Helper()
+
+	_, err := client.RbacV1().ClusterRoleBindings().Create(context.TODO(), clusterrolebinding, metav1.CreateOptions{})
+	checkNilError(t, err)
+}
+
+func createRBACRole(t *testing.T, role *rbacv1.Role, client clientset.Interface) {
+	t.Helper()
+
+	_, err := client.RbacV1().Roles(role.Namespace).Create(context.TODO(), role, metav1.CreateOptions{})
+	checkNilError(t, err)
+}
+
+func createRBACRoleBinding(t *testing.T, rolebinding *rbacv1.RoleBinding, client clientset.Interface) {
+	t.Helper()
+
+	_, err := client.RbacV1().RoleBindings(rolebinding.Namespace).Create(context.TODO(), rolebinding, metav1.CreateOptions{})
+	checkNilError(t, err)
+}
+
+func deleteRBACClusterRole(t *testing.T, clusterrole *rbacv1.ClusterRole, client clientset.Interface) {
+	t.Helper()
+
+	checkNilError(t, client.RbacV1().ClusterRoles().Delete(context.TODO(), clusterrole.Name, metav1.DeleteOptions{}))
+}
+
+func deleteRBACClusterRoleBinding(t *testing.T, clusterrolebinding *rbacv1.ClusterRoleBinding, client clientset.Interface) {
+	t.Helper()
+
+	checkNilError(t, client.RbacV1().ClusterRoleBindings().Delete(context.TODO(), clusterrolebinding.Name, metav1.DeleteOptions{}))
+}
+
+func deleteRBACRole(t *testing.T, role *rbacv1.Role, client clientset.Interface) {
+	t.Helper()
+
+	checkNilError(t, client.RbacV1().Roles(role.Namespace).Delete(context.TODO(), role.Name, metav1.DeleteOptions{}))
+}
+
+func deleteRBACRoleBinding(t *testing.T, rolebinding *rbacv1.RoleBinding, client clientset.Interface) {
+	t.Helper()
+
+	checkNilError(t, client.RbacV1().RoleBindings(rolebinding.Namespace).Delete(context.TODO(), rolebinding.Name, metav1.DeleteOptions{}))
 }

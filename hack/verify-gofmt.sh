@@ -14,7 +14,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# GoFmt apparently is changing @ head...
+# This script checks whether the source code needs to be formatted or not by
+# `gofmt`. Run `hack/update-gofmt.sh` to actually format sources.
+#
+# Note: gofmt output can change between go versions.
+#
+# Usage: `hack/verify-gofmt.sh`.
 
 set -o errexit
 set -o nounset
@@ -25,29 +30,30 @@ source "${KUBE_ROOT}/hack/lib/init.sh"
 
 cd "${KUBE_ROOT}"
 
-# Prefer bazel's gofmt.
-gofmt="external/io_bazel_rules_go_toolchain/bin/gofmt"
-if [[ ! -x "${gofmt}" ]]; then
-  gofmt=$(which gofmt)
-  kube::golang::verify_go_version
-fi
+kube::golang::setup_env
 
 find_files() {
   find . -not \( \
       \( \
-        -wholename './output' \
-        -o -wholename './.git' \
+        -wholename './.git' \
         -o -wholename './_output' \
-        -o -wholename './_gopath' \
         -o -wholename './release' \
         -o -wholename './target' \
         -o -wholename '*/third_party/*' \
         -o -wholename '*/vendor/*' \
-        -o -wholename './staging/src/k8s.io/client-go/*vendor/*' \
+        -o -wholename '*/testdata/*' \
         -o -wholename '*/bindata.go' \
       \) -prune \
     \) -name '*.go'
 }
+
+# GOTOOLCHAIN has no effect on the version of gofmt.
+# We need to find right gofmt, otherwise the one in PATH will be used.
+gofmt="$(go env GOROOT)/bin/gofmt"
+if [[ ! -x "${gofmt}" ]]; then
+  echo "Failed to find $gofmt" >&2
+  exit 1
+fi
 
 # gofmt exits with non-zero exit code if it finds a problem unrelated to
 # formatting (e.g., a file does not parse correctly). Without "|| true" this

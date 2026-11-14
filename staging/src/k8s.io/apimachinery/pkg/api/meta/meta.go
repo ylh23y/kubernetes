@@ -25,7 +25,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/klog"
+	"k8s.io/klog/v2"
 )
 
 // errNotList is returned when an object implements the Object style interfaces but not the List style
@@ -39,8 +39,6 @@ var errNotCommon = fmt.Errorf("object does not implement the common interface fo
 func CommonAccessor(obj interface{}) (metav1.Common, error) {
 	switch t := obj.(type) {
 	case List:
-		return t, nil
-	case metav1.ListInterface:
 		return t, nil
 	case ListMetaAccessor:
 		if m := t.GetListMeta(); m != nil {
@@ -71,8 +69,6 @@ func CommonAccessor(obj interface{}) (metav1.Common, error) {
 func ListAccessor(obj interface{}) (List, error) {
 	switch t := obj.(type) {
 	case List:
-		return t, nil
-	case metav1.ListInterface:
 		return t, nil
 	case ListMetaAccessor:
 		if m := t.GetListMeta(); m != nil {
@@ -134,7 +130,6 @@ func AsPartialObjectMetadata(m metav1.Object) *metav1.PartialObjectMetadata {
 				Annotations:                m.GetAnnotations(),
 				OwnerReferences:            m.GetOwnerReferences(),
 				Finalizers:                 m.GetFinalizers(),
-				ClusterName:                m.GetClusterName(),
 				ManagedFields:              m.GetManagedFields(),
 			},
 		}
@@ -604,7 +599,8 @@ func (a genericAccessor) SetFinalizers(finalizers []string) {
 func (a genericAccessor) GetOwnerReferences() []metav1.OwnerReference {
 	var ret []metav1.OwnerReference
 	s := a.ownerReferences
-	if s.Kind() != reflect.Ptr || s.Elem().Kind() != reflect.Slice {
+	if s.Kind() != reflect.Pointer || s.Elem().Kind() != reflect.Slice {
+		//nolint:logcheck // Should not happen.
 		klog.Errorf("expect %v to be a pointer to slice", s)
 		return ret
 	}
@@ -613,6 +609,7 @@ func (a genericAccessor) GetOwnerReferences() []metav1.OwnerReference {
 	ret = make([]metav1.OwnerReference, s.Len(), s.Len()+1)
 	for i := 0; i < s.Len(); i++ {
 		if err := extractFromOwnerReference(s.Index(i), &ret[i]); err != nil {
+			//nolint:logcheck // Should not happen.
 			klog.Errorf("extractFromOwnerReference failed: %v", err)
 			return ret
 		}
@@ -622,13 +619,15 @@ func (a genericAccessor) GetOwnerReferences() []metav1.OwnerReference {
 
 func (a genericAccessor) SetOwnerReferences(references []metav1.OwnerReference) {
 	s := a.ownerReferences
-	if s.Kind() != reflect.Ptr || s.Elem().Kind() != reflect.Slice {
+	if s.Kind() != reflect.Pointer || s.Elem().Kind() != reflect.Slice {
+		//nolint:logcheck // Should not happen.
 		klog.Errorf("expect %v to be a pointer to slice", s)
 	}
 	s = s.Elem()
 	newReferences := reflect.MakeSlice(s.Type(), len(references), len(references))
 	for i := 0; i < len(references); i++ {
 		if err := setOwnerReference(newReferences.Index(i), &references[i]); err != nil {
+			//nolint:logcheck // Should not happen.
 			klog.Errorf("setOwnerReference failed: %v", err)
 			return
 		}

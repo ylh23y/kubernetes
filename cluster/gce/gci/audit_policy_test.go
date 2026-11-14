@@ -18,7 +18,7 @@ package gci
 
 import (
 	"fmt"
-	"io/ioutil"
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -26,9 +26,9 @@ import (
 	auditinstall "k8s.io/apiserver/pkg/apis/audit/install"
 	auditpkg "k8s.io/apiserver/pkg/audit"
 	auditpolicy "k8s.io/apiserver/pkg/audit/policy"
+	"k8s.io/apiserver/pkg/authentication/serviceaccount"
 	"k8s.io/apiserver/pkg/authentication/user"
 	"k8s.io/apiserver/pkg/authorization/authorizer"
-	"k8s.io/kubernetes/pkg/serviceaccount"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -40,7 +40,7 @@ func init() {
 }
 
 func TestCreateMasterAuditPolicy(t *testing.T) {
-	baseDir, err := ioutil.TempDir("", "configure-helper-test") // cleaned up by c.tearDown()
+	baseDir, err := os.MkdirTemp("", "configure-helper-test") // cleaned up by c.tearDown()
 	require.NoError(t, err, "Failed to create temp directory")
 
 	policyFile := filepath.Join(baseDir, "audit_policy.yaml")
@@ -52,8 +52,12 @@ func TestCreateMasterAuditPolicy(t *testing.T) {
 	defer c.tearDown()
 
 	// Initialize required environment variables.
-	const kubeEnvTmpl = `readonly KUBE_HOME={{.KubeHome}}`
-	c.mustInvokeFunc(kubeEnvTmpl, kubeAPIServerEnv{KubeHome: c.kubeHome})
+	c.mustInvokeFunc(
+		kubeAPIServerEnv{KubeHome: c.kubeHome},
+		[]string{"configure-helper.sh"},
+		"base.template",
+		"testdata/kube-apiserver/base.template",
+	)
 
 	policy, err := auditpolicy.LoadPolicyFromFile(policyFile)
 	require.NoError(t, err, "Failed to load generated policy.")
@@ -69,13 +73,11 @@ func TestCreateMasterAuditPolicy(t *testing.T) {
 		scheduler           = newUserInfo(user.KubeScheduler, user.AllAuthenticated)
 		apiserver           = newUserInfo(user.APIServerUser, user.SystemPrivilegedGroup)
 		autoscaler          = newUserInfo("cluster-autoscaler", user.AllAuthenticated)
-		npd                 = newUserInfo("system:node-problem-detector", user.AllAuthenticated)
-		npdSA               = serviceaccount.UserInfo("kube-system", "node-problem-detector", "")
 		namespaceController = serviceaccount.UserInfo("kube-system", "namespace-controller", "")
 		endpointController  = serviceaccount.UserInfo("kube-system", "endpoint-controller", "")
 		defaultSA           = serviceaccount.UserInfo("default", "default", "")
 
-		allUsers = []user.Info{anonymous, kubeproxy, ingress, kubelet, node, controller, scheduler, apiserver, autoscaler, npd, npdSA, namespaceController, endpointController, defaultSA}
+		allUsers = []user.Info{anonymous, kubeproxy, ingress, kubelet, node, controller, scheduler, apiserver, autoscaler, namespaceController, endpointController, defaultSA}
 	)
 
 	// Resources for test cases
@@ -113,8 +115,8 @@ func TestCreateMasterAuditPolicy(t *testing.T) {
 	)
 
 	at := auditTester{
-		T:       t,
-		checker: auditpolicy.NewChecker(policy),
+		T:         t,
+		evaluator: auditpolicy.NewPolicyRuleEvaluator(policy),
 	}
 
 	at.testResources(none, kubeproxy, "watch", endpoints, sysEndpoints, services, serviceStatus)
@@ -145,20 +147,20 @@ func TestCreateMasterAuditPolicy(t *testing.T) {
 
 	at.testResources(none, node, apiserver, defaultSA, anonymous, "get", "list", "create", "patch", "update", "delete", events)
 
-	at.testResources(request, kubelet, node, npd, npdSA, "update", "patch", nodeStatus, podStatus)
+	at.testResources(request, kubelet, node, "update", "patch", nodeStatus, podStatus)
 
 	at.testResources(request, namespaceController, "deletecollection", pods, namespaces)
 
-	at.testResources(metadata, defaultSA, anonymous, npd, namespaceController, "get", "create", "update", secrets, configmaps, sysConfigmaps, tokenReviews)
-	at.testResources(request, defaultSA, anonymous, npd, namespaceController, "get", "list", "watch", sysEndpoints, podMetrics, pods, clusterRoles, deployments)
-	at.testResources(response, defaultSA, anonymous, npd, namespaceController, "create", "update", "patch", "delete", sysEndpoints, podMetrics, pods, clusterRoles, deployments)
+	at.testResources(metadata, defaultSA, anonymous, namespaceController, "get", "create", "update", secrets, configmaps, sysConfigmaps, tokenReviews)
+	at.testResources(request, defaultSA, anonymous, namespaceController, "get", "list", "watch", sysEndpoints, podMetrics, pods, clusterRoles, deployments)
+	at.testResources(response, defaultSA, anonymous, namespaceController, "create", "update", "patch", "delete", sysEndpoints, podMetrics, pods, clusterRoles, deployments)
 
-	at.testResources(metadata, defaultSA, anonymous, npd, namespaceController, "get", "list", "watch", "create", "update", "patch", "delete", foobars, foobarbaz)
+	at.testResources(metadata, defaultSA, anonymous, namespaceController, "get", "list", "watch", "create", "update", "patch", "delete", foobars, foobarbaz)
 }
 
 type auditTester struct {
 	*testing.T
-	checker auditpolicy.Checker
+	evaluator auditpkg.PolicyRuleEvaluator
 }
 
 func (t *auditTester) testResources(level audit.Level, usrVerbRes ...interface{}) {
@@ -225,12 +227,12 @@ func (t *auditTester) expectLevel(expected audit.Level, attrs authorizer.Attribu
 		}
 	}
 	name := fmt.Sprintf("%s.%s.%s", attrs.GetUser().GetName(), attrs.GetVerb(), obj)
-	checker := t.checker
+	evaluator := t.evaluator
 	t.Run(name, func(t *testing.T) {
-		level, stages := checker.LevelAndStages(attrs)
-		assert.Equal(t, expected, level)
-		if level != audit.LevelNone {
-			assert.ElementsMatch(t, stages, []audit.Stage{audit.StageRequestReceived})
+		auditConfig := evaluator.EvaluatePolicyRule(attrs)
+		assert.Equal(t, expected, auditConfig.Level)
+		if auditConfig.Level != audit.LevelNone {
+			assert.ElementsMatch(t, auditConfig.OmitStages, []audit.Stage{audit.StageRequestReceived})
 		}
 	})
 }

@@ -25,7 +25,7 @@ import (
 
 	admissionv1 "k8s.io/api/admission/v1"
 	admissionv1beta1 "k8s.io/api/admission/v1beta1"
-	admissionregistrationv1beta1 "k8s.io/api/admissionregistration/v1beta1"
+	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
 	appsv1 "k8s.io/api/apps/v1"
 	authenticationv1 "k8s.io/api/authentication/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -36,7 +36,7 @@ import (
 	"k8s.io/apiserver/pkg/admission/plugin/webhook"
 	"k8s.io/apiserver/pkg/admission/plugin/webhook/generic"
 	"k8s.io/apiserver/pkg/authentication/user"
-	utilpointer "k8s.io/utils/pointer"
+	"k8s.io/utils/ptr"
 )
 
 func TestVerifyAdmissionResponse(t *testing.T) {
@@ -476,7 +476,7 @@ func TestCreateAdmissionObjects(t *testing.T) {
 
 	testcases := []struct {
 		name       string
-		attrs      *generic.VersionedAttributes
+		attrs      *admission.VersionedAttributes
 		invocation *generic.WebhookInvocation
 
 		expectRequest  func(uid types.UID) runtime.Object
@@ -486,14 +486,14 @@ func TestCreateAdmissionObjects(t *testing.T) {
 		{
 			name: "no supported versions",
 			invocation: &generic.WebhookInvocation{
-				Webhook: webhook.NewMutatingWebhookAccessor("mywebhook", &admissionregistrationv1beta1.MutatingWebhook{}),
+				Webhook: webhook.NewMutatingWebhookAccessor("mywebhook", "mycfg", &admissionregistrationv1.MutatingWebhook{}),
 			},
 			expectErr: "webhook does not accept known AdmissionReview versions",
 		},
 		{
 			name: "no known supported versions",
 			invocation: &generic.WebhookInvocation{
-				Webhook: webhook.NewMutatingWebhookAccessor("mywebhook", &admissionregistrationv1beta1.MutatingWebhook{
+				Webhook: webhook.NewMutatingWebhookAccessor("mywebhook", "mycfg", &admissionregistrationv1.MutatingWebhook{
 					AdmissionReviewVersions: []string{"vX"},
 				}),
 			},
@@ -501,16 +501,16 @@ func TestCreateAdmissionObjects(t *testing.T) {
 		},
 		{
 			name: "v1",
-			attrs: &generic.VersionedAttributes{
-				VersionedObject:    versionedObj.DeepCopyObject(),
-				VersionedOldObject: versionedObjOld.DeepCopyObject(),
+			attrs: &admission.VersionedAttributes{
+				VersionedObject:    admission.NewLazyObject(versionedObj.DeepCopyObject()),
+				VersionedOldObject: admission.NewLazyObject(versionedObjOld.DeepCopyObject()),
 				Attributes:         attrs,
 			},
 			invocation: &generic.WebhookInvocation{
 				Resource:    schema.GroupVersionResource{Group: "extensions", Version: "v1beta1", Resource: "deployments"},
 				Subresource: "",
 				Kind:        schema.GroupVersionKind{Group: "extensions", Version: "v1beta1", Kind: "Deployment"},
-				Webhook: webhook.NewMutatingWebhookAccessor("mywebhook", &admissionregistrationv1beta1.MutatingWebhook{
+				Webhook: webhook.NewMutatingWebhookAccessor("mywebhook", "mycfg", &admissionregistrationv1.MutatingWebhook{
 					AdmissionReviewVersions: []string{"v1", "v1beta1"},
 				}),
 			},
@@ -535,7 +535,7 @@ func TestCreateAdmissionObjects(t *testing.T) {
 						},
 						Object:    runtime.RawExtension{Object: versionedObj},
 						OldObject: runtime.RawExtension{Object: versionedObjOld},
-						DryRun:    utilpointer.BoolPtr(false),
+						DryRun:    ptr.To(false),
 						Options:   runtime.RawExtension{Object: &metav1.UpdateOptions{FieldManager: "foo"}},
 					},
 				}
@@ -544,16 +544,16 @@ func TestCreateAdmissionObjects(t *testing.T) {
 		},
 		{
 			name: "v1beta1",
-			attrs: &generic.VersionedAttributes{
-				VersionedObject:    versionedObj.DeepCopyObject(),
-				VersionedOldObject: versionedObjOld.DeepCopyObject(),
+			attrs: &admission.VersionedAttributes{
+				VersionedObject:    admission.NewLazyObject(versionedObj.DeepCopyObject()),
+				VersionedOldObject: admission.NewLazyObject(versionedObjOld.DeepCopyObject()),
 				Attributes:         attrs,
 			},
 			invocation: &generic.WebhookInvocation{
 				Resource:    schema.GroupVersionResource{Group: "extensions", Version: "v1beta1", Resource: "deployments"},
 				Subresource: "",
 				Kind:        schema.GroupVersionKind{Group: "extensions", Version: "v1beta1", Kind: "Deployment"},
-				Webhook: webhook.NewMutatingWebhookAccessor("mywebhook", &admissionregistrationv1beta1.MutatingWebhook{
+				Webhook: webhook.NewMutatingWebhookAccessor("mywebhook", "mycfg", &admissionregistrationv1.MutatingWebhook{
 					AdmissionReviewVersions: []string{"v1beta1", "v1"},
 				}),
 			},
@@ -578,7 +578,7 @@ func TestCreateAdmissionObjects(t *testing.T) {
 						},
 						Object:    runtime.RawExtension{Object: versionedObj},
 						OldObject: runtime.RawExtension{Object: versionedObjOld},
-						DryRun:    utilpointer.BoolPtr(false),
+						DryRun:    ptr.To(false),
 						Options:   runtime.RawExtension{Object: &metav1.UpdateOptions{FieldManager: "foo"}},
 					},
 				}

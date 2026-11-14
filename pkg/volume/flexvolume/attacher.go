@@ -19,9 +19,9 @@ package flexvolume
 import (
 	"time"
 
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/klog"
+	"k8s.io/klog/v2"
 	"k8s.io/kubernetes/pkg/volume"
 )
 
@@ -70,9 +70,9 @@ func (a *flexVolumeAttacher) GetDeviceMountPath(spec *volume.Spec) (string, erro
 }
 
 // MountDevice is part of the volume.Attacher interface
-func (a *flexVolumeAttacher) MountDevice(spec *volume.Spec, devicePath string, deviceMountPath string) error {
+func (a *flexVolumeAttacher) MountDevice(spec *volume.Spec, devicePath string, deviceMountPath string, _ volume.DeviceMounterArgs) error {
 	// Mount only once.
-	alreadyMounted, err := prepareForMount(a.plugin.host.GetMounter(a.plugin.GetPluginName()), deviceMountPath)
+	alreadyMounted, err := prepareForMount(a.plugin.host.GetMounter(), deviceMountPath)
 	if err != nil {
 		return err
 	}
@@ -90,7 +90,7 @@ func (a *flexVolumeAttacher) MountDevice(spec *volume.Spec, devicePath string, d
 		// Devicepath is empty if the plugin does not support attach calls. Ignore mountDevice calls if the
 		// plugin does not implement attach interface.
 		if devicePath != "" {
-			return (*attacherDefaults)(a).MountDevice(spec, devicePath, deviceMountPath, a.plugin.host.GetMounter(a.plugin.GetPluginName()))
+			return (*attacherDefaults)(a).MountDevice(spec, devicePath, deviceMountPath, a.plugin.host.GetMounter())
 		}
 		return nil
 	}

@@ -1,4 +1,4 @@
-// +build linux
+//go:build linux
 
 /*
 Copyright 2014 The Kubernetes Authors.
@@ -20,7 +20,6 @@ package subpath
 
 import (
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -28,10 +27,8 @@ import (
 	"syscall"
 
 	"golang.org/x/sys/unix"
-
-	"k8s.io/klog"
-
-	"k8s.io/kubernetes/pkg/util/mount"
+	"k8s.io/klog/v2"
+	"k8s.io/mount-utils"
 )
 
 const (
@@ -79,7 +76,7 @@ func (sp *subpath) PrepareSafeSubpath(subPath Subpath) (newHostPath string, clea
 	return newHostPath, cleanupAction, err
 }
 
-// This implementation is shared between Linux and NsEnter
+// safeOpenSubPath opens subpath and returns its fd.
 func safeOpenSubPath(mounter mount.Interface, subpath Subpath) (int, error) {
 	if !mount.PathWithinBase(subpath.Path, subpath.VolumePath) {
 		return -1, fmt.Errorf("subpath %q not within volume path %q", subpath.Path, subpath.VolumePath)
@@ -93,26 +90,42 @@ func safeOpenSubPath(mounter mount.Interface, subpath Subpath) (int, error) {
 
 // prepareSubpathTarget creates target for bind-mount of subpath. It returns
 // "true" when the target already exists and something is mounted there.
-// Given Subpath must have all paths with already resolved symlinks and with
-// paths relevant to kubelet (when it runs in a container).
-// This function is called also by NsEnterMounter. It works because
-// /var/lib/kubelet is mounted from the host into the container with Kubelet as
-// /var/lib/kubelet too.
 func prepareSubpathTarget(mounter mount.Interface, subpath Subpath) (bool, string, error) {
 	// Early check for already bind-mounted subpath.
 	bindPathTarget := getSubpathBindTarget(subpath)
-	notMount, err := mount.IsNotMountPoint(mounter, bindPathTarget)
+	isMount, err := mounter.IsMountPoint(bindPathTarget)
 	if err != nil {
-		if !os.IsNotExist(err) {
-			return false, "", fmt.Errorf("error checking path %s for mount: %s", bindPathTarget, err)
+		if os.IsNotExist(err) {
+			// Ignore ErrorNotExist: the file/directory will be created below if it does not exist yet.
+			isMount = false
+		} else if mount.IsCorruptedMnt(err) {
+			// The mount point is corrupted, attempt to recover by re-creating it.
+			klog.Warningf("Detected corrupted mount at %s (error: %v), unmounting", bindPathTarget, err)
+			if unmountErr := mounter.Unmount(bindPathTarget); unmountErr != nil {
+				return false, "", fmt.Errorf("error unmounting corrupted mount %s: %w", bindPathTarget, unmountErr)
+			}
+			isMount = false
+		} else {
+			return false, "", fmt.Errorf("error checking path %s for mount: %w", bindPathTarget, err)
 		}
-		// Ignore ErrorNotExist: the file/directory will be created below if it does not exist yet.
-		notMount = true
 	}
-	if !notMount {
-		// It's already mounted
-		klog.V(5).Infof("Skipping bind-mounting subpath %s: already mounted", bindPathTarget)
-		return true, bindPathTarget, nil
+	if isMount {
+		// It's already mounted, so check if it's bind-mounted to the same path
+		samePath, err := checkSubPathFileEqual(subpath, bindPathTarget)
+		if err != nil {
+			return false, "", fmt.Errorf("error checking subpath mount info for %s: %s", bindPathTarget, err)
+		}
+		if !samePath {
+			// Use lazy unmount so a hung FUSE/GlusterFS flush cannot block pod recovery.
+			klog.V(4).Infof("Subpath bind mount at %s points to a different inode/device than source, will lazy-unmount and recreate", bindPathTarget)
+			if err = lazyUnmountFn(bindPathTarget); err != nil {
+				return false, "", fmt.Errorf("error lazy-unmounting stale subpath mount %s: %w", bindPathTarget, err)
+			}
+		} else {
+			// It's already mounted
+			klog.V(5).Infof("Skipping bind-mounting subpath %s: already mounted", bindPathTarget)
+			return true, bindPathTarget, nil
+		}
 	}
 
 	// bindPathTarget is in /var/lib/kubelet and thus reachable without any
@@ -137,11 +150,34 @@ func prepareSubpathTarget(mounter mount.Interface, subpath Subpath) (bool, strin
 		// A file is enough for all possible targets (symlink, device, pipe,
 		// socket, ...), bind-mounting them into a file correctly changes type
 		// of the target file.
-		if err = ioutil.WriteFile(bindPathTarget, []byte{}, 0640); err != nil {
+		if err = os.WriteFile(bindPathTarget, []byte{}, 0640); err != nil {
 			return false, "", fmt.Errorf("error creating file %s: %s", bindPathTarget, err)
 		}
 	}
 	return false, bindPathTarget, nil
+}
+
+// lazyUnmountFn is a package-level variable so tests can replace it without
+// forking the binary.
+var lazyUnmountFn = func(path string) error {
+	return syscall.Unmount(path, syscall.MNT_DETACH)
+}
+
+func checkSubPathFileEqual(subpath Subpath, bindMountTarget string) (bool, error) {
+	s, err := os.Lstat(subpath.Path)
+	if err != nil {
+		return false, fmt.Errorf("stat %s failed: %s", subpath.Path, err)
+	}
+
+	t, err := os.Lstat(bindMountTarget)
+	if err != nil {
+		return false, fmt.Errorf("lstat %s failed: %s", bindMountTarget, err)
+	}
+
+	if !os.SameFile(s, t) {
+		return false, nil
+	}
+	return true, nil
 }
 
 func getSubpathBindTarget(subpath Subpath) string {
@@ -198,8 +234,9 @@ func doBindSubPath(mounter mount.Interface, subpath Subpath) (hostPath string, e
 
 	// Do the bind mount
 	options := []string{"bind"}
+	mountFlags := []string{"--no-canonicalize"}
 	klog.V(5).Infof("bind mounting %q at %q", mountSource, bindPathTarget)
-	if err = mounter.Mount(mountSource, bindPathTarget, "" /*fstype*/, options); err != nil {
+	if err = mounter.MountSensitiveWithoutSystemdWithMountFlags(mountSource, bindPathTarget, "" /*fstype*/, options, nil /* sensitiveOptions */, mountFlags); err != nil {
 		return "", fmt.Errorf("error mounting %s: %s", subpath.Path, err)
 	}
 	success = true
@@ -208,13 +245,13 @@ func doBindSubPath(mounter mount.Interface, subpath Subpath) (hostPath string, e
 	return bindPathTarget, nil
 }
 
-// This implementation is shared between Linux and NsEnter
+// doCleanSubPaths tears down the subpath bind mounts for a pod
 func doCleanSubPaths(mounter mount.Interface, podDir string, volumeName string) error {
 	// scan /var/lib/kubelet/pods/<uid>/volume-subpaths/<volume>/*
 	subPathDir := filepath.Join(podDir, containerSubPathDirectoryName, volumeName)
 	klog.V(4).Infof("Cleaning up subpath mounts for %s", subPathDir)
 
-	containerDirs, err := ioutil.ReadDir(subPathDir)
+	containerDirs, err := os.ReadDir(subPathDir)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil
@@ -231,7 +268,12 @@ func doCleanSubPaths(mounter mount.Interface, podDir string, volumeName string) 
 
 		// scan /var/lib/kubelet/pods/<uid>/volume-subpaths/<volume>/<container name>/*
 		fullContainerDirPath := filepath.Join(subPathDir, containerDir.Name())
-		err = filepath.Walk(fullContainerDirPath, func(path string, info os.FileInfo, err error) error {
+		// The original traversal method here was ReadDir, which was not so robust to handle some error such as "stale NFS file handle",
+		// so it was replaced with filepath.Walk in a later patch, which can pass through error and handled by the callback WalkFunc.
+		// After go 1.16, WalkDir was introduced, it's more effective than Walk because the callback WalkDirFunc is called before
+		// reading a directory, making it save some time when a container's subPath contains lots of dirs.
+		// See https://github.com/kubernetes/kubernetes/pull/71804 and https://github.com/kubernetes/kubernetes/issues/107667 for more details.
+		err = filepath.WalkDir(fullContainerDirPath, func(path string, info os.DirEntry, _ error) error {
 			if path == fullContainerDirPath {
 				// Skip top level directory
 				return nil
@@ -241,6 +283,13 @@ func doCleanSubPaths(mounter mount.Interface, podDir string, volumeName string) 
 			if err = doCleanSubPath(mounter, fullContainerDirPath, filepath.Base(path)); err != nil {
 				return err
 			}
+
+			// We need to check that info is not nil. This may happen when the incoming err is not nil due to stale mounts or permission errors.
+			if info != nil && info.IsDir() {
+				// skip subdirs of the volume: it only matters the first level to unmount, otherwise it would try to unmount subdir of the volume
+				return filepath.SkipDir
+			}
+
 			return nil
 		})
 		if err != nil {
@@ -331,9 +380,7 @@ func removeEmptyDirs(baseDir, endDir string) error {
 	return nil
 }
 
-// This implementation is shared between Linux and NsEnterMounter. Both pathname
-// and base must be either already resolved symlinks or thet will be resolved in
-// kubelet's mount namespace (in case it runs containerized).
+// doSafeMakeDir creates a directory at pathname, but only if it is within base.
 func doSafeMakeDir(pathname string, base string, perm os.FileMode) error {
 	klog.V(4).Infof("Creating directory %q within base %q", pathname, base)
 
@@ -395,7 +442,7 @@ func doSafeMakeDir(pathname string, base string, perm os.FileMode) error {
 		klog.V(4).Infof("Creating %s", dir)
 		err = syscall.Mkdirat(parentFD, currentPath, uint32(perm))
 		if err != nil {
-			return fmt.Errorf("cannot create directory %s: %s", currentPath, err)
+			return fmt.Errorf("cannot create directory %s: %w", currentPath, err)
 		}
 		// Dive into the created directory
 		childFD, err = syscall.Openat(parentFD, dir, nofollowFlags|unix.O_CLOEXEC, 0)
@@ -415,29 +462,29 @@ func doSafeMakeDir(pathname string, base string, perm os.FileMode) error {
 		}
 		parentFD = childFD
 		childFD = -1
+
+		// Everything was created. mkdirat(..., perm) above was affected by current
+		// umask and we must apply the right permissions to the all created directory.
+		// (that's the one that will be available to the container as subpath)
+		// so user can read/write it.
+		// parentFD is the last created directory.
+
+		// Translate perm (os.FileMode) to uint32 that fchmod() expects
+		kernelPerm := uint32(perm & os.ModePerm)
+		if perm&os.ModeSetgid > 0 {
+			kernelPerm |= syscall.S_ISGID
+		}
+		if perm&os.ModeSetuid > 0 {
+			kernelPerm |= syscall.S_ISUID
+		}
+		if perm&os.ModeSticky > 0 {
+			kernelPerm |= syscall.S_ISVTX
+		}
+		if err = syscall.Fchmod(parentFD, kernelPerm); err != nil {
+			return fmt.Errorf("chmod %q failed: %s", currentPath, err)
+		}
 	}
 
-	// Everything was created. mkdirat(..., perm) above was affected by current
-	// umask and we must apply the right permissions to the last directory
-	// (that's the one that will be available to the container as subpath)
-	// so user can read/write it. This is the behavior of previous code.
-	// TODO: chmod all created directories, not just the last one.
-	// parentFD is the last created directory.
-
-	// Translate perm (os.FileMode) to uint32 that fchmod() expects
-	kernelPerm := uint32(perm & os.ModePerm)
-	if perm&os.ModeSetgid > 0 {
-		kernelPerm |= syscall.S_ISGID
-	}
-	if perm&os.ModeSetuid > 0 {
-		kernelPerm |= syscall.S_ISUID
-	}
-	if perm&os.ModeSticky > 0 {
-		kernelPerm |= syscall.S_ISVTX
-	}
-	if err = syscall.Fchmod(parentFD, kernelPerm); err != nil {
-		return fmt.Errorf("chmod %q failed: %s", currentPath, err)
-	}
 	return nil
 }
 
@@ -482,7 +529,6 @@ func findExistingPrefix(base, pathname string) (string, []string, error) {
 	return pathname, []string{}, nil
 }
 
-// This implementation is shared between Linux and NsEnterMounter
 // Open path and return its fd.
 // Symlinks are disallowed (pathname must already resolve symlinks),
 // and the path must be within the base directory.
@@ -525,10 +571,16 @@ func doSafeOpen(pathname string, base string) (int, error) {
 	// Follow the segments one by one using openat() to make
 	// sure the user cannot change already existing directories into symlinks.
 	for _, seg := range segments {
+		var deviceStat unix.Stat_t
+
 		currentPath = filepath.Join(currentPath, seg)
 		if !mount.PathWithinBase(currentPath, base) {
 			return -1, fmt.Errorf("path %s is outside of allowed base %s", currentPath, base)
 		}
+
+		// Trigger auto mount if it's an auto-mounted directory, ignore error if not a directory.
+		// Notice the trailing slash is mandatory, see "automount" in openat(2) and open_by_handle_at(2).
+		unix.Fstatat(parentFD, seg+"/", &deviceStat, unix.AT_SYMLINK_NOFOLLOW)
 
 		klog.V(5).Infof("Opening path %s", currentPath)
 		childFD, err = syscall.Openat(parentFD, seg, openFDFlags|unix.O_CLOEXEC, 0)
@@ -536,14 +588,13 @@ func doSafeOpen(pathname string, base string) (int, error) {
 			return -1, fmt.Errorf("cannot open %s: %s", currentPath, err)
 		}
 
-		var deviceStat unix.Stat_t
 		err := unix.Fstat(childFD, &deviceStat)
 		if err != nil {
-			return -1, fmt.Errorf("Error running fstat on %s with %v", currentPath, err)
+			return -1, fmt.Errorf("error running fstat on %s with %v", currentPath, err)
 		}
 		fileFmt := deviceStat.Mode & syscall.S_IFMT
 		if fileFmt == syscall.S_IFLNK {
-			return -1, fmt.Errorf("Unexpected symlink found %s", currentPath)
+			return -1, fmt.Errorf("unexpected symlink found %s", currentPath)
 		}
 
 		// Close parentFD

@@ -24,8 +24,16 @@ import (
 
 // Interface provides access to all the informers in this group version.
 type Interface interface {
-	// NetworkPolicies returns a NetworkPolicyInformer.
-	NetworkPolicies() NetworkPolicyInformer
+	// IPAddresses returns a TypedIPAddressInformer.
+	IPAddresses() TypedIPAddressInformer
+	// Ingresses returns a TypedIngressInformer.
+	Ingresses() TypedIngressInformer
+	// IngressClasses returns a TypedIngressClassInformer.
+	IngressClasses() TypedIngressClassInformer
+	// NetworkPolicies returns a TypedNetworkPolicyInformer.
+	NetworkPolicies() TypedNetworkPolicyInformer
+	// ServiceCIDRs returns a TypedServiceCIDRInformer.
+	ServiceCIDRs() TypedServiceCIDRInformer
 }
 
 type version struct {
@@ -39,7 +47,27 @@ func New(f internalinterfaces.SharedInformerFactory, namespace string, tweakList
 	return &version{factory: f, namespace: namespace, tweakListOptions: tweakListOptions}
 }
 
-// NetworkPolicies returns a NetworkPolicyInformer.
-func (v *version) NetworkPolicies() NetworkPolicyInformer {
+// IPAddresses returns a TypedIPAddressInformer.
+func (v *version) IPAddresses() TypedIPAddressInformer {
+	return &iPAddressInformer{factory: v.factory, tweakListOptions: v.tweakListOptions}
+}
+
+// Ingresses returns a TypedIngressInformer.
+func (v *version) Ingresses() TypedIngressInformer {
+	return &ingressInformer{factory: v.factory, namespace: v.namespace, tweakListOptions: v.tweakListOptions}
+}
+
+// IngressClasses returns a TypedIngressClassInformer.
+func (v *version) IngressClasses() TypedIngressClassInformer {
+	return &ingressClassInformer{factory: v.factory, tweakListOptions: v.tweakListOptions}
+}
+
+// NetworkPolicies returns a TypedNetworkPolicyInformer.
+func (v *version) NetworkPolicies() TypedNetworkPolicyInformer {
 	return &networkPolicyInformer{factory: v.factory, namespace: v.namespace, tweakListOptions: v.tweakListOptions}
+}
+
+// ServiceCIDRs returns a TypedServiceCIDRInformer.
+func (v *version) ServiceCIDRs() TypedServiceCIDRInformer {
+	return &serviceCIDRInformer{factory: v.factory, tweakListOptions: v.tweakListOptions}
 }

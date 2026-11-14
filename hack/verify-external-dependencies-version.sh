@@ -14,6 +14,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# This script verifies that dependencies are up-to-date across different files
+# Usage: `hack/verify-external-dependencies-version.sh`.
+
 set -o errexit
 set -o nounset
 set -o pipefail
@@ -21,8 +24,14 @@ set -o pipefail
 KUBE_ROOT=$(dirname "${BASH_SOURCE[0]}")/..
 source "${KUBE_ROOT}/hack/lib/init.sh"
 
-kube::golang::verify_go_version
+kube::golang::setup_env
 
-cd "${KUBE_ROOT}"
+# Prefer full path for running zeitgeist
+ZEITGEIST_BIN="$(go -C hack/tools tool -n zeitgeist)"
 
-go run cmd/verifydependencies/verifydependencies.go "${KUBE_ROOT}"/build/dependencies.yaml
+# TODO: revert sed hack when zetigeist respects CLICOLOR/ttys
+CLICOLOR=0 "${ZEITGEIST_BIN}" validate \
+  --local-only \
+  --base-path "${KUBE_ROOT}" \
+  --config "${KUBE_ROOT}"/build/dependencies.yaml \
+  2> >(sed -e $'s/\x1b\[[0-9;]*m//g' >&2)

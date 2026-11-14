@@ -20,8 +20,8 @@ import (
 	"reflect"
 	"testing"
 
+	"k8s.io/apimachinery/pkg/util/version"
 	"k8s.io/component-base/featuregate"
-	"k8s.io/kubernetes/cmd/kubeadm/app/constants"
 )
 
 func TestKnownFeatures(t *testing.T) {
@@ -92,8 +92,9 @@ func TestNewFeatureGate(t *testing.T) {
 			expectedError: true,
 		},
 		{ //deprecated feature-gate key
-			value:         "deprecated=true",
-			expectedError: true,
+			value:                "deprecated=true",
+			expectedError:        false,
+			expectedFeaturesGate: map[string]bool{"deprecated": true},
 		},
 		{ //one feature
 			value:                "feature1=true",
@@ -129,7 +130,7 @@ func TestNewFeatureGate(t *testing.T) {
 func TestValidateVersion(t *testing.T) {
 	var someFeatures = FeatureList{
 		"feature1": {FeatureSpec: featuregate.FeatureSpec{Default: false, PreRelease: featuregate.Beta}},
-		"feature2": {FeatureSpec: featuregate.FeatureSpec{Default: true, PreRelease: featuregate.Alpha}, MinimumVersion: constants.MinimumControlPlaneVersion.WithPreRelease("alpha.1")},
+		"feature2": {FeatureSpec: featuregate.FeatureSpec{Default: true, PreRelease: featuregate.Alpha}, MinimumVersion: version.MustParseSemantic("v1.17.0").WithPreRelease("alpha.1")},
 	}
 
 	var tests = []struct {
@@ -146,7 +147,7 @@ func TestValidateVersion(t *testing.T) {
 		{
 			name:              "min version but correct value given",
 			requestedFeatures: map[string]bool{"feature2": true},
-			requestedVersion:  constants.MinimumControlPlaneVersion.String(),
+			requestedVersion:  "v1.17.0",
 			expectedError:     false,
 		},
 		{
@@ -206,13 +207,47 @@ func TestCheckDeprecatedFlags(t *testing.T) {
 			features:    map[string]bool{"feature1": true},
 			expectedMsg: map[string]string{},
 		},
+		{
+			name:        "invalid feature",
+			features:    map[string]bool{"feature2": true},
+			expectedMsg: map[string]string{"feature2": "Unknown feature gate flag: feature2"},
+		},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			msg := CheckDeprecatedFlags(&someFeatures, test.features)
 			if !reflect.DeepEqual(test.expectedMsg, msg) {
-				t.Error("CheckDeprecatedFlags didn't returned expected message")
+				t.Errorf("CheckDeprecatedFlags() = %v, want %v", msg, test.expectedMsg)
+			}
+		})
+	}
+}
+
+func TestSupports(t *testing.T) {
+	var someFeatures = FeatureList{
+		"feature1": {FeatureSpec: featuregate.FeatureSpec{Default: false, PreRelease: featuregate.Beta}},
+	}
+	tests := []struct {
+		name        string
+		featureName string
+		want        bool
+	}{
+		{
+			name:        "the feature is not supported",
+			featureName: "foo",
+			want:        false,
+		},
+		{
+			name:        "the feature is supported",
+			featureName: "feature1",
+			want:        true,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := Supports(someFeatures, test.featureName); got != test.want {
+				t.Errorf("Supports() = %v, want %v", got, test.want)
 			}
 		})
 	}

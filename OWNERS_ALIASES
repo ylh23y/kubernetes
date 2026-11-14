@@ -1,471 +1,596 @@
 aliases:
+  sig-api-machinery-approvers:
+    - deads2k
+    - jpbetz
+    - sttts
+  sig-api-machinery-reviewers:
+    - deads2k
+    - jpbetz
+    - sttts
+  # Note: sig-architecture-approvers has approval on root files (including go.mod/go.sum) until https://github.com/kubernetes/test-infra/pull/21398 is resolved.
+  # People with approve rights via this alias should defer dependency update PRs to dep-approvers.
+  sig-architecture-approvers:
+    - dims
+    - derekwaynecarr
+    - johnbelamaric
   # sig-auth subproject aliases
   sig-auth-audit-approvers:
     - sttts
     - tallclair
   sig-auth-audit-reviewers:
-    - CaoShuFeng
-    - hzxuzhonghu
-    - lavalamp
     - sttts
     - tallclair
-
   sig-auth-authenticators-approvers:
     - deads2k
     - liggitt
-    - mikedanese
+    - enj
   sig-auth-authenticators-reviewers:
     - deads2k
     - enj
-    - jianhuiz
-    - lavalamp
     - liggitt
-    - mbohlool
-    - mikedanese
     - sttts
     - wojtek-t
-
+    - aramase
   sig-auth-authorizers-approvers:
     - deads2k
     - liggitt
-    - mikedanese
   sig-auth-authorizers-reviewers:
-    - david-mcmahon
     - deads2k
     - dims
     - enj
-    - erictune
-    - jianhuiz
-    - krousey
-    - lavalamp
     - liggitt
-    - mbohlool
-    - mikedanese
-    - mml
-    - ncdc
-    - nikhiljindal
-    - smarterclayton
     - sttts
     - thockin
     - wojtek-t
-
+  # - emeritus
+  # - ncdc
   sig-auth-certificates-approvers:
     - liggitt
-    - mikedanese
-    - smarterclayton
   sig-auth-certificates-reviewers:
-    - awly
-    - caesarxuchao
-    - david-mcmahon
     - deads2k
     - dims
     - enj
-    - errordeveloper
-    - hongchaodeng
-    - jianhuiz
-    - lavalamp
     - liggitt
-    - mbohlool
-    - mikedanese
-    - smarterclayton
-    - sttts
-    - thockin
-    - timothysc
-    - wojtek-t
-
   sig-auth-encryption-at-rest-approvers:
-    - immutableT
-    - smarterclayton
-  sig-auth-encryption-at-rest-reviewers:
     - enj
-    - immutableT
-    - lavalamp
-    - liggitt
-    - sakshamsharma
-    - smarterclayton
-    - wojtek-t
-
+  sig-auth-encryption-at-rest-reviewers:
+    - aramase
+    - enj
   sig-auth-node-isolation-approvers:
     - deads2k
     - liggitt
-    - mikedanese
     - tallclair
   sig-auth-node-isolation-reviewers:
     - deads2k
     - liggitt
-    - mikedanese
     - tallclair
-
   sig-auth-policy-approvers:
     - deads2k
     - liggitt
     - tallclair
   sig-auth-policy-reviewers:
     - deads2k
-    - hongchaodeng
-    - jianhuiz
     - liggitt
-    - mbohlool
-    - pweil-
     - tallclair
     - krmayankk
-
   sig-auth-serviceaccounts-approvers:
-    - deads2k
-    - liggitt
-    - mikedanese
-  sig-auth-serviceaccounts-reviewers:
-    - awly
     - deads2k
     - enj
     - liggitt
-    - mikedanese
-    - WanLinghao
-
+  sig-auth-serviceaccounts-reviewers:
+    - deads2k
+    - enj
+    - liggitt
   # SIG Release
-  sig-release-approvers:
-    - calebamiles # SIG Chair
-    - justaugustus # SIG Chair
-    - tpepper # SIG Chair
   release-engineering-approvers:
-    - calebamiles # SIG Chair
-    - justaugustus # SIG Chair
-    - tpepper # SIG Chair / Patch Release Team
-  release-engineering-reviewers:
-    - aleksandra-malinowska # Patch Release Team
-    - calebamiles # SIG Chair
-    - feiskyer # Patch Release Team
-    - hoegaarden # Patch Release Team
-    - justaugustus # SIG Chair
-    - tpepper # SIG Chair / Patch Release Team
-
-  sig-storage-reviewers:
+    - cpanato # SIG Technical Lead / RelEng subproject owner / Release Manager
+    - jeremyrickard # SIG Chair / RelEng subproject owner / Release Manager
+    - justaugustus # SIG Chair / RelEng subproject owner / Release Manager
+    - puerco # SIG Technical Lead / RelEng subproject owner / Release Manager
+    - saschagrunert # SIG Chair / RelEng subproject owner / Release Manager
+    - Verolop # SIG Technical Lead / RelEng subproject owner / Release Manager
+    - xmudrii # RelEng subproject lead / Release Manager
+  release-managers:
+    - cpanato
+    - jeremyrickard
+    - justaugustus
+    - palnabarun
+    - puerco
+    - saschagrunert
+    - Verolop
+    - xmudrii
+  release-team-subproject-leads:
+    - gracenng # Release Team subproject lead
+    - katcosgrove # Release Team subproject lead
+  build-image-approvers:
+    - BenTheElder
+    - cblecker
+    - cpanato # SIG Technical Lead / RelEng subproject owner / Release Manager
+    - dims
+    - jeremyrickard # SIG Chair / RelEng subproject owner / Release Manager
+    - justaugustus # SIG Chair / RelEng subproject owner / Release Manager
+    - palnabarun # Release Manager
+    - puerco # SIG Technical Lead / RelEng subproject owner / Release Manager
+    - saschagrunert # SIG Chair / RelEng subproject owner / Release Manager
+    - Verolop # SIG Technical Lead / RelEng subproject owner / Release Manager
+    - xmudrii # RelEng subproject lead / Release Manager
+  build-image-reviewers:
+    - BenTheElder
+    - cblecker
+    - cpanato # SIG Technical Lead / RelEng subproject owner / Release Manager
+    - dims
+    - jeremyrickard # SIG Chair / RelEng subproject owner / Release Manager
+    #- justaugustus # SIG Chair / RelEng subproject owner / Release Manager - approvals only
+    - palnabarun # Release Manager
+    - puerco # SIG Technical Lead / RelEng subproject owner / Release Manager
+    - saschagrunert # SIG Chair / RelEng subproject owner / Release Manager
+    - Verolop # SIG Technical Lead / RelEng subproject owner / Release Manager
+    - xmudrii # RelEng subproject lead / Release Manager
+  sig-storage-approvers:
+    - gnufied
+    - jsafrane
+    - msau42
     - saad-ali
-    - childsb
-
+    - thockin
+    - xing-yang
+  # emeritus:
+  # - rootfs
+  sig-storage-reviewers:
+    - carlory
+    - gnufied
+    - humblec
+    - jsafrane
+    - jingxu97
+    - mattcary
+    - mauriciopoppe
+    - msau42
+    - saikat-royc
+    - sunnylovestiramisu
+    - xing-yang
+  # emeritus:
+  # - chrishenzie
+  # - davidz627
+  # - Jiawei0227
+  # - rootfs
+  # - verult
   sig-scheduling-maintainers:
-    - bsalamat
-    - k82cn
-    - wojtek-t
-    - ravisantoshgudimetla
-    - Huang-Wei
     - ahg-g
+    - ania-borowiec
+    - dom4ha
+    - Huang-Wei
+    - kerthcet
+    - macsko
+    - mm4tt
+    - sanposhiho
+    - tosi3k
+  # emeritus:
+  # - alculquicondor
+  # - damemi
+  # - bsalamat
+  # - k82cn
+  # - ravisantoshgudimetla
+  # - wojtek-t
   sig-scheduling:
-    - bsalamat
-    - k82cn
-    - resouer
-    - ravisantoshgudimetla
-    - Huang-Wei
-    - wgliang
-    - ahg-g
-    - draveness
+    - ania-borowiec
+    - Argh4k
+    - AxeZhan
+    - brejman
+    - damemi
+    - denkensk
+    - dom4ha
+    - helayoty
+    - kerthcet
+    - macsko
+    - mm4tt
+    - pacoxu
+    - sanposhiho
+    - tosi3k
+    - utam0k
+  # emeritus:
+  # - adtac
+  # - liu-cong
+  # - draveness
+  # - hex108
+  # - resouer
+  # - wgliang
+  # - chendave
 
   sig-cli-maintainers:
-    - adohe
-    - brendandburns
-    - deads2k
-    - janetkuo
-    - liggitt
-    - seans3
-    - monopole
-    - droot
+    - ardaguclu
     - apelisse
-    - mengqiy
-    - smarterclayton
-    - soltysh
-  sig-cli:
-    - adohe
-    - deads2k
-    - derekwaynecarr
-    - dixudx
-    - dims
-    - dshulyak
-    - eparis
-    - ghodss
-    - juanvallejo
-    - mengqiy
-    - rootfs
+    - brianpursley
+    - eddiezane
     - seans3
-    - shiywang
-    - smarterclayton
+    - soltysh
+  # emeritus:
+  # - adohe
+  # - brendandburns
+  # - deads2k
+  # - droot
+  # - janetkuo
+  # - mengqiy
+  # - monopole
+  # - smarterclayton
+  # - KnVerey
+  # - pwittrock
+  sig-cli-reviewers:
+    - ardaguclu
+    - brianpursley
+    - eddiezane
+    - mpuckett159
+    - seans3
     - soltysh
   sig-testing-reviewers:
+    - aojea
     - bentheelder
     - cblecker
-    - fejta
-    - krzyzacy
-    - ixdy
-    - spiffxp
-  sig-testing-approvers:
-    - bentheelder
-    - cblecker
-    - fejta
-    - krzyzacy
-    - ixdy
-    - spiffxp
+    - dims
+    - pohly
+  # emeritus:
+  # - spiffxp
+  sig-node-approvers:
+    - Random-Liu
+    - dchen1107
+    - derekwaynecarr
+    - yujuhong
+    - sjenning
+    - mrunalp
+    - klueska
+    - SergeyKanzhelev
+    - tallclair
+  # emeretus:
+  # - dashpole
+  # - vishh
+  sig-node-cri-approvers:
+    - msau42
+    - thockin
+    - saschagrunert
+    - haircommander
+    - mikebrow
   sig-node-reviewers:
     - Random-Liu
-    - dashpole
     - dchen1107
     - derekwaynecarr
     - dims
+    - endocrimes
     - feiskyer
+    - HirazawaUi
     - mtaufen
-    - pmorie
-    - resouer
     - sjenning
-    - sjpotter
-    - tallclair
-    - tmrts
-    - vishh
-    - yifan-gu
+    - wzshiming
     - yujuhong
     - krmayankk
-    - mattjmcnaughton
-  sig-network-approvers:
-    - bowei
-    - caseydavenport
-    - danwinship
-    - dcbw
-    - dnardo
-    - freehan
-    - johnbelamaric
-    - mrhohn
-    - nicksardo
-    - thockin
-  sig-network-reviewers:
-    - bowei
-    - caseydavenport
-    - danwinship
-    - dcbw
-    - dnardo
-    - freehan
-    - johnbelamaric
-    - mrhohn
-    - nicksardo
-    - thockin
-    - rramkumar1
-    - cmluciano
-    - m1093782566
+    - matthyx
+    - odinuge
     - andrewsykim
+    - mrunalp
+    - SergeyKanzhelev
+    - bobbypage
+    - pacoxu
+    - bart0sh
+    - saschagrunert
+    - haircommander
+    - tzneal
+    - rphillips
+    - kannon92
+    - ffromani
+    - tallclair
+    - natasha41575
+    - ndixita
+    - harche
+    - pravk03
+  sig-network-approvers:
+    - aojea
+    - bowei
+    - danwinship
+    - robscott
+    - thockin
+  # emeritus:
+  # - andrewsykim
+  # - caseydavenport
+  # - dcbw
+  # - freehan
+  # - khenidak
+  # - mrhohn
+  sig-network-reviewers:
+    - adrianmoisey
+    - aojea
+    - aroradaman
+    - bowei
+    - danwinship
+    - robscott
+    - thockin
+    - tnqn
   sig-apps-approvers:
     - kow3ns
     - janetkuo
     - soltysh
-    - tnozicka
-    - erictune
-    - smarterclayton
+    - atiratree
   sig-apps-reviewers:
-    - enisoc
-    - erictune
-    - foxish
+    - atiratree
     - janetkuo
     - kow3ns
-    - mortent
-    - smarterclayton
-    - soltysh
-    - tnozicka
     - krmayankk
-  sig-autoscaling-maintainers:
-    - aleksandra-malinowska
-    - bskiba
-    - MaciekPytel
-    - mwielgus
+    - mimowo
+    - mortent
+    - soltysh
+  # sig-apps-emeritus:
+  # - tnozicka
 
+  sig-autoscaling-maintainers:
+    - adrianmoisey
+    - jackfrancis
+    - omerap12
+    - towca
+  # emeritus
+  # - maciekpytel
+  # - mwielgus
+  # - raywainman
+  # - gjtempleton
+  sig-instrumentation-approvers:
+    - dashpole
+    - RainbowMango
+    - serathius
+    - dgrisonnet
+    - richabanker
+    - pohly
+  # sig-instrumentation-emeritus
+  # - brancz
+  # - DirectXMan12
+  # - ehashman
+  # - logicalhan
+  # - rexagod
+  sig-instrumentation-reviewers:
+    - dashpole
+    - s-urbaniak
+    - coffeepac
+    - RainbowMango
+    - serathius
+    - dgrisonnet
+    - pohly
+    - mengjiao-liu
+    - nmn3m
+    - richabanker
   api-approvers:
-    - erictune
-    - lavalamp
-    - smarterclayton
+    - deads2k
+    - msau42
     - thockin
     - liggitt
-    # - bgrant0607 # manual escalations only
-
+    - jpbetz
   # subsets of api-approvers by sig area to help focus approval requests to those with domain knowledge
   sig-api-machinery-api-approvers:
-    - lavalamp
+    - deads2k
     - liggitt
-    - smarterclayton
-
+    - jpbetz
   sig-apps-api-approvers:
-    - erictune
-    - lavalamp
+    - deads2k
     - liggitt
-    - smarterclayton
-
   sig-auth-api-approvers:
+    - deads2k
     - liggitt
-    - smarterclayton
-
   sig-cli-api-approvers:
+    - deads2k
     - liggitt
-    - smarterclayton
-
   sig-cloud-provider-api-approvers:
     - liggitt
     - thockin
-
+  sig-cloud-provider-leads:
+    - bridgetkromhout
+    - cheftako
+    - elmiko
+    - joelspeed
   sig-cluster-lifecycle-api-approvers:
+    - deads2k
     - liggitt
-    - smarterclayton
-
+  sig-cluster-lifecycle-leads:
+    - fabriziopandini
+    - hakman
+    - justinsb
+    - neolit123
+    - sbueringer
   sig-network-api-approvers:
-    - smarterclayton
     - thockin
-
   sig-network-api-reviewers:
-    - caseydavenport
-    - cmluciano
+    - aojea
     - danwinship
     - thockin
-
-  sig-node-api-approvers:
-    - smarterclayton
-    - thockin
-
   sig-scheduling-api-approvers:
-    - lavalamp
-    - smarterclayton
+    - msau42
     - thockin
-
+  sig-security-approvers:
+    - IanColdwater
+    - tabbysable
+  sig-security-reviewers:
+    - IanColdwater
+    - tabbysable
   sig-storage-api-approvers:
     - liggitt
+    - msau42
     - thockin
-
   sig-windows-api-approvers:
-    - smarterclayton
     - thockin
     - liggitt
-  
   api-reviewers:
-    - erictune
-    - lavalamp
-    - smarterclayton
+    - andrewsykim
     - thockin
     - liggitt
     - wojtek-t
     - deads2k
     - yujuhong
-    - brendandburns
     - derekwaynecarr
     - caesarxuchao
-    - vishh
-    - mikedanese
-    - nikhiljindal
-    - gmarek
-    - davidopp
-    - pmorie
     - sttts
     - dchen1107
     - saad-ali
-    - zmerlynn
     - luxas
     - janetkuo
+    - jpbetz
     - justinsb
     - pwittrock
-    - roberthbailey
-    - ncdc
     - tallclair
-    - yifan-gu
-    - eparis
     - mwielgus
-    - timothysc
     - soltysh
-    - piosz
     - jsafrane
-    - jbeda
-
+    - dims
+    - cici37
+  # - emeritus
+  # - ncdc
   # api-reviewers targeted by sig area
   # see https://git.k8s.io/community/sig-architecture/api-review-process.md#training-reviews
-  
   sig-api-machinery-api-reviewers:
     - caesarxuchao
     - deads2k
     - jpbetz
     - sttts
-  
-  # sig-apps-api-reviewers:
-  #   - 
-  #   - 
-
+    - cici37
+  sig-apps-api-reviewers:
+    - janetkuo
+    - kow3ns
+    - soltysh
   sig-auth-api-reviewers:
     - enj
-    - mikedanese
-
   sig-cli-api-reviewers:
     - pwittrock
     - soltysh
-
   sig-cloud-provider-api-reviewers:
-    - andrewsykim
+    - elmiko
     - cheftako
-  
+    - joelspeed
+    - dims
   # sig-cluster-lifecycle-api-reviewers:
-  #   - 
   #   -
-  
+  #   -
+  sig-contributor-experience-approvers:
+    - mrbobbytables
+    - cblecker
+    - nikhita
+    - palnabarun
+    - kaslin
+    - MadhavJivrajani
+    - mfahlandt
+    - Priyankasaggu11929
+  # See https://github.com/kubernetes/org/blob/main/OWNERS_ALIASES
+  # for the authoritative list of SIG Docs leads, or look for
+  # https://github.com/kubernetes/website/blob/main/OWNERS_ALIASES
+  # for the list that this was derived from. SIG Docs' leads can
+  # confirm modifications here.
+  sig-docs-approvers:
+    - dipesh-rawat
+    - divya-mohan0209
+    - katcosgrove
+    - lmktfy
+    - natalisucks
+    - nate-double-u
+    - reylejano
+    - salaxander
+    - SayakMukhopadhyay
+    - tengqm
   sig-node-api-reviewers:
     - dchen1107
     - derekwaynecarr
     - tallclair
     - yujuhong
-  
-  sig-scheduling-api-reviewers:
-      - bsalamat
-      - k82cn
-  
+  sig-scalability-approvers:
+    - marseel
+    - mborsz
+    - mengqiy
+    - shyamjvs
+    - wojtek-t
+  # emeritus:
+  # - mm4tt
+  sig-scalability-reviewers:
+    - marseel
+    - mborsz
+    - mengqiy
+    - shyamjvs
+    - wojtek-t
+  # emeritus:
+  # - mm4tt
+  # sig-scheduling-api-reviewers:
+  # emeritus:
+  # - alculquicondor
   sig-storage-api-reviewers:
+    - deads2k
     - saad-ali
     - msau42
     - jsafrane
-
-  
+    - xing-yang
   sig-windows-api-reviewers:
-    - patricklang
-    - ddebroy
-    - benmoss
-
+    - jayunit100
+    - jsturtevant
+    - marosset
+  # Note: dep-approvers has approval on root files (including OWNERS_ALIASES) until https://github.com/kubernetes/test-infra/pull/21398 is resolved.
+  # People with approve rights via this alias should defer updates of root files other than go.mod/go.sum to dep-approvers.
   dep-approvers:
-    - apelisse
     - BenTheElder
     - cblecker
     - dims
     - thockin
     - sttts
     - soltysh
+    - liggitt
+  dep-reviewers:
+    - BenTheElder
+    - cblecker
+    - dims
+    - thockin
+    - sttts
+    - soltysh
+    - liggitt
   feature-approvers:
-    - bgrant0607      # Architecture
-    - brancz          # Instrumentation
-    - bsalamat        # Scheduling
-    - calebamiles     # Release
-    - caseydavenport  # Network
-    - childsb         # Storage
-    - countspongebob  # Scalability
-    - csbell          # Multicluster
-    - dcbw            # Network
-    - dchen1107       # Node
-    - deads2k         # API Machinery
-    - derekwaynecarr  # Node
-    - dghubble        # On Premise
-    - jdumars         # Architecture, Cluster Ops, Release
-    - kow3ns          # Apps
-    - lavalamp        # API Machinery
-    - liggitt         # Auth
-    - lukemarsden     # Cluster Lifecycle
-    - luxas           # Cluster Lifecycle
-    - marcoceppi      # On Premise
-    - mattfarina      # Apps
-    - michmike        # Windows
-    - mwielgus        # Autoscaling
-    - piosz           # Instrumentation
-    - prydonius       # Apps
-    - pwittrock       # CLI
-    - quinton-hoole   # Multicluster
-    - roberthbailey   # Cluster Lifecycle
-    - saad-ali        # Storage
-    - seans3          # CLI
-    - soltysh         # CLI
-    - tallclair       # Auth
-    - thockin         # Network
-    - timothysc       # Cluster Lifecycle, Scheduling
-    - wojtek-t        # Scalability
-    - zehicle         # Cluster Ops
+    - adrianmoisey # Autoscaling
+    - ardaguclu # CLI
+    - aojea # Network, Testing
+    - cheftako # Cloud Provider
+    - danwinship # Network
+    - dashpole # Instrumentation
+    - dchen1107 # Node
+    - deads2k # API Machinery
+    - derekwaynecarr # Node
+    - dgrisonnet # Instrumentation
+    - dims # Architecture
+    - dom4ha # Scheduling
+    - eddiezane # CLI
+    - elmiko # Cloud Provider
+    - enj # Auth
+    - gnufied # Storage
+    - jackfrancis # Autoscaling
+    - janetkuo # Apps
+    - jayunit100 # Windows
+    - joelspeed # Cloud Provider
+    - jpbetz # API Machinery
+    - jsafrane # Storage
+    - jsturtevant # Windows
+    - justinsb # Cluster Lifecycle
+    - kow3ns # Apps
+    - liggitt # Auth
+    - luxas # Cluster Lifecycle
+    - macsko # Scheduling
+    - marosset # Windows
+    - mikezappa87 # Network
+    - mm4tt # Scheduling
+    - mrunalp # Node
+    - msau42 # Storage
+    - omerap12 # Autoscaling
+    - pohly # Instrumentation
+    - richabanker # Instrumentation
+    - sanposhiho # Scheduling
+    - sergeykanzhelev # Node
+    - shaneutt # Network
+    - soltysh # Apps, CLI
+    - sttts # API Machinery
+    - tallclair # Auth
+    - thockin # Network
+    - towca # Autoscaling
+    - xing-yang # Storage
+    - wojtek-t # Scalability
+  # feature-approvers-emeritus:
+  # - logicalhan # Instrumentation
+  # - rexagod # Instrumentation
+  # conformance aliases https://git.k8s.io/enhancements/keps/sig-architecture/20190412-conformance-behaviors.md
+  conformance-behavior-approvers:
+    - BenTheElder
+    - johnbelamaric
+    - dims
+  # emeritus:
+  # - spiffpx

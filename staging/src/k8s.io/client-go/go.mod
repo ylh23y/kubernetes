@@ -2,45 +2,65 @@
 
 module k8s.io/client-go
 
-go 1.12
+go 1.27.0
+
+godebug default=go1.27
 
 require (
-	github.com/Azure/go-autorest v11.1.2+incompatible
-	github.com/davecgh/go-spew v1.1.1
-	github.com/dgrijalva/jwt-go v0.0.0-20160705203006-01aeca54ebda // indirect
-	github.com/evanphx/json-patch v4.2.0+incompatible
-	github.com/gogo/protobuf v1.2.2-0.20190723190241-65acae22fc9d
-	github.com/golang/groupcache v0.0.0-20160516000752-02826c3e7903
-	github.com/golang/protobuf v1.2.0
-	github.com/google/btree v0.0.0-20160524151835-7d79101e329e // indirect
-	github.com/google/gofuzz v1.0.0
-	github.com/googleapis/gnostic v0.0.0-20170729233727-0c5108395e2d
-	github.com/gophercloud/gophercloud v0.1.0
-	github.com/gregjones/httpcache v0.0.0-20170728041850-787624de3eb7
-	github.com/imdario/mergo v0.3.5
-	github.com/peterbourgon/diskv v2.0.1+incompatible
-	github.com/spf13/pflag v1.0.3
-	github.com/stretchr/testify v1.3.0
-	golang.org/x/crypto v0.0.0-20190611184440-5c40567a22f8
-	golang.org/x/net v0.0.0-20190613194153-d28f0bde5980
-	golang.org/x/oauth2 v0.0.0-20190402181905-9f3314589c9a
-	golang.org/x/time v0.0.0-20161028155119-f51c12702a4d
-	google.golang.org/appengine v1.5.0 // indirect
+	github.com/go-logr/logr v1.4.4
+	github.com/google/gnostic-models v0.7.1
+	github.com/google/go-cmp v0.7.0
+	github.com/google/uuid v1.6.0
+	github.com/gorilla/websocket v1.5.4-0.20250319132907-e064f32e3674
+	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822
+	github.com/onsi/gomega v1.44.0
+	github.com/peterbourgon/diskv/v3 v3.0.1
+	github.com/spf13/pflag v1.0.10
+	github.com/stretchr/testify v1.12.1
+	go.uber.org/goleak v1.3.0
+	golang.org/x/net v0.62.0
+	golang.org/x/oauth2 v0.37.0
+	golang.org/x/term v0.47.0
+	golang.org/x/time v0.16.0
+	google.golang.org/protobuf v1.36.12
+	gopkg.in/evanphx/json-patch.v4 v4.13.0
 	k8s.io/api v0.0.0
 	k8s.io/apimachinery v0.0.0
-	k8s.io/klog v0.3.1
-	k8s.io/utils v0.0.0-20190607212802-c55fbcfc754a
-	sigs.k8s.io/yaml v1.1.0
+	k8s.io/klog/v2 v2.140.0
+	k8s.io/ktesting v0.0.0
+	k8s.io/kube-openapi v0.0.0-20261014044854-ca3452a79603
+	k8s.io/streaming v0.0.0
+	k8s.io/utils v0.0.0-20260626114624-be93311217bd
+	sigs.k8s.io/json v0.0.0-20250730193827-2d320260d730
+	sigs.k8s.io/randfill v1.0.0
+	sigs.k8s.io/structured-merge-diff/v7 v7.0.1
+	sigs.k8s.io/yaml v1.6.0
+)
+
+require (
+	github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc // indirect
+	github.com/fxamacker/cbor/v2 v2.9.4 // indirect
+	github.com/go-openapi/jsonpointer v1.0.2 // indirect
+	github.com/go-openapi/jsonreference v1.0.2 // indirect
+	github.com/go-openapi/swag/conv v0.29.2 // indirect
+	github.com/go-openapi/swag/jsonutils v0.29.2 // indirect
+	github.com/go-openapi/swag/pools v0.29.2 // indirect
+	github.com/go-openapi/swag/typeutils v0.29.2 // indirect
+	github.com/google/btree v1.1.3 // indirect
+	github.com/moby/spdystream v0.5.1 // indirect
+	github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2 // indirect
+	github.com/stretchr/objx v0.5.3 // indirect
+	github.com/x448/float16 v0.8.4 // indirect
+	go.yaml.in/yaml/v2 v2.4.4 // indirect
+	go.yaml.in/yaml/v3 v3.0.5 // indirect
+	golang.org/x/sys v0.49.0 // indirect
+	golang.org/x/text v0.43.0 // indirect
+	gopkg.in/inf.v0 v0.9.1 // indirect
 )
 
 replace (
-	golang.org/x/crypto => golang.org/x/crypto v0.0.0-20181025213731-e84da0312774
-	golang.org/x/net => golang.org/x/net v0.0.0-20190206173232-65e2d4e15006
-	golang.org/x/sync => golang.org/x/sync v0.0.0-20181108010431-42b317875d0f
-	golang.org/x/sys => golang.org/x/sys v0.0.0-20190209173611-3b5209105503
-	golang.org/x/text => golang.org/x/text v0.3.1-0.20181227161524-e6919f6577db
-	golang.org/x/tools => golang.org/x/tools v0.0.0-20190313210603-aa82965741a9
 	k8s.io/api => ../api
 	k8s.io/apimachinery => ../apimachinery
-	k8s.io/client-go => ../client-go
+	k8s.io/ktesting => ../ktesting
+	k8s.io/streaming => ../streaming
 )

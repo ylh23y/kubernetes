@@ -17,9 +17,12 @@ limitations under the License.
 package pluginmanager
 
 import (
+	"context"
 	"fmt"
-	"io/ioutil"
 	"os"
+	"path/filepath"
+	"reflect"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -28,119 +31,102 @@ import (
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/tools/record"
-	pluginwatcherapi "k8s.io/kubernetes/pkg/kubelet/apis/pluginregistration/v1"
-	registerapi "k8s.io/kubernetes/pkg/kubelet/apis/pluginregistration/v1"
+	registerapi "k8s.io/kubelet/pkg/apis/pluginregistration/v1"
+
+	"k8s.io/ktesting"
 	"k8s.io/kubernetes/pkg/kubelet/config"
-	"k8s.io/kubernetes/pkg/kubelet/pluginmanager/cache"
 	"k8s.io/kubernetes/pkg/kubelet/pluginmanager/pluginwatcher"
 )
 
-const (
-	testHostname = "test-hostname"
-)
-
 var (
-	socketDir           string
-	deprecatedSocketDir string
-	supportedVersions   = []string{"v1beta1", "v1beta2"}
+	socketDir         string
+	supportedVersions = []string{"v1beta1", "v1beta2"}
 )
-
-// fake cache.PluginHandler
-type PluginHandler interface {
-	ValidatePlugin(pluginName string, endpoint string, versions []string, foundInDeprecatedDir bool) error
-	RegisterPlugin(pluginName, endpoint string, versions []string) error
-	DeRegisterPlugin(pluginName string)
-}
 
 type fakePluginHandler struct {
-	validatePluginCalled   bool
-	registerPluginCalled   bool
-	deregisterPluginCalled bool
+	events []string
 	sync.RWMutex
 }
 
 func newFakePluginHandler() *fakePluginHandler {
-	return &fakePluginHandler{
-		validatePluginCalled:   false,
-		registerPluginCalled:   false,
-		deregisterPluginCalled: false,
-	}
+	return &fakePluginHandler{}
 }
 
 // ValidatePlugin is a fake method
-func (f *fakePluginHandler) ValidatePlugin(pluginName string, endpoint string, versions []string, foundInDeprecatedDir bool) error {
+func (f *fakePluginHandler) ValidatePlugin(_ context.Context, pluginName string, endpoint string, versions []string) error {
 	f.Lock()
 	defer f.Unlock()
-	f.validatePluginCalled = true
+	f.events = append(f.events, "validate "+pluginName+" "+endpoint)
 	return nil
 }
 
 // RegisterPlugin is a fake method
-func (f *fakePluginHandler) RegisterPlugin(pluginName, endpoint string, versions []string) error {
+func (f *fakePluginHandler) RegisterPlugin(_ context.Context, pluginName, endpoint string, versions []string, pluginClientTimeout *time.Duration) error {
 	f.Lock()
 	defer f.Unlock()
-	f.registerPluginCalled = true
+	f.events = append(f.events, "register "+pluginName+" "+endpoint)
 	return nil
 }
 
 // DeRegisterPlugin is a fake method
-func (f *fakePluginHandler) DeRegisterPlugin(pluginName string) {
+func (f *fakePluginHandler) DeRegisterPlugin(_ context.Context, pluginName, endpoint string) {
 	f.Lock()
 	defer f.Unlock()
-	f.deregisterPluginCalled = true
-	return
+	f.events = append(f.events, "deregister "+pluginName+" "+endpoint)
+}
+
+func (f *fakePluginHandler) Reset() {
+	f.Lock()
+	defer f.Unlock()
+	f.events = nil
 }
 
 func init() {
-	d, err := ioutil.TempDir("", "plugin_manager_test")
-	if err != nil {
-		panic(fmt.Sprintf("Could not create a temp directory: %s", d))
-	}
-
-	d2, err := ioutil.TempDir("", "deprecateddir_plugin_manager_test")
+	d, err := os.MkdirTemp("", "plugin_manager_test")
 	if err != nil {
 		panic(fmt.Sprintf("Could not create a temp directory: %s", d))
 	}
 
 	socketDir = d
-	deprecatedSocketDir = d2
 }
 
 func cleanup(t *testing.T) {
 	require.NoError(t, os.RemoveAll(socketDir))
-	require.NoError(t, os.RemoveAll(deprecatedSocketDir))
 	os.MkdirAll(socketDir, 0755)
-	os.MkdirAll(deprecatedSocketDir, 0755)
 }
 
-func newWatcher(
-	t *testing.T, testDeprecatedDir bool,
-	desiredStateOfWorldCache cache.DesiredStateOfWorld) *pluginwatcher.Watcher {
-
-	depSocketDir := ""
-	if testDeprecatedDir {
-		depSocketDir = deprecatedSocketDir
-	}
-	w := pluginwatcher.NewWatcher(socketDir, depSocketDir, desiredStateOfWorldCache)
-	require.NoError(t, w.Start(wait.NeverStop))
-
-	return w
+func waitForRegistration(t *testing.T, fakePluginHandler *fakePluginHandler, pluginName, endpoint string) {
+	t.Helper()
+	waitFor(t, fakePluginHandler,
+		[]string{"validate " + pluginName + " " + endpoint, "register " + pluginName + " " + endpoint},
+		"Timed out waiting for plugin to be added to actual state of world cache.",
+	)
 }
 
-func waitForRegistration(t *testing.T, fakePluginHandler *fakePluginHandler) {
+func waitForDeRegistration(t *testing.T, fakePluginHandler *fakePluginHandler, pluginName, endpoint string) {
+	t.Helper()
+	waitFor(t, fakePluginHandler,
+		[]string{"deregister " + pluginName + " " + endpoint},
+		"Timed out waiting for plugin to be removed from actual state of the world cache.",
+	)
+}
+
+func waitFor(t *testing.T, fakePluginHandler *fakePluginHandler, expected []string, what string) {
+	t.Helper()
 	err := retryWithExponentialBackOff(
-		time.Duration(500*time.Millisecond),
+		100*time.Millisecond,
 		func() (bool, error) {
 			fakePluginHandler.Lock()
 			defer fakePluginHandler.Unlock()
-			if fakePluginHandler.validatePluginCalled && fakePluginHandler.registerPluginCalled {
+			if reflect.DeepEqual(fakePluginHandler.events, expected) {
 				return true, nil
 			}
+			t.Logf("expected %#v, got %#v, will retry", expected, fakePluginHandler.events)
 			return false, nil
 		},
 	)
 	if err != nil {
-		t.Fatalf("Timed out waiting for plugin to be added to actual state of world cache.")
+		t.Fatal(what)
 	}
 }
 
@@ -154,40 +140,54 @@ func retryWithExponentialBackOff(initialDuration time.Duration, fn wait.Conditio
 	return wait.ExponentialBackoff(backoff, fn)
 }
 
-func TestPluginRegistration(t *testing.T) {
+func TestPluginManager(t *testing.T) {
 	defer cleanup(t)
 
-	pluginManager := newTestPluginManager(socketDir, deprecatedSocketDir)
+	tCtx := ktesting.Init(t)
+	pluginManager := newTestPluginManager(socketDir)
 
 	// Start the plugin manager
 	stopChan := make(chan struct{})
 	defer close(stopChan)
 	go func() {
-		sourcesReady := config.NewSourcesReady(func(_ sets.String) bool { return true })
-		pluginManager.Run(sourcesReady, stopChan)
+		sourcesReady := config.NewSourcesReady(func(_ sets.Set[string]) bool { return true })
+		pluginManager.Run(tCtx, sourcesReady, stopChan)
 	}()
 
 	// Add handler for device plugin
 	fakeHandler := newFakePluginHandler()
-	pluginManager.AddHandler(pluginwatcherapi.DevicePlugin, fakeHandler)
+	pluginManager.AddHandler(registerapi.DevicePlugin, fakeHandler)
 
-	// Add a new plugin
-	socketPath := fmt.Sprintf("%s/plugin.sock", socketDir)
-	pluginName := "example-plugin"
-	p := pluginwatcher.NewTestExamplePlugin(pluginName, registerapi.DevicePlugin, socketPath, supportedVersions...)
-	require.NoError(t, p.Serve("v1beta1", "v1beta2"))
+	const maxDepth = 3
+	// Make sure the plugin manager is aware of the socket in subdirectories
+	for i := 0; i < maxDepth; i++ {
+		fakeHandler.Reset()
+		pluginDir := socketDir
 
-	// Verify that the plugin is registered
-	waitForRegistration(t, fakeHandler)
+		for j := 0; j < i; j++ {
+			pluginDir = filepath.Join(pluginDir, strconv.Itoa(j))
+		}
+		require.NoError(t, os.MkdirAll(pluginDir, os.ModePerm))
+		socketPath := filepath.Join(pluginDir, fmt.Sprintf("plugin-%d.sock", i))
+
+		// Add a new plugin
+		pluginName := fmt.Sprintf("example-plugin-%d", i)
+		p := pluginwatcher.NewTestExamplePlugin(pluginName, registerapi.DevicePlugin, socketPath, supportedVersions...)
+		require.NoError(t, p.Serve(tCtx, "v1beta1", "v1beta2"))
+
+		// Verify that the plugin is registered
+		waitForRegistration(t, fakeHandler, pluginName, socketPath)
+
+		// And unregister.
+		fakeHandler.Reset()
+		require.NoError(t, p.Stop(tCtx))
+		waitForDeRegistration(t, fakeHandler, pluginName, socketPath)
+	}
 }
 
-func newTestPluginManager(
-	sockDir string,
-	deprecatedSockDir string) PluginManager {
-
+func newTestPluginManager(sockDir string) PluginManager {
 	pm := NewPluginManager(
 		sockDir,
-		deprecatedSockDir,
 		&record.FakeRecorder{},
 	)
 	return pm

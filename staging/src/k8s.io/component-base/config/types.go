@@ -62,13 +62,19 @@ type LeaderElectionConfiguration struct {
 	// resourceLock indicates the resource object type that will be used to lock
 	// during leader election cycles.
 	ResourceLock string
+	// resourceName indicates the name of resource object that will be used to lock
+	// during leader election cycles.
+	ResourceName string
+	// resourceNamespace indicates the namespace of resource object that will be used to lock
+	// during leader election cycles.
+	ResourceNamespace string
 }
 
 // DebuggingConfiguration holds configuration for Debugging related features.
 type DebuggingConfiguration struct {
 	// enableProfiling enables profiling via web interface host:port/debug/pprof/
 	EnableProfiling bool
-	// enableContentionProfiling enables lock contention profiling, if
+	// enableContentionProfiling enables block profiling, if
 	// enableProfiling is true.
 	EnableContentionProfiling bool
 }

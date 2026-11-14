@@ -1,3 +1,8 @@
+> ⚠️ **This is an automatically published [staged repository](https://git.k8s.io/kubernetes/staging#external-repository-staging-area) for Kubernetes**.   
+> Contributions, including issues and pull requests, should be made to the main Kubernetes repository: [https://github.com/kubernetes/kubernetes](https://github.com/kubernetes/kubernetes).  
+> This repository is read-only for importing, and not used for direct contributions.  
+> See [CONTRIBUTING.md](./CONTRIBUTING.md) for more details.
+
 # apiserver
 
 Generic library for building a Kubernetes aggregated API server.
@@ -28,3 +33,4 @@ Code changes are made in that location, merged into `k8s.io/kubernetes` and late
  1. Directly modify any files under `pkg` in this repo.  Those are driven from `k8s.io/kubernetes/staging/src/k8s.io/apiserver`.
  2. Expect compatibility.  This repo is changing quickly in direct support of
     Kubernetes and the API isn't yet stable enough for API guarantees.
+

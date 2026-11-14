@@ -18,9 +18,7 @@ package testing
 
 import (
 	"bytes"
-	"errors"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"time"
@@ -28,9 +26,11 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/meta/testrestmapper"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/conversion"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/runtime/serializer"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/cli-runtime/pkg/genericclioptions"
 	"k8s.io/cli-runtime/pkg/resource"
 	"k8s.io/client-go/discovery"
@@ -38,6 +38,8 @@ import (
 	"k8s.io/client-go/dynamic"
 	fakedynamic "k8s.io/client-go/dynamic/fake"
 	"k8s.io/client-go/kubernetes"
+	openapiclient "k8s.io/client-go/openapi"
+	"k8s.io/client-go/openapi/openapitest"
 	restclient "k8s.io/client-go/rest"
 	"k8s.io/client-go/rest/fake"
 	"k8s.io/client-go/restmapper"
@@ -128,6 +130,34 @@ func NewInternalType(kind, apiversion, name string) *InternalType {
 	return &item
 }
 
+func convertInternalTypeToExternalType(in *InternalType, out *ExternalType, s conversion.Scope) error {
+	out.Kind = in.Kind
+	out.APIVersion = in.APIVersion
+	out.Name = in.Name
+	return nil
+}
+
+func convertInternalTypeToExternalType2(in *InternalType, out *ExternalType2, s conversion.Scope) error {
+	out.Kind = in.Kind
+	out.APIVersion = in.APIVersion
+	out.Name = in.Name
+	return nil
+}
+
+func convertExternalTypeToInternalType(in *ExternalType, out *InternalType, s conversion.Scope) error {
+	out.Kind = in.Kind
+	out.APIVersion = in.APIVersion
+	out.Name = in.Name
+	return nil
+}
+
+func convertExternalType2ToInternalType(in *ExternalType2, out *InternalType, s conversion.Scope) error {
+	out.Kind = in.Kind
+	out.APIVersion = in.APIVersion
+	out.Name = in.Name
+	return nil
+}
+
 // InternalNamespacedType schema for internal namespaced types
 // +k8s:deepcopy-gen=true
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
@@ -209,7 +239,37 @@ func NewInternalNamespacedType(kind, apiversion, name, namespace string) *Intern
 	return &item
 }
 
-var errInvalidVersion = errors.New("not a version")
+func convertInternalNamespacedTypeToExternalNamespacedType(in *InternalNamespacedType, out *ExternalNamespacedType, s conversion.Scope) error {
+	out.Kind = in.Kind
+	out.APIVersion = in.APIVersion
+	out.Name = in.Name
+	out.Namespace = in.Namespace
+	return nil
+}
+
+func convertInternalNamespacedTypeToExternalNamespacedType2(in *InternalNamespacedType, out *ExternalNamespacedType2, s conversion.Scope) error {
+	out.Kind = in.Kind
+	out.APIVersion = in.APIVersion
+	out.Name = in.Name
+	out.Namespace = in.Namespace
+	return nil
+}
+
+func convertExternalNamespacedTypeToInternalNamespacedType(in *ExternalNamespacedType, out *InternalNamespacedType, s conversion.Scope) error {
+	out.Kind = in.Kind
+	out.APIVersion = in.APIVersion
+	out.Name = in.Name
+	out.Namespace = in.Namespace
+	return nil
+}
+
+func convertExternalNamespacedType2ToInternalNamespacedType(in *ExternalNamespacedType2, out *InternalNamespacedType, s conversion.Scope) error {
+	out.Kind = in.Kind
+	out.APIVersion = in.APIVersion
+	out.Name = in.Name
+	out.Namespace = in.Namespace
+	return nil
+}
 
 // ValidVersion of API
 var ValidVersion = "v1"
@@ -230,17 +290,63 @@ func NewExternalScheme() (*runtime.Scheme, meta.RESTMapper, runtime.Codec) {
 	return scheme, mapper, codec
 }
 
+func registerConversions(s *runtime.Scheme) error {
+	if err := s.AddConversionFunc((*InternalType)(nil), (*ExternalType)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return convertInternalTypeToExternalType(a.(*InternalType), b.(*ExternalType), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddConversionFunc((*InternalType)(nil), (*ExternalType2)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return convertInternalTypeToExternalType2(a.(*InternalType), b.(*ExternalType2), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddConversionFunc((*ExternalType)(nil), (*InternalType)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return convertExternalTypeToInternalType(a.(*ExternalType), b.(*InternalType), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddConversionFunc((*ExternalType2)(nil), (*InternalType)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return convertExternalType2ToInternalType(a.(*ExternalType2), b.(*InternalType), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddConversionFunc((*InternalNamespacedType)(nil), (*ExternalNamespacedType)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return convertInternalNamespacedTypeToExternalNamespacedType(a.(*InternalNamespacedType), b.(*ExternalNamespacedType), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddConversionFunc((*InternalNamespacedType)(nil), (*ExternalNamespacedType2)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return convertInternalNamespacedTypeToExternalNamespacedType2(a.(*InternalNamespacedType), b.(*ExternalNamespacedType2), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddConversionFunc((*ExternalNamespacedType)(nil), (*InternalNamespacedType)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return convertExternalNamespacedTypeToInternalNamespacedType(a.(*ExternalNamespacedType), b.(*InternalNamespacedType), scope)
+	}); err != nil {
+		return err
+	}
+	if err := s.AddConversionFunc((*ExternalNamespacedType2)(nil), (*InternalNamespacedType)(nil), func(a, b interface{}, scope conversion.Scope) error {
+		return convertExternalNamespacedType2ToInternalNamespacedType(a.(*ExternalNamespacedType2), b.(*InternalNamespacedType), scope)
+	}); err != nil {
+		return err
+	}
+	return nil
+}
+
 // AddToScheme adds required objects into scheme
 func AddToScheme(scheme *runtime.Scheme) (meta.RESTMapper, runtime.Codec) {
 	scheme.AddKnownTypeWithName(InternalGV.WithKind("Type"), &InternalType{})
 	scheme.AddKnownTypeWithName(UnlikelyGV.WithKind("Type"), &ExternalType{})
-	//This tests that kubectl will not confuse the external scheme with the internal scheme, even when they accidentally have versions of the same name.
+	// This tests that kubectl will not confuse the external scheme with the internal scheme, even when they accidentally have versions of the same name.
 	scheme.AddKnownTypeWithName(ValidVersionGV.WithKind("Type"), &ExternalType2{})
 
 	scheme.AddKnownTypeWithName(InternalGV.WithKind("NamespacedType"), &InternalNamespacedType{})
 	scheme.AddKnownTypeWithName(UnlikelyGV.WithKind("NamespacedType"), &ExternalNamespacedType{})
-	//This tests that kubectl will not confuse the external scheme with the internal scheme, even when they accidentally have versions of the same name.
+	// This tests that kubectl will not confuse the external scheme with the internal scheme, even when they accidentally have versions of the same name.
 	scheme.AddKnownTypeWithName(ValidVersionGV.WithKind("NamespacedType"), &ExternalNamespacedType2{})
+
+	utilruntime.Must(registerConversions(scheme))
 
 	codecs := serializer.NewCodecFactory(scheme)
 	codec := codecs.LegacyCodec(UnlikelyGV)
@@ -257,24 +363,45 @@ func AddToScheme(scheme *runtime.Scheme) (meta.RESTMapper, runtime.Codec) {
 	return mapper, codec
 }
 
-type fakeCachedDiscoveryClient struct {
+type FakeCachedDiscoveryClient struct {
 	discovery.DiscoveryInterface
+	Groups             []*metav1.APIGroup
+	Resources          []*metav1.APIResourceList
+	PreferredResources []*metav1.APIResourceList
+	Invalidations      int
 }
 
-func (d *fakeCachedDiscoveryClient) Fresh() bool {
+func NewFakeCachedDiscoveryClient() *FakeCachedDiscoveryClient {
+	return &FakeCachedDiscoveryClient{
+		Groups:             []*metav1.APIGroup{},
+		Resources:          []*metav1.APIResourceList{},
+		PreferredResources: []*metav1.APIResourceList{},
+		Invalidations:      0,
+	}
+}
+
+func (d *FakeCachedDiscoveryClient) Fresh() bool {
 	return true
 }
 
-func (d *fakeCachedDiscoveryClient) Invalidate() {
+func (d *FakeCachedDiscoveryClient) Invalidate() {
+	d.Invalidations++
 }
 
-// Deprecated: use ServerGroupsAndResources instead.
-func (d *fakeCachedDiscoveryClient) ServerResources() ([]*metav1.APIResourceList, error) {
-	return []*metav1.APIResourceList{}, nil
+func (d *FakeCachedDiscoveryClient) ServerGroupsAndResources() ([]*metav1.APIGroup, []*metav1.APIResourceList, error) {
+	return d.Groups, d.Resources, nil
 }
 
-func (d *fakeCachedDiscoveryClient) ServerGroupsAndResources() ([]*metav1.APIGroup, []*metav1.APIResourceList, error) {
-	return []*metav1.APIGroup{}, []*metav1.APIResourceList{}, nil
+func (d *FakeCachedDiscoveryClient) ServerGroups() (*metav1.APIGroupList, error) {
+	groupList := &metav1.APIGroupList{Groups: []metav1.APIGroup{}}
+	for _, g := range d.Groups {
+		groupList.Groups = append(groupList.Groups, *g)
+	}
+	return groupList, nil
+}
+
+func (d *FakeCachedDiscoveryClient) ServerPreferredResources() ([]*metav1.APIResourceList, error) {
+	return d.PreferredResources, nil
 }
 
 // TestFactory extends cmdutil.Factory
@@ -293,13 +420,14 @@ type TestFactory struct {
 
 	UnstructuredClientForMappingFunc resource.FakeClientFunc
 	OpenAPISchemaFunc                func() (openapi.Resources, error)
+	OpenAPIV3ClientFunc              func() (openapiclient.Client, error)
 }
 
 // NewTestFactory returns an initialized TestFactory instance
 func NewTestFactory() *TestFactory {
 	// specify an optionalClientConfig to explicitly use in testing
 	// to avoid polluting an existing user config.
-	tmpFile, err := ioutil.TempFile("", "cmdtests_temp")
+	tmpFile, err := os.CreateTemp(os.TempDir(), "cmdtests_temp")
 	if err != nil {
 		panic(fmt.Sprintf("unable to create a fake client config: %v", err))
 	}
@@ -338,12 +466,24 @@ func (f *TestFactory) WithNamespace(ns string) *TestFactory {
 	return f
 }
 
+// WithClientConfig sets the client config to use
+func (f *TestFactory) WithClientConfig(clientConfig clientcmd.ClientConfig) *TestFactory {
+	f.kubeConfigFlags.WithClientConfig(clientConfig)
+	return f
+}
+
+func (f *TestFactory) WithDiscoveryClient(discoveryClient discovery.CachedDiscoveryInterface) *TestFactory {
+	f.kubeConfigFlags.WithDiscoveryClient(discoveryClient)
+	return f
+}
+
 // Cleanup cleans up TestFactory temp config file
 func (f *TestFactory) Cleanup() {
 	if f.tempConfigFile == nil {
 		return
 	}
 
+	f.tempConfigFile.Close()
 	os.Remove(f.tempConfigFile.Name())
 }
 
@@ -357,6 +497,25 @@ func (f *TestFactory) ClientForMapping(mapping *meta.RESTMapping) (resource.REST
 	return f.Client, nil
 }
 
+// PathOptions returns a new PathOptions with a temp file
+func (f *TestFactory) PathOptions() *clientcmd.PathOptions {
+	pathOptions := clientcmd.NewDefaultPathOptions()
+	pathOptions.GlobalFile = f.tempConfigFile.Name()
+	pathOptions.EnvVar = ""
+	return pathOptions
+}
+
+// PathOptionsWithConfig writes a config to a temp file and returns PathOptions
+func (f *TestFactory) PathOptionsWithConfig(config clientcmdapi.Config) (*clientcmd.PathOptions, error) {
+	pathOptions := f.PathOptions()
+	err := clientcmd.WriteToFile(config, pathOptions.GlobalFile)
+	if err != nil {
+		return nil, err
+	}
+
+	return pathOptions, nil
+}
+
 // UnstructuredClientForMapping is used to get UnstructuredClient from a TestFactory
 func (f *TestFactory) UnstructuredClientForMapping(mapping *meta.RESTMapping) (resource.RESTClient, error) {
 	if f.UnstructuredClientForMappingFunc != nil {
@@ -366,7 +525,7 @@ func (f *TestFactory) UnstructuredClientForMapping(mapping *meta.RESTMapping) (r
 }
 
 // Validator returns a validation schema
-func (f *TestFactory) Validator(validate bool) (validation.Schema, error) {
+func (f *TestFactory) Validator(validateDirective string) (validation.Schema, error) {
 	return validation.NullSchema{}, nil
 }
 
@@ -376,6 +535,13 @@ func (f *TestFactory) OpenAPISchema() (openapi.Resources, error) {
 		return f.OpenAPISchemaFunc()
 	}
 	return openapitesting.EmptyResources{}, nil
+}
+
+func (f *TestFactory) OpenAPIV3Client() (openapiclient.Client, error) {
+	if f.OpenAPIV3ClientFunc != nil {
+		return f.OpenAPIV3ClientFunc()
+	}
+	return openapitest.NewFakeClient(), nil
 }
 
 // NewBuilder returns an initialized resource.Builder instance
@@ -407,10 +573,11 @@ func (f *TestFactory) KubernetesClientSet() (*kubernetes.Clientset, error) {
 	clientset.AuthorizationV1beta1().RESTClient().(*restclient.RESTClient).Client = fakeClient.Client
 	clientset.AuthorizationV1().RESTClient().(*restclient.RESTClient).Client = fakeClient.Client
 	clientset.AuthorizationV1beta1().RESTClient().(*restclient.RESTClient).Client = fakeClient.Client
+	clientset.AuthenticationV1alpha1().RESTClient().(*restclient.RESTClient).Client = fakeClient.Client
 	clientset.AutoscalingV1().RESTClient().(*restclient.RESTClient).Client = fakeClient.Client
-	clientset.AutoscalingV2beta1().RESTClient().(*restclient.RESTClient).Client = fakeClient.Client
+	clientset.AutoscalingV2().RESTClient().(*restclient.RESTClient).Client = fakeClient.Client
 	clientset.BatchV1().RESTClient().(*restclient.RESTClient).Client = fakeClient.Client
-	clientset.BatchV2alpha1().RESTClient().(*restclient.RESTClient).Client = fakeClient.Client
+	clientset.CertificatesV1().RESTClient().(*restclient.RESTClient).Client = fakeClient.Client
 	clientset.CertificatesV1beta1().RESTClient().(*restclient.RESTClient).Client = fakeClient.Client
 	clientset.ExtensionsV1beta1().RESTClient().(*restclient.RESTClient).Client = fakeClient.Client
 	clientset.RbacV1alpha1().RESTClient().(*restclient.RESTClient).Client = fakeClient.Client
@@ -421,6 +588,7 @@ func (f *TestFactory) KubernetesClientSet() (*kubernetes.Clientset, error) {
 	clientset.AppsV1beta2().RESTClient().(*restclient.RESTClient).Client = fakeClient.Client
 	clientset.AppsV1().RESTClient().(*restclient.RESTClient).Client = fakeClient.Client
 	clientset.PolicyV1beta1().RESTClient().(*restclient.RESTClient).Client = fakeClient.Client
+	clientset.PolicyV1().RESTClient().(*restclient.RESTClient).Client = fakeClient.Client
 	clientset.DiscoveryClient.RESTClient().(*restclient.RESTClient).Client = fakeClient.Client
 
 	return clientset, nil
@@ -472,8 +640,8 @@ func testRESTMapper() meta.RESTMapper {
 		},
 	}
 
-	fakeDs := &fakeCachedDiscoveryClient{}
-	expander := restmapper.NewShortcutExpander(mapper, fakeDs)
+	fakeDs := NewFakeCachedDiscoveryClient()
+	expander := restmapper.NewShortcutExpander(mapper, fakeDs, nil)
 	return expander
 }
 
@@ -568,15 +736,15 @@ func testDynamicResources() []*restmapper.APIGroupResources {
 				Name: "autoscaling",
 				Versions: []metav1.GroupVersionForDiscovery{
 					{Version: "v1"},
-					{Version: "v2beta1"},
+					{Version: "v2"},
 				},
-				PreferredVersion: metav1.GroupVersionForDiscovery{Version: "v2beta1"},
+				PreferredVersion: metav1.GroupVersionForDiscovery{Version: "v2"},
 			},
 			VersionedResources: map[string][]metav1.APIResource{
 				"v1": {
 					{Name: "horizontalpodautoscalers", Namespaced: true, Kind: "HorizontalPodAutoscaler"},
 				},
-				"v2beta1": {
+				"v2": {
 					{Name: "horizontalpodautoscalers", Namespaced: true, Kind: "HorizontalPodAutoscaler"},
 				},
 			},
@@ -629,6 +797,7 @@ func testDynamicResources() []*restmapper.APIGroupResources {
 			VersionedResources: map[string][]metav1.APIResource{
 				"v1": {
 					{Name: "bars", Namespaced: true, Kind: "Bar"},
+					{Name: "applysets", Namespaced: false, Kind: "ApplySet"},
 				},
 			},
 		},

@@ -1,4 +1,4 @@
-// +build linux
+//go:build linux
 
 /*
 Copyright 2014 The Kubernetes Authors.
@@ -26,16 +26,24 @@ import (
 	"path/filepath"
 	"reflect"
 	"strconv"
+	"strings"
 	"syscall"
 	"testing"
 
-	"k8s.io/klog"
-
-	"k8s.io/kubernetes/pkg/util/mount"
+	"k8s.io/klog/v2"
+	"k8s.io/mount-utils"
 )
+
+func removeAll(t *testing.T, dir string) {
+	t.Helper()
+	if err := os.RemoveAll(dir); err != nil {
+		t.Errorf("failed to remove %q: %v", dir, err)
+	}
+}
 
 func TestSafeMakeDir(t *testing.T) {
 	defaultPerm := os.FileMode(0750) + os.ModeDir
+	maxPerm := os.FileMode(0777) + os.ModeDir
 	tests := []struct {
 		name string
 		// Function that prepares directory structure for the test under given
@@ -54,6 +62,16 @@ func TestSafeMakeDir(t *testing.T) {
 			"test/directory",
 			"test/directory",
 			defaultPerm,
+			false,
+		},
+		{
+			"all-created-subpath-directory-with-permissions",
+			func(base string) error {
+				return nil
+			},
+			"test/directory",
+			"test",
+			maxPerm,
 			false,
 		},
 		{
@@ -185,7 +203,7 @@ func TestSafeMakeDir(t *testing.T) {
 		{
 			"non-directory",
 			func(base string) error {
-				return ioutil.WriteFile(filepath.Join(base, "test"), []byte{}, defaultPerm)
+				return os.WriteFile(filepath.Join(base, "test"), []byte{}, defaultPerm)
 			},
 			"test/directory",
 			"",
@@ -195,7 +213,7 @@ func TestSafeMakeDir(t *testing.T) {
 		{
 			"non-directory-final",
 			func(base string) error {
-				return ioutil.WriteFile(filepath.Join(base, "test"), []byte{}, defaultPerm)
+				return os.WriteFile(filepath.Join(base, "test"), []byte{}, defaultPerm)
 			},
 			"test",
 			"",
@@ -246,11 +264,11 @@ func TestSafeMakeDir(t *testing.T) {
 	for i := range tests {
 		test := tests[i]
 		t.Run(test.name, func(t *testing.T) {
-			base, err := ioutil.TempDir("", "safe-make-dir-"+test.name+"-")
+			base, err := os.MkdirTemp("", "safe-make-dir-"+test.name+"-")
 			if err != nil {
-				t.Fatalf(err.Error())
+				t.Fatal(err.Error())
 			}
-			defer os.RemoveAll(base)
+			defer removeAll(t, base)
 			test.prepare(base)
 			pathToCreate := filepath.Join(base, test.path)
 			err = doSafeMakeDir(pathToCreate, base, test.perm)
@@ -356,7 +374,7 @@ func TestRemoveEmptyDirs(t *testing.T) {
 				if err := os.MkdirAll(filepath.Join(base, "a/b"), defaultPerm); err != nil {
 					return err
 				}
-				return ioutil.WriteFile(filepath.Join(base, "a/b", "c"), []byte{}, defaultPerm)
+				return os.WriteFile(filepath.Join(base, "a/b", "c"), []byte{}, defaultPerm)
 			},
 			validate: func(base string) error {
 				if err := validateDirExists(filepath.Join(base, "a/b")); err != nil {
@@ -372,9 +390,9 @@ func TestRemoveEmptyDirs(t *testing.T) {
 
 	for _, test := range tests {
 		klog.V(4).Infof("test %q", test.name)
-		base, err := ioutil.TempDir("", "remove-empty-dirs-"+test.name+"-")
+		base, err := os.MkdirTemp("", "remove-empty-dirs-"+test.name+"-")
 		if err != nil {
-			t.Fatalf(err.Error())
+			t.Fatal(err.Error())
 		}
 		if err = test.prepare(base); err != nil {
 			os.RemoveAll(base)
@@ -409,6 +427,7 @@ func TestCleanSubPaths(t *testing.T) {
 		// Function that validates directory structure after the test
 		validate    func(base string) error
 		expectError bool
+		unmount     func(path string) error
 	}{
 		{
 			name: "not-exists",
@@ -437,7 +456,7 @@ func TestCleanSubPaths(t *testing.T) {
 				if err := os.MkdirAll(path, defaultPerm); err != nil {
 					return nil, err
 				}
-				return nil, ioutil.WriteFile(filepath.Join(path, "0"), []byte{}, defaultPerm)
+				return nil, os.WriteFile(filepath.Join(path, "0"), []byte{}, defaultPerm)
 			},
 			validate: func(base string) error {
 				return validateDirNotExists(filepath.Join(base, containerSubPathDirectoryName))
@@ -451,7 +470,7 @@ func TestCleanSubPaths(t *testing.T) {
 				if err := os.MkdirAll(path, defaultPerm); err != nil {
 					return nil, err
 				}
-				return nil, ioutil.WriteFile(filepath.Join(path, "container1"), []byte{}, defaultPerm)
+				return nil, os.WriteFile(filepath.Join(path, "container1"), []byte{}, defaultPerm)
 			},
 			validate: func(base string) error {
 				return validateDirExists(filepath.Join(base, containerSubPathDirectoryName, testVol))
@@ -465,7 +484,7 @@ func TestCleanSubPaths(t *testing.T) {
 				if err := os.MkdirAll(filepath.Join(path, "container1"), defaultPerm); err != nil {
 					return nil, err
 				}
-				return nil, ioutil.WriteFile(filepath.Join(path, "container2"), []byte{}, defaultPerm)
+				return nil, os.WriteFile(filepath.Join(path, "container2"), []byte{}, defaultPerm)
 			},
 			validate: func(base string) error {
 				path := filepath.Join(base, containerSubPathDirectoryName, testVol)
@@ -539,13 +558,71 @@ func TestCleanSubPaths(t *testing.T) {
 				return validateDirExists(baseSubdir)
 			},
 		},
+		{
+			name: "subpath-with-files",
+			prepare: func(base string) ([]mount.MountPoint, error) {
+				containerPath := filepath.Join(base, containerSubPathDirectoryName, testVol, "container1")
+				if err := os.MkdirAll(containerPath, defaultPerm); err != nil {
+					return nil, err
+				}
+
+				file0 := filepath.Join(containerPath, "0")
+				if err := os.WriteFile(file0, []byte{}, defaultPerm); err != nil {
+					return nil, err
+				}
+
+				dir1 := filepath.Join(containerPath, "1")
+				if err := os.MkdirAll(filepath.Join(dir1, "my-dir-1"), defaultPerm); err != nil {
+					return nil, err
+				}
+
+				dir2 := filepath.Join(containerPath, "2")
+				if err := os.MkdirAll(filepath.Join(dir2, "my-dir-2"), defaultPerm); err != nil {
+					return nil, err
+				}
+
+				file3 := filepath.Join(containerPath, "3")
+				if err := os.WriteFile(file3, []byte{}, defaultPerm); err != nil {
+					return nil, err
+				}
+
+				mounts := []mount.MountPoint{
+					{Device: "/dev/sdb", Path: file0},
+					{Device: "/dev/sdc", Path: dir1},
+					{Device: "/dev/sdd", Path: dir2},
+					{Device: "/dev/sde", Path: file3},
+				}
+				return mounts, nil
+			},
+			unmount: func(mountpath string) error {
+				err := filepath.Walk(mountpath, func(path string, info os.FileInfo, _ error) error {
+					if path == mountpath {
+						// Skip top level directory
+						return nil
+					}
+
+					if err := os.Remove(path); err != nil {
+						return err
+					}
+					return filepath.SkipDir
+				})
+				if err != nil {
+					return fmt.Errorf("error processing %s: %s", mountpath, err)
+				}
+
+				return nil
+			},
+			validate: func(base string) error {
+				return validateDirNotExists(filepath.Join(base, containerSubPathDirectoryName))
+			},
+		},
 	}
 
 	for _, test := range tests {
 		klog.V(4).Infof("test %q", test.name)
-		base, err := ioutil.TempDir("", "clean-subpaths-"+test.name+"-")
+		base, err := os.MkdirTemp("", "clean-subpaths-"+test.name+"-")
 		if err != nil {
-			t.Fatalf(err.Error())
+			t.Fatal(err.Error())
 		}
 		mounts, err := test.prepare(base)
 		if err != nil {
@@ -553,7 +630,8 @@ func TestCleanSubPaths(t *testing.T) {
 			t.Fatalf("failed to prepare test %q: %v", test.name, err.Error())
 		}
 
-		fm := &mount.FakeMounter{MountPoints: mounts}
+		fm := mount.NewFakeMounter(mounts)
+		fm.UnmountFunc = test.unmount
 
 		err = doCleanSubPaths(fm, base, testVol)
 		if err != nil && !test.expectError {
@@ -582,7 +660,7 @@ func setupFakeMounter(testMounts []string) *mount.FakeMounter {
 	for _, mountPoint := range testMounts {
 		mounts = append(mounts, mount.MountPoint{Device: "/foo", Path: mountPoint})
 	}
-	return &mount.FakeMounter{MountPoints: mounts}
+	return mount.NewFakeMounter(mounts)
 }
 
 func getTestPaths(base string) (string, string) {
@@ -630,7 +708,7 @@ func TestBindSubPath(t *testing.T) {
 				if err := os.MkdirAll(volpath, defaultPerm); err != nil {
 					return nil, "", "", err
 				}
-				return nil, volpath, subpath, ioutil.WriteFile(subpath, []byte{}, defaultPerm)
+				return nil, volpath, subpath, os.WriteFile(subpath, []byte{}, defaultPerm)
 			},
 			expectError: false,
 		},
@@ -679,7 +757,7 @@ func TestBindSubPath(t *testing.T) {
 					return nil, "", "", err
 				}
 				// touch file outside
-				if err := ioutil.WriteFile(child, []byte{}, defaultPerm); err != nil {
+				if err := os.WriteFile(child, []byte{}, defaultPerm); err != nil {
 					return nil, "", "", err
 				}
 
@@ -714,7 +792,7 @@ func TestBindSubPath(t *testing.T) {
 					return nil, "", "", err
 				}
 				// touch file outside
-				if err := ioutil.WriteFile(child, []byte{}, defaultPerm); err != nil {
+				if err := os.WriteFile(child, []byte{}, defaultPerm); err != nil {
 					return nil, "", "", err
 				}
 
@@ -755,7 +833,11 @@ func TestBindSubPath(t *testing.T) {
 			name: "subpath-mount-already-exists",
 			prepare: func(base string) ([]string, string, string, error) {
 				volpath, subpathMount := getTestPaths(base)
-				mounts := []string{subpathMount}
+				// Do NOT list subpathMount as a mount point: the intent of this
+				// test is that the bind target directory already exists on disk,
+				// not that a mismatching mount is present.  Listing it as mounted
+				// would trigger the lazyUnmountFn path which fails on a plain dir.
+				mounts := []string{}
 				if err := os.MkdirAll(subpathMount, defaultPerm); err != nil {
 					return nil, "", "", err
 				}
@@ -799,9 +881,9 @@ func TestBindSubPath(t *testing.T) {
 
 	for _, test := range tests {
 		klog.V(4).Infof("test %q", test.name)
-		base, err := ioutil.TempDir("", "bind-subpath-"+test.name+"-")
+		base, err := os.MkdirTemp("", "bind-subpath-"+test.name+"-")
 		if err != nil {
-			t.Fatalf(err.Error())
+			t.Fatal(err.Error())
 		}
 
 		mounts, volPath, subPath, err := test.prepare(base)
@@ -848,6 +930,362 @@ func TestBindSubPath(t *testing.T) {
 
 		os.RemoveAll(base)
 	}
+}
+
+func TestSubpath_PrepareSafeSubpath(t *testing.T) {
+	//complete code
+	defaultPerm := os.FileMode(0750)
+
+	tests := []struct {
+		name string
+		// Function that prepares directory structure for the test under given
+		// base.
+		prepare        func(base string) ([]string, string, string, error)
+		modifyMounter  func(fm *mount.FakeMounter, bindPathTarget string)
+		expectError    bool
+		expectAction   []mount.FakeAction
+		mountExists    bool
+		expectDirExist bool
+	}{
+		{
+			name: "subpath-mount-already-exists-with-mismatching-mount",
+			prepare: func(base string) ([]string, string, string, error) {
+				volpath, subpathMount := getTestPaths(base)
+				mounts := []string{subpathMount}
+				if err := os.MkdirAll(subpathMount, defaultPerm); err != nil {
+					return nil, "", "", err
+				}
+
+				subpath := filepath.Join(volpath, "dir0")
+				return mounts, volpath, subpath, os.MkdirAll(subpath, defaultPerm)
+			},
+			// lazyUnmountFn is injected via modifyMounter below; mounter.Unmount
+			// is no longer called for the mismatching-mount path.
+			modifyMounter: func(fm *mount.FakeMounter, bindPathTarget string) {
+				origLazyUnmountFn := lazyUnmountFn
+				lazyUnmountFn = func(path string) error {
+					lazyUnmountFn = origLazyUnmountFn
+					return nil
+				}
+			},
+			expectError:  false,
+			expectAction: []mount.FakeAction{},
+			mountExists:  false,
+		},
+		{
+			name: "subpath-mount-already-exists-with-samefile",
+			prepare: func(base string) ([]string, string, string, error) {
+				volpath, subpathMount := getTestPaths(base)
+				mounts := []string{subpathMount}
+				subpathMountRoot := filepath.Dir(subpathMount)
+
+				if err := os.MkdirAll(subpathMountRoot, defaultPerm); err != nil {
+					return nil, "", "", err
+				}
+				targetFile, err := os.Create(subpathMount)
+				if err != nil {
+					return nil, "", "", err
+				}
+				defer targetFile.Close()
+
+				if err := os.MkdirAll(volpath, defaultPerm); err != nil {
+					return nil, "", "", err
+				}
+				subpath := filepath.Join(volpath, "file0")
+				// using hard link to simulate bind mounts
+				err = os.Link(subpathMount, subpath)
+				if err != nil {
+					return nil, "", "", err
+				}
+				return mounts, volpath, subpath, nil
+			},
+			expectError:  false,
+			expectAction: []mount.FakeAction{},
+			mountExists:  true,
+		},
+		{
+			name: "subpath-mount-corrupted-recovered",
+			prepare: func(base string) ([]string, string, string, error) {
+				volpath, subpathMount := getTestPaths(base)
+				mounts := []string{subpathMount}
+				if err := os.MkdirAll(subpathMount, defaultPerm); err != nil {
+					return nil, "", "", err
+				}
+
+				subpath := filepath.Join(volpath, "dir0")
+				return mounts, volpath, subpath, os.MkdirAll(subpath, defaultPerm)
+			},
+			modifyMounter: func(fm *mount.FakeMounter, bindPathTarget string) {
+				fm.MountCheckErrors = map[string]error{
+					bindPathTarget: os.NewSyscallError("fake", syscall.ESTALE),
+				}
+			},
+			expectError:  false,
+			expectAction: []mount.FakeAction{{Action: "unmount"}},
+			mountExists:  false,
+		},
+		{
+			name: "subpath-mount-corrupted-unmount-fails",
+			prepare: func(base string) ([]string, string, string, error) {
+				volpath, subpathMount := getTestPaths(base)
+				mounts := []string{subpathMount}
+				if err := os.MkdirAll(subpathMount, defaultPerm); err != nil {
+					return nil, "", "", err
+				}
+
+				subpath := filepath.Join(volpath, "dir0")
+				return mounts, volpath, subpath, os.MkdirAll(subpath, defaultPerm)
+			},
+			modifyMounter: func(fm *mount.FakeMounter, bindPathTarget string) {
+				fm.MountCheckErrors = map[string]error{
+					bindPathTarget: os.NewSyscallError("fake", syscall.ESTALE),
+				}
+				fm.UnmountFunc = func(path string) error {
+					return fmt.Errorf("unmount failed")
+				}
+			},
+			expectError:    true,
+			expectDirExist: true,
+		},
+	}
+	for _, test := range tests {
+		klog.V(4).Infof("test %q", test.name)
+		base, err := os.MkdirTemp("", "bind-subpath-"+test.name+"-")
+		if err != nil {
+			t.Fatal(err.Error())
+		}
+		defer removeAll(t, base)
+
+		mounts, volPath, subPath, err := test.prepare(base)
+		if err != nil {
+			os.RemoveAll(base)
+			t.Fatalf("failed to prepare test %q: %v", test.name, err.Error())
+		}
+
+		fm := setupFakeMounter(mounts)
+
+		subpath := Subpath{
+			VolumeMountIndex: testSubpath,
+			Path:             subPath,
+			VolumeName:       testVol,
+			VolumePath:       volPath,
+			PodDir:           filepath.Join(base, "pod0"),
+			ContainerName:    testContainer,
+		}
+
+		_, subpathMount := getTestPaths(base)
+		if test.modifyMounter != nil {
+			test.modifyMounter(fm, subpathMount)
+		}
+		bindMountExists, bindPathTarget, err := prepareSubpathTarget(fm, subpath)
+
+		if bindMountExists != test.mountExists {
+			t.Errorf("test %q failed: expected bindMountExists %v, got %v", test.name, test.mountExists, bindMountExists)
+		}
+
+		logActions := fm.GetLog()
+		if len(test.expectAction) == 0 && len(logActions) > 0 {
+			t.Errorf("test %q failed: expected no actions, got %v", test.name, logActions)
+		}
+
+		if len(test.expectAction) > 0 {
+			foundMatchingAction := false
+			testAction := test.expectAction[0]
+			for _, action := range logActions {
+				if action.Action == testAction.Action {
+					foundMatchingAction = true
+					break
+				}
+			}
+			if !foundMatchingAction {
+				t.Errorf("test %q failed: expected action %q, got %v", test.name, testAction.Action, logActions)
+			}
+		}
+
+		if test.expectError {
+			if err == nil {
+				t.Errorf("test %q failed: expected error, got success", test.name)
+			}
+			if bindPathTarget != "" {
+				t.Errorf("test %q failed: expected empty bindPathTarget, got %v", test.name, bindPathTarget)
+			}
+			if !test.expectDirExist {
+				if err = validateDirNotExists(subpathMount); err != nil {
+					t.Errorf("test %q failed: %v", test.name, err)
+				}
+			}
+		}
+		if !test.expectError {
+			if err != nil {
+				t.Errorf("test %q failed: %v", test.name, err)
+			}
+			if bindPathTarget != subpathMount {
+				t.Errorf("test %q failed: expected bindPathTarget %v, got %v", test.name, subpathMount, bindPathTarget)
+			}
+			if err = validateFileExists(subpathMount); err != nil {
+				t.Errorf("test %q failed: %v", test.name, err)
+			}
+		}
+	}
+}
+
+func TestPrepareSubpathTargetDifferentDevice(t *testing.T) {
+	defaultPerm := os.FileMode(0750)
+
+	base, err := os.MkdirTemp("", "different-device-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer removeAll(t, base)
+
+	volPath, subpathMount := getTestPaths(base)
+	if err := os.MkdirAll(filepath.Dir(subpathMount), defaultPerm); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(volPath, defaultPerm); err != nil {
+		t.Fatal(err)
+	}
+
+	// Bind-mount target exists as a regular file (simulates an existing bind mount).
+	if err := os.WriteFile(subpathMount, []byte{}, 0640); err != nil {
+		t.Fatal(err)
+	}
+
+	// Source is a distinct file, different inode, not a hard-link to the target.
+	sourceFile := filepath.Join(volPath, "file-different")
+	if err := os.WriteFile(sourceFile, []byte{}, 0640); err != nil {
+		t.Fatal(err)
+	}
+
+	// FakeMounter lists subpathMount as a mount point so IsMountPoint returns true.
+	fm := setupFakeMounter([]string{subpathMount})
+
+	subpath := Subpath{
+		VolumeMountIndex: testSubpath,
+		Path:             sourceFile,
+		VolumeName:       testVol,
+		VolumePath:       volPath,
+		PodDir:           filepath.Join(base, "pod0"),
+		ContainerName:    testContainer,
+	}
+
+	// Inject a spy for lazyUnmountFn; mounter.Unmount must NOT be called.
+	lazyUnmountCalled := false
+	origLazyUnmountFn := lazyUnmountFn
+	defer func() { lazyUnmountFn = origLazyUnmountFn }()
+	lazyUnmountFn = func(path string) error {
+		lazyUnmountCalled = true
+		return nil
+	}
+
+	alreadyMounted, gotTarget, err := prepareSubpathTarget(fm, subpath)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if alreadyMounted {
+		t.Errorf("expected alreadyMounted=false after stale-device remount, got true")
+	}
+	if gotTarget != subpathMount {
+		t.Errorf("expected target %q, got %q", subpathMount, gotTarget)
+	}
+	if !lazyUnmountCalled {
+		t.Errorf("expected lazyUnmountFn to be called when source and bind-target have different inodes/devices")
+	}
+	// mounter.Unmount must NOT have been called, only lazyUnmountFn.
+	if actions := fm.GetLog(); len(actions) != 0 {
+		t.Errorf("expected no mounter.Unmount actions (must use lazyUnmountFn), got %v", actions)
+	}
+}
+
+func TestSubpathStaleBindMountRemount(t *testing.T) {
+	defaultPerm := os.FileMode(0750)
+
+	setup := func(t *testing.T) (base, volPath, subpathMount, sourceFile string) {
+		t.Helper()
+		var err error
+		base, err = os.MkdirTemp("", "stale-remount-")
+		if err != nil {
+			t.Fatal(err)
+		}
+		volPath, subpathMount = getTestPaths(base)
+		if err = os.MkdirAll(filepath.Dir(subpathMount), defaultPerm); err != nil {
+			t.Fatal(err)
+		}
+		if err = os.MkdirAll(volPath, defaultPerm); err != nil {
+			t.Fatal(err)
+		}
+		if err = os.WriteFile(subpathMount, []byte{}, 0640); err != nil {
+			t.Fatal(err)
+		}
+		sourceFile = filepath.Join(volPath, "file-stale")
+		if err = os.WriteFile(sourceFile, []byte{}, 0640); err != nil {
+			t.Fatal(err)
+		}
+		return
+	}
+
+	t.Run("lazyUnmount-error-propagated", func(t *testing.T) {
+		base, volPath, subpathMount, sourceFile := setup(t)
+		defer removeAll(t, base)
+
+		fm := setupFakeMounter([]string{subpathMount})
+		subpath := Subpath{
+			VolumeMountIndex: testSubpath,
+			Path:             sourceFile,
+			VolumeName:       testVol,
+			VolumePath:       volPath,
+			PodDir:           filepath.Join(base, "pod0"),
+			ContainerName:    testContainer,
+		}
+
+		origLazyUnmountFn := lazyUnmountFn
+		defer func() { lazyUnmountFn = origLazyUnmountFn }()
+		lazyUnmountFn = func(string) error {
+			return fmt.Errorf("MNT_DETACH failed: device busy")
+		}
+
+		_, _, err := prepareSubpathTarget(fm, subpath)
+		if err == nil {
+			t.Fatal("expected error when lazyUnmountFn fails, got nil")
+		}
+		if !strings.Contains(err.Error(), "MNT_DETACH failed") {
+			t.Errorf("expected error to contain 'MNT_DETACH failed', got: %v", err)
+		}
+	})
+
+	t.Run("lazyUnmount-success-bind-mount-recreated", func(t *testing.T) {
+		base, volPath, subpathMount, sourceFile := setup(t)
+		defer removeAll(t, base)
+
+		fm := setupFakeMounter([]string{subpathMount})
+		subpath := Subpath{
+			VolumeMountIndex: testSubpath,
+			Path:             sourceFile,
+			VolumeName:       testVol,
+			VolumePath:       volPath,
+			PodDir:           filepath.Join(base, "pod0"),
+			ContainerName:    testContainer,
+		}
+
+		origLazyUnmountFn := lazyUnmountFn
+		defer func() { lazyUnmountFn = origLazyUnmountFn }()
+		lazyUnmountFn = func(string) error { return nil }
+
+		alreadyMounted, gotTarget, err := prepareSubpathTarget(fm, subpath)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if alreadyMounted {
+			t.Errorf("expected alreadyMounted=false so bind mount is recreated, got true")
+		}
+		if gotTarget != subpathMount {
+			t.Errorf("expected target %q, got %q", subpathMount, gotTarget)
+		}
+		// mounter.Unmount must NOT have been called.
+		if actions := fm.GetLog(); len(actions) != 0 {
+			t.Errorf("expected no mounter.Unmount actions, got %v", actions)
+		}
+	})
 }
 
 func TestSafeOpen(t *testing.T) {
@@ -934,7 +1372,7 @@ func TestSafeOpen(t *testing.T) {
 		{
 			"non-directory",
 			func(base string) error {
-				return ioutil.WriteFile(filepath.Join(base, "test"), []byte{}, defaultPerm)
+				return os.WriteFile(filepath.Join(base, "test"), []byte{}, defaultPerm)
 			},
 			"test/directory",
 			true,
@@ -942,7 +1380,7 @@ func TestSafeOpen(t *testing.T) {
 		{
 			"non-directory-final",
 			func(base string) error {
-				return ioutil.WriteFile(filepath.Join(base, "test"), []byte{}, defaultPerm)
+				return os.WriteFile(filepath.Join(base, "test"), []byte{}, defaultPerm)
 			},
 			"test",
 			false,
@@ -986,7 +1424,7 @@ func TestSafeOpen(t *testing.T) {
 				socketFile, socketError := createSocketFile(base)
 
 				if socketError != nil {
-					return fmt.Errorf("Error preparing socket file %s with %v", socketFile, socketError)
+					return fmt.Errorf("error preparing socket file %s with %w", socketFile, socketError)
 				}
 				return nil
 			},
@@ -999,7 +1437,7 @@ func TestSafeOpen(t *testing.T) {
 				testSocketFile, socketError := createSocketFile(base)
 
 				if socketError != nil {
-					return fmt.Errorf("Error preparing socket file %s with %v", testSocketFile, socketError)
+					return fmt.Errorf("error preparing socket file %s with %w", testSocketFile, socketError)
 				}
 				return nil
 			},
@@ -1010,9 +1448,9 @@ func TestSafeOpen(t *testing.T) {
 
 	for _, test := range tests {
 		klog.V(4).Infof("test %q", test.name)
-		base, err := ioutil.TempDir("", "safe-open-"+test.name+"-")
+		base, err := os.MkdirTemp("", "safe-open-"+test.name+"-")
 		if err != nil {
-			t.Fatalf(err.Error())
+			t.Fatal(err.Error())
 		}
 
 		test.prepare(base)
@@ -1157,9 +1595,9 @@ func TestFindExistingPrefix(t *testing.T) {
 
 	for _, test := range tests {
 		klog.V(4).Infof("test %q", test.name)
-		base, err := ioutil.TempDir("", "find-prefix-"+test.name+"-")
+		base, err := os.MkdirTemp("", "find-prefix-"+test.name+"-")
 		if err != nil {
-			t.Fatalf(err.Error())
+			t.Fatal(err.Error())
 		}
 		test.prepare(base)
 		path := filepath.Join(base, test.path)
@@ -1192,7 +1630,7 @@ func validateDirEmpty(dir string) error {
 	}
 
 	if len(files) != 0 {
-		return fmt.Errorf("Directory %q is not empty", dir)
+		return fmt.Errorf("directory %q is not empty", dir)
 	}
 	return nil
 }

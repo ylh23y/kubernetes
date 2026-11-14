@@ -20,10 +20,11 @@ import (
 	"context"
 	"fmt"
 
+	"sigs.k8s.io/structured-merge-diff/v7/fieldpath"
+
 	"k8s.io/apimachinery/pkg/api/meta"
 	metatable "k8s.io/apimachinery/pkg/api/meta/table"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	metav1beta1 "k8s.io/apimachinery/pkg/apis/meta/v1beta1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apiserver/pkg/registry/generic"
 	genericregistry "k8s.io/apiserver/pkg/registry/generic/registry"
@@ -41,14 +42,19 @@ type REST struct {
 func NewREST(scheme *runtime.Scheme, optsGetter generic.RESTOptionsGetter) *REST {
 	strategy := apiservice.NewStrategy(scheme)
 	store := &genericregistry.Store{
-		NewFunc:                  func() runtime.Object { return &apiregistration.APIService{} },
-		NewListFunc:              func() runtime.Object { return &apiregistration.APIServiceList{} },
-		PredicateFunc:            apiservice.MatchAPIService,
-		DefaultQualifiedResource: apiregistration.Resource("apiservices"),
+		NewFunc:                   func() runtime.Object { return &apiregistration.APIService{} },
+		NewListFunc:               func() runtime.Object { return &apiregistration.APIServiceList{} },
+		PredicateFunc:             apiservice.MatchAPIService,
+		DefaultQualifiedResource:  apiregistration.Resource("apiservices"),
+		SingularQualifiedResource: apiregistration.Resource("apiservice"),
 
-		CreateStrategy: strategy,
-		UpdateStrategy: strategy,
-		DeleteStrategy: strategy,
+		CreateStrategy:      strategy,
+		UpdateStrategy:      strategy,
+		DeleteStrategy:      strategy,
+		ResetFieldsStrategy: strategy,
+
+		// TODO: define table converter that exposes more than name/creation timestamp
+		TableConvertor: rest.NewDefaultTableConvertor(apiregistration.Resource("apiservices")),
 	}
 	options := &generic.StoreOptions{RESTOptions: optsGetter, AttrFunc: apiservice.GetAttrs}
 	if err := store.CompleteWithOptions(options); err != nil {
@@ -57,12 +63,20 @@ func NewREST(scheme *runtime.Scheme, optsGetter generic.RESTOptionsGetter) *REST
 	return &REST{store}
 }
 
+// Implement CategoriesProvider
+var _ rest.CategoriesProvider = &REST{}
+
+// Categories implements the CategoriesProvider interface. Returns a list of categories a resource is part of.
+func (c *REST) Categories() []string {
+	return []string{"api-extensions"}
+}
+
 var swaggerMetadataDescriptions = metav1.ObjectMeta{}.SwaggerDoc()
 
 // ConvertToTable implements the TableConvertor interface for REST.
-func (c *REST) ConvertToTable(ctx context.Context, obj runtime.Object, tableOptions runtime.Object) (*metav1beta1.Table, error) {
-	table := &metav1beta1.Table{
-		ColumnDefinitions: []metav1beta1.TableColumnDefinition{
+func (c *REST) ConvertToTable(ctx context.Context, obj runtime.Object, tableOptions runtime.Object) (*metav1.Table, error) {
+	table := &metav1.Table{
+		ColumnDefinitions: []metav1.TableColumnDefinition{
 			{Name: "Name", Type: "string", Format: "name", Description: swaggerMetadataDescriptions["name"]},
 			{Name: "Service", Type: "string", Description: "The reference to the service that hosts this API endpoint."},
 			{Name: "Available", Type: "string", Description: "Whether this service is available."},
@@ -71,13 +85,11 @@ func (c *REST) ConvertToTable(ctx context.Context, obj runtime.Object, tableOpti
 	}
 	if m, err := meta.ListAccessor(obj); err == nil {
 		table.ResourceVersion = m.GetResourceVersion()
-		table.SelfLink = m.GetSelfLink()
 		table.Continue = m.GetContinue()
 		table.RemainingItemCount = m.GetRemainingItemCount()
 	} else {
 		if m, err := meta.CommonAccessor(obj); err == nil {
 			table.ResourceVersion = m.GetResourceVersion()
-			table.SelfLink = m.GetSelfLink()
 		}
 	}
 
@@ -116,10 +128,12 @@ func getCondition(conditions []apiregistration.APIServiceCondition, conditionTyp
 // NewStatusREST makes a RESTStorage for status that has more limited options.
 // It is based on the original REST so that we can share the same underlying store
 func NewStatusREST(scheme *runtime.Scheme, rest *REST) *StatusREST {
+	strategy := apiservice.NewStatusStrategy(scheme)
 	statusStore := *rest.Store
 	statusStore.CreateStrategy = nil
 	statusStore.DeleteStrategy = nil
-	statusStore.UpdateStrategy = apiservice.NewStatusStrategy(scheme)
+	statusStore.UpdateStrategy = strategy
+	statusStore.ResetFieldsStrategy = strategy
 	return &StatusREST{store: &statusStore}
 }
 
@@ -135,6 +149,12 @@ func (r *StatusREST) New() runtime.Object {
 	return &apiregistration.APIService{}
 }
 
+// Destroy cleans up resources on shutdown.
+func (r *StatusREST) Destroy() {
+	// Given that underlying store is shared with REST,
+	// we don't destroy it here explicitly.
+}
+
 // Get retrieves the object from the storage. It is required to support Patch.
 func (r *StatusREST) Get(ctx context.Context, name string, options *metav1.GetOptions) (runtime.Object, error) {
 	return r.store.Get(ctx, name, options)
@@ -145,4 +165,9 @@ func (r *StatusREST) Update(ctx context.Context, name string, objInfo rest.Updat
 	// We are explicitly setting forceAllowCreate to false in the call to the underlying storage because
 	// subresources should never allow create on update.
 	return r.store.Update(ctx, name, objInfo, createValidation, updateValidation, false, options)
+}
+
+// GetResetFields implements rest.ResetFieldsStrategy
+func (r *StatusREST) GetResetFields() map[fieldpath.APIVersion]*fieldpath.Set {
+	return r.store.GetResetFields()
 }

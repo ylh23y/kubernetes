@@ -19,8 +19,8 @@ package metrics
 import (
 	"sync"
 
-	"github.com/prometheus/client_golang/prometheus"
-	"k8s.io/klog"
+	"k8s.io/component-base/metrics"
+	"k8s.io/component-base/metrics/legacyregistry"
 	"k8s.io/kubernetes/pkg/kubelet/volumemanager/cache"
 	"k8s.io/kubernetes/pkg/volume"
 	volumeutil "k8s.io/kubernetes/pkg/volume/util"
@@ -30,17 +30,52 @@ const (
 	pluginNameNotAvailable = "N/A"
 
 	// Metric keys for Volume Manager.
-	volumeManagerTotalVolumes = "volume_manager_total_volumes"
+	volumeManagerTotalVolumes                     = "volume_manager_total_volumes"
+	reconstructVolumeOperationsTotal              = "reconstruct_volume_operations_total"
+	reconstructVolumeOperationsErrorsTotal        = "reconstruct_volume_operations_errors_total"
+	forceCleanedFailedVolumeOperationsTotal       = "force_cleaned_failed_volume_operations_total"
+	forceCleanedFailedVolumeOperationsErrorsTotal = "force_cleaned_failed_volume_operation_errors_total"
 )
 
 var (
 	registerMetrics sync.Once
 
-	totalVolumesDesc = prometheus.NewDesc(
+	totalVolumesDesc = metrics.NewDesc(
 		volumeManagerTotalVolumes,
 		"Number of volumes in Volume Manager",
 		[]string{"plugin_name", "state"},
 		nil,
+		metrics.ALPHA, "",
+	)
+
+	ReconstructVolumeOperationsTotal = metrics.NewCounter(
+		&metrics.CounterOpts{
+			Name:           reconstructVolumeOperationsTotal,
+			Help:           "The number of volumes that were attempted to be reconstructed from the operating system during kubelet startup. This includes both successful and failed reconstruction.",
+			StabilityLevel: metrics.ALPHA,
+		},
+	)
+	ReconstructVolumeOperationsErrorsTotal = metrics.NewCounter(
+		&metrics.CounterOpts{
+			Name:           reconstructVolumeOperationsErrorsTotal,
+			Help:           "The number of volumes that failed reconstruction from the operating system during kubelet startup.",
+			StabilityLevel: metrics.ALPHA,
+		},
+	)
+
+	ForceCleanedFailedVolumeOperationsTotal = metrics.NewCounter(
+		&metrics.CounterOpts{
+			Name:           forceCleanedFailedVolumeOperationsTotal,
+			Help:           "The number of volumes that were force cleaned after their reconstruction failed during kubelet startup. This includes both successful and failed cleanups.",
+			StabilityLevel: metrics.ALPHA,
+		},
+	)
+	ForceCleanedFailedVolumeOperationsErrorsTotal = metrics.NewCounter(
+		&metrics.CounterOpts{
+			Name:           forceCleanedFailedVolumeOperationsErrorsTotal,
+			Help:           "The number of volumes that failed force cleanup after their reconstruction failed during kubelet startup.",
+			StabilityLevel: metrics.ALPHA,
+		},
 	)
 )
 
@@ -59,36 +94,38 @@ func (v volumeCount) add(state, plugin string) {
 // Register registers Volume Manager metrics.
 func Register(asw cache.ActualStateOfWorld, dsw cache.DesiredStateOfWorld, pluginMgr *volume.VolumePluginMgr) {
 	registerMetrics.Do(func() {
-		prometheus.MustRegister(&totalVolumesCollector{asw, dsw, pluginMgr})
+		legacyregistry.CustomMustRegister(&totalVolumesCollector{asw: asw, dsw: dsw, pluginMgr: pluginMgr})
+		legacyregistry.MustRegister(ReconstructVolumeOperationsTotal)
+		legacyregistry.MustRegister(ReconstructVolumeOperationsErrorsTotal)
+		legacyregistry.MustRegister(ForceCleanedFailedVolumeOperationsTotal)
+		legacyregistry.MustRegister(ForceCleanedFailedVolumeOperationsErrorsTotal)
 	})
 }
 
 type totalVolumesCollector struct {
+	metrics.BaseStableCollector
+
 	asw       cache.ActualStateOfWorld
 	dsw       cache.DesiredStateOfWorld
 	pluginMgr *volume.VolumePluginMgr
 }
 
-var _ prometheus.Collector = &totalVolumesCollector{}
+var _ metrics.StableCollector = &totalVolumesCollector{}
 
-// Describe implements the prometheus.Collector interface.
-func (c *totalVolumesCollector) Describe(ch chan<- *prometheus.Desc) {
+// DescribeWithStability implements the metrics.StableCollector interface.
+func (c *totalVolumesCollector) DescribeWithStability(ch chan<- *metrics.Desc) {
 	ch <- totalVolumesDesc
 }
 
-// Collect implements the prometheus.Collector interface.
-func (c *totalVolumesCollector) Collect(ch chan<- prometheus.Metric) {
+// CollectWithStability implements the metrics.StableCollector interface.
+func (c *totalVolumesCollector) CollectWithStability(ch chan<- metrics.Metric) {
 	for stateName, pluginCount := range c.getVolumeCount() {
 		for pluginName, count := range pluginCount {
-			metric, err := prometheus.NewConstMetric(totalVolumesDesc,
-				prometheus.GaugeValue,
+			ch <- metrics.NewLazyConstMetric(totalVolumesDesc,
+				metrics.GaugeValue,
 				float64(count),
 				pluginName,
 				stateName)
-			if err != nil {
-				klog.Warningf("Failed to create metric : %v", err)
-			}
-			ch <- metric
 		}
 	}
 }

@@ -17,15 +17,18 @@ limitations under the License.
 package bootstrap
 
 import (
+	"context"
 	"strings"
+	"sync"
 	"time"
 
-	"k8s.io/klog"
+	"k8s.io/klog/v2"
 
 	"fmt"
 
 	v1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/wait"
@@ -37,8 +40,6 @@ import (
 	bootstrapapi "k8s.io/cluster-bootstrap/token/api"
 	jws "k8s.io/cluster-bootstrap/token/jws"
 	api "k8s.io/kubernetes/pkg/apis/core"
-	"k8s.io/kubernetes/pkg/controller"
-	"k8s.io/kubernetes/pkg/util/metrics"
 )
 
 // SignerOptions contains options for the Signer
@@ -52,7 +53,7 @@ type SignerOptions struct {
 	// TokenSecretNamespace string is the namespace for token Secrets.
 	TokenSecretNamespace string
 
-	// ConfigMapResynce is the time.Duration at which to fully re-list configmaps.
+	// ConfigMapResync is the time.Duration at which to fully re-list configmaps.
 	// If zero, re-list will be delayed as long as possible
 	ConfigMapResync time.Duration
 
@@ -82,7 +83,7 @@ type Signer struct {
 	// have one item (Named <ConfigMapName>) in this queue. We are using it
 	// serializes and collapses updates as they can come from both the ConfigMap
 	// and Secrets controllers.
-	syncQueue workqueue.RateLimitingInterface
+	syncQueue workqueue.TypedRateLimitingInterface[string]
 
 	secretLister corelisters.SecretLister
 	secretSynced cache.InformerSynced
@@ -92,7 +93,8 @@ type Signer struct {
 }
 
 // NewSigner returns a new *Signer.
-func NewSigner(cl clientset.Interface, secrets informers.SecretInformer, configMaps informers.ConfigMapInformer, options SignerOptions) (*Signer, error) {
+func NewSigner(ctx context.Context, cl clientset.Interface, secrets informers.SecretInformer, configMaps informers.ConfigMapInformer, options SignerOptions) (*Signer, error) {
+	logger := klog.FromContext(ctx)
 	e := &Signer{
 		client:             cl,
 		configMapKey:       options.ConfigMapNamespace + "/" + options.ConfigMapName,
@@ -103,15 +105,16 @@ func NewSigner(cl clientset.Interface, secrets informers.SecretInformer, configM
 		secretSynced:       secrets.Informer().HasSynced,
 		configMapLister:    configMaps.Lister(),
 		configMapSynced:    configMaps.Informer().HasSynced,
-		syncQueue:          workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "bootstrap_signer_queue"),
-	}
-	if cl.CoreV1().RESTClient().GetRateLimiter() != nil {
-		if err := metrics.RegisterMetricAndTrackRateLimiterUsage("bootstrap_signer", cl.CoreV1().RESTClient().GetRateLimiter()); err != nil {
-			return nil, err
-		}
+		syncQueue: workqueue.NewTypedRateLimitingQueueWithConfig(
+			workqueue.DefaultTypedControllerRateLimiter[string](),
+			workqueue.TypedRateLimitingQueueConfig[string]{
+				Logger: &logger,
+				Name:   "bootstrap_signer_queue",
+			},
+		),
 	}
 
-	configMaps.Informer().AddEventHandlerWithResyncPeriod(
+	_, _ = configMaps.Informer().AddEventHandlerWithOptions(
 		cache.FilteringResourceEventHandler{
 			FilterFunc: func(obj interface{}) bool {
 				switch t := obj.(type) {
@@ -127,10 +130,13 @@ func NewSigner(cl clientset.Interface, secrets informers.SecretInformer, configM
 				UpdateFunc: func(_, _ interface{}) { e.pokeConfigMapSync() },
 			},
 		},
-		options.ConfigMapResync,
+		cache.HandlerOptions{
+			Logger:       &logger,
+			ResyncPeriod: &options.ConfigMapResync,
+		},
 	)
 
-	secrets.Informer().AddEventHandlerWithResyncPeriod(
+	_, _ = secrets.Informer().AddEventHandlerWithOptions(
 		cache.FilteringResourceEventHandler{
 			FilterFunc: func(obj interface{}) bool {
 				switch t := obj.(type) {
@@ -147,45 +153,56 @@ func NewSigner(cl clientset.Interface, secrets informers.SecretInformer, configM
 				DeleteFunc: func(_ interface{}) { e.pokeConfigMapSync() },
 			},
 		},
-		options.SecretResync,
+		cache.HandlerOptions{
+			Logger:       &logger,
+			ResyncPeriod: &options.SecretResync,
+		},
 	)
 
 	return e, nil
 }
 
 // Run runs controller loops and returns when they are done
-func (e *Signer) Run(stopCh <-chan struct{}) {
-	// Shut down queues
-	defer utilruntime.HandleCrash()
-	defer e.syncQueue.ShutDown()
+func (e *Signer) Run(ctx context.Context) {
+	defer utilruntime.HandleCrashWithContext(ctx)
 
-	if !controller.WaitForCacheSync("bootstrap_signer", stopCh, e.configMapSynced, e.secretSynced) {
+	logger := klog.FromContext(ctx)
+	logger.V(5).Info("Starting")
+
+	var wg sync.WaitGroup
+	defer func() {
+		logger.V(1).Info("Shutting down")
+		e.syncQueue.ShutDown()
+		wg.Wait()
+	}()
+
+	if !cache.WaitForNamedCacheSyncWithContext(ctx, e.configMapSynced, e.secretSynced) {
 		return
 	}
 
-	klog.V(5).Infof("Starting workers")
-	go wait.Until(e.serviceConfigMapQueue, 0, stopCh)
-	<-stopCh
-	klog.V(1).Infof("Shutting down")
+	wg.Go(func() {
+		wait.UntilWithContext(ctx, e.serviceConfigMapQueue, 0)
+	})
+	<-ctx.Done()
 }
 
 func (e *Signer) pokeConfigMapSync() {
 	e.syncQueue.Add(e.configMapKey)
 }
 
-func (e *Signer) serviceConfigMapQueue() {
+func (e *Signer) serviceConfigMapQueue(ctx context.Context) {
 	key, quit := e.syncQueue.Get()
 	if quit {
 		return
 	}
 	defer e.syncQueue.Done(key)
 
-	e.signConfigMap()
+	e.signConfigMap(ctx)
 }
 
 // signConfigMap computes the signatures on our latest cached objects and writes
 // back if necessary.
-func (e *Signer) signConfigMap() {
+func (e *Signer) signConfigMap(ctx context.Context) {
 	origCM := e.getConfigMap()
 
 	if origCM == nil {
@@ -196,10 +213,12 @@ func (e *Signer) signConfigMap() {
 
 	newCM := origCM.DeepCopy()
 
+	logger := klog.FromContext(ctx)
+
 	// First capture the config we are signing
 	content, ok := newCM.Data[bootstrapapi.KubeConfigKey]
 	if !ok {
-		klog.V(3).Infof("No %s key in %s/%s ConfigMap", bootstrapapi.KubeConfigKey, origCM.Namespace, origCM.Name)
+		logger.V(3).Info("No key in ConfigMap", "key", bootstrapapi.KubeConfigKey, "configMap", klog.KObj(origCM))
 		return
 	}
 
@@ -214,7 +233,7 @@ func (e *Signer) signConfigMap() {
 	}
 
 	// Now recompute signatures and store them on the new map
-	tokens := e.getTokens()
+	tokens := e.getTokens(ctx)
 	for tokenID, tokenValue := range tokens {
 		sig, err := jws.ComputeDetachedSignature(content, tokenID, tokenValue)
 		if err != nil {
@@ -238,14 +257,14 @@ func (e *Signer) signConfigMap() {
 	}
 
 	if needUpdate {
-		e.updateConfigMap(newCM)
+		e.updateConfigMap(ctx, newCM)
 	}
 }
 
-func (e *Signer) updateConfigMap(cm *v1.ConfigMap) {
-	_, err := e.client.CoreV1().ConfigMaps(cm.Namespace).Update(cm)
+func (e *Signer) updateConfigMap(ctx context.Context, cm *v1.ConfigMap) {
+	_, err := e.client.CoreV1().ConfigMaps(cm.Namespace).Update(ctx, cm, metav1.UpdateOptions{})
 	if err != nil && !apierrors.IsConflict(err) && !apierrors.IsNotFound(err) {
-		klog.V(3).Infof("Error updating ConfigMap: %v", err)
+		klog.FromContext(ctx).V(3).Info("Error updating ConfigMap", "err", err)
 	}
 }
 
@@ -283,11 +302,11 @@ func (e *Signer) listSecrets() []*v1.Secret {
 
 // getTokens returns a map of tokenID->tokenSecret. It ensures the token is
 // valid for signing.
-func (e *Signer) getTokens() map[string]string {
+func (e *Signer) getTokens(ctx context.Context) map[string]string {
 	ret := map[string]string{}
 	secretObjs := e.listSecrets()
 	for _, secret := range secretObjs {
-		tokenID, tokenSecret, ok := validateSecretForSigning(secret)
+		tokenID, tokenSecret, ok := validateSecretForSigning(ctx, secret)
 		if !ok {
 			continue
 		}
@@ -296,7 +315,7 @@ func (e *Signer) getTokens() map[string]string {
 		if _, ok := ret[tokenID]; ok {
 			// This should never happen as we ensure a consistent secret name.
 			// But leave this in here just in case.
-			klog.V(1).Infof("Duplicate bootstrap tokens found for id %s, ignoring on in %s/%s", tokenID, secret.Namespace, secret.Name)
+			klog.FromContext(ctx).V(1).Info("Duplicate bootstrap tokens found for id, ignoring on the duplicate secret", "tokenID", tokenID, "ignoredSecret", klog.KObj(secret))
 			continue
 		}
 

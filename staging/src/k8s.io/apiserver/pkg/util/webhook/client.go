@@ -22,14 +22,21 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/http"
 	"net/url"
+	"strconv"
+	"strings"
 
-	"github.com/hashicorp/golang-lru"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/runtime/serializer"
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
+	"k8s.io/apiserver/pkg/features"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	"k8s.io/apiserver/pkg/util/x509metrics"
 	"k8s.io/client-go/rest"
+	"k8s.io/utils/lru"
+	netutils "k8s.io/utils/net"
 )
 
 const (
@@ -63,10 +70,7 @@ type ClientManager struct {
 
 // NewClientManager creates a clientManager.
 func NewClientManager(gvs []schema.GroupVersion, addToSchemaFuncs ...func(s *runtime.Scheme) error) (ClientManager, error) {
-	cache, err := lru.New(defaultCacheSize)
-	if err != nil {
-		return ClientManager{}, err
-	}
+	cache := lru.New(defaultCacheSize)
 	hookScheme := runtime.NewScheme()
 	for _, addToSchemaFunc := range addToSchemaFuncs {
 		if err := addToSchemaFunc(hookScheme); err != nil {
@@ -129,7 +133,24 @@ func (cm *ClientManager) HookClient(cc ClientConfig) (*rest.RESTClient, error) {
 		return client.(*rest.RESTClient), nil
 	}
 
-	complete := func(cfg *rest.Config) (*rest.RESTClient, error) {
+	cfg, err := cm.hookClientConfig(cc)
+	if err != nil {
+		return nil, err
+	}
+
+	client, err := rest.UnversionedRESTClientFor(cfg)
+	if err == nil {
+		cm.cache.Add(string(cacheKey), client)
+	}
+	return client, err
+}
+
+func (cm *ClientManager) hookClientConfig(cc ClientConfig) (*rest.Config, error) {
+	complete := func(cfg *rest.Config) (*rest.Config, error) {
+		// Avoid client-side rate limiting talking to the webhook backend.
+		// Rate limiting should happen when deciding how many requests to serve.
+		cfg.QPS = -1
+
 		// Combine CAData from the config with any existing CA bundle provided
 		if len(cfg.TLSClientConfig.CAData) > 0 {
 			cfg.TLSClientConfig.CAData = append(cfg.TLSClientConfig.CAData, '\n')
@@ -138,21 +159,37 @@ func (cm *ClientManager) HookClient(cc ClientConfig) (*rest.RESTClient, error) {
 
 		cfg.ContentConfig.NegotiatedSerializer = cm.negotiatedSerializer
 		cfg.ContentConfig.ContentType = runtime.ContentTypeJSON
-		client, err := rest.UnversionedRESTClientFor(cfg)
-		if err == nil {
-			cm.cache.Add(string(cacheKey), client)
-		}
-		return client, err
+
+		// Add a transport wrapper that allows detection of TLS connections to
+		// servers with serving certificates with deprecated characteristics
+		cfg.Wrap(x509metrics.NewDeprecatedCertificateRoundTripperWrapperConstructor(
+			x509MissingSANCounter,
+			x509InsecureSHA1Counter,
+		))
+		return cfg, nil
 	}
 
 	if cc.Service != nil {
-		restConfig, err := cm.authInfoResolver.ClientConfigForService(cc.Service.Name, cc.Service.Namespace)
+		port := cc.Service.Port
+		if port == 0 {
+			// Default to port 443 if no service port is specified
+			port = 443
+		}
+
+		restConfig, err := cm.authInfoResolver.ClientConfigForService(cc.Service.Name, cc.Service.Namespace, int(port))
 		if err != nil {
 			return nil, err
 		}
 		cfg := rest.CopyConfig(restConfig)
+
+		// Use http/1.1 instead of http/2.
+		// This is a workaround for http/2-enabled clients not load-balancing concurrent requests to multiple backends.
+		// See https://issue.k8s.io/75791 for details.
+		cfg.NextProtos = []string{"http/1.1"}
+
 		serverName := cc.Service.Name + "." + cc.Service.Namespace + ".svc"
-		host := serverName + ":443"
+
+		host := net.JoinHostPort(serverName, strconv.Itoa(int(port)))
 		cfg.Host = "https://" + host
 		cfg.APIPath = cc.Service.Path
 		// Set the server name if not already set
@@ -160,24 +197,36 @@ func (cm *ClientManager) HookClient(cc ClientConfig) (*rest.RESTClient, error) {
 			cfg.TLSClientConfig.ServerName = serverName
 		}
 
-		delegateDialer := cfg.Dial
-		if delegateDialer == nil {
-			var d net.Dialer
-			delegateDialer = d.DialContext
-		}
-		cfg.Dial = func(ctx context.Context, network, addr string) (net.Conn, error) {
-			if addr == host {
-				port := cc.Service.Port
-				if port == 0 {
-					port = 443
-				}
-				u, err := cm.serviceResolver.ResolveEndpoint(cc.Service.Namespace, cc.Service.Name, port)
-				if err != nil {
-					return nil, err
-				}
-				addr = u.Host
+		if !utilfeature.DefaultFeatureGate.Enabled(features.WebhookRoundTripLoadBalancing) {
+			delegateDialer := cfg.Dial
+			if delegateDialer == nil {
+				var d net.Dialer
+				delegateDialer = d.DialContext
 			}
-			return delegateDialer(ctx, network, addr)
+			cfg.Dial = func(ctx context.Context, network, addr string) (net.Conn, error) {
+				if addr == host {
+					u, err := cm.serviceResolver.ResolveEndpoint(cc.Service.Namespace, cc.Service.Name, port)
+					if err != nil {
+						return nil, err
+					}
+					addr = u.Host
+				}
+				return delegateDialer(ctx, network, addr)
+			}
+		} else {
+			// Use a custom roundtripper since http transport caches
+			// the connections by the URL. Host. The service resolver
+			// provides the actual endpoint address, if we use a custom
+			// dialer then the cached connection may not be closed.
+			cfg.Wrap(func(rt http.RoundTripper) http.RoundTripper {
+				return &resolvingRoundTripper{
+					delegate:        rt,
+					serviceResolver: cm.serviceResolver,
+					namespace:       cc.Service.Namespace,
+					serviceName:     cc.Service.Name,
+					port:            port,
+				}
+			})
 		}
 
 		return complete(cfg)
@@ -192,7 +241,13 @@ func (cm *ClientManager) HookClient(cc ClientConfig) (*rest.RESTClient, error) {
 		return nil, &ErrCallingWebhook{WebhookName: cc.Name, Reason: fmt.Errorf("Unparsable URL: %v", err)}
 	}
 
-	restConfig, err := cm.authInfoResolver.ClientConfigFor(u.Host)
+	hostPort := u.Host
+	if len(u.Port()) == 0 {
+		// Default to port 443 if no port is specified
+		hostPort = net.JoinHostPort(hostPort, "443")
+	}
+
+	restConfig, err := cm.authInfoResolver.ClientConfigFor(hostPort)
 	if err != nil {
 		return nil, err
 	}
@@ -200,6 +255,55 @@ func (cm *ClientManager) HookClient(cc ClientConfig) (*rest.RESTClient, error) {
 	cfg := rest.CopyConfig(restConfig)
 	cfg.Host = u.Scheme + "://" + u.Host
 	cfg.APIPath = u.Path
+	if !isLocalHost(u) {
+		cfg.NextProtos = []string{"http/1.1"}
+	}
 
 	return complete(cfg)
+}
+
+func isLocalHost(u *url.URL) bool {
+	host := u.Hostname()
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+
+	netIP := netutils.ParseIPSloppy(host)
+	if netIP != nil {
+		return netIP.IsLoopback()
+	}
+	return false
+}
+
+// resolvingRoundTripper is a roundtripper that resolves the endpoint address
+// for the given service and updates the request URL to use the resolved endpoint address.
+type resolvingRoundTripper struct {
+	delegate        http.RoundTripper
+	serviceResolver ServiceResolver
+	namespace       string
+	serviceName     string
+	port            int32
+}
+
+func (r *resolvingRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	serverName := r.serviceName + "." + r.namespace + ".svc"
+	host := net.JoinHostPort(serverName, strconv.Itoa(int(r.port)))
+	if req.URL.Host != host {
+		return r.delegate.RoundTrip(req)
+	}
+	u, err := r.serviceResolver.ResolveEndpoint(r.namespace, r.serviceName, r.port)
+	if err != nil {
+		return nil, err
+	}
+	newReq := req.Clone(req.Context())
+	// Preserve the original Host header
+	if len(newReq.Host) == 0 {
+		newReq.Host = req.URL.Host
+	}
+	newReq.URL.Host = u.Host
+	return r.delegate.RoundTrip(newReq)
+}
+
+func (r *resolvingRoundTripper) WrappedRoundTripper() http.RoundTripper {
+	return r.delegate
 }

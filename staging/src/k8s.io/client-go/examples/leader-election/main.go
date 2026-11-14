@@ -19,22 +19,20 @@ package main
 import (
 	"context"
 	"flag"
-	"fmt"
-	"log"
 	"os"
 	"os/signal"
-	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
+	"github.com/google/uuid"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/tools/leaderelection"
 	"k8s.io/client-go/tools/leaderelection/resourcelock"
-	"k8s.io/client-go/transport"
-	"k8s.io/klog"
+	"k8s.io/klog/v2"
 )
 
 func buildConfig(kubeconfig string) (*rest.Config, error) {
@@ -60,15 +58,25 @@ func main() {
 	var leaseLockName string
 	var leaseLockNamespace string
 	var id string
+	var startedLeading atomic.Bool
 
 	flag.StringVar(&kubeconfig, "kubeconfig", "", "absolute path to the kubeconfig file")
-	flag.StringVar(&id, "id", "", "the holder identity name")
-	flag.StringVar(&leaseLockName, "lease-lock-name", "example", "the lease lock resource name")
-	flag.StringVar(&leaseLockNamespace, "lease-lock-namespace", "default", "the lease lock resource namespace")
+	flag.StringVar(&id, "id", uuid.New().String(), "the holder identity name")
+	flag.StringVar(&leaseLockName, "lease-lock-name", "", "the lease lock resource name")
+	flag.StringVar(&leaseLockNamespace, "lease-lock-namespace", "", "the lease lock resource namespace")
 	flag.Parse()
 
-	if id == "" {
-		klog.Fatal("unable to get id (missing id flag).")
+	// Some more complete example could also allow configuring different logging backends.
+	// In this one we use the klog default.
+	logger := klog.Background()
+
+	if leaseLockName == "" {
+		logger.Error(nil, "Unable to get lease lock resource name (missing lease-lock-name flag)")
+		klog.FlushAndExit(klog.ExitFlushTimeout, 1)
+	}
+	if leaseLockNamespace == "" {
+		logger.Error(nil, "Unable to get lease lock resource namespace (missing lease-lock-namespace flag)")
+		klog.FlushAndExit(klog.ExitFlushTimeout, 1)
 	}
 
 	// leader election uses the Kubernetes API by writing to a
@@ -78,9 +86,33 @@ func main() {
 	// independently.
 	config, err := buildConfig(kubeconfig)
 	if err != nil {
-		klog.Fatal(err)
+		logger.Error(err, "Building Kubernetes client configuration failed")
+		klog.FlushAndExit(klog.ExitFlushTimeout, 1)
 	}
 	client := clientset.NewForConfigOrDie(config)
+
+	run := func(ctx context.Context) {
+		// complete your controller loop here
+		logger.Info("Controller loop...")
+
+		select {}
+	}
+
+	// use a Go context so we can tell the leaderelection code when we
+	// want to step down
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// listen for interrupts or the Linux SIGTERM signal and cancel
+	// our context, which the leader election code will observe and
+	// step down
+	ch := make(chan os.Signal, 1)
+	signal.Notify(ch, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-ch
+		logger.Info("Received termination, signaling shutdown")
+		cancel()
+	}()
 
 	// we use the Lease lock type since edits to Leases are less common
 	// and fewer objects in the cluster watch "all Leases".
@@ -94,25 +126,6 @@ func main() {
 			Identity: id,
 		},
 	}
-
-	// use a Go context so we can tell the leaderelection code when we
-	// want to step down
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	// use a client that will stop allowing new requests once the context ends
-	config.Wrap(transport.ContextCanceller(ctx, fmt.Errorf("the leader is shutting down")))
-
-	// listen for interrupts or the Linux SIGTERM signal and cancel
-	// our context, which the leader election code will observe and
-	// step down
-	ch := make(chan os.Signal, 1)
-	signal.Notify(ch, os.Interrupt, syscall.SIGTERM)
-	go func() {
-		<-ch
-		log.Printf("Received termination, signaling shutdown")
-		cancel()
-	}()
 
 	// start the leader election code loop
 	leaderelection.RunOrDie(ctx, leaderelection.LeaderElectionConfig{
@@ -131,12 +144,25 @@ func main() {
 			OnStartedLeading: func(ctx context.Context) {
 				// we're notified when we start - this is where you would
 				// usually put your code
-				klog.Infof("%s: leading", id)
+				startedLeading.Store(true)
+				run(ctx)
 			},
 			OnStoppedLeading: func() {
-				// we can do cleanup here, or after the RunOrDie method
-				// returns
-				klog.Infof("%s: lost", id)
+				// we can do cleanup here, but note that this callback is always called
+				// when the LeaderElector exits, even if it did not start leading.
+				// Therefore, we should check if we actually started leading before
+				// performing any cleanup operations to avoid unexpected behavior.
+				logger.Info("Leader lost", "identity", id)
+
+				// Example check to ensure we only perform cleanup if we actually started leading
+				if startedLeading.Load() {
+					// Perform cleanup operations here
+					// For example, releasing resources, closing connections, etc.
+					logger.Info("Performing cleanup operations...")
+				} else {
+					logger.Info("Skipping cleanup because we never started leading")
+				}
+				os.Exit(0)
 			},
 			OnNewLeader: func(identity string) {
 				// we're notified when new leader elected
@@ -144,18 +170,8 @@ func main() {
 					// I just got the lock
 					return
 				}
-				klog.Infof("new leader elected: %v", identity)
+				logger.Info("New leader elected", "identity", identity)
 			},
 		},
 	})
-
-	// because the context is closed, the client should report errors
-	_, err = client.CoordinationV1().Leases(leaseLockNamespace).Get(leaseLockName, metav1.GetOptions{})
-	if err == nil || !strings.Contains(err.Error(), "the leader is shutting down") {
-		log.Fatalf("%s: expected to get an error when trying to make a client call: %v", id, err)
-	}
-
-	// we no longer hold the lease, so perform any cleanup and then
-	// exit
-	log.Printf("%s: done", id)
 }

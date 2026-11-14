@@ -21,16 +21,18 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/davecgh/go-spew/spew"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/version"
 	. "k8s.io/client-go/discovery"
+	"k8s.io/client-go/openapi"
 	restclient "k8s.io/client-go/rest"
 	"k8s.io/client-go/rest/fake"
+	"k8s.io/ktesting"
+	"k8s.io/utils/dump"
 
-	"github.com/googleapis/gnostic/OpenAPIv2"
+	openapi_v2 "github.com/google/gnostic-models/openapiv2"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -96,7 +98,8 @@ func TestRESTMapper(t *testing.T) {
 		},
 	}
 
-	restMapper := NewDiscoveryRESTMapper(resources)
+	tCtx := ktesting.Init(t)
+	restMapper := NewDiscoveryRESTMapperWithContext(resources)
 
 	kindTCs := []struct {
 		input schema.GroupVersionResource
@@ -163,7 +166,7 @@ func TestRESTMapper(t *testing.T) {
 	}
 
 	for _, tc := range kindTCs {
-		got, err := restMapper.KindFor(tc.input)
+		got, err := restMapper.KindForWithContext(tCtx, tc.input)
 		if err != nil {
 			t.Errorf("KindFor(%#v) unexpected error: %v", tc.input, err)
 			continue
@@ -229,7 +232,7 @@ func TestRESTMapper(t *testing.T) {
 	}
 
 	for _, tc := range resourceTCs {
-		got, err := restMapper.ResourceFor(tc.input)
+		got, err := restMapper.ResourceForWithContext(tCtx, tc.input)
 		if err != nil {
 			t.Errorf("ResourceFor(%#v) unexpected error: %v", tc.input, err)
 			continue
@@ -244,45 +247,46 @@ func TestRESTMapper(t *testing.T) {
 func TestDeferredDiscoveryRESTMapper_CacheMiss(t *testing.T) {
 	assert := assert.New(t)
 
+	tCtx := ktesting.Init(t)
 	cdc := fakeCachedDiscoveryInterface{fresh: false}
-	m := NewDeferredDiscoveryRESTMapper(&cdc)
+	m := NewDeferredDiscoveryRESTMapperWithContext(ToCachedDiscoveryInterfaceWithContext(&cdc))
 	assert.False(cdc.fresh, "should NOT be fresh after instantiation")
 	assert.Zero(cdc.invalidateCalls, "should not have called Invalidate()")
 
-	gvk, err := m.KindFor(schema.GroupVersionResource{
+	gvk, err := m.KindForWithContext(tCtx, schema.GroupVersionResource{
 		Group:    "a",
 		Version:  "v1",
 		Resource: "foo",
 	})
 	assert.NoError(err)
 	assert.True(cdc.fresh, "should be fresh after a cache-miss")
-	assert.Equal(cdc.invalidateCalls, 1, "should have called Invalidate() once")
-	assert.Equal(gvk.Kind, "Foo")
+	assert.Equal(1, cdc.invalidateCalls, "should have called Invalidate() once")
+	assert.Equal("Foo", gvk.Kind)
 
-	gvk, err = m.KindFor(schema.GroupVersionResource{
+	gvk, err = m.KindForWithContext(tCtx, schema.GroupVersionResource{
 		Group:    "a",
 		Version:  "v1",
 		Resource: "foo",
 	})
 	assert.NoError(err)
-	assert.Equal(cdc.invalidateCalls, 1, "should NOT have called Invalidate() again")
+	assert.Equal(1, cdc.invalidateCalls, "should NOT have called Invalidate() again")
 
-	gvk, err = m.KindFor(schema.GroupVersionResource{
+	gvk, err = m.KindForWithContext(tCtx, schema.GroupVersionResource{
 		Group:    "a",
 		Version:  "v1",
 		Resource: "bar",
 	})
 	assert.Error(err)
-	assert.Equal(cdc.invalidateCalls, 1, "should NOT have called Invalidate() again after another cache-miss, but with fresh==true")
+	assert.Equal(1, cdc.invalidateCalls, "should NOT have called Invalidate() again after another cache-miss, but with fresh==true")
 
 	cdc.fresh = false
-	gvk, err = m.KindFor(schema.GroupVersionResource{
+	gvk, err = m.KindForWithContext(tCtx, schema.GroupVersionResource{
 		Group:    "a",
 		Version:  "v1",
 		Resource: "bar",
 	})
 	assert.Error(err)
-	assert.Equal(cdc.invalidateCalls, 2, "should HAVE called Invalidate() again after another cache-miss, but with fresh==false")
+	assert.Equal(2, cdc.invalidateCalls, "should HAVE called Invalidate() again after another cache-miss, but with fresh==false")
 }
 
 func TestGetAPIGroupResources(t *testing.T) {
@@ -356,14 +360,15 @@ func TestGetAPIGroupResources(t *testing.T) {
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			got, err := GetAPIGroupResources(test.discovery)
+			tCtx := ktesting.Init(t)
+			got, err := GetAPIGroupResourcesWithContext(tCtx, ToDiscoveryInterfaceWithContext(test.discovery))
 			if err == nil && test.expectedError != nil {
 				t.Fatalf("expected error %q, but got none", test.expectedError)
 			} else if err != nil && test.expectedError == nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
 			if !reflect.DeepEqual(test.expected, got) {
-				t.Errorf("unexpected result:\nexpected = %s\ngot = %s", spew.Sdump(test.expected), spew.Sdump(got))
+				t.Errorf("unexpected result:\nexpected = %s\ngot = %s", dump.Pretty(test.expected), dump.Pretty(got))
 			}
 		})
 	}
@@ -392,6 +397,7 @@ func (d *fakeFailingDiscovery) ServerGroups() (*metav1.APIGroupList, error) {
 }
 
 func (d *fakeFailingDiscovery) ServerGroupsAndResources() ([]*metav1.APIGroup, []*metav1.APIResourceList, error) {
+	//nolint:logcheck // Implementing the old, non-contextual DiscoveryInterface method leaves no context to pass through.
 	return ServerGroupsAndResources(d)
 }
 func (d *fakeFailingDiscovery) ServerResourcesForGroupVersion(groupVersion string) (*metav1.APIResourceList, error) {
@@ -401,15 +407,13 @@ func (d *fakeFailingDiscovery) ServerResourcesForGroupVersion(groupVersion strin
 	return nil, fmt.Errorf("not found")
 }
 
-func (d *fakeFailingDiscovery) ServerResources() ([]*metav1.APIResourceList, error) {
-	return ServerResources(d)
-}
-
 func (d *fakeFailingDiscovery) ServerPreferredResources() ([]*metav1.APIResourceList, error) {
+	//nolint:logcheck // Implementing the old, non-contextual DiscoveryInterface method leaves no context to pass through.
 	return ServerPreferredResources(d)
 }
 
 func (d *fakeFailingDiscovery) ServerPreferredNamespacedResources() ([]*metav1.APIResourceList, error) {
+	//nolint:logcheck // Implementing the old, non-contextual DiscoveryInterface method leaves no context to pass through.
 	return ServerPreferredNamespacedResources(d)
 }
 
@@ -418,6 +422,14 @@ func (*fakeFailingDiscovery) ServerVersion() (*version.Info, error) {
 }
 
 func (*fakeFailingDiscovery) OpenAPISchema() (*openapi_v2.Document, error) {
+	panic("implement me")
+}
+
+func (c *fakeFailingDiscovery) OpenAPIV3() openapi.Client {
+	panic("implement me")
+}
+
+func (c *fakeFailingDiscovery) WithLegacy() DiscoveryInterface {
 	panic("implement me")
 }
 
@@ -453,6 +465,7 @@ func (c *fakeCachedDiscoveryInterface) ServerGroups() (*metav1.APIGroupList, err
 }
 
 func (c *fakeCachedDiscoveryInterface) ServerGroupsAndResources() ([]*metav1.APIGroup, []*metav1.APIResourceList, error) {
+	//nolint:logcheck // Implementing the old, non-contextual DiscoveryInterface method leaves no context to pass through.
 	return ServerGroupsAndResources(c)
 }
 
@@ -462,11 +475,6 @@ func (c *fakeCachedDiscoveryInterface) ServerResourcesForGroupVersion(groupVersi
 	}
 
 	return nil, errors.NewNotFound(schema.GroupResource{}, "")
-}
-
-// Deprecated: use ServerGroupsAndResources instead.
-func (c *fakeCachedDiscoveryInterface) ServerResources() ([]*metav1.APIResourceList, error) {
-	return ServerResources(c)
 }
 
 func (c *fakeCachedDiscoveryInterface) ServerPreferredResources() ([]*metav1.APIResourceList, error) {
@@ -497,6 +505,14 @@ func (c *fakeCachedDiscoveryInterface) ServerVersion() (*version.Info, error) {
 
 func (c *fakeCachedDiscoveryInterface) OpenAPISchema() (*openapi_v2.Document, error) {
 	return &openapi_v2.Document{}, nil
+}
+
+func (c *fakeCachedDiscoveryInterface) OpenAPIV3() openapi.Client {
+	panic("implement me")
+}
+
+func (c *fakeCachedDiscoveryInterface) WithLegacy() DiscoveryInterface {
+	panic("implement me")
 }
 
 var (

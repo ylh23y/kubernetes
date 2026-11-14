@@ -17,12 +17,16 @@ limitations under the License.
 package helpers
 
 import (
+	"context"
+	"reflect"
 	"strings"
 	"testing"
 
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes/fake"
 	utilnet "k8s.io/utils/net"
+	"k8s.io/utils/ptr"
 )
 
 /*
@@ -59,13 +63,13 @@ func TestGetLoadBalancerSourceRanges(t *testing.T) {
 		annotations[v1.AnnotationLoadBalancerSourceRangesKey] = v
 		svc := v1.Service{}
 		svc.Annotations = annotations
-		cidrs, err := GetLoadBalancerSourceRanges(&svc)
+		_, err := GetLoadBalancerSourceRanges(&svc)
 		if err != nil {
 			t.Errorf("Unexpected error parsing: %q", v)
 		}
 		svc = v1.Service{}
 		svc.Spec.LoadBalancerSourceRanges = strings.Split(v, ",")
-		cidrs, err = GetLoadBalancerSourceRanges(&svc)
+		cidrs, err := GetLoadBalancerSourceRanges(&svc)
 		if err != nil {
 			t.Errorf("Unexpected error parsing: %q", v)
 		}
@@ -158,25 +162,25 @@ func TestRequestsOnlyLocalTraffic(t *testing.T) {
 	checkRequestsOnlyLocalTraffic(false, &v1.Service{
 		Spec: v1.ServiceSpec{
 			Type:                  v1.ServiceTypeNodePort,
-			ExternalTrafficPolicy: v1.ServiceExternalTrafficPolicyTypeCluster,
+			ExternalTrafficPolicy: v1.ServiceExternalTrafficPolicyCluster,
 		},
 	})
 	checkRequestsOnlyLocalTraffic(true, &v1.Service{
 		Spec: v1.ServiceSpec{
 			Type:                  v1.ServiceTypeNodePort,
-			ExternalTrafficPolicy: v1.ServiceExternalTrafficPolicyTypeLocal,
+			ExternalTrafficPolicy: v1.ServiceExternalTrafficPolicyLocal,
 		},
 	})
 	checkRequestsOnlyLocalTraffic(false, &v1.Service{
 		Spec: v1.ServiceSpec{
 			Type:                  v1.ServiceTypeLoadBalancer,
-			ExternalTrafficPolicy: v1.ServiceExternalTrafficPolicyTypeCluster,
+			ExternalTrafficPolicy: v1.ServiceExternalTrafficPolicyCluster,
 		},
 	})
 	checkRequestsOnlyLocalTraffic(true, &v1.Service{
 		Spec: v1.ServiceSpec{
 			Type:                  v1.ServiceTypeLoadBalancer,
-			ExternalTrafficPolicy: v1.ServiceExternalTrafficPolicyTypeLocal,
+			ExternalTrafficPolicy: v1.ServiceExternalTrafficPolicyLocal,
 		},
 	})
 }
@@ -198,25 +202,25 @@ func TestNeedsHealthCheck(t *testing.T) {
 	checkNeedsHealthCheck(false, &v1.Service{
 		Spec: v1.ServiceSpec{
 			Type:                  v1.ServiceTypeNodePort,
-			ExternalTrafficPolicy: v1.ServiceExternalTrafficPolicyTypeCluster,
+			ExternalTrafficPolicy: v1.ServiceExternalTrafficPolicyCluster,
 		},
 	})
 	checkNeedsHealthCheck(false, &v1.Service{
 		Spec: v1.ServiceSpec{
 			Type:                  v1.ServiceTypeNodePort,
-			ExternalTrafficPolicy: v1.ServiceExternalTrafficPolicyTypeLocal,
+			ExternalTrafficPolicy: v1.ServiceExternalTrafficPolicyLocal,
 		},
 	})
 	checkNeedsHealthCheck(false, &v1.Service{
 		Spec: v1.ServiceSpec{
 			Type:                  v1.ServiceTypeLoadBalancer,
-			ExternalTrafficPolicy: v1.ServiceExternalTrafficPolicyTypeCluster,
+			ExternalTrafficPolicy: v1.ServiceExternalTrafficPolicyCluster,
 		},
 	})
 	checkNeedsHealthCheck(true, &v1.Service{
 		Spec: v1.ServiceSpec{
 			Type:                  v1.ServiceTypeLoadBalancer,
-			ExternalTrafficPolicy: v1.ServiceExternalTrafficPolicyTypeLocal,
+			ExternalTrafficPolicy: v1.ServiceExternalTrafficPolicyLocal,
 		},
 	})
 }
@@ -265,6 +269,230 @@ func TestHasLBFinalizer(t *testing.T) {
 		t.Run(tc.desc, func(t *testing.T) {
 			if hasFinalizer := HasLBFinalizer(tc.svc); hasFinalizer != tc.hasFinalizer {
 				t.Errorf("HasLBFinalizer() = %t, want %t", hasFinalizer, tc.hasFinalizer)
+			}
+		})
+	}
+}
+
+func TestPatchService(t *testing.T) {
+	svcOrigin := &v1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        "test-patch",
+			Annotations: map[string]string{},
+		},
+		Spec: v1.ServiceSpec{
+			ClusterIP: "10.0.0.1",
+		},
+	}
+	fakeCs := fake.NewSimpleClientset(svcOrigin)
+
+	// Issue a separate update and verify patch doesn't fail after this.
+	svcToUpdate := svcOrigin.DeepCopy()
+	addAnnotations(svcToUpdate)
+	if _, err := fakeCs.CoreV1().Services(svcOrigin.Namespace).Update(context.TODO(), svcToUpdate, metav1.UpdateOptions{}); err != nil {
+		t.Fatalf("Failed to update service: %v", err)
+	}
+
+	// Attempt to patch based the original service.
+	svcToPatch := svcOrigin.DeepCopy()
+	svcToPatch.Finalizers = []string{"foo"}
+	svcToPatch.Spec.ClusterIP = "10.0.0.2"
+	svcToPatch.Status = v1.ServiceStatus{
+		LoadBalancer: v1.LoadBalancerStatus{
+			Ingress: []v1.LoadBalancerIngress{
+				{IP: "8.8.8.8"},
+			},
+		},
+	}
+	svcPatched, err := PatchService(fakeCs.CoreV1(), svcOrigin, svcToPatch)
+	if err != nil {
+		t.Fatalf("Failed to patch service: %v", err)
+	}
+
+	// Service returned by patch will contain latest content (e.g from
+	// the separate update).
+	addAnnotations(svcToPatch)
+	if !reflect.DeepEqual(svcPatched, svcToPatch) {
+		t.Errorf("PatchStatus() = %+v, want %+v", svcPatched, svcToPatch)
+	}
+	// Explicitly validate if spec is unchanged from origin.
+	if !reflect.DeepEqual(svcPatched.Spec, svcOrigin.Spec) {
+		t.Errorf("Got spec = %+v, want %+v", svcPatched.Spec, svcOrigin.Spec)
+	}
+}
+
+func Test_getPatchBytes(t *testing.T) {
+	origin := &v1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "test-patch-bytes",
+			Finalizers: []string{"foo"},
+		},
+	}
+	updated := &v1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "test-patch-bytes",
+			Finalizers: []string{"foo", "bar"},
+		},
+	}
+
+	b, err := getPatchBytes(origin, updated)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected := `{"metadata":{"$setElementOrder/finalizers":["foo","bar"],"finalizers":["bar"]}}`
+	if string(b) != expected {
+		t.Errorf("getPatchBytes(%+v, %+v) = %s ; want %s", origin, updated, string(b), expected)
+	}
+}
+
+func addAnnotations(svc *v1.Service) {
+	svc.Annotations["foo"] = "bar"
+}
+
+func TestLoadBalancerStatusEqual(t *testing.T) {
+	tests := []struct {
+		name string
+		l    *v1.LoadBalancerStatus
+		r    *v1.LoadBalancerStatus
+		want bool
+	}{
+		{
+			name: "empty",
+			l:    &v1.LoadBalancerStatus{},
+			r:    &v1.LoadBalancerStatus{},
+			want: true,
+		},
+		{
+			name: "same ip",
+			l: &v1.LoadBalancerStatus{
+				Ingress: []v1.LoadBalancerIngress{
+					{IP: "192.168.0.1"},
+				},
+			},
+			r: &v1.LoadBalancerStatus{
+				Ingress: []v1.LoadBalancerIngress{
+					{IP: "192.168.0.1"},
+				},
+			},
+			want: true,
+		},
+		{
+			name: "different ip",
+			l: &v1.LoadBalancerStatus{
+				Ingress: []v1.LoadBalancerIngress{
+					{IP: "192.168.0.2"},
+				},
+			},
+			r: &v1.LoadBalancerStatus{
+				Ingress: []v1.LoadBalancerIngress{
+					{IP: "192.168.0.1"},
+				},
+			},
+			want: false,
+		},
+		{
+			name: "same ipmode",
+			l: &v1.LoadBalancerStatus{
+				Ingress: []v1.LoadBalancerIngress{
+					{IP: "192.168.0.1", IPMode: ptr.To(v1.LoadBalancerIPModeVIP)},
+				},
+			},
+			r: &v1.LoadBalancerStatus{
+				Ingress: []v1.LoadBalancerIngress{
+					{IP: "192.168.0.1", IPMode: ptr.To(v1.LoadBalancerIPModeVIP)},
+				},
+			},
+			want: true,
+		},
+		{
+			name: "only one ipmode set",
+			l: &v1.LoadBalancerStatus{
+				Ingress: []v1.LoadBalancerIngress{
+					{IP: "192.168.0.1"},
+				},
+			},
+			r: &v1.LoadBalancerStatus{
+				Ingress: []v1.LoadBalancerIngress{
+					{IP: "192.168.0.1", IPMode: ptr.To(v1.LoadBalancerIPModeVIP)},
+				},
+			},
+			want: false,
+		},
+		{
+			name: "different ipmode",
+			l: &v1.LoadBalancerStatus{
+				Ingress: []v1.LoadBalancerIngress{
+					{IP: "192.168.0.1", IPMode: ptr.To(v1.LoadBalancerIPModeProxy)},
+				},
+			},
+			r: &v1.LoadBalancerStatus{
+				Ingress: []v1.LoadBalancerIngress{
+					{IP: "192.168.0.1", IPMode: ptr.To(v1.LoadBalancerIPModeVIP)},
+				},
+			},
+			want: false,
+		},
+		{
+			name: "same ports",
+			l: &v1.LoadBalancerStatus{
+				Ingress: []v1.LoadBalancerIngress{
+					{IP: "192.168.0.1", Ports: []v1.PortStatus{{Port: 80, Protocol: v1.ProtocolTCP}}},
+				},
+			},
+			r: &v1.LoadBalancerStatus{
+				Ingress: []v1.LoadBalancerIngress{
+					{IP: "192.168.0.1", Ports: []v1.PortStatus{{Port: 80, Protocol: v1.ProtocolTCP}}},
+				},
+			},
+			want: true,
+		},
+		{
+			name: "same ports different protocol",
+			l: &v1.LoadBalancerStatus{
+				Ingress: []v1.LoadBalancerIngress{
+					{IP: "192.168.0.1", Ports: []v1.PortStatus{{Port: 80, Protocol: v1.ProtocolTCP}}},
+				},
+			},
+			r: &v1.LoadBalancerStatus{
+				Ingress: []v1.LoadBalancerIngress{
+					{IP: "192.168.0.1", Ports: []v1.PortStatus{{Port: 80, Protocol: v1.ProtocolUDP}}},
+				},
+			},
+			want: false,
+		},
+		{
+			name: "only one port",
+			l: &v1.LoadBalancerStatus{
+				Ingress: []v1.LoadBalancerIngress{
+					{IP: "192.168.0.1", Ports: []v1.PortStatus{{Port: 80, Protocol: v1.ProtocolTCP}}},
+				},
+			},
+			r: &v1.LoadBalancerStatus{
+				Ingress: []v1.LoadBalancerIngress{
+					{IP: "192.168.0.1", Ports: []v1.PortStatus{}},
+				},
+			},
+			want: false,
+		},
+		{
+			name: "only one port",
+			l: &v1.LoadBalancerStatus{
+				Ingress: []v1.LoadBalancerIngress{
+					{IP: "192.168.0.1", Ports: []v1.PortStatus{{Port: 80, Protocol: v1.ProtocolTCP}}},
+				},
+			},
+			r: &v1.LoadBalancerStatus{
+				Ingress: []v1.LoadBalancerIngress{
+					{IP: "192.168.0.1", Ports: []v1.PortStatus{}},
+				},
+			},
+			want: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := LoadBalancerStatusEqual(tt.l, tt.r); got != tt.want {
+				t.Errorf("LoadBalancerStatusEqual() = %v, want %v", got, tt.want)
 			}
 		})
 	}

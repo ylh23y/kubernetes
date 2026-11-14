@@ -51,15 +51,6 @@ func newAutoRegisterManagedModifiedAPIService(name string) *apiregistrationv1.AP
 	}
 }
 
-func newAutoRegisterManagedOnStartModifiedAPIService(name string) *apiregistrationv1.APIService {
-	return &apiregistrationv1.APIService{
-		ObjectMeta: metav1.ObjectMeta{Name: name, Labels: map[string]string{AutoRegisterManagedLabel: string("onstart")}},
-		Spec: apiregistrationv1.APIServiceSpec{
-			Group: "something",
-		},
-	}
-}
-
 func newAPIService(name string) *apiregistrationv1.APIService {
 	return &apiregistrationv1.APIService{
 		ObjectMeta: metav1.ObjectMeta{Name: name},
@@ -325,7 +316,10 @@ func TestSync(t *testing.T) {
 			apiServiceClient:  fakeClient.ApiregistrationV1(),
 			apiServiceLister:  listers.NewAPIServiceLister(apiServiceIndexer),
 			apiServicesToSync: map[string]*apiregistrationv1.APIService{},
-			queue:             workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "autoregister"),
+			queue: workqueue.NewTypedRateLimitingQueueWithConfig(
+				workqueue.DefaultTypedControllerRateLimiter[string](),
+				workqueue.TypedRateLimitingQueueConfig[string]{Name: "autoregister"},
+			),
 
 			syncedSuccessfullyLock: &sync.RWMutex{},
 			syncedSuccessfully:     alreadySynced,

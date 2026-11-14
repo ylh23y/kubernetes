@@ -17,6 +17,7 @@ limitations under the License.
 package storage
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"time"
@@ -26,17 +27,17 @@ import (
 	"k8s.io/apimachinery/pkg/util/rand"
 	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/kubernetes/test/e2e/framework"
-	e2elog "k8s.io/kubernetes/test/e2e/framework/log"
+	e2epod "k8s.io/kubernetes/test/e2e/framework/pod"
 	"k8s.io/kubernetes/test/e2e/storage/utils"
 	imageutils "k8s.io/kubernetes/test/utils/image"
+	admissionapi "k8s.io/pod-security-admission/api"
 
-	"github.com/onsi/ginkgo"
+	"github.com/onsi/ginkgo/v2"
 )
 
 var (
 	volumePath = "/test-volume"
 	volumeName = "test-volume"
-	mountImage = imageutils.GetE2EImage(imageutils.Mounttest)
 )
 
 var _ = utils.SIGDescribe("Ephemeralstorage", func() {
@@ -45,6 +46,7 @@ var _ = utils.SIGDescribe("Ephemeralstorage", func() {
 	)
 
 	f := framework.NewDefaultFramework("pv")
+	f.NamespacePodSecurityLevel = admissionapi.LevelBaseline
 
 	ginkgo.BeforeEach(func() {
 		c = f.ClientSet
@@ -52,15 +54,15 @@ var _ = utils.SIGDescribe("Ephemeralstorage", func() {
 
 	ginkgo.Describe("When pod refers to non-existent ephemeral storage", func() {
 		for _, testSource := range invalidEphemeralSource("pod-ephm-test") {
-			ginkgo.It(fmt.Sprintf("should allow deletion of pod with invalid volume : %s", testSource.volumeType), func() {
+			ginkgo.It(fmt.Sprintf("should allow deletion of pod with invalid volume : %s", testSource.volumeType), func(ctx context.Context) {
 				pod := testEphemeralVolumePod(f, testSource.volumeType, testSource.source)
-				pod, err := c.CoreV1().Pods(f.Namespace.Name).Create(pod)
+				pod, err := c.CoreV1().Pods(f.Namespace.Name).Create(ctx, pod, metav1.CreateOptions{})
 				framework.ExpectNoError(err)
 
 				// Allow it to sleep for 30 seconds
 				time.Sleep(30 * time.Second)
-				e2elog.Logf("Deleting pod %q/%q", pod.Namespace, pod.Name)
-				framework.ExpectNoError(framework.DeletePodWithWait(f, c, pod))
+				framework.Logf("Deleting pod %q/%q", pod.Namespace, pod.Name)
+				framework.ExpectNoError(e2epod.DeletePodWithWait(ctx, c, pod))
 			})
 		}
 	})
@@ -84,7 +86,7 @@ func testEphemeralVolumePod(f *framework.Framework, volumeType string, source *v
 			Containers: []v1.Container{
 				{
 					Name:  fmt.Sprintf("test-container-subpath-%s", suffix),
-					Image: mountImage,
+					Image: imageutils.GetE2EImage(imageutils.Agnhost),
 					VolumeMounts: []v1.VolumeMount{
 						{
 							Name:      volumeName,

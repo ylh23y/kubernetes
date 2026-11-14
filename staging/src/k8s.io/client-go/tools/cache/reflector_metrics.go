@@ -40,25 +40,18 @@ type SummaryMetric interface {
 	Observe(float64)
 }
 
+// HistogramMetric captures individual observations into configurable buckets.
+// It also provides a sum and count of observations.
+type HistogramMetric interface {
+	Observe(float64)
+}
+
 type noopMetric struct{}
 
 func (noopMetric) Inc()            {}
 func (noopMetric) Dec()            {}
 func (noopMetric) Observe(float64) {}
 func (noopMetric) Set(float64)     {}
-
-type reflectorMetrics struct {
-	numberOfLists       CounterMetric
-	listDuration        SummaryMetric
-	numberOfItemsInList SummaryMetric
-
-	numberOfWatches      CounterMetric
-	numberOfShortWatches CounterMetric
-	watchDuration        SummaryMetric
-	numberOfItemsInWatch SummaryMetric
-
-	lastResourceVersion GaugeMetric
-}
 
 // MetricsProvider generates various metrics used by the reflector.
 type MetricsProvider interface {

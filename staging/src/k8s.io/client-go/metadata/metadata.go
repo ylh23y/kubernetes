@@ -17,13 +17,15 @@ limitations under the License.
 package metadata
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"time"
 
-	"k8s.io/klog"
+	"k8s.io/klog/v2"
 
-	metainternalversion "k8s.io/apimachinery/pkg/apis/meta/internalversion"
+	metainternalversionscheme "k8s.io/apimachinery/pkg/apis/meta/internalversion/scheme"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -63,7 +65,7 @@ func ConfigFor(inConfig *rest.Config) *rest.Config {
 	config := rest.CopyConfig(inConfig)
 	config.AcceptContentTypes = "application/vnd.kubernetes.protobuf,application/json"
 	config.ContentType = "application/vnd.kubernetes.protobuf"
-	config.NegotiatedSerializer = metainternalversion.Codecs.WithoutConversion()
+	config.NegotiatedSerializer = metainternalversionscheme.Codecs.WithoutConversion()
 	if config.UserAgent == "" {
 		config.UserAgent = rest.DefaultKubernetesUserAgent()
 	}
@@ -84,13 +86,27 @@ func NewForConfigOrDie(c *rest.Config) Interface {
 // metadata details about any Kubernetes object (core, aggregated, or custom
 // resource based) in the form of PartialObjectMetadata objects, or returns
 // an error.
+// NewForConfig is equivalent to NewForConfigAndClient(c, httpClient),
+// where httpClient was generated with rest.HTTPClientFor(c).
 func NewForConfig(inConfig *rest.Config) (Interface, error) {
+	config := ConfigFor(inConfig)
+
+	httpClient, err := rest.HTTPClientFor(config)
+	if err != nil {
+		return nil, err
+	}
+	return NewForConfigAndClient(config, httpClient)
+}
+
+// NewForConfigAndClient creates a new metadata client for the given config and http client.
+// Note the http client provided takes precedence over the configured transport values.
+func NewForConfigAndClient(inConfig *rest.Config, h *http.Client) (Interface, error) {
 	config := ConfigFor(inConfig)
 	// for serializing the options
 	config.GroupVersion = &schema.GroupVersion{}
 	config.APIPath = "/this-value-should-never-be-sent"
 
-	restClient, err := rest.RESTClientFor(config)
+	restClient, err := rest.RESTClientForConfigAndClient(config, h)
 	if err != nil {
 		return nil, err
 	}
@@ -119,14 +135,17 @@ func (c *client) Namespace(ns string) ResourceInterface {
 }
 
 // Delete removes the provided resource from the server.
-func (c *client) Delete(name string, opts *metav1.DeleteOptions, subresources ...string) error {
+func (c *client) Delete(ctx context.Context, name string, opts metav1.DeleteOptions, subresources ...string) error {
 	if len(name) == 0 {
 		return fmt.Errorf("name is required")
 	}
-	if opts == nil {
-		opts = &metav1.DeleteOptions{}
-	}
-	deleteOptionsByte, err := runtime.Encode(deleteOptionsCodec.LegacyCodec(schema.GroupVersion{Version: "v1"}), opts)
+	// if DeleteOptions are delivered to Negotiator for serialization,
+	// HTTP-Request header will bring "Content-Type: application/vnd.kubernetes.protobuf"
+	// apiextensions-apiserver uses unstructuredNegotiatedSerializer to decode the input,
+	// server-side will reply with 406 errors.
+	// The special treatment here is to be compatible with CRD Handler
+	// see: https://github.com/kubernetes/kubernetes/blob/1a845ccd076bbf1b03420fe694c85a5cd3bd6bed/staging/src/k8s.io/apiextensions-apiserver/pkg/apiserver/customresource_handler.go#L843
+	deleteOptionsByte, err := runtime.Encode(deleteOptionsCodec.LegacyCodec(schema.GroupVersion{Version: "v1"}), &opts)
 	if err != nil {
 		return err
 	}
@@ -134,17 +153,42 @@ func (c *client) Delete(name string, opts *metav1.DeleteOptions, subresources ..
 	result := c.client.client.
 		Delete().
 		AbsPath(append(c.makeURLSegments(name), subresources...)...).
+		SetHeader("Content-Type", runtime.ContentTypeJSON).
 		Body(deleteOptionsByte).
-		Do()
+		Do(ctx)
 	return result.Error()
 }
 
-// DeleteCollection triggers deletion of all resources in the specified scope (namespace or cluster).
-func (c *client) DeleteCollection(opts *metav1.DeleteOptions, listOptions metav1.ListOptions) error {
-	if opts == nil {
-		opts = &metav1.DeleteOptions{}
+// DeleteWithResult removes the provided resource from the server.
+func (c *client) DeleteWithResult(ctx context.Context, name string, opts metav1.DeleteOptions, subresources ...string) (metav1.APIResult, error) {
+	if len(name) == 0 {
+		return nil, fmt.Errorf("name is required")
 	}
-	deleteOptionsByte, err := runtime.Encode(deleteOptionsCodec.LegacyCodec(schema.GroupVersion{Version: "v1"}), opts)
+	// if DeleteOptions are delivered to Negotiator for serialization,
+	// HTTP-Request header will bring "Content-Type: application/vnd.kubernetes.protobuf"
+	// apiextensions-apiserver uses unstructuredNegotiatedSerializer to decode the input,
+	// server-side will reply with 406 errors.
+	// The special treatment here is to be compatible with CRD Handler
+	// see: https://github.com/kubernetes/kubernetes/blob/1a845ccd076bbf1b03420fe694c85a5cd3bd6bed/staging/src/k8s.io/apiextensions-apiserver/pkg/apiserver/customresource_handler.go#L843
+	deleteOptionsByte, err := runtime.Encode(deleteOptionsCodec.LegacyCodec(schema.GroupVersion{Version: "v1"}), &opts)
+	if err != nil {
+		return nil, err
+	}
+
+	result := c.client.client.
+		Delete().
+		AbsPath(append(c.makeURLSegments(name), subresources...)...).
+		SetHeader("Content-Type", runtime.ContentTypeJSON).
+		SetHeader("Accept", "application/vnd.kubernetes.protobuf;as=PartialObjectMetadata;g=meta.k8s.io;v=v1,application/json;as=PartialObjectMetadata;g=meta.k8s.io;v=v1,application/json").
+		Body(deleteOptionsByte).
+		Do(ctx)
+	return metadataResult{rest.APIResultAdapter{Result: result}}, result.Error()
+}
+
+// DeleteCollection triggers deletion of all resources in the specified scope (namespace or cluster).
+func (c *client) DeleteCollection(ctx context.Context, opts metav1.DeleteOptions, listOptions metav1.ListOptions) error {
+	// See comment on Delete
+	deleteOptionsByte, err := runtime.Encode(deleteOptionsCodec.LegacyCodec(schema.GroupVersion{Version: "v1"}), &opts)
 	if err != nil {
 		return err
 	}
@@ -152,27 +196,28 @@ func (c *client) DeleteCollection(opts *metav1.DeleteOptions, listOptions metav1
 	result := c.client.client.
 		Delete().
 		AbsPath(c.makeURLSegments("")...).
+		SetHeader("Content-Type", runtime.ContentTypeJSON).
 		Body(deleteOptionsByte).
 		SpecificallyVersionedParams(&listOptions, dynamicParameterCodec, versionV1).
-		Do()
+		Do(ctx)
 	return result.Error()
 }
 
 // Get returns the resource with name from the specified scope (namespace or cluster).
-func (c *client) Get(name string, opts metav1.GetOptions, subresources ...string) (*metav1.PartialObjectMetadata, error) {
+func (c *client) Get(ctx context.Context, name string, opts metav1.GetOptions, subresources ...string) (*metav1.PartialObjectMetadata, error) {
 	if len(name) == 0 {
 		return nil, fmt.Errorf("name is required")
 	}
 	result := c.client.client.Get().AbsPath(append(c.makeURLSegments(name), subresources...)...).
 		SetHeader("Accept", "application/vnd.kubernetes.protobuf;as=PartialObjectMetadata;g=meta.k8s.io;v=v1,application/json;as=PartialObjectMetadata;g=meta.k8s.io;v=v1,application/json").
 		SpecificallyVersionedParams(&opts, dynamicParameterCodec, versionV1).
-		Do()
+		Do(ctx)
 	if err := result.Error(); err != nil {
 		return nil, err
 	}
 	obj, err := result.Get()
 	if runtime.IsNotRegisteredError(err) {
-		klog.V(5).Infof("Unable to retrieve PartialObjectMetadata: %#v", err)
+		klog.FromContext(ctx).V(5).Info("Could not retrieve PartialObjectMetadata", "err", err)
 		rawBytes, err := result.Raw()
 		if err != nil {
 			return nil, err
@@ -198,17 +243,17 @@ func (c *client) Get(name string, opts metav1.GetOptions, subresources ...string
 }
 
 // List returns all resources within the specified scope (namespace or cluster).
-func (c *client) List(opts metav1.ListOptions) (*metav1.PartialObjectMetadataList, error) {
+func (c *client) List(ctx context.Context, opts metav1.ListOptions) (*metav1.PartialObjectMetadataList, error) {
 	result := c.client.client.Get().AbsPath(c.makeURLSegments("")...).
 		SetHeader("Accept", "application/vnd.kubernetes.protobuf;as=PartialObjectMetadataList;g=meta.k8s.io;v=v1,application/json;as=PartialObjectMetadataList;g=meta.k8s.io;v=v1,application/json").
 		SpecificallyVersionedParams(&opts, dynamicParameterCodec, versionV1).
-		Do()
+		Do(ctx)
 	if err := result.Error(); err != nil {
 		return nil, err
 	}
 	obj, err := result.Get()
 	if runtime.IsNotRegisteredError(err) {
-		klog.V(5).Infof("Unable to retrieve PartialObjectMetadataList: %#v", err)
+		klog.FromContext(ctx).V(5).Info("Could not retrieve PartialObjectMetadataList", "err", err)
 		rawBytes, err := result.Raw()
 		if err != nil {
 			return nil, err
@@ -231,7 +276,7 @@ func (c *client) List(opts metav1.ListOptions) (*metav1.PartialObjectMetadataLis
 }
 
 // Watch finds all changes to the resources in the specified scope (namespace or cluster).
-func (c *client) Watch(opts metav1.ListOptions) (watch.Interface, error) {
+func (c *client) Watch(ctx context.Context, opts metav1.ListOptions) (watch.Interface, error) {
 	var timeout time.Duration
 	if opts.TimeoutSeconds != nil {
 		timeout = time.Duration(*opts.TimeoutSeconds) * time.Second
@@ -242,11 +287,11 @@ func (c *client) Watch(opts metav1.ListOptions) (watch.Interface, error) {
 		SetHeader("Accept", "application/vnd.kubernetes.protobuf;as=PartialObjectMetadata;g=meta.k8s.io;v=v1,application/json;as=PartialObjectMetadata;g=meta.k8s.io;v=v1,application/json").
 		SpecificallyVersionedParams(&opts, dynamicParameterCodec, versionV1).
 		Timeout(timeout).
-		Watch()
+		Watch(ctx)
 }
 
 // Patch modifies the named resource in the specified scope (namespace or cluster).
-func (c *client) Patch(name string, pt types.PatchType, data []byte, opts metav1.PatchOptions, subresources ...string) (*metav1.PartialObjectMetadata, error) {
+func (c *client) Patch(ctx context.Context, name string, pt types.PatchType, data []byte, opts metav1.PatchOptions, subresources ...string) (*metav1.PartialObjectMetadata, error) {
 	if len(name) == 0 {
 		return nil, fmt.Errorf("name is required")
 	}
@@ -256,7 +301,7 @@ func (c *client) Patch(name string, pt types.PatchType, data []byte, opts metav1
 		Body(data).
 		SetHeader("Accept", "application/vnd.kubernetes.protobuf;as=PartialObjectMetadata;g=meta.k8s.io;v=v1,application/json;as=PartialObjectMetadata;g=meta.k8s.io;v=v1,application/json").
 		SpecificallyVersionedParams(&opts, dynamicParameterCodec, versionV1).
-		Do()
+		Do(ctx)
 	if err := result.Error(); err != nil {
 		return nil, err
 	}
@@ -309,4 +354,28 @@ func (c *client) makeURLSegments(name string) []string {
 
 func isLikelyObjectMetadata(meta *metav1.PartialObjectMetadata) bool {
 	return len(meta.UID) > 0 || !meta.CreationTimestamp.IsZero() || len(meta.Name) > 0 || len(meta.GenerateName) > 0
+}
+
+type metadataResult struct {
+	rest.APIResultAdapter
+}
+
+func (r metadataResult) Get() (runtime.Object, error) {
+	obj, err := r.Result.Get()
+	if runtime.IsNotRegisteredError(err) {
+		rawBytes, err := r.Result.Raw()
+		if err != nil {
+			return nil, err
+		}
+		var partial metav1.PartialObjectMetadata
+		if err := json.Unmarshal(rawBytes, &partial); err != nil {
+			return nil, fmt.Errorf("unable to decode returned object as PartialObjectMetadata: %w", err)
+		}
+		if !isLikelyObjectMetadata(&partial) {
+			return nil, fmt.Errorf("object does not appear to match the ObjectMeta schema: %#v", partial)
+		}
+		partial.TypeMeta = metav1.TypeMeta{}
+		return &partial, nil
+	}
+	return obj, err
 }

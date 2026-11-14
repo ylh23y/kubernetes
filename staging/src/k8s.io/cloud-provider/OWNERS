@@ -1,46 +1,28 @@
 # See the OWNERS docs at https://go.k8s.io/owners
 
 approvers:
-- mikedanese
-- dims
-- wlan0
-- andrewsykim
-- cheftako
+  - sig-cloud-provider-leads
 reviewers:
-- wojtek-t
-- deads2k
-- derekwaynecarr
-- vishh
-- mikedanese
-- liggitt
-- gmarek
-- davidopp
-- pmorie
-- sttts
-- quinton-hoole
-- dchen1107
-- saad-ali
-- zmerlynn
-- luxas
-- justinsb
-- roberthbailey
-- eparis
-- jlowdermilk
-- piosz
-- jsafrane
-- dims
-- krousey
-- rootfs
-- jszczepkowski
-- markturansky
-- girishkalele
-- jdef
-- freehan
-- jingxu97
-- wlan0
-- cheftako
-- andrewsykim
-- mcrute
+  - aojea
+  - wojtek-t
+  - deads2k
+  - derekwaynecarr
+  - liggitt
+  - sttts
+  - dchen1107
+  - saad-ali
+  - luxas
+  - justinsb
+  - jsafrane
+  - dims
+  - freehan
+  - jingxu97
+  - wlan0
+  - cheftako
+  - andrewsykim
+emeritus_approvers:
+  - dims
+  - andrewsykim
 labels:
-- sig/cloud-provider
-- area/cloudprovider
+  - sig/cloud-provider
+  - area/cloudprovider

@@ -17,32 +17,82 @@ limitations under the License.
 package devicemanager
 
 import (
-	"path"
+	"context"
+	"fmt"
+	"os"
+	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/proto"
 
-	pluginapi "k8s.io/kubernetes/pkg/kubelet/apis/deviceplugin/v1beta1"
+	"k8s.io/klog/v2"
+	"k8s.io/ktesting"
+	pluginapi "k8s.io/kubelet/pkg/apis/deviceplugin/v1beta1"
+	plugin "k8s.io/kubernetes/pkg/kubelet/cm/devicemanager/plugin/v1beta1"
 )
 
-var (
-	esocketName = "mock.sock"
-)
+// monitorCallback is the function called when a device's health state changes,
+// or new devices are reported, or old devices are deleted.
+// Updated contains the most recent state of the Device.
+type monitorCallback func(logger klog.Logger, resourceName string, devices []*pluginapi.Device)
+
+func newMockPluginManager() *mockPluginManager {
+	return &mockPluginManager{
+		func(string) error { return nil },
+		func(string, plugin.DevicePlugin) error { return nil },
+		func(klog.Logger, string, string) {},
+		func(string, *pluginapi.ListAndWatchResponse) {},
+	}
+}
+
+type mockPluginManager struct {
+	cleanupPluginDirectory     func(string) error
+	pluginConnected            func(string, plugin.DevicePlugin) error
+	pluginDisconnected         func(klog.Logger, string, string)
+	pluginListAndWatchReceiver func(string, *pluginapi.ListAndWatchResponse)
+}
+
+func (m *mockPluginManager) CleanupPluginDirectory(r string) error {
+	return m.cleanupPluginDirectory(r)
+}
+
+func (m *mockPluginManager) PluginConnected(_ context.Context, r string, p plugin.DevicePlugin) error {
+	return m.pluginConnected(r, p)
+}
+
+func (m *mockPluginManager) PluginDisconnected(logger klog.Logger, r string, s string) {
+	m.pluginDisconnected(logger, r, s)
+}
+
+func (m *mockPluginManager) PluginListAndWatchReceiver(_ klog.Logger, r string, lr *pluginapi.ListAndWatchResponse) {
+	m.pluginListAndWatchReceiver(r, lr)
+}
+
+func esocketName() string {
+	return fmt.Sprintf("mock%d.sock", time.Now().UnixNano())
+}
 
 func TestNewEndpoint(t *testing.T) {
-	socket := path.Join("/tmp", esocketName)
+	logger, tCtx := ktesting.NewTestContext(t)
+	socket := filepath.Join(os.TempDir(), esocketName())
 
 	devs := []*pluginapi.Device{
 		{ID: "ADeviceId", Health: pluginapi.Healthy},
 	}
 
-	p, e := esetup(t, devs, socket, "mock", func(n string, d []pluginapi.Device) {})
-	defer ecleanup(t, p, e)
+	p, e := esetup(tCtx, t, devs, socket, "mock", func(logger klog.Logger, n string, d []*pluginapi.Device) {})
+	defer func() {
+		err := ecleanup(logger, p, e)
+		require.NoError(t, err)
+	}()
 }
 
 func TestRun(t *testing.T) {
-	socket := path.Join("/tmp", esocketName)
+	logger, tCtx := ktesting.NewTestContext(t)
+	socket := filepath.Join(os.TempDir(), esocketName())
 
 	devs := []*pluginapi.Device{
 		{ID: "ADeviceId", Health: pluginapi.Healthy},
@@ -58,7 +108,7 @@ func TestRun(t *testing.T) {
 
 	callbackCount := 0
 	callbackChan := make(chan int)
-	callback := func(n string, devices []pluginapi.Device) {
+	callback := func(_ klog.Logger, n string, devices []*pluginapi.Device) {
 		// Should be called twice:
 		// one for plugin registration, one for plugin update.
 		if callbackCount > 2 {
@@ -91,10 +141,13 @@ func TestRun(t *testing.T) {
 		callbackChan <- callbackCount
 	}
 
-	p, e := esetup(t, devs, socket, "mock", callback)
-	defer ecleanup(t, p, e)
+	p, e := esetup(tCtx, t, devs, socket, "mock", callback)
+	defer func() {
+		err := ecleanup(logger, p, e)
+		require.NoError(t, err)
+	}()
 
-	go e.run()
+	go e.client.Run(tCtx)
 	// Wait for the first callback to be issued.
 	<-callbackChan
 
@@ -103,21 +156,25 @@ func TestRun(t *testing.T) {
 	// Wait for the second callback to be issued.
 	<-callbackChan
 
-	require.Equal(t, callbackCount, 2)
+	require.Equal(t, 2, callbackCount)
 }
 
 func TestAllocate(t *testing.T) {
-	socket := path.Join("/tmp", esocketName)
+	logger, tCtx := ktesting.NewTestContext(t)
+	socket := filepath.Join(os.TempDir(), esocketName())
 	devs := []*pluginapi.Device{
 		{ID: "ADeviceId", Health: pluginapi.Healthy},
 	}
 	callbackCount := 0
 	callbackChan := make(chan int)
-	p, e := esetup(t, devs, socket, "mock", func(n string, d []pluginapi.Device) {
+	p, e := esetup(tCtx, t, devs, socket, "mock", func(_ klog.Logger, n string, d []*pluginapi.Device) {
 		callbackCount++
 		callbackChan <- callbackCount
 	})
-	defer ecleanup(t, p, e)
+	defer func() {
+		err := ecleanup(logger, p, e)
+		require.NoError(t, err)
+	}()
 
 	resp := new(pluginapi.AllocateResponse)
 	contResp := new(pluginapi.ContainerAllocateResponse)
@@ -141,11 +198,11 @@ func TestAllocate(t *testing.T) {
 
 	resp.ContainerResponses = append(resp.ContainerResponses, contResp)
 
-	p.SetAllocFunc(func(r *pluginapi.AllocateRequest, devs map[string]pluginapi.Device) (*pluginapi.AllocateResponse, error) {
+	p.SetAllocFunc(func(r *pluginapi.AllocateRequest, devs map[string]*pluginapi.Device) (*pluginapi.AllocateResponse, error) {
 		return resp, nil
 	})
 
-	go e.run()
+	go e.client.Run(tCtx)
 	// Wait for the callback to be issued.
 	select {
 	case <-callbackChan:
@@ -154,24 +211,93 @@ func TestAllocate(t *testing.T) {
 		t.FailNow()
 	}
 
-	respOut, err := e.allocate([]string{"ADeviceId"})
+	respOut, err := e.allocate(tCtx, []string{"ADeviceId"})
 	require.NoError(t, err)
-	require.Equal(t, resp, respOut)
+	require.True(t, proto.Equal(resp, respOut))
 }
 
-func esetup(t *testing.T, devs []*pluginapi.Device, socket, resourceName string, callback monitorCallback) (*Stub, *endpointImpl) {
-	p := NewDevicePluginStub(devs, socket, resourceName, false)
+func TestGetPreferredAllocation(t *testing.T) {
+	logger, tCtx := ktesting.NewTestContext(t)
+	socket := filepath.Join(os.TempDir(), esocketName())
+	callbackCount := 0
+	callbackChan := make(chan int)
+	p, e := esetup(tCtx, t, []*pluginapi.Device{}, socket, "mock", func(_ klog.Logger, n string, d []*pluginapi.Device) {
+		callbackCount++
+		callbackChan <- callbackCount
+	})
+	defer func() {
+		err := ecleanup(logger, p, e)
+		require.NoError(t, err)
+	}()
 
-	err := p.Start()
+	resp := &pluginapi.PreferredAllocationResponse{
+		ContainerResponses: []*pluginapi.ContainerPreferredAllocationResponse{
+			{DeviceIDs: []string{"device0", "device1", "device2"}},
+		},
+	}
+
+	p.SetGetPreferredAllocFunc(func(r *pluginapi.PreferredAllocationRequest, devs map[string]*pluginapi.Device) (*pluginapi.PreferredAllocationResponse, error) {
+		return resp, nil
+	})
+
+	go e.client.Run(tCtx)
+	// Wait for the callback to be issued.
+	select {
+	case <-callbackChan:
+		break
+	case <-time.After(time.Second):
+		t.FailNow()
+	}
+
+	respOut, err := e.getPreferredAllocation(tCtx, []string{}, []string{}, -1)
+	require.NoError(t, err)
+	require.True(t, proto.Equal(resp, respOut))
+}
+
+func esetup(ctx context.Context, t *testing.T, devs []*pluginapi.Device, socket, resourceName string, callback monitorCallback) (*plugin.Stub, *endpointImpl) {
+	logger := klog.FromContext(ctx)
+	m := newMockPluginManager()
+
+	m.pluginListAndWatchReceiver = func(r string, resp *pluginapi.ListAndWatchResponse) {
+		var newDevs []*pluginapi.Device
+		for _, d := range resp.Devices {
+			newDevs = append(newDevs, d)
+		}
+		callback(klog.FromContext(ctx), resourceName, newDevs)
+	}
+
+	var dp plugin.DevicePlugin
+	var wg sync.WaitGroup
+	wg.Add(1)
+	m.pluginConnected = func(r string, c plugin.DevicePlugin) error {
+		dp = c
+		wg.Done()
+		return nil
+	}
+
+	p := plugin.NewDevicePluginStub(logger, devs, socket, resourceName, false, false)
+	err := p.Start(ctx)
 	require.NoError(t, err)
 
-	e, err := newEndpointImpl(socket, resourceName, callback)
+	c := plugin.NewPluginClient(resourceName, socket, m)
+	err = c.Connect(ctx)
 	require.NoError(t, err)
+
+	wg.Wait()
+
+	e := newEndpointImpl(dp)
+	e.client = c
+
+	m.pluginDisconnected = func(logger klog.Logger, r string, s string) {
+		e.setStopTime(time.Now())
+	}
 
 	return p, e
 }
 
-func ecleanup(t *testing.T, p *Stub, e *endpointImpl) {
-	p.Stop()
-	e.stop()
+func ecleanup(logger klog.Logger, p *plugin.Stub, e *endpointImpl) error {
+	if err := p.Stop(logger); err != nil {
+		return err
+	}
+	return e.client.Disconnect(logger)
 }

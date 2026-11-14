@@ -17,11 +17,15 @@ limitations under the License.
 package testing
 
 import (
+	"fmt"
 	"net/http"
 	"net/url"
+	"reflect"
+	"strings"
 	"sync"
+	"time"
 
-	registrationv1beta1 "k8s.io/api/admissionregistration/v1beta1"
+	registrationv1 "k8s.io/api/admissionregistration/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -29,31 +33,33 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apiserver/pkg/admission"
 	"k8s.io/apiserver/pkg/admission/plugin/webhook/testcerts"
+	auditinternal "k8s.io/apiserver/pkg/apis/audit"
 	"k8s.io/apiserver/pkg/authentication/user"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	fakeclientset "k8s.io/client-go/kubernetes/fake"
+	"k8s.io/utils/ptr"
 )
 
-var matchEverythingRules = []registrationv1beta1.RuleWithOperations{{
-	Operations: []registrationv1beta1.OperationType{registrationv1beta1.OperationAll},
-	Rule: registrationv1beta1.Rule{
+var matchEverythingRules = []registrationv1.RuleWithOperations{{
+	Operations: []registrationv1.OperationType{registrationv1.OperationAll},
+	Rule: registrationv1.Rule{
 		APIGroups:   []string{"*"},
 		APIVersions: []string{"*"},
 		Resources:   []string{"*/*"},
 	},
 }}
 
-var sideEffectsUnknown = registrationv1beta1.SideEffectClassUnknown
-var sideEffectsNone = registrationv1beta1.SideEffectClassNone
-var sideEffectsSome = registrationv1beta1.SideEffectClassSome
-var sideEffectsNoneOnDryRun = registrationv1beta1.SideEffectClassNoneOnDryRun
+var sideEffectsUnknown = registrationv1.SideEffectClassUnknown
+var sideEffectsNone = registrationv1.SideEffectClassNone
+var sideEffectsSome = registrationv1.SideEffectClassSome
+var sideEffectsNoneOnDryRun = registrationv1.SideEffectClassNoneOnDryRun
 
-var reinvokeNever = registrationv1beta1.NeverReinvocationPolicy
-var reinvokeIfNeeded = registrationv1beta1.IfNeededReinvocationPolicy
+var reinvokeNever = registrationv1.NeverReinvocationPolicy
+var reinvokeIfNeeded = registrationv1.IfNeededReinvocationPolicy
 
 // NewFakeValidatingDataSource returns a mock client and informer returning the given webhooks.
-func NewFakeValidatingDataSource(name string, webhooks []registrationv1beta1.ValidatingWebhook, stopCh <-chan struct{}) (clientset kubernetes.Interface, factory informers.SharedInformerFactory) {
+func NewFakeValidatingDataSource(name string, webhooks []registrationv1.ValidatingWebhook, stopCh <-chan struct{}) (clientset kubernetes.Interface, factory informers.SharedInformerFactory) {
 	var objs = []runtime.Object{
 		&corev1.Namespace{
 			ObjectMeta: metav1.ObjectMeta{
@@ -64,7 +70,7 @@ func NewFakeValidatingDataSource(name string, webhooks []registrationv1beta1.Val
 			},
 		},
 	}
-	objs = append(objs, &registrationv1beta1.ValidatingWebhookConfiguration{
+	objs = append(objs, &registrationv1.ValidatingWebhookConfiguration{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "test-webhooks",
 		},
@@ -78,7 +84,7 @@ func NewFakeValidatingDataSource(name string, webhooks []registrationv1beta1.Val
 }
 
 // NewFakeMutatingDataSource returns a mock client and informer returning the given webhooks.
-func NewFakeMutatingDataSource(name string, webhooks []registrationv1beta1.MutatingWebhook, stopCh <-chan struct{}) (clientset kubernetes.Interface, factory informers.SharedInformerFactory) {
+func NewFakeMutatingDataSource(name string, webhooks []registrationv1.MutatingWebhook, stopCh <-chan struct{}) (clientset kubernetes.Interface, factory informers.SharedInformerFactory) {
 	var objs = []runtime.Object{
 		&corev1.Namespace{
 			ObjectMeta: metav1.ObjectMeta{
@@ -89,7 +95,7 @@ func NewFakeMutatingDataSource(name string, webhooks []registrationv1beta1.Mutat
 			},
 		},
 	}
-	objs = append(objs, &registrationv1beta1.MutatingWebhookConfiguration{
+	objs = append(objs, &registrationv1.MutatingWebhookConfiguration{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "test-webhooks",
 		},
@@ -136,6 +142,11 @@ type FakeAttributes struct {
 
 // AddAnnotation adds an annotation key value pair to FakeAttributes
 func (f *FakeAttributes) AddAnnotation(k, v string) error {
+	return f.AddAnnotationWithLevel(k, v, auditinternal.LevelMetadata)
+}
+
+// AddAnnotationWithLevel adds an annotation key value pair to FakeAttributes
+func (f *FakeAttributes) AddAnnotationWithLevel(k, v string, _ auditinternal.Level) error {
 	f.mutex.Lock()
 	defer f.mutex.Unlock()
 	if err := f.Attributes.AddAnnotation(k, v); err != nil {
@@ -149,7 +160,7 @@ func (f *FakeAttributes) AddAnnotation(k, v string) error {
 }
 
 // GetAnnotations reads annotations from FakeAttributes
-func (f *FakeAttributes) GetAnnotations() map[string]string {
+func (f *FakeAttributes) GetAnnotations(level auditinternal.Level) map[string]string {
 	f.mutex.Lock()
 	defer f.mutex.Unlock()
 	return f.annotations
@@ -190,11 +201,11 @@ type urlConfigGenerator struct {
 	baseURL *url.URL
 }
 
-func (c urlConfigGenerator) ccfgURL(urlPath string) registrationv1beta1.WebhookClientConfig {
+func (c urlConfigGenerator) ccfgURL(urlPath string) registrationv1.WebhookClientConfig {
 	u2 := *c.baseURL
 	u2.Path = urlPath
 	urlString := u2.String()
-	return registrationv1beta1.WebhookClientConfig{
+	return registrationv1.WebhookClientConfig{
 		URL:      &urlString,
 		CABundle: testcerts.CACert,
 	}
@@ -203,49 +214,105 @@ func (c urlConfigGenerator) ccfgURL(urlPath string) registrationv1beta1.WebhookC
 // ValidatingTest is a validating webhook test case.
 type ValidatingTest struct {
 	Name                   string
-	Webhooks               []registrationv1beta1.ValidatingWebhook
+	Webhooks               []registrationv1.ValidatingWebhook
 	Path                   string
 	IsCRD                  bool
 	IsDryRun               bool
 	AdditionalLabels       map[string]string
+	SkipBenchmark          bool
 	ExpectLabels           map[string]string
 	ExpectAllow            bool
 	ErrorContains          string
 	ExpectAnnotations      map[string]string
 	ExpectStatusCode       int32
+	ExpectRejectionMetrics string
 	ExpectReinvokeWebhooks map[string]bool
 }
 
 // MutatingTest is a mutating webhook test case.
 type MutatingTest struct {
 	Name                   string
-	Webhooks               []registrationv1beta1.MutatingWebhook
+	Webhooks               []registrationv1.MutatingWebhook
 	Path                   string
 	IsCRD                  bool
 	IsDryRun               bool
 	AdditionalLabels       map[string]string
+	SkipBenchmark          bool
 	ExpectLabels           map[string]string
 	ExpectAllow            bool
 	ErrorContains          string
 	ExpectAnnotations      map[string]string
 	ExpectStatusCode       int32
+	ExpectRejectionMetrics string
 	ExpectReinvokeWebhooks map[string]bool
 }
 
+// DurationTest is webhook duration test case, used both in mutating and
+// validating plugin test cases.
+type DurationTest struct {
+	Name                string
+	Webhooks            []registrationv1.ValidatingWebhook
+	InitContext         bool
+	IsDryRun            bool
+	ExpectedDurationSum time.Duration
+	ExpectedDurationMax time.Duration
+}
+
 // ConvertToMutatingTestCases converts a validating test case to a mutating one for test purposes.
-func ConvertToMutatingTestCases(tests []ValidatingTest) []MutatingTest {
+func ConvertToMutatingTestCases(tests []ValidatingTest, configurationName string) []MutatingTest {
 	r := make([]MutatingTest, len(tests))
 	for i, t := range tests {
-		r[i] = MutatingTest{t.Name, ConvertToMutatingWebhooks(t.Webhooks), t.Path, t.IsCRD, t.IsDryRun, t.AdditionalLabels, t.ExpectLabels, t.ExpectAllow, t.ErrorContains, t.ExpectAnnotations, t.ExpectStatusCode, t.ExpectReinvokeWebhooks}
+		for idx, hook := range t.Webhooks {
+			if t.ExpectAnnotations == nil {
+				t.ExpectAnnotations = map[string]string{}
+			}
+			// Add expected annotation if the converted webhook is intended to match
+			if reflect.DeepEqual(hook.NamespaceSelector, &metav1.LabelSelector{}) &&
+				reflect.DeepEqual(hook.ObjectSelector, &metav1.LabelSelector{}) &&
+				reflect.DeepEqual(hook.Rules, matchEverythingRules) {
+				key := fmt.Sprintf("mutation.webhook.admission.k8s.io/round_0_index_%d", idx)
+				value := mutationAnnotationValue(configurationName, hook.Name, false)
+				t.ExpectAnnotations[key] = value
+			}
+			// Break if the converted webhook is intended to fail close
+			if strings.Contains(hook.Name, "internalErr") && (hook.FailurePolicy == nil || *hook.FailurePolicy == registrationv1.Fail) {
+				break
+			}
+		}
+		// Change annotation keys for Validating's fail open to Mutating's fail open.
+		failOpenAnnotations := map[string]string{}
+		for key, value := range t.ExpectAnnotations {
+			if strings.HasPrefix(key, "failed-open.validating.webhook.admission.k8s.io/") {
+				failOpenAnnotations[key] = value
+			}
+		}
+		for key, value := range failOpenAnnotations {
+			newKey := strings.Replace(key, "failed-open.validating.webhook.admission.k8s.io/", "failed-open.mutation.webhook.admission.k8s.io/", 1)
+			t.ExpectAnnotations[newKey] = value
+			delete(t.ExpectAnnotations, key)
+		}
+		expectedMetrics := strings.ReplaceAll(t.ExpectRejectionMetrics, `type="validating"`, `type="admit"`)
+		r[i] = MutatingTest{t.Name, ConvertToMutatingWebhooks(t.Webhooks), t.Path, t.IsCRD, t.IsDryRun, t.AdditionalLabels, t.SkipBenchmark, t.ExpectLabels, t.ExpectAllow, t.ErrorContains, t.ExpectAnnotations, t.ExpectStatusCode, expectedMetrics, t.ExpectReinvokeWebhooks}
 	}
 	return r
 }
 
 // ConvertToMutatingWebhooks converts a validating webhook to a mutating one for test purposes.
-func ConvertToMutatingWebhooks(webhooks []registrationv1beta1.ValidatingWebhook) []registrationv1beta1.MutatingWebhook {
-	mutating := make([]registrationv1beta1.MutatingWebhook, len(webhooks))
+func ConvertToMutatingWebhooks(webhooks []registrationv1.ValidatingWebhook) []registrationv1.MutatingWebhook {
+	mutating := make([]registrationv1.MutatingWebhook, len(webhooks))
 	for i, h := range webhooks {
-		mutating[i] = registrationv1beta1.MutatingWebhook{h.Name, h.ClientConfig, h.Rules, h.FailurePolicy, h.MatchPolicy, h.NamespaceSelector, h.ObjectSelector, h.SideEffects, h.TimeoutSeconds, h.AdmissionReviewVersions, nil}
+		mutating[i] = registrationv1.MutatingWebhook{
+			Name:                    h.Name,
+			ClientConfig:            h.ClientConfig,
+			Rules:                   h.Rules,
+			FailurePolicy:           h.FailurePolicy,
+			MatchPolicy:             h.MatchPolicy,
+			NamespaceSelector:       h.NamespaceSelector,
+			ObjectSelector:          h.ObjectSelector,
+			SideEffects:             h.SideEffects,
+			TimeoutSeconds:          h.TimeoutSeconds,
+			AdmissionReviewVersions: h.AdmissionReviewVersions,
+		}
 	}
 	return mutating
 }
@@ -255,18 +322,18 @@ func ConvertToMutatingWebhooks(webhooks []registrationv1beta1.ValidatingWebhook)
 // AdmissionResponse. The test cases are used by both MutatingAdmissionWebhook
 // and ValidatingAdmissionWebhook.
 func NewNonMutatingTestCases(url *url.URL) []ValidatingTest {
-	policyFail := registrationv1beta1.Fail
-	policyIgnore := registrationv1beta1.Ignore
+	policyFail := registrationv1.Fail
+	policyIgnore := registrationv1.Ignore
 	ccfgURL := urlConfigGenerator{url}.ccfgURL
 
 	return []ValidatingTest{
 		{
 			Name: "no match",
-			Webhooks: []registrationv1beta1.ValidatingWebhook{{
+			Webhooks: []registrationv1.ValidatingWebhook{{
 				Name:         "nomatch",
 				ClientConfig: ccfgSVC("disallow"),
-				Rules: []registrationv1beta1.RuleWithOperations{{
-					Operations: []registrationv1beta1.OperationType{registrationv1beta1.Create},
+				Rules: []registrationv1.RuleWithOperations{{
+					Operations: []registrationv1.OperationType{registrationv1.Create},
 				}},
 				NamespaceSelector:       &metav1.LabelSelector{},
 				ObjectSelector:          &metav1.LabelSelector{},
@@ -276,7 +343,7 @@ func NewNonMutatingTestCases(url *url.URL) []ValidatingTest {
 		},
 		{
 			Name: "match & allow",
-			Webhooks: []registrationv1beta1.ValidatingWebhook{{
+			Webhooks: []registrationv1.ValidatingWebhook{{
 				Name:                    "allow.example.com",
 				ClientConfig:            ccfgSVC("allow"),
 				Rules:                   matchEverythingRules,
@@ -289,7 +356,7 @@ func NewNonMutatingTestCases(url *url.URL) []ValidatingTest {
 		},
 		{
 			Name: "match & disallow",
-			Webhooks: []registrationv1beta1.ValidatingWebhook{{
+			Webhooks: []registrationv1.ValidatingWebhook{{
 				Name:                    "disallow",
 				ClientConfig:            ccfgSVC("disallow"),
 				Rules:                   matchEverythingRules,
@@ -302,7 +369,7 @@ func NewNonMutatingTestCases(url *url.URL) []ValidatingTest {
 		},
 		{
 			Name: "match & disallow ii",
-			Webhooks: []registrationv1beta1.ValidatingWebhook{{
+			Webhooks: []registrationv1.ValidatingWebhook{{
 				Name:                    "disallowReason",
 				ClientConfig:            ccfgSVC("disallowReason"),
 				Rules:                   matchEverythingRules,
@@ -315,7 +382,7 @@ func NewNonMutatingTestCases(url *url.URL) []ValidatingTest {
 		},
 		{
 			Name: "match & disallow & but allowed because namespaceSelector exempt the ns",
-			Webhooks: []registrationv1beta1.ValidatingWebhook{{
+			Webhooks: []registrationv1.ValidatingWebhook{{
 				Name:         "disallow",
 				ClientConfig: ccfgSVC("disallow"),
 				Rules:        newMatchEverythingRules(),
@@ -334,7 +401,7 @@ func NewNonMutatingTestCases(url *url.URL) []ValidatingTest {
 		},
 		{
 			Name: "match & disallow & but allowed because namespaceSelector exempt the ns ii",
-			Webhooks: []registrationv1beta1.ValidatingWebhook{{
+			Webhooks: []registrationv1.ValidatingWebhook{{
 				Name:         "disallow",
 				ClientConfig: ccfgSVC("disallow"),
 				Rules:        newMatchEverythingRules(),
@@ -352,7 +419,7 @@ func NewNonMutatingTestCases(url *url.URL) []ValidatingTest {
 		},
 		{
 			Name: "match & fail (but allow because fail open)",
-			Webhooks: []registrationv1beta1.ValidatingWebhook{{
+			Webhooks: []registrationv1.ValidatingWebhook{{
 				Name:                    "internalErr A",
 				ClientConfig:            ccfgSVC("internalErr"),
 				Rules:                   matchEverythingRules,
@@ -378,11 +445,17 @@ func NewNonMutatingTestCases(url *url.URL) []ValidatingTest {
 				AdmissionReviewVersions: []string{"v1beta1"},
 			}},
 
-			ExpectAllow: true,
+			SkipBenchmark: true,
+			ExpectAllow:   true,
+			ExpectAnnotations: map[string]string{
+				"failed-open.validating.webhook.admission.k8s.io/round_0_index_0": "internalErr A",
+				"failed-open.validating.webhook.admission.k8s.io/round_0_index_1": "internalErr B",
+				"failed-open.validating.webhook.admission.k8s.io/round_0_index_2": "internalErr C",
+			},
 		},
 		{
 			Name: "match & fail (but disallow because fail close on nil FailurePolicy)",
-			Webhooks: []registrationv1beta1.ValidatingWebhook{{
+			Webhooks: []registrationv1.ValidatingWebhook{{
 				Name:                    "internalErr A",
 				ClientConfig:            ccfgSVC("internalErr"),
 				NamespaceSelector:       &metav1.LabelSelector{},
@@ -409,7 +482,7 @@ func NewNonMutatingTestCases(url *url.URL) []ValidatingTest {
 		},
 		{
 			Name: "match & fail (but fail because fail closed)",
-			Webhooks: []registrationv1beta1.ValidatingWebhook{{
+			Webhooks: []registrationv1.ValidatingWebhook{{
 				Name:                    "internalErr A",
 				ClientConfig:            ccfgSVC("internalErr"),
 				Rules:                   matchEverythingRules,
@@ -438,8 +511,36 @@ func NewNonMutatingTestCases(url *url.URL) []ValidatingTest {
 			ExpectAllow:      false,
 		},
 		{
+			Name: "match & invalid client config",
+			Webhooks: []registrationv1.ValidatingWebhook{{
+				Name:                    "invalidClientConfig",
+				ClientConfig:            registrationv1.WebhookClientConfig{},
+				Rules:                   matchEverythingRules,
+				NamespaceSelector:       &metav1.LabelSelector{},
+				ObjectSelector:          &metav1.LabelSelector{},
+				AdmissionReviewVersions: []string{"v1beta1"},
+			}},
+			ExpectStatusCode:       http.StatusInternalServerError,
+			ExpectRejectionMetrics: `apiserver_admission_webhook_rejection_total{error_type="calling_webhook_error",name="invalidClientConfig",operation="UPDATE",rejection_code="500",type="validating"} 1`,
+			ErrorContains:          "could not get REST client",
+		},
+		{
+			Name: "match & non-status error",
+			Webhooks: []registrationv1.ValidatingWebhook{{
+				Name:                    "nonStatusError",
+				ClientConfig:            ccfgSVC("nonStatusError"),
+				Rules:                   matchEverythingRules,
+				NamespaceSelector:       &metav1.LabelSelector{},
+				ObjectSelector:          &metav1.LabelSelector{},
+				AdmissionReviewVersions: []string{"v1beta1"},
+			}},
+			ExpectStatusCode:       http.StatusInternalServerError,
+			ExpectRejectionMetrics: `apiserver_admission_webhook_rejection_total{error_type="calling_webhook_error",name="nonStatusError",operation="UPDATE",rejection_code="503",type="validating"} 1`,
+			ErrorContains:          "failed to call webhook",
+		},
+		{
 			Name: "match & allow (url)",
-			Webhooks: []registrationv1beta1.ValidatingWebhook{{
+			Webhooks: []registrationv1.ValidatingWebhook{{
 				Name:                    "allow.example.com",
 				ClientConfig:            ccfgURL("allow"),
 				Rules:                   matchEverythingRules,
@@ -452,7 +553,7 @@ func NewNonMutatingTestCases(url *url.URL) []ValidatingTest {
 		},
 		{
 			Name: "match & disallow (url)",
-			Webhooks: []registrationv1beta1.ValidatingWebhook{{
+			Webhooks: []registrationv1.ValidatingWebhook{{
 				Name:                    "disallow",
 				ClientConfig:            ccfgURL("disallow"),
 				Rules:                   matchEverythingRules,
@@ -464,7 +565,7 @@ func NewNonMutatingTestCases(url *url.URL) []ValidatingTest {
 			ErrorContains:    "without explanation",
 		}, {
 			Name: "absent response and fail open",
-			Webhooks: []registrationv1beta1.ValidatingWebhook{{
+			Webhooks: []registrationv1.ValidatingWebhook{{
 				Name:                    "nilResponse",
 				ClientConfig:            ccfgURL("nilResponse"),
 				FailurePolicy:           &policyIgnore,
@@ -473,11 +574,13 @@ func NewNonMutatingTestCases(url *url.URL) []ValidatingTest {
 				ObjectSelector:          &metav1.LabelSelector{},
 				AdmissionReviewVersions: []string{"v1beta1"},
 			}},
-			ExpectAllow: true,
+			SkipBenchmark:     true,
+			ExpectAllow:       true,
+			ExpectAnnotations: map[string]string{"failed-open.validating.webhook.admission.k8s.io/round_0_index_0": "nilResponse"},
 		},
 		{
 			Name: "absent response and fail closed",
-			Webhooks: []registrationv1beta1.ValidatingWebhook{{
+			Webhooks: []registrationv1.ValidatingWebhook{{
 				Name:                    "nilResponse",
 				ClientConfig:            ccfgURL("nilResponse"),
 				FailurePolicy:           &policyFail,
@@ -491,11 +594,11 @@ func NewNonMutatingTestCases(url *url.URL) []ValidatingTest {
 		},
 		{
 			Name: "no match dry run",
-			Webhooks: []registrationv1beta1.ValidatingWebhook{{
+			Webhooks: []registrationv1.ValidatingWebhook{{
 				Name:         "nomatch",
 				ClientConfig: ccfgSVC("allow"),
-				Rules: []registrationv1beta1.RuleWithOperations{{
-					Operations: []registrationv1beta1.OperationType{registrationv1beta1.Create},
+				Rules: []registrationv1.RuleWithOperations{{
+					Operations: []registrationv1.OperationType{registrationv1.Create},
 				}},
 				NamespaceSelector:       &metav1.LabelSelector{},
 				ObjectSelector:          &metav1.LabelSelector{},
@@ -507,7 +610,7 @@ func NewNonMutatingTestCases(url *url.URL) []ValidatingTest {
 		},
 		{
 			Name: "match dry run side effects Unknown",
-			Webhooks: []registrationv1beta1.ValidatingWebhook{{
+			Webhooks: []registrationv1.ValidatingWebhook{{
 				Name:                    "allow",
 				ClientConfig:            ccfgSVC("allow"),
 				Rules:                   matchEverythingRules,
@@ -522,7 +625,7 @@ func NewNonMutatingTestCases(url *url.URL) []ValidatingTest {
 		},
 		{
 			Name: "match dry run side effects None",
-			Webhooks: []registrationv1beta1.ValidatingWebhook{{
+			Webhooks: []registrationv1.ValidatingWebhook{{
 				Name:                    "allow",
 				ClientConfig:            ccfgSVC("allow"),
 				Rules:                   matchEverythingRules,
@@ -537,7 +640,7 @@ func NewNonMutatingTestCases(url *url.URL) []ValidatingTest {
 		},
 		{
 			Name: "match dry run side effects Some",
-			Webhooks: []registrationv1beta1.ValidatingWebhook{{
+			Webhooks: []registrationv1.ValidatingWebhook{{
 				Name:                    "allow",
 				ClientConfig:            ccfgSVC("allow"),
 				Rules:                   matchEverythingRules,
@@ -552,7 +655,7 @@ func NewNonMutatingTestCases(url *url.URL) []ValidatingTest {
 		},
 		{
 			Name: "match dry run side effects NoneOnDryRun",
-			Webhooks: []registrationv1beta1.ValidatingWebhook{{
+			Webhooks: []registrationv1.ValidatingWebhook{{
 				Name:                    "allow",
 				ClientConfig:            ccfgSVC("allow"),
 				Rules:                   matchEverythingRules,
@@ -567,7 +670,7 @@ func NewNonMutatingTestCases(url *url.URL) []ValidatingTest {
 		},
 		{
 			Name: "illegal annotation format",
-			Webhooks: []registrationv1beta1.ValidatingWebhook{{
+			Webhooks: []registrationv1.ValidatingWebhook{{
 				Name:                    "invalidAnnotation",
 				ClientConfig:            ccfgURL("invalidAnnotation"),
 				Rules:                   matchEverythingRules,
@@ -579,7 +682,7 @@ func NewNonMutatingTestCases(url *url.URL) []ValidatingTest {
 		},
 		{
 			Name: "skip webhook whose objectSelector does not match",
-			Webhooks: []registrationv1beta1.ValidatingWebhook{{
+			Webhooks: []registrationv1.ValidatingWebhook{{
 				Name:                    "allow.example.com",
 				ClientConfig:            ccfgSVC("allow"),
 				Rules:                   matchEverythingRules,
@@ -603,7 +706,7 @@ func NewNonMutatingTestCases(url *url.URL) []ValidatingTest {
 		},
 		{
 			Name: "skip webhook whose objectSelector does not match CRD's labels",
-			Webhooks: []registrationv1beta1.ValidatingWebhook{{
+			Webhooks: []registrationv1.ValidatingWebhook{{
 				Name:                    "allow.example.com",
 				ClientConfig:            ccfgSVC("allow"),
 				Rules:                   matchEverythingRules,
@@ -631,14 +734,114 @@ func NewNonMutatingTestCases(url *url.URL) []ValidatingTest {
 	}
 }
 
+// NewNonMutatingPanicTestCases returns test cases with a given base url.
+// All test cases in NewNonMutatingTestCases have no Patch set in
+// AdmissionResponse. The expected responses are set for panic handling.
+func NewNonMutatingPanicTestCases(url *url.URL) []ValidatingTest {
+	policyIgnore := registrationv1.Ignore
+	policyFail := registrationv1.Fail
+
+	return []ValidatingTest{
+		{
+			Name: "match & allow, but panic",
+			Webhooks: []registrationv1.ValidatingWebhook{{
+				Name:                    "allow.example.com",
+				ClientConfig:            ccfgSVC("allow"),
+				Rules:                   matchEverythingRules,
+				NamespaceSelector:       &metav1.LabelSelector{},
+				ObjectSelector:          &metav1.LabelSelector{},
+				AdmissionReviewVersions: []string{"v1beta1"},
+			}},
+			ExpectStatusCode:  http.StatusForbidden,
+			ErrorContains:     "ValidatingAdmissionWebhook/allow.example.com has panicked: Start panicking!",
+			ExpectAnnotations: map[string]string{},
+		},
+		{
+			Name: "match & fail (but allow because fail open)",
+			Webhooks: []registrationv1.ValidatingWebhook{{
+				Name:                    "internalErr A",
+				ClientConfig:            ccfgSVC("internalErr"),
+				Rules:                   matchEverythingRules,
+				NamespaceSelector:       &metav1.LabelSelector{},
+				ObjectSelector:          &metav1.LabelSelector{},
+				FailurePolicy:           &policyIgnore,
+				AdmissionReviewVersions: []string{"v1beta1"},
+			}, {
+				Name:                    "internalErr B",
+				ClientConfig:            ccfgSVC("internalErr"),
+				Rules:                   matchEverythingRules,
+				NamespaceSelector:       &metav1.LabelSelector{},
+				ObjectSelector:          &metav1.LabelSelector{},
+				FailurePolicy:           &policyIgnore,
+				AdmissionReviewVersions: []string{"v1beta1"},
+			}, {
+				Name:                    "internalErr C",
+				ClientConfig:            ccfgSVC("internalErr"),
+				Rules:                   matchEverythingRules,
+				NamespaceSelector:       &metav1.LabelSelector{},
+				ObjectSelector:          &metav1.LabelSelector{},
+				FailurePolicy:           &policyIgnore,
+				AdmissionReviewVersions: []string{"v1beta1"},
+			}},
+
+			SkipBenchmark: true,
+			ExpectAllow:   true,
+			ExpectAnnotations: map[string]string{
+				"failed-open.validating.webhook.admission.k8s.io/round_0_index_0": "internalErr A",
+				"failed-open.validating.webhook.admission.k8s.io/round_0_index_1": "internalErr B",
+				"failed-open.validating.webhook.admission.k8s.io/round_0_index_2": "internalErr C",
+			},
+		},
+		{
+			Name: "match & fail (but fail because fail closed)",
+			Webhooks: []registrationv1.ValidatingWebhook{{
+				Name:                    "internalErr A",
+				ClientConfig:            ccfgSVC("internalErr"),
+				Rules:                   matchEverythingRules,
+				NamespaceSelector:       &metav1.LabelSelector{},
+				ObjectSelector:          &metav1.LabelSelector{},
+				FailurePolicy:           &policyFail,
+				AdmissionReviewVersions: []string{"v1beta1"},
+			}, {
+				Name:                    "internalErr B",
+				ClientConfig:            ccfgSVC("internalErr"),
+				Rules:                   matchEverythingRules,
+				NamespaceSelector:       &metav1.LabelSelector{},
+				ObjectSelector:          &metav1.LabelSelector{},
+				FailurePolicy:           &policyFail,
+				AdmissionReviewVersions: []string{"v1beta1"},
+			}, {
+				Name:                    "internalErr C",
+				ClientConfig:            ccfgSVC("internalErr"),
+				Rules:                   matchEverythingRules,
+				NamespaceSelector:       &metav1.LabelSelector{},
+				ObjectSelector:          &metav1.LabelSelector{},
+				FailurePolicy:           &policyFail,
+				AdmissionReviewVersions: []string{"v1beta1"},
+			}},
+			ExpectStatusCode: http.StatusInternalServerError,
+			ExpectAllow:      false,
+			ErrorContains:    " has panicked: Start panicking!",
+		},
+	}
+}
+
+func mutationAnnotationValue(configuration, webhook string, mutated bool) string {
+	return fmt.Sprintf(`{"configuration":"%s","webhook":"%s","mutated":%t}`, configuration, webhook, mutated)
+}
+
+func patchAnnotationValue(configuration, webhook string, patch string) string {
+	return strings.Replace(fmt.Sprintf(`{"configuration": "%s", "webhook": "%s", "patch": %s, "patchType": "JSONPatch"}`, configuration, webhook, patch), " ", "", -1)
+}
+
 // NewMutatingTestCases returns test cases with a given base url.
 // All test cases in NewMutatingTestCases have Patch set in
 // AdmissionResponse. The test cases are only used by both MutatingAdmissionWebhook.
-func NewMutatingTestCases(url *url.URL) []MutatingTest {
+func NewMutatingTestCases(url *url.URL, configurationName string) []MutatingTest {
 	return []MutatingTest{
 		{
 			Name: "match & remove label",
-			Webhooks: []registrationv1beta1.MutatingWebhook{{
+			Webhooks: []registrationv1.MutatingWebhook{{
 				Name:                    "removelabel.example.com",
 				ClientConfig:            ccfgSVC("removeLabel"),
 				Rules:                   matchEverythingRules,
@@ -646,14 +849,18 @@ func NewMutatingTestCases(url *url.URL) []MutatingTest {
 				ObjectSelector:          &metav1.LabelSelector{},
 				AdmissionReviewVersions: []string{"v1beta1"},
 			}},
-			ExpectAllow:       true,
-			AdditionalLabels:  map[string]string{"remove": "me"},
-			ExpectLabels:      map[string]string{"pod.name": "my-pod"},
-			ExpectAnnotations: map[string]string{"removelabel.example.com/key1": "value1"},
+			ExpectAllow:      true,
+			AdditionalLabels: map[string]string{"remove": "me"},
+			ExpectLabels:     map[string]string{"pod.name": "my-pod"},
+			ExpectAnnotations: map[string]string{
+				"removelabel.example.com/key1":                      "value1",
+				"mutation.webhook.admission.k8s.io/round_0_index_0": mutationAnnotationValue(configurationName, "removelabel.example.com", true),
+				"patch.webhook.admission.k8s.io/round_0_index_0":    patchAnnotationValue(configurationName, "removelabel.example.com", `[{"op": "remove", "path": "/metadata/labels/remove"}]`),
+			},
 		},
 		{
 			Name: "match & add label",
-			Webhooks: []registrationv1beta1.MutatingWebhook{{
+			Webhooks: []registrationv1.MutatingWebhook{{
 				Name:                    "addLabel",
 				ClientConfig:            ccfgSVC("addLabel"),
 				Rules:                   matchEverythingRules,
@@ -663,10 +870,14 @@ func NewMutatingTestCases(url *url.URL) []MutatingTest {
 			}},
 			ExpectAllow:  true,
 			ExpectLabels: map[string]string{"pod.name": "my-pod", "added": "test"},
+			ExpectAnnotations: map[string]string{
+				"mutation.webhook.admission.k8s.io/round_0_index_0": mutationAnnotationValue(configurationName, "addLabel", true),
+				"patch.webhook.admission.k8s.io/round_0_index_0":    patchAnnotationValue(configurationName, "addLabel", `[{"op": "add", "path": "/metadata/labels/added", "value": "test"}]`),
+			},
 		},
 		{
 			Name: "match CRD & add label",
-			Webhooks: []registrationv1beta1.MutatingWebhook{{
+			Webhooks: []registrationv1.MutatingWebhook{{
 				Name:                    "addLabel",
 				ClientConfig:            ccfgSVC("addLabel"),
 				Rules:                   matchEverythingRules,
@@ -677,10 +888,14 @@ func NewMutatingTestCases(url *url.URL) []MutatingTest {
 			IsCRD:        true,
 			ExpectAllow:  true,
 			ExpectLabels: map[string]string{"crd.name": "my-test-crd", "added": "test"},
+			ExpectAnnotations: map[string]string{
+				"mutation.webhook.admission.k8s.io/round_0_index_0": mutationAnnotationValue(configurationName, "addLabel", true),
+				"patch.webhook.admission.k8s.io/round_0_index_0":    patchAnnotationValue(configurationName, "addLabel", `[{"op": "add", "path": "/metadata/labels/added", "value": "test"}]`),
+			},
 		},
 		{
 			Name: "match CRD & remove label",
-			Webhooks: []registrationv1beta1.MutatingWebhook{{
+			Webhooks: []registrationv1.MutatingWebhook{{
 				Name:                    "removelabel.example.com",
 				ClientConfig:            ccfgSVC("removeLabel"),
 				Rules:                   matchEverythingRules,
@@ -688,15 +903,19 @@ func NewMutatingTestCases(url *url.URL) []MutatingTest {
 				ObjectSelector:          &metav1.LabelSelector{},
 				AdmissionReviewVersions: []string{"v1beta1"},
 			}},
-			IsCRD:             true,
-			ExpectAllow:       true,
-			AdditionalLabels:  map[string]string{"remove": "me"},
-			ExpectLabels:      map[string]string{"crd.name": "my-test-crd"},
-			ExpectAnnotations: map[string]string{"removelabel.example.com/key1": "value1"},
+			IsCRD:            true,
+			ExpectAllow:      true,
+			AdditionalLabels: map[string]string{"remove": "me"},
+			ExpectLabels:     map[string]string{"crd.name": "my-test-crd"},
+			ExpectAnnotations: map[string]string{
+				"removelabel.example.com/key1":                      "value1",
+				"mutation.webhook.admission.k8s.io/round_0_index_0": mutationAnnotationValue(configurationName, "removelabel.example.com", true),
+				"patch.webhook.admission.k8s.io/round_0_index_0":    patchAnnotationValue(configurationName, "removelabel.example.com", `[{"op": "remove", "path": "/metadata/labels/remove"}]`),
+			},
 		},
 		{
 			Name: "match & invalid mutation",
-			Webhooks: []registrationv1beta1.MutatingWebhook{{
+			Webhooks: []registrationv1.MutatingWebhook{{
 				Name:                    "invalidMutation",
 				ClientConfig:            ccfgSVC("invalidMutation"),
 				Rules:                   matchEverythingRules,
@@ -706,10 +925,81 @@ func NewMutatingTestCases(url *url.URL) []MutatingTest {
 			}},
 			ExpectStatusCode: http.StatusInternalServerError,
 			ErrorContains:    "invalid character",
+			ExpectAnnotations: map[string]string{
+				"mutation.webhook.admission.k8s.io/round_0_index_0": mutationAnnotationValue(configurationName, "invalidMutation", false),
+			},
+		},
+		{
+			Name: "match & invalid patch",
+			Webhooks: []registrationv1.MutatingWebhook{{
+				Name:                    "invalidPatch",
+				ClientConfig:            ccfgSVC("invalidPatch"),
+				Rules:                   matchEverythingRules,
+				NamespaceSelector:       &metav1.LabelSelector{},
+				ObjectSelector:          &metav1.LabelSelector{},
+				AdmissionReviewVersions: []string{"v1beta1"},
+			}},
+			ExpectStatusCode: http.StatusInternalServerError,
+			ErrorContains:    "unexpected end of JSON input",
+			ExpectAnnotations: map[string]string{
+				"mutation.webhook.admission.k8s.io/round_0_index_0": mutationAnnotationValue(configurationName, "invalidPatch", false),
+			},
+		},
+		{
+			Name: "match & invalid patch fail open",
+			Webhooks: []registrationv1.MutatingWebhook{{
+				Name:                    "invalidPatch",
+				ClientConfig:            ccfgSVC("invalidPatch"),
+				Rules:                   matchEverythingRules,
+				NamespaceSelector:       &metav1.LabelSelector{},
+				ObjectSelector:          &metav1.LabelSelector{},
+				AdmissionReviewVersions: []string{"v1beta1"},
+				FailurePolicy:           ptr.To(registrationv1.Ignore),
+			}},
+			ExpectAllow:      true,
+			ExpectStatusCode: http.StatusOK,
+			ExpectAnnotations: map[string]string{
+				"failed-open.mutation.webhook.admission.k8s.io/round_0_index_0": "invalidPatch",
+				"mutation.webhook.admission.k8s.io/round_0_index_0":             mutationAnnotationValue(configurationName, "invalidPatch", false),
+			},
+		},
+		{
+			Name: "match & invalid client config",
+			Webhooks: []registrationv1.MutatingWebhook{{
+				Name:                    "invalidClientConfig",
+				ClientConfig:            registrationv1.WebhookClientConfig{},
+				Rules:                   matchEverythingRules,
+				NamespaceSelector:       &metav1.LabelSelector{},
+				ObjectSelector:          &metav1.LabelSelector{},
+				AdmissionReviewVersions: []string{"v1beta1"},
+			}},
+			ExpectStatusCode:       http.StatusInternalServerError,
+			ExpectRejectionMetrics: `apiserver_admission_webhook_rejection_total{error_type="calling_webhook_error",name="invalidClientConfig",operation="UPDATE",rejection_code="500",type="admit"} 1`,
+			ErrorContains:          "could not get REST client",
+			ExpectAnnotations: map[string]string{
+				"mutation.webhook.admission.k8s.io/round_0_index_0": mutationAnnotationValue(configurationName, "invalidClientConfig", false),
+			},
+		},
+		{
+			Name: "match & non-status error",
+			Webhooks: []registrationv1.MutatingWebhook{{
+				Name:                    "nonStatusError",
+				ClientConfig:            ccfgSVC("nonStatusError"),
+				Rules:                   matchEverythingRules,
+				NamespaceSelector:       &metav1.LabelSelector{},
+				ObjectSelector:          &metav1.LabelSelector{},
+				AdmissionReviewVersions: []string{"v1beta1"},
+			}},
+			ExpectStatusCode:       http.StatusInternalServerError,
+			ExpectRejectionMetrics: `apiserver_admission_webhook_rejection_total{error_type="calling_webhook_error",name="nonStatusError",operation="UPDATE",rejection_code="503",type="admit"} 1`,
+			ErrorContains:          "failed to call webhook",
+			ExpectAnnotations: map[string]string{
+				"mutation.webhook.admission.k8s.io/round_0_index_0": mutationAnnotationValue(configurationName, "nonStatusError", false),
+			},
 		},
 		{
 			Name: "match & remove label dry run unsupported",
-			Webhooks: []registrationv1beta1.MutatingWebhook{{
+			Webhooks: []registrationv1.MutatingWebhook{{
 				Name:                    "removeLabel",
 				ClientConfig:            ccfgSVC("removeLabel"),
 				Rules:                   matchEverythingRules,
@@ -721,10 +1011,13 @@ func NewMutatingTestCases(url *url.URL) []MutatingTest {
 			IsDryRun:         true,
 			ExpectStatusCode: http.StatusBadRequest,
 			ErrorContains:    "does not support dry run",
+			ExpectAnnotations: map[string]string{
+				"mutation.webhook.admission.k8s.io/round_0_index_0": mutationAnnotationValue(configurationName, "removeLabel", false),
+			},
 		},
 		{
 			Name: "first webhook remove labels, second webhook shouldn't be called",
-			Webhooks: []registrationv1beta1.MutatingWebhook{{
+			Webhooks: []registrationv1.MutatingWebhook{{
 				Name:              "removelabel.example.com",
 				ClientConfig:      ccfgSVC("removeLabel"),
 				Rules:             matchEverythingRules,
@@ -747,14 +1040,18 @@ func NewMutatingTestCases(url *url.URL) []MutatingTest {
 				Rules:                   matchEverythingRules,
 				AdmissionReviewVersions: []string{"v1beta1"},
 			}},
-			ExpectAllow:       true,
-			AdditionalLabels:  map[string]string{"remove": "me"},
-			ExpectLabels:      map[string]string{"pod.name": "my-pod"},
-			ExpectAnnotations: map[string]string{"removelabel.example.com/key1": "value1"},
+			ExpectAllow:      true,
+			AdditionalLabels: map[string]string{"remove": "me"},
+			ExpectLabels:     map[string]string{"pod.name": "my-pod"},
+			ExpectAnnotations: map[string]string{
+				"removelabel.example.com/key1":                      "value1",
+				"mutation.webhook.admission.k8s.io/round_0_index_0": mutationAnnotationValue(configurationName, "removelabel.example.com", true),
+				"patch.webhook.admission.k8s.io/round_0_index_0":    patchAnnotationValue(configurationName, "removelabel.example.com", `[{"op": "remove", "path": "/metadata/labels/remove"}]`),
+			},
 		},
 		{
 			Name: "first webhook remove labels from CRD, second webhook shouldn't be called",
-			Webhooks: []registrationv1beta1.MutatingWebhook{{
+			Webhooks: []registrationv1.MutatingWebhook{{
 				Name:              "removelabel.example.com",
 				ClientConfig:      ccfgSVC("removeLabel"),
 				Rules:             matchEverythingRules,
@@ -777,17 +1074,21 @@ func NewMutatingTestCases(url *url.URL) []MutatingTest {
 				Rules:                   matchEverythingRules,
 				AdmissionReviewVersions: []string{"v1beta1"},
 			}},
-			IsCRD:             true,
-			ExpectAllow:       true,
-			AdditionalLabels:  map[string]string{"remove": "me"},
-			ExpectLabels:      map[string]string{"crd.name": "my-test-crd"},
-			ExpectAnnotations: map[string]string{"removelabel.example.com/key1": "value1"},
+			IsCRD:            true,
+			ExpectAllow:      true,
+			AdditionalLabels: map[string]string{"remove": "me"},
+			ExpectLabels:     map[string]string{"crd.name": "my-test-crd"},
+			ExpectAnnotations: map[string]string{
+				"removelabel.example.com/key1":                      "value1",
+				"mutation.webhook.admission.k8s.io/round_0_index_0": mutationAnnotationValue(configurationName, "removelabel.example.com", true),
+				"patch.webhook.admission.k8s.io/round_0_index_0":    patchAnnotationValue(configurationName, "removelabel.example.com", `[{"op": "remove", "path": "/metadata/labels/remove"}]`),
+			},
 		},
 		// No need to test everything with the url case, since only the
 		// connection is different.
 		{
 			Name: "match & reinvoke if needed policy",
-			Webhooks: []registrationv1beta1.MutatingWebhook{{
+			Webhooks: []registrationv1.MutatingWebhook{{
 				Name:                    "addLabel",
 				ClientConfig:            ccfgSVC("addLabel"),
 				Rules:                   matchEverythingRules,
@@ -807,10 +1108,16 @@ func NewMutatingTestCases(url *url.URL) []MutatingTest {
 			AdditionalLabels:       map[string]string{"remove": "me"},
 			ExpectAllow:            true,
 			ExpectReinvokeWebhooks: map[string]bool{"addLabel": true},
+			ExpectAnnotations: map[string]string{
+				"mutation.webhook.admission.k8s.io/round_0_index_0": mutationAnnotationValue(configurationName, "addLabel", true),
+				"mutation.webhook.admission.k8s.io/round_0_index_1": mutationAnnotationValue(configurationName, "removeLabel", true),
+				"patch.webhook.admission.k8s.io/round_0_index_0":    patchAnnotationValue(configurationName, "addLabel", `[{"op": "add", "path": "/metadata/labels/added", "value": "test"}]`),
+				"patch.webhook.admission.k8s.io/round_0_index_1":    patchAnnotationValue(configurationName, "removeLabel", `[{"op": "remove", "path": "/metadata/labels/remove"}]`),
+			},
 		},
 		{
 			Name: "match & never reinvoke policy",
-			Webhooks: []registrationv1beta1.MutatingWebhook{{
+			Webhooks: []registrationv1.MutatingWebhook{{
 				Name:                    "addLabel",
 				ClientConfig:            ccfgSVC("addLabel"),
 				Rules:                   matchEverythingRules,
@@ -821,10 +1128,14 @@ func NewMutatingTestCases(url *url.URL) []MutatingTest {
 			}},
 			ExpectAllow:            true,
 			ExpectReinvokeWebhooks: map[string]bool{"addLabel": false},
+			ExpectAnnotations: map[string]string{
+				"mutation.webhook.admission.k8s.io/round_0_index_0": mutationAnnotationValue(configurationName, "addLabel", true),
+				"patch.webhook.admission.k8s.io/round_0_index_0":    patchAnnotationValue(configurationName, "addLabel", `[{"op": "add", "path": "/metadata/labels/added", "value": "test"}]`),
+			},
 		},
 		{
 			Name: "match & never reinvoke policy (by default)",
-			Webhooks: []registrationv1beta1.MutatingWebhook{{
+			Webhooks: []registrationv1.MutatingWebhook{{
 				Name:                    "addLabel",
 				ClientConfig:            ccfgSVC("addLabel"),
 				Rules:                   matchEverythingRules,
@@ -834,10 +1145,14 @@ func NewMutatingTestCases(url *url.URL) []MutatingTest {
 			}},
 			ExpectAllow:            true,
 			ExpectReinvokeWebhooks: map[string]bool{"addLabel": false},
+			ExpectAnnotations: map[string]string{
+				"mutation.webhook.admission.k8s.io/round_0_index_0": mutationAnnotationValue(configurationName, "addLabel", true),
+				"patch.webhook.admission.k8s.io/round_0_index_0":    patchAnnotationValue(configurationName, "addLabel", `[{"op": "add", "path": "/metadata/labels/added", "value": "test"}]`),
+			},
 		},
 		{
 			Name: "match & no reinvoke",
-			Webhooks: []registrationv1beta1.MutatingWebhook{{
+			Webhooks: []registrationv1.MutatingWebhook{{
 				Name:                    "noop",
 				ClientConfig:            ccfgSVC("noop"),
 				Rules:                   matchEverythingRules,
@@ -846,6 +1161,9 @@ func NewMutatingTestCases(url *url.URL) []MutatingTest {
 				AdmissionReviewVersions: []string{"v1beta1"},
 			}},
 			ExpectAllow: true,
+			ExpectAnnotations: map[string]string{
+				"mutation.webhook.admission.k8s.io/round_0_index_0": mutationAnnotationValue(configurationName, "noop", false),
+			},
 		},
 	}
 }
@@ -853,20 +1171,20 @@ func NewMutatingTestCases(url *url.URL) []MutatingTest {
 // CachedTest is a test case for the client manager.
 type CachedTest struct {
 	Name            string
-	Webhooks        []registrationv1beta1.ValidatingWebhook
+	Webhooks        []registrationv1.ValidatingWebhook
 	ExpectAllow     bool
 	ExpectCacheMiss bool
 }
 
 // NewCachedClientTestcases returns a set of client manager test cases.
 func NewCachedClientTestcases(url *url.URL) []CachedTest {
-	policyIgnore := registrationv1beta1.Ignore
+	policyIgnore := registrationv1.Ignore
 	ccfgURL := urlConfigGenerator{url}.ccfgURL
 
 	return []CachedTest{
 		{
 			Name: "uncached: service webhook, path 'allow'",
-			Webhooks: []registrationv1beta1.ValidatingWebhook{{
+			Webhooks: []registrationv1.ValidatingWebhook{{
 				Name:                    "cache1",
 				ClientConfig:            ccfgSVC("allow"),
 				Rules:                   newMatchEverythingRules(),
@@ -880,7 +1198,7 @@ func NewCachedClientTestcases(url *url.URL) []CachedTest {
 		},
 		{
 			Name: "uncached: service webhook, path 'internalErr'",
-			Webhooks: []registrationv1beta1.ValidatingWebhook{{
+			Webhooks: []registrationv1.ValidatingWebhook{{
 				Name:                    "cache2",
 				ClientConfig:            ccfgSVC("internalErr"),
 				Rules:                   newMatchEverythingRules(),
@@ -894,7 +1212,7 @@ func NewCachedClientTestcases(url *url.URL) []CachedTest {
 		},
 		{
 			Name: "cached: service webhook, path 'allow'",
-			Webhooks: []registrationv1beta1.ValidatingWebhook{{
+			Webhooks: []registrationv1.ValidatingWebhook{{
 				Name:                    "cache3",
 				ClientConfig:            ccfgSVC("allow"),
 				Rules:                   newMatchEverythingRules(),
@@ -908,7 +1226,7 @@ func NewCachedClientTestcases(url *url.URL) []CachedTest {
 		},
 		{
 			Name: "uncached: url webhook, path 'allow'",
-			Webhooks: []registrationv1beta1.ValidatingWebhook{{
+			Webhooks: []registrationv1.ValidatingWebhook{{
 				Name:                    "cache4",
 				ClientConfig:            ccfgURL("allow"),
 				Rules:                   newMatchEverythingRules(),
@@ -921,8 +1239,8 @@ func NewCachedClientTestcases(url *url.URL) []CachedTest {
 			ExpectCacheMiss: true,
 		},
 		{
-			Name: "cached: service webhook, path 'allow'",
-			Webhooks: []registrationv1beta1.ValidatingWebhook{{
+			Name: "cached: url webhook, path 'allow'",
+			Webhooks: []registrationv1.ValidatingWebhook{{
 				Name:                    "cache5",
 				ClientConfig:            ccfgURL("allow"),
 				Rules:                   newMatchEverythingRules(),
@@ -938,9 +1256,9 @@ func NewCachedClientTestcases(url *url.URL) []CachedTest {
 }
 
 // ccfgSVC returns a client config using the service reference mechanism.
-func ccfgSVC(urlPath string) registrationv1beta1.WebhookClientConfig {
-	return registrationv1beta1.WebhookClientConfig{
-		Service: &registrationv1beta1.ServiceReference{
+func ccfgSVC(urlPath string) registrationv1.WebhookClientConfig {
+	return registrationv1.WebhookClientConfig{
+		Service: &registrationv1.ServiceReference{
 			Name:      "webhook-test",
 			Namespace: "default",
 			Path:      &urlPath,
@@ -949,10 +1267,10 @@ func ccfgSVC(urlPath string) registrationv1beta1.WebhookClientConfig {
 	}
 }
 
-func newMatchEverythingRules() []registrationv1beta1.RuleWithOperations {
-	return []registrationv1beta1.RuleWithOperations{{
-		Operations: []registrationv1beta1.OperationType{registrationv1beta1.OperationAll},
-		Rule: registrationv1beta1.Rule{
+func newMatchEverythingRules() []registrationv1.RuleWithOperations {
+	return []registrationv1.RuleWithOperations{{
+		Operations: []registrationv1.OperationType{registrationv1.OperationAll},
+		Rule: registrationv1.Rule{
 			APIGroups:   []string{"*"},
 			APIVersions: []string{"*"},
 			Resources:   []string{"*/*"},
@@ -965,4 +1283,68 @@ func NewObjectInterfacesForTest() admission.ObjectInterfaces {
 	scheme := runtime.NewScheme()
 	corev1.AddToScheme(scheme)
 	return admission.NewObjectInterfacesFromScheme(scheme)
+}
+
+// NewValidationDurationTestCases returns test cases for webhook duration test
+func NewValidationDurationTestCases(url *url.URL) []DurationTest {
+	ccfgURL := urlConfigGenerator{url}.ccfgURL
+	webhooks := []registrationv1.ValidatingWebhook{
+		{
+			Name:                    "allow match",
+			ClientConfig:            ccfgURL("allow/100"),
+			Rules:                   matchEverythingRules,
+			NamespaceSelector:       &metav1.LabelSelector{},
+			ObjectSelector:          &metav1.LabelSelector{},
+			AdmissionReviewVersions: []string{"v1beta1"},
+		},
+		{
+			Name:                    "allow no match",
+			ClientConfig:            ccfgURL("allow/200"),
+			NamespaceSelector:       &metav1.LabelSelector{},
+			ObjectSelector:          &metav1.LabelSelector{},
+			AdmissionReviewVersions: []string{"v1beta1"},
+		},
+		{
+			Name:                    "disallow match",
+			ClientConfig:            ccfgURL("disallow/400"),
+			Rules:                   matchEverythingRules,
+			NamespaceSelector:       &metav1.LabelSelector{},
+			ObjectSelector:          &metav1.LabelSelector{},
+			AdmissionReviewVersions: []string{"v1beta1"},
+		},
+		{
+			Name:                    "disallow no match",
+			ClientConfig:            ccfgURL("disallow/800"),
+			NamespaceSelector:       &metav1.LabelSelector{},
+			ObjectSelector:          &metav1.LabelSelector{},
+			AdmissionReviewVersions: []string{"v1beta1"},
+		},
+	}
+
+	return []DurationTest{
+		{
+			Name:                "duration test",
+			IsDryRun:            false,
+			InitContext:         true,
+			Webhooks:            webhooks,
+			ExpectedDurationSum: 500,
+			ExpectedDurationMax: 400,
+		},
+		{
+			Name:                "duration dry run",
+			IsDryRun:            true,
+			InitContext:         true,
+			Webhooks:            webhooks,
+			ExpectedDurationSum: 0,
+			ExpectedDurationMax: 0,
+		},
+		{
+			Name:                "duration no init",
+			IsDryRun:            false,
+			InitContext:         false,
+			Webhooks:            webhooks,
+			ExpectedDurationSum: 0,
+			ExpectedDurationMax: 0,
+		},
+	}
 }

@@ -24,6 +24,7 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/runtime/serializer"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apiserver/pkg/endpoints/handlers/negotiation"
 	"k8s.io/apiserver/pkg/endpoints/handlers/responsewriters"
 
@@ -36,33 +37,41 @@ import (
 // apisHandler serves the `/apis` endpoint.
 // This is registered as a filter so that it never collides with any explicitly registered endpoints
 type apisHandler struct {
-	codecs serializer.CodecFactory
-	lister listers.APIServiceLister
+	codecs         serializer.CodecFactory
+	lister         listers.APIServiceLister
+	discoveryGroup metav1.APIGroup
 }
 
-var discoveryGroup = metav1.APIGroup{
-	Name: apiregistrationv1api.GroupName,
-	Versions: []metav1.GroupVersionForDiscovery{
-		{
+func discoveryGroup(enabledVersions sets.String) metav1.APIGroup {
+	retval := metav1.APIGroup{
+		Name: apiregistrationv1api.GroupName,
+		Versions: []metav1.GroupVersionForDiscovery{
+			{
+				GroupVersion: apiregistrationv1api.SchemeGroupVersion.String(),
+				Version:      apiregistrationv1api.SchemeGroupVersion.Version,
+			},
+		},
+		PreferredVersion: metav1.GroupVersionForDiscovery{
 			GroupVersion: apiregistrationv1api.SchemeGroupVersion.String(),
 			Version:      apiregistrationv1api.SchemeGroupVersion.Version,
 		},
-		{
+	}
+
+	if enabledVersions.Has(apiregistrationv1beta1api.SchemeGroupVersion.Version) {
+		retval.Versions = append(retval.Versions, metav1.GroupVersionForDiscovery{
 			GroupVersion: apiregistrationv1beta1api.SchemeGroupVersion.String(),
 			Version:      apiregistrationv1beta1api.SchemeGroupVersion.Version,
-		},
-	},
-	PreferredVersion: metav1.GroupVersionForDiscovery{
-		GroupVersion: apiregistrationv1api.SchemeGroupVersion.String(),
-		Version:      apiregistrationv1api.SchemeGroupVersion.Version,
-	},
+		})
+	}
+
+	return retval
 }
 
 func (r *apisHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	discoveryGroupList := &metav1.APIGroupList{
 		// always add OUR api group to the list first.  Since we'll never have a registered APIService for it
 		// and since this is the crux of the API, having this first will give our names priority.  It's good to be king.
-		Groups: []metav1.APIGroup{discoveryGroup},
+		Groups: []metav1.APIGroup{r.discoveryGroup},
 	}
 
 	apiServices, err := r.lister.List(labels.Everything())
@@ -82,7 +91,7 @@ func (r *apisHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		}
 	}
 
-	responsewriters.WriteObjectNegotiated(r.codecs, negotiation.DefaultEndpointRestrictions, schema.GroupVersion{}, w, req, http.StatusOK, discoveryGroupList)
+	responsewriters.WriteObjectNegotiated(r.codecs, negotiation.DefaultEndpointRestrictions, schema.GroupVersion{}, w, req, http.StatusOK, discoveryGroupList, false)
 }
 
 // convertToDiscoveryAPIGroup takes apiservices in a single group and returns a discovery compatible object.
@@ -127,7 +136,7 @@ type apiGroupHandler struct {
 
 func (r *apiGroupHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	apiServices, err := r.lister.List(labels.Everything())
-	if statusErr, ok := err.(*apierrors.StatusError); ok && err != nil {
+	if statusErr, ok := err.(*apierrors.StatusError); ok {
 		responsewriters.WriteRawJSON(int(statusErr.Status().Code), statusErr.Status(), w)
 		return
 	}
@@ -153,5 +162,5 @@ func (r *apiGroupHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		http.Error(w, "", http.StatusNotFound)
 		return
 	}
-	responsewriters.WriteObjectNegotiated(r.codecs, negotiation.DefaultEndpointRestrictions, schema.GroupVersion{}, w, req, http.StatusOK, discoveryGroup)
+	responsewriters.WriteObjectNegotiated(r.codecs, negotiation.DefaultEndpointRestrictions, schema.GroupVersion{}, w, req, http.StatusOK, discoveryGroup, false)
 }

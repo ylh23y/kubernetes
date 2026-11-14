@@ -17,9 +17,15 @@ limitations under the License.
 package node
 
 import (
+	"fmt"
 	"sync"
+	"time"
 
+	certsv1 "k8s.io/api/certificates/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/component-helpers/storage/ephemeral"
+	"k8s.io/dynamic-resource-allocation/resourceclaim"
 	pvutil "k8s.io/kubernetes/pkg/api/v1/persistentvolume"
 	podutil "k8s.io/kubernetes/pkg/api/v1/pod"
 	"k8s.io/kubernetes/third_party/forked/gonum/graph"
@@ -76,7 +82,8 @@ func (e *destinationEdge) DestinationID() int { return e.Destination.ID() }
 // pvc  <- pv
 // pv   <- secret
 type Graph struct {
-	lock  sync.RWMutex
+	lock sync.RWMutex
+	// Calling graph.SetEdge is restricted to the addEdgeLocked method of Graph.
 	graph *simple.DirectedAcyclicGraph
 	// vertices is a map of type -> namespace -> name -> vertex
 	vertices map[vertexType]namespaceVertexMapping
@@ -111,42 +118,63 @@ type vertexType byte
 
 const (
 	configMapVertexType vertexType = iota
+	sliceVertexType
 	nodeVertexType
 	podVertexType
 	pvcVertexType
 	pvVertexType
+	resourceClaimVertexType
 	secretVertexType
 	vaVertexType
 	serviceAccountVertexType
+	pcrVertexType
 )
 
 var vertexTypes = map[vertexType]string{
 	configMapVertexType:      "configmap",
+	sliceVertexType:          "resourceslice",
 	nodeVertexType:           "node",
 	podVertexType:            "pod",
 	pvcVertexType:            "pvc",
 	pvVertexType:             "pv",
+	resourceClaimVertexType:  "resourceclaim",
 	secretVertexType:         "secret",
 	vaVertexType:             "volumeattachment",
 	serviceAccountVertexType: "serviceAccount",
+	pcrVertexType:            "podcertificaterequest",
+}
+
+// vertexTypeWithAuthoritativeIndex indicates which types of vertices can hold
+// a destination edge index that is authoritative i.e. if the index exists,
+// then it always stores all of the Nodes that are reachable from that vertex
+// in the graph.
+var vertexTypeWithAuthoritativeIndex = map[vertexType]bool{
+	configMapVertexType:      true,
+	sliceVertexType:          true,
+	podVertexType:            true,
+	pvcVertexType:            true,
+	resourceClaimVertexType:  true,
+	vaVertexType:             true,
+	serviceAccountVertexType: true,
+	pcrVertexType:            true,
 }
 
 // must be called under a write lock
-func (g *Graph) getOrCreateVertex_locked(vertexType vertexType, namespace, name string) *namedVertex {
-	if vertex, exists := g.getVertex_rlocked(vertexType, namespace, name); exists {
+func (g *Graph) getOrCreateVertexLocked(vertexType vertexType, namespace, name string) *namedVertex {
+	if vertex, exists := g.getVertexRLocked(vertexType, namespace, name); exists {
 		return vertex
 	}
-	return g.createVertex_locked(vertexType, namespace, name)
+	return g.createVertexLocked(vertexType, namespace, name)
 }
 
 // must be called under a read lock
-func (g *Graph) getVertex_rlocked(vertexType vertexType, namespace, name string) (*namedVertex, bool) {
+func (g *Graph) getVertexRLocked(vertexType vertexType, namespace, name string) (*namedVertex, bool) {
 	vertex, exists := g.vertices[vertexType][namespace][name]
 	return vertex, exists
 }
 
 // must be called under a write lock
-func (g *Graph) createVertex_locked(vertexType vertexType, namespace, name string) *namedVertex {
+func (g *Graph) createVertexLocked(vertexType vertexType, namespace, name string) *namedVertex {
 	typedVertices, exists := g.vertices[vertexType]
 	if !exists {
 		typedVertices = namespaceVertexMapping{}
@@ -167,15 +195,15 @@ func (g *Graph) createVertex_locked(vertexType vertexType, namespace, name strin
 }
 
 // must be called under write lock
-func (g *Graph) deleteVertex_locked(vertexType vertexType, namespace, name string) {
-	vertex, exists := g.getVertex_rlocked(vertexType, namespace, name)
+func (g *Graph) deleteVertexLocked(vertexType vertexType, namespace, name string) {
+	vertex, exists := g.getVertexRLocked(vertexType, namespace, name)
 	if !exists {
 		return
 	}
 
 	// find existing neighbors with a single edge (meaning we are their only neighbor)
 	neighborsToRemove := []graph.Node{}
-	neighborsToRecompute := []graph.Node{}
+	edgesToRemoveFromIndexes := []graph.Edge{}
 	g.graph.VisitFrom(vertex, func(neighbor graph.Node) bool {
 		// this downstream neighbor has only one edge (which must be from us), so remove them as well
 		if g.graph.Degree(neighbor) == 1 {
@@ -188,70 +216,104 @@ func (g *Graph) deleteVertex_locked(vertexType vertexType, namespace, name strin
 			// this upstream neighbor has only one edge (which must be to us), so remove them as well
 			neighborsToRemove = append(neighborsToRemove, neighbor)
 		} else {
-			// recompute the destination edge index on this neighbor
-			neighborsToRecompute = append(neighborsToRemove, neighbor)
+			// decrement the destination edge index on this neighbor if the edge between us was a destination edge
+			edgesToRemoveFromIndexes = append(edgesToRemoveFromIndexes, g.graph.EdgeBetween(vertex, neighbor))
 		}
 		return true
 	})
 
 	// remove the vertex
-	g.removeVertex_locked(vertex)
+	g.removeVertexLocked(vertex)
 
 	// remove neighbors that are now edgeless
 	for _, neighbor := range neighborsToRemove {
-		g.removeVertex_locked(neighbor.(*namedVertex))
+		g.removeVertexLocked(neighbor.(*namedVertex))
 	}
 
-	// recompute destination indexes for neighbors that dropped outbound edges
-	for _, neighbor := range neighborsToRecompute {
-		g.recomputeDestinationIndex_locked(neighbor)
+	// remove edges from destination indexes for neighbors that dropped outbound edges
+	for _, edge := range edgesToRemoveFromIndexes {
+		g.removeEdgeFromDestinationIndexLocked(edge)
 	}
 }
 
 // must be called under write lock
 // deletes edges from a given vertex type to a specific vertex
 // will delete each orphaned "from" vertex, but will never delete the "to" vertex
-func (g *Graph) deleteEdges_locked(fromType, toType vertexType, toNamespace, toName string) {
+func (g *Graph) deleteEdgesLocked(fromType, toType vertexType, toNamespace, toName string) {
 	// get the "to" side
-	toVert, exists := g.getVertex_rlocked(toType, toNamespace, toName)
+	toVert, exists := g.getVertexRLocked(toType, toNamespace, toName)
 	if !exists {
 		return
 	}
 
 	// delete all edges between vertices of fromType and toVert
 	neighborsToRemove := []*namedVertex{}
-	neighborsToRecompute := []*namedVertex{}
+	edgesToRemove := []graph.Edge{}
 	g.graph.VisitTo(toVert, func(from graph.Node) bool {
 		fromVert := from.(*namedVertex)
 		if fromVert.vertexType != fromType {
 			return true
 		}
-		// remove the edge
-		g.graph.RemoveEdge(simple.Edge{F: fromVert, T: toVert})
-		// track vertexes that changed edges
-		if g.graph.Degree(fromVert) == 0 {
+		// this neighbor has only one edge (which must be to us), so remove them as well
+		if g.graph.Degree(fromVert) == 1 {
 			neighborsToRemove = append(neighborsToRemove, fromVert)
 		} else {
-			neighborsToRecompute = append(neighborsToRecompute, fromVert)
+			edgesToRemove = append(edgesToRemove, g.graph.EdgeBetween(from, toVert))
 		}
 		return true
 	})
 
 	// clean up orphaned verts
 	for _, v := range neighborsToRemove {
-		g.removeVertex_locked(v)
+		g.removeVertexLocked(v)
 	}
 
-	// recompute destination indexes for neighbors that dropped outbound edges
-	for _, v := range neighborsToRecompute {
-		g.recomputeDestinationIndex_locked(v)
+	// remove edges and decrement destination indexes for neighbors that dropped outbound edges
+	for _, edge := range edgesToRemove {
+		g.graph.RemoveEdge(edge)
+		g.removeEdgeFromDestinationIndexLocked(edge)
+	}
+}
+
+// A fastpath for recomputeDestinationIndexLocked for "removing edge" case.
+func (g *Graph) removeEdgeFromDestinationIndexLocked(e graph.Edge) {
+	n := e.From()
+	// don't maintain indices for nodes with few edges
+	edgeCount := g.graph.Degree(n)
+	if edgeCount < g.destinationEdgeThreshold {
+		delete(g.destinationEdgeIndex, n.ID())
+		return
+	}
+
+	// decrement the nodeID->destinationID refcount in the index, if the index exists
+	index := g.destinationEdgeIndex[n.ID()]
+	if index == nil {
+		return
+	}
+	if destinationEdge, ok := e.(*destinationEdge); ok {
+		index.decrement(destinationEdge.DestinationID())
+	}
+}
+
+// A fastpath for recomputeDestinationIndexLocked for "adding edge case".
+func (g *Graph) addEdgeToDestinationIndexLocked(e graph.Edge) {
+	n := e.From()
+	index := g.destinationEdgeIndex[n.ID()]
+	if index == nil {
+		// There is no index, use the full index computation method
+		g.recomputeDestinationIndexLocked(n)
+		return
+	}
+	// fast-add the new edge to an existing index
+	if destinationEdge, ok := e.(*destinationEdge); ok {
+		index.increment(destinationEdge.DestinationID())
 	}
 }
 
 // must be called under write lock
-// removeVertex_locked removes the specified vertex from the graph and from the maintained indices.
+// removeVertexLocked removes the specified vertex from the graph and from the maintained indices.
 // It does nothing to indexes of neighbor vertices.
-func (g *Graph) removeVertex_locked(v *namedVertex) {
+func (g *Graph) removeVertexLocked(v *namedVertex) {
 	g.graph.RemoveNode(v)
 	delete(g.destinationEdgeIndex, v.ID())
 	delete(g.vertices[v.vertexType][v.namespace], v.name)
@@ -261,8 +323,8 @@ func (g *Graph) removeVertex_locked(v *namedVertex) {
 }
 
 // must be called under write lock
-// recomputeDestinationIndex_locked recomputes the index of destination ids for the specified vertex
-func (g *Graph) recomputeDestinationIndex_locked(n graph.Node) {
+// recomputeDestinationIndexLocked recomputes the index of destination ids for the specified vertex
+func (g *Graph) recomputeDestinationIndexLocked(n graph.Node) {
 	// don't maintain indices for nodes with few edges
 	edgeCount := g.graph.Degree(n)
 	if edgeCount < g.destinationEdgeThreshold {
@@ -275,44 +337,40 @@ func (g *Graph) recomputeDestinationIndex_locked(n graph.Node) {
 	if index == nil {
 		index = newIntSet()
 	} else {
-		index.startNewGeneration()
+		index.reset()
 	}
 
 	// populate the index
 	g.graph.VisitFrom(n, func(dest graph.Node) bool {
 		if destinationEdge, ok := g.graph.EdgeBetween(n, dest).(*destinationEdge); ok {
-			index.mark(destinationEdge.DestinationID())
+			index.increment(destinationEdge.DestinationID())
 		}
 		return true
 	})
-
-	// remove existing items no longer in the list
-	index.sweep()
-
-	if len(index.members) < g.destinationEdgeThreshold {
-		delete(g.destinationEdgeIndex, n.ID())
-	} else {
-		g.destinationEdgeIndex[n.ID()] = index
-	}
+	g.destinationEdgeIndex[n.ID()] = index
 }
 
 // AddPod should only be called once spec.NodeName is populated.
-// It sets up edges for the following relationships (which are immutable for a pod once bound to a node):
+// It sets up edges for the following relationships:
 //
-//   pod -> node
-//
-//   secret    -> pod
-//   configmap -> pod
-//   pvc       -> pod
-//   svcacct   -> pod
+//	pod       -> node
+//	secret    -> pod
+//	configmap -> pod
+//	pvc       -> pod
+//	svcacct   -> pod
 func (g *Graph) AddPod(pod *corev1.Pod) {
+	start := time.Now()
+	defer func() {
+		graphActionsDuration.WithLabelValues("AddPod").Observe(time.Since(start).Seconds())
+	}()
 	g.lock.Lock()
 	defer g.lock.Unlock()
 
-	g.deleteVertex_locked(podVertexType, pod.Namespace, pod.Name)
-	podVertex := g.getOrCreateVertex_locked(podVertexType, pod.Namespace, pod.Name)
-	nodeVertex := g.getOrCreateVertex_locked(nodeVertexType, "", pod.Spec.NodeName)
-	g.graph.SetEdge(newDestinationEdge(podVertex, nodeVertex, nodeVertex))
+	g.deleteVertexLocked(podVertexType, pod.Namespace, pod.Name)
+	podVertex := g.getOrCreateVertexLocked(podVertexType, pod.Namespace, pod.Name)
+	nodeVertex := g.getOrCreateVertexLocked(nodeVertexType, "", pod.Spec.NodeName)
+	// Edge adds must be handled by addEdgeLocked instead of direct g.graph.SetEdge calls.
+	g.addEdgeLocked(podVertex, nodeVertex, nodeVertex)
 
 	// Short-circuit adding edges to other resources for mirror pods.
 	// A node must never be able to create a pod that grants them permissions on other API objects.
@@ -321,118 +379,252 @@ func (g *Graph) AddPod(pod *corev1.Pod) {
 		return
 	}
 
-	// TODO(mikedanese): If the pod doesn't mount the service account secrets,
-	// should the node still get access to the service account?
-	//
-	// ref https://github.com/kubernetes/kubernetes/issues/58790
+	// The pod unconditionally gets access to the pod's service account.  In the
+	// future, this access could be restricted based on whether or not the pod
+	// actually mounts a service account token, or has a podcertificate volume.
 	if len(pod.Spec.ServiceAccountName) > 0 {
-		serviceAccountVertex := g.getOrCreateVertex_locked(serviceAccountVertexType, pod.Namespace, pod.Spec.ServiceAccountName)
-		g.graph.SetEdge(newDestinationEdge(serviceAccountVertex, podVertex, nodeVertex))
-		g.recomputeDestinationIndex_locked(serviceAccountVertex)
+		serviceAccountVertex := g.getOrCreateVertexLocked(serviceAccountVertexType, pod.Namespace, pod.Spec.ServiceAccountName)
+		// Edge adds must be handled by addEdgeLocked instead of direct g.graph.SetEdge calls.
+		g.addEdgeLocked(serviceAccountVertex, podVertex, nodeVertex)
 	}
 
+	// Secrets
+	added := sets.New[string]()
 	podutil.VisitPodSecretNames(pod, func(secret string) bool {
-		secretVertex := g.getOrCreateVertex_locked(secretVertexType, pod.Namespace, secret)
-		g.graph.SetEdge(newDestinationEdge(secretVertex, podVertex, nodeVertex))
-		g.recomputeDestinationIndex_locked(secretVertex)
+		if added.Has(secret) {
+			return true
+		}
+		added.Insert(secret)
+		secretVertex := g.getOrCreateVertexLocked(secretVertexType, pod.Namespace, secret)
+		// Edge adds must be handled by addEdgeLocked instead of direct g.graph.SetEdge calls.
+		g.addEdgeLocked(secretVertex, podVertex, nodeVertex)
 		return true
 	})
 
+	// ConfigMaps
+	added.Clear()
 	podutil.VisitPodConfigmapNames(pod, func(configmap string) bool {
-		configmapVertex := g.getOrCreateVertex_locked(configMapVertexType, pod.Namespace, configmap)
-		g.graph.SetEdge(newDestinationEdge(configmapVertex, podVertex, nodeVertex))
-		g.recomputeDestinationIndex_locked(configmapVertex)
+		if added.Has(configmap) {
+			return true
+		}
+		added.Insert(configmap)
+		configmapVertex := g.getOrCreateVertexLocked(configMapVertexType, pod.Namespace, configmap)
+		// Edge adds must be handled by addEdgeLocked instead of direct g.graph.SetEdge calls.
+		g.addEdgeLocked(configmapVertex, podVertex, nodeVertex)
 		return true
 	})
 
+	// PVCs
+	added.Clear()
 	for _, v := range pod.Spec.Volumes {
+		claimName := ""
 		if v.PersistentVolumeClaim != nil {
-			pvcVertex := g.getOrCreateVertex_locked(pvcVertexType, pod.Namespace, v.PersistentVolumeClaim.ClaimName)
-			g.graph.SetEdge(newDestinationEdge(pvcVertex, podVertex, nodeVertex))
-			g.recomputeDestinationIndex_locked(pvcVertex)
+			claimName = v.PersistentVolumeClaim.ClaimName
+		} else if v.Ephemeral != nil {
+			claimName = ephemeral.VolumeClaimName(pod, &v)
+		}
+		if claimName != "" && !added.Has(claimName) {
+			added.Insert(claimName)
+			pvcVertex := g.getOrCreateVertexLocked(pvcVertexType, pod.Namespace, claimName)
+			// Edge adds must be handled by addEdgeLocked instead of direct g.graph.SetEdge calls.
+			g.addEdgeLocked(pvcVertex, podVertex, nodeVertex)
 		}
 	}
+
+	// ResourceClaims
+	// Grant kubelet access to all ResourceClaims referenced by or created for
+	// the pod (including extended resource claims). Claims that still need to
+	// be created or intentionally were not created because they are not needed
+	// are skipped by PodClaims.
+	added.Clear()
+	for claimName := range resourceclaim.PodClaims(pod) {
+		if added.Has(claimName) {
+			continue
+		}
+		added.Insert(claimName)
+		claimVertex := g.getOrCreateVertexLocked(resourceClaimVertexType, pod.Namespace, claimName)
+		// Edge adds must be handled by addEdgeLocked instead of direct g.graph.SetEdge calls.
+		g.addEdgeLocked(claimVertex, podVertex, nodeVertex)
+	}
 }
+
+// Must be called under a write lock.
+// All edge adds must be handled by that method rather than by calling
+// g.graph.SetEdge directly.
+// Note: if "from" belongs to vertexTypeWithAuthoritativeIndex, then
+// "destination" must be non-nil.
+func (g *Graph) addEdgeLocked(from, to, destination *namedVertex) {
+	if destination != nil {
+		e := newDestinationEdge(from, to, destination)
+		g.graph.SetEdge(e)
+		g.addEdgeToDestinationIndexLocked(e)
+		return
+	}
+
+	// We must not create edges without a Node label from a vertex that is
+	// supposed to hold authoritative destination edge index only.
+	// Entering this branch would mean there's a bug in the Node authorizer.
+	if vertexTypeWithAuthoritativeIndex[from.vertexType] {
+		panic(fmt.Sprintf("vertex of type %q must have destination edges only", vertexTypes[from.vertexType]))
+	}
+	g.graph.SetEdge(simple.Edge{F: from, T: to})
+}
+
 func (g *Graph) DeletePod(name, namespace string) {
+	start := time.Now()
+	defer func() {
+		graphActionsDuration.WithLabelValues("DeletePod").Observe(time.Since(start).Seconds())
+	}()
 	g.lock.Lock()
 	defer g.lock.Unlock()
-	g.deleteVertex_locked(podVertexType, namespace, name)
+	g.deleteVertexLocked(podVertexType, namespace, name)
+}
+
+// AddPodCertificateRequest adds a PodCertificateRequest to the graph.
+//
+// PCRs technically have two valid edges:
+//
+// * PCR -> Pod (-> Node)
+//
+// * PCR -> Node
+//
+// We only add the direct PCR -> Node edge, since that is enough to perform the
+// authorization, and it's a shorter graph traversal.  The noderestriction
+// admission plugin ensures that all PCRs created have a valid node,
+// serviceaccount, and pod combination that actually exists in the cluster.
+func (g *Graph) AddPodCertificateRequest(pcr *certsv1.PodCertificateRequest) {
+	start := time.Now()
+	defer func() {
+		graphActionsDuration.WithLabelValues("AddPodCertificateRequest").Observe(time.Since(start).Seconds())
+	}()
+	g.lock.Lock()
+	defer g.lock.Unlock()
+
+	g.deleteVertexLocked(pcrVertexType, pcr.ObjectMeta.Namespace, pcr.ObjectMeta.Name)
+	pcrVertex := g.getOrCreateVertexLocked(pcrVertexType, pcr.ObjectMeta.Namespace, pcr.ObjectMeta.Name)
+	nodeVertex := g.getOrCreateVertexLocked(nodeVertexType, "", string(pcr.Spec.NodeName))
+	g.addEdgeLocked(pcrVertex, nodeVertex, nodeVertex)
+}
+
+// DeletePodCertificateRequest removes it from the graph.
+func (g *Graph) DeletePodCertificateRequest(pcr *certsv1.PodCertificateRequest) {
+	start := time.Now()
+	defer func() {
+		graphActionsDuration.WithLabelValues("DeletePodCertificateRequest").Observe(time.Since(start).Seconds())
+	}()
+	g.lock.Lock()
+	defer g.lock.Unlock()
+	g.deleteVertexLocked(pcrVertexType, pcr.ObjectMeta.Namespace, pcr.ObjectMeta.Name)
 }
 
 // AddPV sets up edges for the following relationships:
 //
-//   secret -> pv
+//	secret -> pv
 //
-//   pv -> pvc
+//	pv -> pvc
 func (g *Graph) AddPV(pv *corev1.PersistentVolume) {
+	start := time.Now()
+	defer func() {
+		graphActionsDuration.WithLabelValues("AddPV").Observe(time.Since(start).Seconds())
+	}()
 	g.lock.Lock()
 	defer g.lock.Unlock()
 
 	// clear existing edges
-	g.deleteVertex_locked(pvVertexType, "", pv.Name)
+	g.deleteVertexLocked(pvVertexType, "", pv.Name)
 
 	// if we have a pvc, establish new edges
 	if pv.Spec.ClaimRef != nil {
-		pvVertex := g.getOrCreateVertex_locked(pvVertexType, "", pv.Name)
+		pvVertex := g.getOrCreateVertexLocked(pvVertexType, "", pv.Name)
 
 		// since we don't know the other end of the pvc -> pod -> node chain (or it may not even exist yet), we can't decorate these edges with kubernetes node info
-		g.graph.SetEdge(simple.Edge{F: pvVertex, T: g.getOrCreateVertex_locked(pvcVertexType, pv.Spec.ClaimRef.Namespace, pv.Spec.ClaimRef.Name)})
+		// Edge adds must be handled by addEdgeLocked instead of direct g.graph.SetEdge calls.
+		g.addEdgeLocked(pvVertex, g.getOrCreateVertexLocked(pvcVertexType, pv.Spec.ClaimRef.Namespace, pv.Spec.ClaimRef.Name), nil)
+		added := sets.New[int]()
 		pvutil.VisitPVSecretNames(pv, func(namespace, secret string, kubeletVisible bool) bool {
 			// This grants access to the named secret in the same namespace as the bound PVC
 			if kubeletVisible {
-				g.graph.SetEdge(simple.Edge{F: g.getOrCreateVertex_locked(secretVertexType, namespace, secret), T: pvVertex})
+				secretVertex := g.getOrCreateVertexLocked(secretVertexType, namespace, secret)
+				if !added.Has(secretVertex.ID()) {
+					added.Insert(secretVertex.ID())
+					// Edge adds must be handled by addEdgeLocked instead of direct g.graph.SetEdge calls.
+					g.addEdgeLocked(secretVertex, pvVertex, nil)
+				}
 			}
 			return true
 		})
 	}
 }
 func (g *Graph) DeletePV(name string) {
+	start := time.Now()
+	defer func() {
+		graphActionsDuration.WithLabelValues("DeletePV").Observe(time.Since(start).Seconds())
+	}()
 	g.lock.Lock()
 	defer g.lock.Unlock()
-	g.deleteVertex_locked(pvVertexType, "", name)
+	g.deleteVertexLocked(pvVertexType, "", name)
 }
 
 // AddVolumeAttachment sets up edges for the following relationships:
 //
-//   volume attachment -> node
+//	volume attachment -> node
 func (g *Graph) AddVolumeAttachment(attachmentName, nodeName string) {
+	start := time.Now()
+	defer func() {
+		graphActionsDuration.WithLabelValues("AddVolumeAttachment").Observe(time.Since(start).Seconds())
+	}()
 	g.lock.Lock()
 	defer g.lock.Unlock()
 
 	// clear existing edges
-	g.deleteVertex_locked(vaVertexType, "", attachmentName)
+	g.deleteVertexLocked(vaVertexType, "", attachmentName)
 
 	// if we have a node, establish new edges
 	if len(nodeName) > 0 {
-		vaVertex := g.getOrCreateVertex_locked(vaVertexType, "", attachmentName)
-		nodeVertex := g.getOrCreateVertex_locked(nodeVertexType, "", nodeName)
-		g.graph.SetEdge(newDestinationEdge(vaVertex, nodeVertex, nodeVertex))
+		vaVertex := g.getOrCreateVertexLocked(vaVertexType, "", attachmentName)
+		nodeVertex := g.getOrCreateVertexLocked(nodeVertexType, "", nodeName)
+		// Edge adds must be handled by addEdgeLocked instead of direct g.graph.SetEdge calls.
+		g.addEdgeLocked(vaVertex, nodeVertex, nodeVertex)
 	}
 }
 func (g *Graph) DeleteVolumeAttachment(name string) {
+	start := time.Now()
+	defer func() {
+		graphActionsDuration.WithLabelValues("DeleteVolumeAttachment").Observe(time.Since(start).Seconds())
+	}()
 	g.lock.Lock()
 	defer g.lock.Unlock()
-	g.deleteVertex_locked(vaVertexType, "", name)
+	g.deleteVertexLocked(vaVertexType, "", name)
 }
 
-// SetNodeConfigMap sets up edges for the Node.Spec.ConfigSource.ConfigMap relationship:
+// AddResourceSlice sets up edges for the following relationships:
 //
-// configmap -> node
-func (g *Graph) SetNodeConfigMap(nodeName, configMapName, configMapNamespace string) {
+//	node resource slice -> node
+func (g *Graph) AddResourceSlice(sliceName, nodeName string) {
+	start := time.Now()
+	defer func() {
+		graphActionsDuration.WithLabelValues("AddResourceSlice").Observe(time.Since(start).Seconds())
+	}()
 	g.lock.Lock()
 	defer g.lock.Unlock()
 
-	// TODO(mtaufen): ensure len(nodeName) > 0 in all cases (would sure be nice to have a dependently-typed language here...)
+	// clear existing edges
+	g.deleteVertexLocked(sliceVertexType, "", sliceName)
 
-	// clear edges configmaps -> node where the destination is the current node *only*
-	// at present, a node can only have one *direct* configmap reference at a time
-	g.deleteEdges_locked(configMapVertexType, nodeVertexType, "", nodeName)
-
-	// establish new edges if we have a real ConfigMap to reference
-	if len(configMapName) > 0 && len(configMapNamespace) > 0 {
-		configmapVertex := g.getOrCreateVertex_locked(configMapVertexType, configMapNamespace, configMapName)
-		nodeVertex := g.getOrCreateVertex_locked(nodeVertexType, "", nodeName)
-		g.graph.SetEdge(newDestinationEdge(configmapVertex, nodeVertex, nodeVertex))
+	// if we have a node, establish new edges
+	if len(nodeName) > 0 {
+		sliceVertex := g.getOrCreateVertexLocked(sliceVertexType, "", sliceName)
+		nodeVertex := g.getOrCreateVertexLocked(nodeVertexType, "", nodeName)
+		// Edge adds must be handled by addEdgeLocked instead of direct g.graph.SetEdge calls.
+		g.addEdgeLocked(sliceVertex, nodeVertex, nodeVertex)
 	}
-
+}
+func (g *Graph) DeleteResourceSlice(sliceName string) {
+	start := time.Now()
+	defer func() {
+		graphActionsDuration.WithLabelValues("DeleteResourceSlice").Observe(time.Since(start).Seconds())
+	}()
+	g.lock.Lock()
+	defer g.lock.Unlock()
+	g.deleteVertexLocked(sliceVertexType, "", sliceName)
 }

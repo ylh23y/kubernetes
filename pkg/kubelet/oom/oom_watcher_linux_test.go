@@ -17,21 +17,159 @@ limitations under the License.
 package oom
 
 import (
+	"context"
+	"fmt"
 	"testing"
-
-	"github.com/stretchr/testify/assert"
+	"time"
 
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/client-go/tools/record"
+	"k8s.io/ktesting"
+	"k8s.io/kubernetes/third_party/forked/cadvisor/oomparser"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
-// TestBasic verifies that the OOMWatch works without error.
-func TestBasic(t *testing.T) {
-	fakeRecorder := &record.FakeRecorder{}
-	node := &v1.ObjectReference{}
-	oomWatcher := NewWatcher(fakeRecorder)
-	assert.NoError(t, oomWatcher.Start(node))
+type fakeStreamer struct {
+	oomInstancesToStream []*oomparser.OomInstance
+}
 
-	// TODO: Improve this test once cadvisor exports events.EventChannel as an interface
-	// and thereby allow using a mock version of cadvisor.
+func (fs *fakeStreamer) StreamOoms(_ context.Context, outStream chan<- *oomparser.OomInstance) {
+	for _, oi := range fs.oomInstancesToStream {
+		outStream <- oi
+	}
+}
+
+// TestWatcherRecordsEventsForOomEvents ensures that our OomInstances coming
+// from `StreamOoms` are translated into events in our recorder.
+func TestWatcherRecordsEventsForOomEvents(t *testing.T) {
+	tCtx := ktesting.Init(t)
+	oomInstancesToStream := []*oomparser.OomInstance{
+		{
+			Pid:                 1000,
+			ProcessName:         "fakeProcess",
+			TimeOfDeath:         time.Now(),
+			ContainerName:       recordEventContainerName + "some-container",
+			VictimContainerName: recordEventContainerName,
+		},
+	}
+	numExpectedOomEvents := len(oomInstancesToStream)
+
+	fakeStreamer := &fakeStreamer{
+		oomInstancesToStream: oomInstancesToStream,
+	}
+
+	fakeRecorder := record.NewFakeRecorder(numExpectedOomEvents)
+	node := &v1.ObjectReference{}
+
+	oomWatcher := &realWatcher{
+		recorder:    fakeRecorder,
+		oomStreamer: fakeStreamer,
+	}
+	require.NoError(t, oomWatcher.Start(tCtx, node))
+
+	eventsRecorded := getRecordedEvents(fakeRecorder, numExpectedOomEvents)
+	assert.Len(t, eventsRecorded, numExpectedOomEvents)
+}
+
+func getRecordedEvents(fakeRecorder *record.FakeRecorder, numExpectedOomEvents int) []string {
+	eventsRecorded := []string{}
+
+	select {
+	case event := <-fakeRecorder.Events:
+		eventsRecorded = append(eventsRecorded, event)
+
+		if len(eventsRecorded) == numExpectedOomEvents {
+			break
+		}
+	case <-time.After(10 * time.Second):
+		break
+	}
+
+	return eventsRecorded
+}
+
+// TestWatcherRecordsEventsForOomEventsCorrectContainerName verifies that we
+// only record OOM events when the container name is the one for which we want
+// to record events (i.e. /).
+func TestWatcherRecordsEventsForOomEventsCorrectContainerName(t *testing.T) {
+	// By "incorrect" container name, we mean a container name for which we
+	// don't want to record an oom event.
+	tCtx := ktesting.Init(t)
+	numOomEventsWithIncorrectContainerName := 1
+	oomInstancesToStream := []*oomparser.OomInstance{
+		{
+			Pid:                 1000,
+			ProcessName:         "fakeProcess",
+			TimeOfDeath:         time.Now(),
+			ContainerName:       recordEventContainerName + "some-container",
+			VictimContainerName: recordEventContainerName,
+		},
+		{
+			Pid:                 1000,
+			ProcessName:         "fakeProcess",
+			TimeOfDeath:         time.Now(),
+			ContainerName:       recordEventContainerName + "kubepods/some-container",
+			VictimContainerName: recordEventContainerName + "kubepods",
+		},
+	}
+	numExpectedOomEvents := len(oomInstancesToStream) - numOomEventsWithIncorrectContainerName
+
+	fakeStreamer := &fakeStreamer{
+		oomInstancesToStream: oomInstancesToStream,
+	}
+
+	fakeRecorder := record.NewFakeRecorder(numExpectedOomEvents)
+	node := &v1.ObjectReference{}
+
+	oomWatcher := &realWatcher{
+		recorder:    fakeRecorder,
+		oomStreamer: fakeStreamer,
+	}
+	require.NoError(t, oomWatcher.Start(tCtx, node))
+
+	eventsRecorded := getRecordedEvents(fakeRecorder, numExpectedOomEvents)
+	assert.Len(t, eventsRecorded, numExpectedOomEvents)
+}
+
+// TestWatcherRecordsEventsForOomEventsWithAdditionalInfo verifies that our the
+// emitted event has the proper pid/process data when appropriate.
+func TestWatcherRecordsEventsForOomEventsWithAdditionalInfo(t *testing.T) {
+	// The process and event info should appear in the event message.
+	eventPid := 1000
+	processName := "fakeProcess"
+
+	tCtx := ktesting.Init(t)
+
+	oomInstancesToStream := []*oomparser.OomInstance{
+		{
+			Pid:                 eventPid,
+			ProcessName:         processName,
+			TimeOfDeath:         time.Now(),
+			ContainerName:       recordEventContainerName + "some-container",
+			VictimContainerName: recordEventContainerName,
+		},
+	}
+	numExpectedOomEvents := len(oomInstancesToStream)
+
+	fakeStreamer := &fakeStreamer{
+		oomInstancesToStream: oomInstancesToStream,
+	}
+
+	fakeRecorder := record.NewFakeRecorder(numExpectedOomEvents)
+	node := &v1.ObjectReference{}
+
+	oomWatcher := &realWatcher{
+		recorder:    fakeRecorder,
+		oomStreamer: fakeStreamer,
+	}
+	require.NoError(t, oomWatcher.Start(tCtx, node))
+
+	eventsRecorded := getRecordedEvents(fakeRecorder, numExpectedOomEvents)
+
+	assert.Len(t, eventsRecorded, numExpectedOomEvents)
+	assert.Contains(t, eventsRecorded[0], systemOOMEvent)
+	assert.Contains(t, eventsRecorded[0], fmt.Sprintf("pid: %d", eventPid))
+	assert.Contains(t, eventsRecorded[0], fmt.Sprintf("victim process: %s", processName))
 }

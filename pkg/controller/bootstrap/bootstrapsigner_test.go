@@ -17,11 +17,10 @@ limitations under the License.
 package bootstrap
 
 import (
+	"context"
 	"testing"
 
-	"github.com/davecgh/go-spew/spew"
-
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/informers"
@@ -29,23 +28,21 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 	core "k8s.io/client-go/testing"
 	bootstrapapi "k8s.io/cluster-bootstrap/token/api"
+	"k8s.io/ktesting"
 	api "k8s.io/kubernetes/pkg/apis/core"
 	"k8s.io/kubernetes/pkg/controller"
 )
 
-func init() {
-	spew.Config.DisableMethods = true
-}
-
 const testTokenID = "abc123"
 
-func newSigner() (*Signer, *fake.Clientset, coreinformers.SecretInformer, coreinformers.ConfigMapInformer, error) {
+func newSigner(t *testing.T) (*Signer, *fake.Clientset, coreinformers.SecretInformer, coreinformers.ConfigMapInformer, error) {
+	tCtx := ktesting.Init(t)
 	options := DefaultSignerOptions()
 	cl := fake.NewSimpleClientset()
 	informers := informers.NewSharedInformerFactory(fake.NewSimpleClientset(), controller.NoResyncPeriodFunc())
 	secrets := informers.Core().V1().Secrets()
 	configMaps := informers.Core().V1().ConfigMaps()
-	bsc, err := NewSigner(cl, secrets, configMaps, options)
+	bsc, err := NewSigner(tCtx, cl, secrets, configMaps, options)
 	if err != nil {
 		return nil, nil, nil, nil, err
 	}
@@ -70,16 +67,16 @@ func newConfigMap(tokenID, signature string) *v1.ConfigMap {
 }
 
 func TestNoConfigMap(t *testing.T) {
-	signer, cl, _, _, err := newSigner()
+	signer, cl, _, _, err := newSigner(t)
 	if err != nil {
 		t.Fatalf("error creating Signer: %v", err)
 	}
-	signer.signConfigMap()
+	signer.signConfigMap(context.TODO())
 	verifyActions(t, []core.Action{}, cl.Actions())
 }
 
 func TestSimpleSign(t *testing.T) {
-	signer, cl, secrets, configMaps, err := newSigner()
+	signer, cl, secrets, configMaps, err := newSigner(t)
 	if err != nil {
 		t.Fatalf("error creating Signer: %v", err)
 	}
@@ -91,7 +88,7 @@ func TestSimpleSign(t *testing.T) {
 	addSecretSigningUsage(secret, "true")
 	secrets.Informer().GetIndexer().Add(secret)
 
-	signer.signConfigMap()
+	signer.signConfigMap(context.TODO())
 
 	expected := []core.Action{
 		core.NewUpdateAction(schema.GroupVersionResource{Version: "v1", Resource: "configmaps"},
@@ -103,7 +100,7 @@ func TestSimpleSign(t *testing.T) {
 }
 
 func TestNoSignNeeded(t *testing.T) {
-	signer, cl, secrets, configMaps, err := newSigner()
+	signer, cl, secrets, configMaps, err := newSigner(t)
 	if err != nil {
 		t.Fatalf("error creating Signer: %v", err)
 	}
@@ -115,13 +112,13 @@ func TestNoSignNeeded(t *testing.T) {
 	addSecretSigningUsage(secret, "true")
 	secrets.Informer().GetIndexer().Add(secret)
 
-	signer.signConfigMap()
+	signer.signConfigMap(context.TODO())
 
 	verifyActions(t, []core.Action{}, cl.Actions())
 }
 
 func TestUpdateSignature(t *testing.T) {
-	signer, cl, secrets, configMaps, err := newSigner()
+	signer, cl, secrets, configMaps, err := newSigner(t)
 	if err != nil {
 		t.Fatalf("error creating Signer: %v", err)
 	}
@@ -133,7 +130,7 @@ func TestUpdateSignature(t *testing.T) {
 	addSecretSigningUsage(secret, "true")
 	secrets.Informer().GetIndexer().Add(secret)
 
-	signer.signConfigMap()
+	signer.signConfigMap(context.TODO())
 
 	expected := []core.Action{
 		core.NewUpdateAction(schema.GroupVersionResource{Version: "v1", Resource: "configmaps"},
@@ -145,7 +142,7 @@ func TestUpdateSignature(t *testing.T) {
 }
 
 func TestRemoveSignature(t *testing.T) {
-	signer, cl, _, configMaps, err := newSigner()
+	signer, cl, _, configMaps, err := newSigner(t)
 	if err != nil {
 		t.Fatalf("error creating Signer: %v", err)
 	}
@@ -153,7 +150,7 @@ func TestRemoveSignature(t *testing.T) {
 	cm := newConfigMap(testTokenID, "old signature")
 	configMaps.Informer().GetIndexer().Add(cm)
 
-	signer.signConfigMap()
+	signer.signConfigMap(context.TODO())
 
 	expected := []core.Action{
 		core.NewUpdateAction(schema.GroupVersionResource{Version: "v1", Resource: "configmaps"},

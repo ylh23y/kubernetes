@@ -1,4 +1,4 @@
-// +build freebsd linux darwin
+//go:build freebsd || linux || darwin
 
 /*
 Copyright 2018 The Kubernetes Authors.
@@ -24,48 +24,27 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-func TestParseEndpoint(t *testing.T) {
+func TestLocalEndpoint(t *testing.T) {
 	tests := []struct {
-		endpoint         string
+		path             string
+		file             string
 		expectError      bool
-		expectedProtocol string
-		expectedAddr     string
+		expectedFullPath string
 	}{
 		{
-			endpoint:         "unix:///tmp/s1.sock",
-			expectedProtocol: "unix",
-			expectedAddr:     "/tmp/s1.sock",
-		},
-		{
-			endpoint:         "tcp://localhost:15880",
-			expectedProtocol: "tcp",
-			expectedAddr:     "localhost:15880",
-		},
-		{
-			endpoint:         "npipe://./pipe/mypipe",
-			expectedProtocol: "npipe",
-			expectError:      true,
-		},
-		{
-			endpoint:         "tcp1://abc",
-			expectedProtocol: "tcp1",
-			expectError:      true,
-		},
-		{
-			endpoint:    "a b c",
-			expectError: true,
+			path:             "path",
+			file:             "file",
+			expectError:      false,
+			expectedFullPath: "unix:/path/file.sock",
 		},
 	}
-
 	for _, test := range tests {
-		protocol, addr, err := parseEndpoint(test.endpoint)
-		assert.Equal(t, test.expectedProtocol, protocol)
+		fullPath, err := LocalEndpoint(test.path, test.file)
 		if test.expectError {
-			assert.NotNil(t, err, "Expect error during parsing %q", test.endpoint)
+			assert.Error(t, err, "expected error")
 			continue
 		}
-		assert.Nil(t, err, "Expect no error during parsing %q", test.endpoint)
-		assert.Equal(t, test.expectedAddr, addr)
+		assert.NoError(t, err, "expected no error")
+		assert.Equal(t, test.expectedFullPath, fullPath)
 	}
-
 }

@@ -19,7 +19,9 @@ package metrics
 import (
 	"testing"
 
-	"k8s.io/api/core/v1"
+	"k8s.io/klog/v2/ktesting"
+
+	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	k8stypes "k8s.io/apimachinery/pkg/types"
 	"k8s.io/kubernetes/pkg/kubelet/volumemanager/cache"
@@ -27,12 +29,15 @@ import (
 
 	volumetesting "k8s.io/kubernetes/pkg/volume/testing"
 	"k8s.io/kubernetes/pkg/volume/util"
+	"k8s.io/kubernetes/pkg/volume/util/operationexecutor"
 )
 
 func TestMetricCollection(t *testing.T) {
-	volumePluginMgr, fakePlugin := volumetesting.GetTestVolumePluginMgr(t)
-	dsw := cache.NewDesiredStateOfWorld(volumePluginMgr)
-	asw := cache.NewActualStateOfWorld(k8stypes.NodeName("node-name"), volumePluginMgr)
+	logger, _ := ktesting.NewTestContext(t)
+	volumePluginMgr, fakePlugin := volumetesting.GetTestKubeletVolumePluginMgr(t)
+	seLinuxTranslator := util.NewFakeSELinuxLabelTranslator()
+	dsw := cache.NewDesiredStateOfWorld(volumePluginMgr, seLinuxTranslator)
+	asw := cache.NewActualStateOfWorld(k8stypes.NodeName("node-name"), volumePluginMgr, nil)
 	pod := &v1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "pod1",
@@ -55,35 +60,43 @@ func TestMetricCollection(t *testing.T) {
 	podName := util.GetUniquePodName(pod)
 
 	// Add one volume to DesiredStateOfWorld
-	generatedVolumeName, err := dsw.AddPodToVolume(podName, pod, volumeSpec, volumeSpec.Name(), "")
+	generatedVolumeName, err := dsw.AddPodToVolume(logger, podName, pod, volumeSpec, volumeSpec.Name(), "", nil /* seLinuxOptions */)
 	if err != nil {
 		t.Fatalf("AddPodToVolume failed. Expected: <no error> Actual: <%v>", err)
 	}
 
-	mounter, err := fakePlugin.NewMounter(volumeSpec, pod, volume.VolumeOptions{})
+	mounter, err := fakePlugin.NewMounter(volumeSpec, pod)
 	if err != nil {
 		t.Fatalf("NewMounter failed. Expected: <no error> Actual: <%v>", err)
 	}
 
-	mapper, err := fakePlugin.NewBlockVolumeMapper(volumeSpec, pod, volume.VolumeOptions{})
+	mapper, err := fakePlugin.NewBlockVolumeMapper(volumeSpec, pod)
 	if err != nil {
 		t.Fatalf("NewBlockVolumeMapper failed. Expected: <no error> Actual: <%v>", err)
 	}
 
 	// Add one volume to ActualStateOfWorld
 	devicePath := "fake/device/path"
-	err = asw.MarkVolumeAsAttached("", volumeSpec, "", devicePath)
+	err = asw.MarkVolumeAsAttached(logger, "", volumeSpec, "", devicePath)
 	if err != nil {
 		t.Fatalf("MarkVolumeAsAttached failed. Expected: <no error> Actual: <%v>", err)
 	}
 
-	err = asw.AddPodToVolume(
-		podName, pod.UID, generatedVolumeName, mounter, mapper, volumeSpec.Name(), "", volumeSpec)
+	markVolumeOpts := operationexecutor.MarkVolumeOpts{
+		PodName:           podName,
+		PodUID:            pod.UID,
+		VolumeName:        generatedVolumeName,
+		Mounter:           mounter,
+		BlockVolumeMapper: mapper,
+		VolumeSpec:        volumeSpec,
+		VolumeMountState:  operationexecutor.VolumeMounted,
+	}
+	err = asw.AddPodToVolume(markVolumeOpts)
 	if err != nil {
 		t.Fatalf("AddPodToVolume failed. Expected: <no error> Actual: <%v>", err)
 	}
 
-	metricCollector := &totalVolumesCollector{asw, dsw, volumePluginMgr}
+	metricCollector := &totalVolumesCollector{asw: asw, dsw: dsw, pluginMgr: volumePluginMgr}
 
 	// Check if getVolumeCount returns correct data
 	count := metricCollector.getVolumeCount()

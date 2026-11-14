@@ -20,8 +20,8 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/serializer"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
-	kubeschedulerconfig "k8s.io/kubernetes/pkg/scheduler/apis/config"
-	kubeschedulerconfigv1alpha1 "k8s.io/kubernetes/pkg/scheduler/apis/config/v1alpha1"
+	config "k8s.io/kubernetes/pkg/scheduler/apis/config"
+	configv1 "k8s.io/kubernetes/pkg/scheduler/apis/config/v1"
 )
 
 var (
@@ -29,7 +29,7 @@ var (
 	Scheme = runtime.NewScheme()
 
 	// Codecs provides access to encoding and decoding for the scheme.
-	Codecs = serializer.NewCodecFactory(Scheme)
+	Codecs = serializer.NewCodecFactory(Scheme, serializer.EnableStrict)
 )
 
 func init() {
@@ -38,7 +38,9 @@ func init() {
 
 // AddToScheme builds the kubescheduler scheme using all known versions of the kubescheduler api.
 func AddToScheme(scheme *runtime.Scheme) {
-	utilruntime.Must(kubeschedulerconfig.AddToScheme(Scheme))
-	utilruntime.Must(kubeschedulerconfigv1alpha1.AddToScheme(Scheme))
-	utilruntime.Must(scheme.SetVersionPriority(kubeschedulerconfigv1alpha1.SchemeGroupVersion))
+	utilruntime.Must(config.AddToScheme(scheme))
+	utilruntime.Must(configv1.AddToScheme(scheme))
+	utilruntime.Must(scheme.SetVersionPriority(
+		configv1.SchemeGroupVersion,
+	))
 }
